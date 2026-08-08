@@ -161,15 +161,16 @@ EOF
 
 # ── Non-TTY install: doctor --fix once under HOME + resource roots (D86) ──
 output="$(
-  HOME="${home}" \
-  SHELL=/bin/sh \
-  RYK_VERSION="${VERSION}" \
-  RYK_ARTIFACT_DIR="${artifact_dir}" \
-  RYK_INSTALL_DIR="${install_dir}" \
-  RYK_SHARE_DIR="${share_dir}" \
-  RYK_RESOURCE_ROOT="${escaped}" \
-  RYK_TEST_ONBOARD_LOG="${onboard_log}" \
-  sh "${INSTALL_SH}"
+  cat "${INSTALL_SH}" | \
+    HOME="${home}" \
+    SHELL=/bin/sh \
+    RYK_VERSION="${VERSION}" \
+    RYK_ARTIFACT_DIR="${artifact_dir}" \
+    RYK_INSTALL_DIR="${install_dir}" \
+    RYK_SHARE_DIR="${share_dir}" \
+    RYK_RESOURCE_ROOT="${escaped}" \
+    RYK_TEST_ONBOARD_LOG="${onboard_log}" \
+    sh
 )"
 
 # Captured stdout is intentionally non-TTY. Setup must still be automatic via
@@ -216,7 +217,7 @@ resource_root="${share_dir}/${VERSION}"
 # must be replaced, not followed (which plants current/current and fails install).
 old_runtime="${share_dir}/0.0.0-old"
 mkdir -p "${old_runtime}"
-printf 'ryk-runtime-v1\nversion=0.0.0-old\n' > "${old_runtime}/.ryk-install"
+printf 'ryk-runtime-v1\nversion=0.0.0\n' > "${old_runtime}/.ryk-installation"
 # Plant the failure mode from buggy installs: nested selector inside the target.
 ln -sfn "${resource_root}" "${old_runtime}/current"
 ln -sfn "${old_runtime}" "${share_dir}/current"
@@ -235,8 +236,8 @@ sh "${INSTALL_SH}" >/dev/null ||
   fail "current selector not replaced after reinstall (got: $(readlink "${share_dir}/current" 2>/dev/null || true))"
 [[ ! -e "${share_dir}/current/current" ]] ||
   fail "nested current/current pollution still present after reinstall"
-[[ ! -e "${old_runtime}/current" ]] ||
-  fail "nested selector left under previous runtime version dir"
+[[ "$(readlink "${old_runtime}/current")" == "${resource_root}" ]] ||
+  fail "reinstall modified a previous runtime's nested selector"
 
 activation="$(printf '%s\n' "${output}" | awk '/^    eval / { sub(/^    /, ""); print; exit }')"
 [[ -n "${activation}" ]] || fail "installer did not print an activation command"
@@ -410,9 +411,35 @@ assert_rejected_without_touching() {
     RYK_INSTALL_FORCE=1 \
     RYK_INSTALL_SKIP_ONBOARD=1 \
     sh "${INSTALL_SH}" >"${output_path}" 2>&1; then
-    fail "${case_name}: installer accepted a symlinked destination"
+    fail "${case_name}: installer accepted an unsafe destination"
   fi
-  [[ "$(cat "${victim}")" == "untouched" ]] || fail "${case_name}: installer modified the symlink target"
+  [[ "$(cat "${victim}")" == "untouched" ]] || fail "${case_name}: installer modified the victim"
+}
+
+assert_rejected_without_staged_binary() {
+  case_name="$1"
+  case_install_dir="$2"
+  case_share_dir="$3"
+  watched_dir="$4"
+  output_path="${tmp_root}/${case_name}.out"
+
+  if HOME="${home}" \
+    SHELL=/bin/sh \
+    RYK_VERSION="${VERSION}" \
+    RYK_ARTIFACT_DIR="${artifact_dir}" \
+    RYK_INSTALL_DIR="${case_install_dir}" \
+    RYK_SHARE_DIR="${case_share_dir}" \
+    RYK_INSTALL_FORCE=1 \
+    RYK_INSTALL_SKIP_ONBOARD=1 \
+    sh "${INSTALL_SH}" >"${output_path}" 2>&1; then
+    fail "${case_name}: installer accepted a directory binary destination"
+  fi
+  for staged_parent in "${case_install_dir}" "${watched_dir}"; do
+    if [ -d "${staged_parent}" ] &&
+      find "${staged_parent}" -maxdepth 1 -name '.ryk-install.*' -print -quit | grep -q .; then
+      fail "${case_name}: installer left a staged binary in the destination area"
+    fi
+  done
 }
 
 victim_file="${tmp_root}/victim-file"
@@ -423,11 +450,106 @@ ln -s "${victim_file}" "${binary_final_dir}/ryk"
 assert_rejected_without_touching \
   "binary-final-symlink" "${binary_final_dir}" "${tmp_root}/binary-final-share" "${victim_file}"
 
+binary_product_dir="${tmp_root}/binary-product-final"
+mkdir -p "${binary_product_dir}"
+ln -s "${release_root}/bin/ryk" "${binary_product_dir}/ryk"
+binary_product_share="${tmp_root}/binary-product-share"
+binary_product_runtime="${binary_product_share}/1.2.9"
+mkdir -p "${binary_product_runtime}"
+{
+  printf 'ryk-runtime-v1\n'
+  printf 'version=1.2.9\n'
+} > "${binary_product_runtime}/.ryk-installation"
+ln -s "${binary_product_runtime}" "${binary_product_share}/current"
+product_target_before="$(cat "${release_root}/bin/ryk")"
+if ! HOME="${home}" \
+  SHELL=/bin/sh \
+  RYK_VERSION="${VERSION}" \
+  RYK_ARTIFACT_DIR="${artifact_dir}" \
+  RYK_INSTALL_DIR="${binary_product_dir}" \
+  RYK_SHARE_DIR="${binary_product_share}" \
+  RYK_INSTALL_SKIP_ONBOARD=1 \
+  sh "${INSTALL_SH}" >/dev/null 2>&1; then
+  fail "binary-product-final-symlink: installer rejected an existing ryk symlink"
+fi
+[[ ! -L "${binary_product_dir}/ryk" ]] ||
+  fail "binary-product-final-symlink: installer left the destination symlink in place"
+[[ -f "${binary_product_dir}/ryk" ]] ||
+  fail "binary-product-final-symlink: installer did not install a regular binary"
+[[ "$(cat "${release_root}/bin/ryk")" == "${product_target_before}" ]] ||
+  fail "binary-product-final-symlink: installer modified the symlink target"
+
+malicious_target="${tmp_root}/malicious-target"
+malicious_marker="${tmp_root}/malicious-executed"
+cat > "${malicious_target}" <<'EOF'
+#!/usr/bin/env sh
+printf 'executed\n' > "${RYK_MALICIOUS_MARKER:?}"
+exit 0
+EOF
+chmod 0755 "${malicious_target}"
+malicious_dir="${tmp_root}/malicious-final"
+mkdir -p "${malicious_dir}"
+ln -s "${malicious_target}" "${malicious_dir}/ryk"
+if HOME="${home}" \
+  SHELL=/bin/sh \
+  RYK_VERSION="${VERSION}" \
+  RYK_ARTIFACT_DIR="${artifact_dir}" \
+  RYK_INSTALL_DIR="${malicious_dir}" \
+  RYK_SHARE_DIR="${tmp_root}/malicious-share" \
+  RYK_MALICIOUS_MARKER="${malicious_marker}" \
+  RYK_INSTALL_FORCE=1 \
+  RYK_INSTALL_SKIP_ONBOARD=1 \
+  sh "${INSTALL_SH}" >"${tmp_root}/malicious.out" 2>&1; then
+  fail "malicious-final-symlink: installer accepted an executable non-ryk link"
+fi
+[[ ! -e "${malicious_marker}" ]] ||
+  fail "malicious-final-symlink: installer executed the existing destination"
+
 binary_parent_target="${tmp_root}/binary-parent-target"
 mkdir -p "${binary_parent_target}"
+binary_parent_victim="${binary_parent_target}/ryk"
+printf 'untouched\n' > "${binary_parent_victim}"
 ln -s "${binary_parent_target}" "${tmp_root}/binary-parent-link"
 assert_rejected_without_touching \
-  "binary-parent-symlink" "${tmp_root}/binary-parent-link" "${tmp_root}/binary-parent-share" "${victim_file}"
+  "binary-parent-symlink" "${tmp_root}/binary-parent-link" "${tmp_root}/binary-parent-share" "${binary_parent_victim}"
+
+binary_parent_dotdot_target="${tmp_root}/binary-parent-dotdot-target"
+mkdir -p "${binary_parent_dotdot_target}"
+ln -s "${binary_parent_dotdot_target}" "${tmp_root}/binary-parent-dotdot-link"
+binary_parent_dotdot_safe="${tmp_root}/binary-parent-dotdot-safe"
+mkdir -p "${binary_parent_dotdot_safe}"
+binary_parent_dotdot_victim="${binary_parent_dotdot_safe}/ryk"
+printf 'untouched\n' > "${binary_parent_dotdot_victim}"
+assert_rejected_without_touching \
+  "binary-parent-dotdot-symlink" \
+  "${tmp_root}/binary-parent-dotdot-link/../binary-parent-dotdot-safe" \
+  "${tmp_root}/binary-parent-dotdot-share" \
+  "${binary_parent_dotdot_victim}"
+
+binary_plain_dotdot_parent="${tmp_root}/binary-plain-dotdot-parent"
+mkdir -p "${binary_plain_dotdot_parent}"
+binary_plain_dotdot_safe="${tmp_root}/binary-plain-dotdot-safe"
+mkdir -p "${binary_plain_dotdot_safe}"
+binary_plain_dotdot_victim="${binary_plain_dotdot_safe}/ryk"
+printf 'untouched\n' > "${binary_plain_dotdot_victim}"
+assert_rejected_without_touching \
+  "binary-plain-dotdot" \
+  "${binary_plain_dotdot_parent}/../binary-plain-dotdot-safe" \
+  "${tmp_root}/binary-plain-dotdot-share" \
+  "${binary_plain_dotdot_victim}"
+
+binary_directory_parent="${tmp_root}/binary-directory-parent"
+mkdir -p "${binary_directory_parent}/ryk"
+assert_rejected_without_staged_binary \
+  "binary-final-directory" "${binary_directory_parent}" "${tmp_root}/binary-directory-share" "${binary_directory_parent}/ryk"
+
+binary_directory_target="${tmp_root}/binary-directory-target"
+mkdir -p "${binary_directory_target}"
+binary_directory_link_parent="${tmp_root}/binary-directory-link-parent"
+mkdir -p "${binary_directory_link_parent}"
+ln -s "${binary_directory_target}" "${binary_directory_link_parent}/ryk"
+assert_rejected_without_staged_binary \
+  "binary-final-directory-symlink" "${binary_directory_link_parent}" "${tmp_root}/binary-directory-link-share" "${binary_directory_target}"
 
 runtime_victim_dir="${tmp_root}/runtime-victim"
 mkdir -p "${runtime_victim_dir}"
@@ -447,20 +569,62 @@ ln -s "${runtime_parent_target}" "${tmp_root}/runtime-parent-link"
 assert_rejected_without_touching \
   "runtime-parent-symlink" "${tmp_root}/runtime-parent-bin" "${tmp_root}/runtime-parent-link" "${runtime_parent_victim}"
 
+runtime_current_target="${tmp_root}/runtime-current-target"
+mkdir -p "${runtime_current_target}"
+runtime_current_victim="${runtime_current_target}/current"
+printf 'untouched\n' > "${runtime_current_victim}"
+runtime_current_share="${tmp_root}/runtime-current-share"
+mkdir -p "${runtime_current_share}"
+ln -s "${runtime_current_target}" "${runtime_current_share}/current"
+if ! HOME="${home}" \
+  SHELL=/bin/sh \
+  RYK_VERSION="${VERSION}" \
+  RYK_ARTIFACT_DIR="${artifact_dir}" \
+  RYK_INSTALL_DIR="${tmp_root}/runtime-current-bin" \
+  RYK_SHARE_DIR="${runtime_current_share}" \
+  RYK_INSTALL_FORCE=1 \
+  RYK_INSTALL_SKIP_ONBOARD=1 \
+  sh "${INSTALL_SH}" >/dev/null 2>&1; then
+  fail "runtime-current-symlink: installer failed while replacing an external selector"
+fi
+[[ "$(cat "${runtime_current_victim}")" == "untouched" ]] ||
+  fail "runtime-current-symlink: installer deleted the selector target's current file"
+
+# A failure after runtime staging begins must clean every installer-owned
+# staging path. An unmanaged destination forces that late validation failure.
+late_cleanup_share="${tmp_root}/late-cleanup-share"
+mkdir -p "${late_cleanup_share}/${VERSION}"
+printf 'unmanaged\n' > "${late_cleanup_share}/${VERSION}/sentinel"
+late_cleanup_install="${tmp_root}/late-cleanup-bin"
+if HOME="${home}" \
+  SHELL=/bin/sh \
+  RYK_VERSION="${VERSION}" \
+  RYK_ARTIFACT_DIR="${artifact_dir}" \
+  RYK_INSTALL_DIR="${late_cleanup_install}" \
+  RYK_SHARE_DIR="${late_cleanup_share}" \
+  RYK_INSTALL_FORCE=1 \
+  RYK_INSTALL_SKIP_ONBOARD=1 \
+  sh "${INSTALL_SH}" >"${tmp_root}/late-cleanup.out" 2>&1; then
+  fail "late-cleanup: installer accepted an unmanaged runtime destination"
+fi
+for staging_parent in "${late_cleanup_install}" "${late_cleanup_share}"; do
+  if [ -d "${staging_parent}" ] && find "${staging_parent}" -maxdepth 1 \
+    \( -name '.ryk-install.*' -o -name '.ryk-runtime.*' -o -name '.ryk-old.*' -o -name '.ryk-current.*' \) \
+    -print -quit | grep -q .; then
+    fail "late-cleanup: installer left an atomic-install staging path behind"
+  fi
+done
+
 if find "${share_dir}" "${install_dir}" -maxdepth 1 \
   \( -name '.ryk-install.*' -o -name '.ryk-runtime.*' -o -name '.ryk-old.*' -o -name '.ryk-current.*' \) \
   -print -quit | grep -q .; then
   fail "installer left atomic-install staging paths behind"
 fi
 
-grep -qF 'version "1.2.9"' "${REPO_ROOT}/packaging/homebrew/Formula/ryk.rb" ||
-  fail "primary Homebrew formula version does not match VERSION"
-grep -qF 'brew install christopherkarani/ryk/ryk' "${REPO_ROOT}/packaging/homebrew/README.md" ||
-  fail "Homebrew README does not provide a one-line primary ryk install"
+# Package-manager templates are legacy inputs; the supported release channel
+# exercised by this test is the checksum-verified curl installer.
 grep -qF 'raw.githubusercontent.com/christopherkarani/ryk/main/scripts/install.sh' "${INSTALL_SH}" ||
   fail "curl installer guidance does not use the canonical rykan repository"
-grep -qF 'github.com/christopherkarani/ryk/releases/download' "${REPO_ROOT}/packaging/homebrew/Formula/ryk.rb" ||
-  fail "Homebrew release artifacts do not use the canonical rykan repository"
 if git -C "${REPO_ROOT}" grep -nE \
   'github\.com/(christopherkarani|chriskarani)/(orca|aegis|ryk-rs)([^A-Za-z0-9_-]|$)|raw\.githubusercontent\.com/(christopherkarani|chriskarani)/(orca|aegis|ryk-rs)/' \
   -- README.md AGENTS.md scripts packaging integrations schemas macos docs; then

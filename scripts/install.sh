@@ -120,10 +120,11 @@ fail() {
   exit 1
 }
 
-# Refuse to write through any symlink in a configured install path. The final
-# component is included so force mode cannot turn a symlink into an overwrite
-# primitive. Paths are required to be absolute because the installer changes
-# working directory during onboarding.
+# Refuse to write through symlink components in a configured install path.
+# Generic runtime paths reject their final component too; binary destinations
+# use the parent-only helper below so a managed final binary link can be
+# replaced without following it. Paths are required to be absolute because
+# the installer changes working directory during onboarding.
 reject_symlink_components() {
   checked_path="$1"
   checked_label="$2"
@@ -132,16 +133,42 @@ reject_symlink_components() {
     *) fail "$checked_label must be an absolute path: $checked_path" ;;
   esac
 
-  checked_cursor="$checked_path"
-  while [ "$checked_cursor" != "/" ]; do
+  checked_cursor="/"
+  checked_remaining="${checked_path#/}"
+  while [ -n "$checked_remaining" ]; do
+    case "$checked_remaining" in
+      */*)
+        checked_component="${checked_remaining%%/*}"
+        checked_remaining="${checked_remaining#*/}"
+        ;;
+      *)
+        checked_component="$checked_remaining"
+        checked_remaining=""
+        ;;
+    esac
+    case "$checked_component" in
+      ""|.) continue ;;
+      ..)
+        fail "$checked_label must not contain '..': $checked_path" \
+          "Choose an absolute path without parent-directory components."
+        ;;
+    esac
+    checked_cursor="${checked_cursor%/}/$checked_component"
     if [ -L "$checked_cursor" ]; then
       fail "refusing symlinked $checked_label path: $checked_cursor" \
         "Choose a path whose parents and final target are real directories or files."
     fi
-    checked_parent="$(dirname -- "$checked_cursor")"
-    [ "$checked_parent" != "$checked_cursor" ] || break
-    checked_cursor="$checked_parent"
   done
+}
+
+# Binary destinations support one managed exception: an existing final symlink
+# may point at an older ryk binary. The staged `mv` replaces that link itself,
+# but would move into a directory symlink, so validate the parents and final
+# destination separately.
+reject_symlink_parents() {
+  checked_path="$1"
+  checked_label="$2"
+  reject_symlink_components "$(dirname "$checked_path")" "$checked_label"
 }
 
 # Contract: /^    eval / — always printed, including quiet.
@@ -190,8 +217,61 @@ ARTIFACT_DIR="${RYK_ARTIFACT_DIR:-}"
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ryk-install.XXXXXX")"
 RUNTIME_DIRS="integrations fixtures schemas policies ryk-pi"
 INSTALL_MARKER=".ryk-installation"
+install_stage=""
+runtime_stage=""
+runtime_backup=""
+current_stage=""
+
+# `mv source destination` follows a destination symlink to a directory on
+# macOS/BSD. Use the platform-specific no-follow form so replacement always
+# targets the final path itself. If neither form is available, fail closed.
+replace_path_without_following_destination() {
+  replace_source="$1"
+  replace_destination="$2"
+
+  if mv --version >/dev/null 2>&1; then
+    mv -f -T "$replace_source" "$replace_destination"
+    return $?
+  fi
+  mv -f -h "$replace_source" "$replace_destination" 2>/dev/null
+}
 
 cleanup() {
+  if [ -n "${current_stage:-}" ] && {
+    [ -e "$current_stage" ] || [ -L "$current_stage" ]
+  }; then
+    rm -f "$current_stage" 2>/dev/null || true
+  fi
+  if [ -n "${install_stage:-}" ] && {
+    [ -e "$install_stage" ] || [ -L "$install_stage" ]
+  }; then
+    rm -f "$install_stage" 2>/dev/null || true
+  fi
+  if [ -n "${runtime_stage:-}" ] && {
+    [ -e "$runtime_stage" ] || [ -L "$runtime_stage" ]
+  }; then
+    rm -rf "$runtime_stage" 2>/dev/null || true
+  fi
+  if [ -n "${runtime_backup:-}" ]; then
+    backup_marker="$runtime_backup/$INSTALL_MARKER"
+    if [ -f "$backup_marker" ] && [ ! -L "$backup_marker" ] &&
+      grep -q '^ryk-runtime-v1$' "$backup_marker" 2>/dev/null; then
+      if [ -d "$RESOURCE_ROOT" ] && [ -f "$RESOURCE_ROOT/$INSTALL_MARKER" ] &&
+        [ ! -L "$RESOURCE_ROOT/$INSTALL_MARKER" ] &&
+        grep -q '^ryk-runtime-v1$' "$RESOURCE_ROOT/$INSTALL_MARKER" 2>/dev/null; then
+        rm -rf "$RESOURCE_ROOT" 2>/dev/null || true
+      elif [ -L "$RESOURCE_ROOT" ]; then
+        rm -f "$RESOURCE_ROOT" 2>/dev/null || true
+      fi
+      if [ ! -e "$RESOURCE_ROOT" ] && [ ! -L "$RESOURCE_ROOT" ]; then
+        replace_path_without_following_destination "$runtime_backup" "$RESOURCE_ROOT" \
+          >/dev/null 2>&1 || true
+      fi
+    fi
+    if [ ! -f "$backup_marker" ]; then
+      rm -rf "$runtime_backup" 2>/dev/null || true
+    fi
+  fi
   rm -rf "$TMP_DIR"
 }
 trap cleanup EXIT INT TERM
@@ -280,30 +360,64 @@ Refuse to install a corrupted or tampered archive.
   fi
 }
 
-# Exit 0 if candidate emits the canonical machine-readable ryk identity; print
-# semver (may be empty) on stdout. Human banners are intentionally not used for
-# product detection because they are presentation and may change.
-probe_existing_product() {
-  candidate="$1"
-  [ -e "$candidate" ] || return 1
-  out="$("$candidate" version --json 2>/dev/null)" || return 1
-  printf '%s\n' "$out" | grep -Eqi '"product"[[:space:]]*:[[:space:]]*"ryk"' || return 1
-  printf '%s\n' "$out" | sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)".*/\1/p' | head -n1 || true
-  return 0
+# Exit 0 if the install-managed runtime selector contains the static marker
+# written by this installer; print its semver on stdout. Product detection must
+# never execute an existing destination because it may be an attacker-controlled
+# executable reached through a symlink.
+managed_runtime_version() {
+  managed_marker="$CURRENT_LINK/$INSTALL_MARKER"
+  managed_target="$(readlink "$CURRENT_LINK" 2>/dev/null || true)"
+  reject_symlink_parents "$CURRENT_LINK" "runtime selector"
+  [ -L "$CURRENT_LINK" ] || return 1
+  case "$managed_target" in
+    "$SHARE_DIR"/*) ;;
+    *) return 1 ;;
+  esac
+  reject_symlink_components "$managed_target" "runtime selector target"
+  [ -f "$managed_marker" ] || return 1
+  [ ! -L "$managed_marker" ] || return 1
+  grep -q '^ryk-runtime-v1$' "$managed_marker" 2>/dev/null || return 1
+  managed_version="$(sed -n 's/^version=\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)$/\1/p' \
+    "$managed_marker" | head -n1)"
+  [ -n "$managed_version" ] || return 1
+  printf '%s\n' "$managed_version"
+}
+
+validate_binary_destination() {
+  validate_destination="$1"
+  reject_symlink_parents "$validate_destination" "binary destination"
+
+  if [ -d "$validate_destination" ]; then
+    fail "refusing directory binary destination path: $validate_destination" \
+      "Choose a path whose final target is a regular file or an existing ryk symlink."
+  fi
+
+  if [ -L "$validate_destination" ]; then
+    if ! managed_runtime_version >/dev/null; then
+      fail "refusing symlinked binary destination path: $validate_destination" \
+        "Remove the link or complete a managed ryk install under ${SHARE_DIR}, then retry."
+    fi
+    return 0
+  fi
+
+  if [ -e "$validate_destination" ]; then
+    [ -f "$validate_destination" ] ||
+      fail "refusing non-file binary destination path: $validate_destination" \
+        "Choose a path whose final target is a regular file or an existing ryk symlink."
+    if [ "${RYK_INSTALL_FORCE:-0}" != "1" ] && ! managed_runtime_version >/dev/null; then
+      fail "refusing to overwrite non-ryk file at $validate_destination" \
+        "Set RYK_INSTALL_FORCE=1 to replace it, or choose another install dir."
+    fi
+  fi
 }
 
 safe_install() {
   source_bin="$1"
   destination="$2"
 
-  reject_symlink_components "$destination" "binary destination"
-  if [ -e "$destination" ] && [ "${RYK_INSTALL_FORCE:-0}" != "1" ]; then
-    if ! probe_existing_product "$destination" >/dev/null; then
-      fail "refusing to overwrite non-ryk file at $destination" \
-        "Set RYK_INSTALL_FORCE=1 to replace it, or choose another install dir."
-    fi
-  fi
+  validate_binary_destination "$destination"
 
+  reject_symlink_components "$INSTALL_DIR" "binary install directory"
   mkdir -p "$INSTALL_DIR"
   reject_symlink_components "$INSTALL_DIR" "binary install directory"
   install_stage="$(mktemp "$INSTALL_DIR/.ryk-install.XXXXXX")" ||
@@ -314,13 +428,14 @@ safe_install() {
   }
   chmod 0755 "$install_stage" || {
     rm -f "$install_stage"
+    install_stage=""
     fail "could not make the staged ryk binary executable"
   }
-  reject_symlink_components "$destination" "binary destination"
-  mv -f "$install_stage" "$destination" || {
-    rm -f "$install_stage"
+  validate_binary_destination "$destination"
+  if ! replace_path_without_following_destination "$install_stage" "$destination"; then
     fail "could not atomically install ryk at $destination"
-  }
+  fi
+  install_stage=""
 }
 
 install_runtime_assets() {
@@ -344,12 +459,14 @@ install_runtime_assets() {
   for dir in $RUNTIME_DIRS; do
     cp -R "$extract_root/$dir" "$runtime_stage/" || {
       rm -rf "$runtime_stage"
+      runtime_stage=""
       fail "could not stage runtime directory: $dir"
     }
   done
   if [ -d "$extract_root/ryk-dashboard-ui" ]; then
     cp -R "$extract_root/ryk-dashboard-ui" "$runtime_stage/" || {
       rm -rf "$runtime_stage"
+      runtime_stage=""
       fail "could not stage dashboard UI assets"
     }
   fi
@@ -363,46 +480,58 @@ install_runtime_assets() {
   if [ -e "$RESOURCE_ROOT" ]; then
     [ -d "$RESOURCE_ROOT" ] || {
       rm -rf "$runtime_stage"
+      runtime_stage=""
       fail "refusing to replace non-directory runtime destination: $RESOURCE_ROOT"
     }
     [ -f "$RESOURCE_ROOT/$INSTALL_MARKER" ] &&
       [ ! -L "$RESOURCE_ROOT/$INSTALL_MARKER" ] &&
       grep -q '^ryk-runtime-v1$' "$RESOURCE_ROOT/$INSTALL_MARKER" 2>/dev/null || {
       rm -rf "$runtime_stage"
+      runtime_stage=""
       fail "refusing to replace an unmanaged runtime directory: $RESOURCE_ROOT"
     }
     runtime_backup="$(mktemp -d "$SHARE_DIR/.ryk-old.XXXXXX")" ||
       fail "could not reserve runtime backup path under $SHARE_DIR"
-    rmdir "$runtime_backup"
-    mv "$RESOURCE_ROOT" "$runtime_backup" || {
+    rmdir "$runtime_backup" || fail "could not prepare the runtime backup path"
+    if ! replace_path_without_following_destination "$RESOURCE_ROOT" "$runtime_backup"; then
       rm -rf "$runtime_stage"
+      runtime_stage=""
       fail "could not move the prior runtime into a safe backup"
-    }
-  fi
-
-  if ! mv "$runtime_stage" "$RESOURCE_ROOT"; then
-    [ -z "$runtime_backup" ] || mv "$runtime_backup" "$RESOURCE_ROOT" 2>/dev/null || true
-    rm -rf "$runtime_stage"
-    fail "could not atomically install runtime assets at $RESOURCE_ROOT"
+    fi
   fi
 
   reject_symlink_components "$SHARE_DIR" "runtime share directory"
+  reject_symlink_components "$RESOURCE_ROOT" "runtime destination"
+  if ! replace_path_without_following_destination "$runtime_stage" "$RESOURCE_ROOT"; then
+    fail "could not atomically install runtime assets at $RESOURCE_ROOT"
+  fi
+  runtime_stage=""
+
+  reject_symlink_components "$SHARE_DIR" "runtime share directory"
   # Update the selector without following an existing current→version symlink.
-  # On macOS/BSD, `mv -f newlink "$CURRENT_LINK"` when CURRENT_LINK is a symlink
-  # to a directory moves *into* that directory (current/current) instead of
-  # replacing the selector — then fails with "are identical" on reinstall.
-  # ln -sfn replaces the symlink in place and never treats the target as a dir.
+  # A staged link plus the same no-follow move used for binaries also avoids
+  # macOS/BSD's `mv`-into-directory behavior and never mutates the old target.
   if [ -e "$CURRENT_LINK" ] && [ ! -L "$CURRENT_LINK" ]; then
     fail "refusing to replace non-symlink runtime selector: $CURRENT_LINK"
   fi
-  # Drop nested pollution from older buggy installs (current/current inside a version).
-  if [ -L "$CURRENT_LINK/current" ] || [ -e "$CURRENT_LINK/current" ]; then
-    rm -f "$CURRENT_LINK/current" 2>/dev/null || true
+  current_stage="$(mktemp "$SHARE_DIR/.ryk-current.XXXXXX")" ||
+    fail "could not create runtime selector staging link under $SHARE_DIR"
+  rm -f "$current_stage" || fail "could not prepare runtime selector staging link"
+  ln -s "$RESOURCE_ROOT" "$current_stage" ||
+    fail "could not stage the installed runtime selector"
+  reject_symlink_components "$SHARE_DIR" "runtime share directory"
+  if [ -e "$CURRENT_LINK" ] && [ ! -L "$CURRENT_LINK" ]; then
+    fail "refusing to replace non-symlink runtime selector: $CURRENT_LINK"
   fi
-  ln -sfn "$RESOURCE_ROOT" "$CURRENT_LINK" ||
+  if ! replace_path_without_following_destination "$current_stage" "$CURRENT_LINK"; then
     fail "could not atomically select the installed runtime" \
       "Could not point ${CURRENT_LINK} at ${RESOURCE_ROOT}."
-  [ -z "$runtime_backup" ] || rm -rf "$runtime_backup"
+  fi
+  current_stage=""
+  if [ -n "$runtime_backup" ]; then
+    rm -rf "$runtime_backup" || fail "could not remove the prior runtime backup"
+    runtime_backup=""
+  fi
 }
 
 rc_file_for_shell() {
@@ -546,7 +675,7 @@ DESTINATION="$INSTALL_DIR/ryk"
 
 # Empty = fresh install; semver or "installed" = existing CLI at destination.
 PREVIOUS_VERSION=""
-if previous_out="$(probe_existing_product "$DESTINATION")"; then
+if previous_out="$(managed_runtime_version)"; then
   PREVIOUS_VERSION="$previous_out"
   if [ -z "$PREVIOUS_VERSION" ]; then
     PREVIOUS_VERSION="installed"
