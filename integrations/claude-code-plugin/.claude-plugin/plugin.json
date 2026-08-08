@@ -1,6 +1,6 @@
 {
     "name": "ryk",
-    "version": "1.2.11",
+    "version": "1.2.12",
     "description": "ryk safety hooks and skills for Claude Code.",
     "author": {
         "name": "ryk"
