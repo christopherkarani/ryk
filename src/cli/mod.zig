@@ -33,6 +33,7 @@ pub const grok_install = @import("grok_install.zig");
 pub const plugin_install = @import("plugin_install.zig");
 pub const setup = @import("setup.zig");
 pub const start = @import("start.zig");
+pub const unattended = @import("unattended.zig");
 pub const onboarding = @import("onboarding.zig");
 pub const ensure = @import("ensure.zig");
 pub const quickstart = @import("quickstart.zig");
@@ -93,6 +94,7 @@ test {
     _ = plugin;
     _ = @import("openclaw_status.zig");
     _ = start;
+    _ = unattended;
     _ = init; // AINA P3 refreshManagedDiscovery suite (was transitively linked via start→init)
     _ = setup;
     _ = quickstart;
@@ -163,7 +165,7 @@ fn suggestCommand(unknown: []const u8) ?[]const u8 {
 /// receive the shared entry banner (would double-print).
 /// `scan` keeps the progress phase banner-free (spinner only); durable brand
 /// lives on the result scorecard / alt-screen TUI header.
-const self_banner_commands = [_][]const u8{ "version", "--version", "help", "run", "start", "scan" };
+const self_banner_commands = [_][]const u8{ "version", "--version", "help", "run", "start", "unattended", "scan" };
 
 /// Commands whose output is always machine/raw (JSON, generated scripts, export
 /// lines, long-running servers) — never receive the human brand banner.
@@ -509,6 +511,7 @@ fn runWithCwdUsing(
         return run_command.commandWithEnv(io, environ_map, argv[1..], stdout, stderr);
     }
     if (std.mem.eql(u8, command, "start")) return start.command(io, cwd, argv[1..], stdout, stderr);
+    if (std.mem.eql(u8, command, "unattended")) return unattended.command(io, cwd, argv[1..], stdout, stderr);
     // Hard-remove public onboarding peers: single door is `ryk start`.
     if (std.mem.eql(u8, command, "quickstart") or std.mem.eql(u8, command, "setup")) {
         try help.writeRemovedOnboardingPeer(stderr, command);

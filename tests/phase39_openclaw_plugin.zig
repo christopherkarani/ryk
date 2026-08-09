@@ -124,7 +124,7 @@ test "openclaw package.json has openclaw field" {
     try std.testing.expect(openclaw.get("runtimeExtensions") != null);
 }
 
-test "openclaw package.json has correct name" {
+test "openclaw package.json has canonical native name" {
     var dbg_state: std.heap.DebugAllocator(.{}) = .init;
     defer _ = dbg_state.deinit();
     const allocator = dbg_state.allocator();
@@ -136,7 +136,7 @@ test "openclaw package.json has correct name" {
     defer parsed.deinit();
 
     const name = parsed.value.object.get("name").?.string;
-    try std.testing.expectEqualStrings("ryk-openclaw-plugin", name);
+    try std.testing.expectEqualStrings("ryk", name);
 }
 
 test "openclaw package.json main points to dist/index.js" {
@@ -306,13 +306,13 @@ test "openclaw plugin README states no MCP server behavior" {
     try std.testing.expect(std.mem.indexOf(u8, content, "does not add MCP server behavior") != null);
 }
 
-test "openclaw plugin README has npm install instructions demoted as unprotected" {
+test "openclaw plugin README marks registry installs sunset" {
     const content = try readFile(std.testing.allocator, readme_path);
     defer std.testing.allocator.free(content);
 
-    try std.testing.expect(std.mem.indexOf(u8, content, "openclaw plugins install npm:ryk-openclaw-plugin") != null);
-    try std.testing.expect(std.mem.indexOf(u8, content, "NOT recommended for security") != null or
-        std.mem.indexOf(u8, content, "unprotected") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "Npm and ClawHub distribution paths are sunset") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "openclaw plugins install npm:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "openclaw plugins install clawhub:") == null);
 }
 
 test "openclaw plugin README does not claim npm publication happened" {

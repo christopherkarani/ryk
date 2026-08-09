@@ -31,6 +31,7 @@ pub const AgentPreset = enum {
     strict_local,
     team_ci,
     openclaw_hermes,
+    unattended,
     trusted_local,
     no_external_comms,
 
@@ -62,6 +63,7 @@ pub const agent_preset_infos = [_]AgentPresetInfo{
     .{ .preset = .strict_local, .name = "strict-local", .experimental = false, .warning = "" },
     .{ .preset = .team_ci, .name = "team-ci", .experimental = false, .warning = "" },
     .{ .preset = .openclaw_hermes, .name = "openclaw-hermes", .experimental = false, .warning = "" },
+    .{ .preset = .unattended, .name = "unattended", .experimental = false, .warning = "" },
     .{ .preset = .trusted_local, .name = "trusted-local", .experimental = false, .warning = "" },
     .{ .preset = .no_external_comms, .name = "no-external-comms", .experimental = false, .warning = "" },
 };
@@ -91,6 +93,7 @@ pub fn agentPresetText(preset: AgentPreset) []const u8 {
         .strict_local => strict_local_policy,
         .team_ci => team_ci_policy,
         .openclaw_hermes => openclaw_hermes_policy,
+        .unattended => unattended_policy,
         .trusted_local => trusted_local_policy,
         .no_external_comms => no_external_comms_policy,
     };
@@ -207,6 +210,144 @@ const openclaw_hermes_policy =
     \\
 ++ ask_policy;
 
+const unattended_policy =
+    \\# ryk preset: unattended
+    \\# Fail-closed baseline for Hermes/OpenClaw and other agents running without an operator.
+    \\# Every unmatched or approval-class action is denied; this preset never waits for an operator.
+    \\
+    \\version: 1
+    \\mode: strict
+    \\
+    \\workspace:
+    \\  root: "."
+    \\  write_mode: staged
+    \\
+    \\env:
+    \\  inherit: false
+    \\  default: deny
+    \\  allow:
+    \\    - PATH
+    \\    - HOME
+    \\    - LANG
+    \\    - TERM
+    \\    - RYK_UNATTENDED
+    \\    - RYK_OPENCLAW_UNATTENDED
+    \\  deny_patterns:
+    \\    - "*TOKEN*"
+    \\    - "*SECRET*"
+    \\    - "*PASSWORD*"
+    \\    - "*PASSWD*"
+    \\    - "*PRIVATE*"
+    \\    - "*KEY*"
+    \\    - "AWS_*"
+    \\    - "AZURE_*"
+    \\    - "GITHUB_TOKEN"
+    \\    - "GH_TOKEN"
+    \\    - "OPENAI_API_KEY"
+    \\    - "ANTHROPIC_API_KEY"
+    \\    - "NPM_TOKEN"
+    \\    - "PYPI_TOKEN"
+    \\    - "SSH_AUTH_SOCK"
+    \\
+    \\files:
+    \\  read:
+    \\    default: deny
+    \\    allow:
+    \\      - "./**"
+    \\    deny:
+    \\      - "./.env"
+    \\      - "./.env.*"
+    \\      - "~/.ssh/**"
+    \\      - "~/.aws/**"
+    \\      - "~/.config/gh/**"
+    \\      - "**/*credentials*"
+    \\      - "**/*credential*"
+    \\      - "**/*secret*"
+    \\      - "**/*token*"
+    \\  write:
+    \\    default: deny
+    \\    allow:
+    \\      - "./**"
+    \\    deny:
+    \\      - "./.git/**"
+    \\      - ".git/**"
+    \\      - "./.ryk/**"
+    \\      - ".ryk/**"
+    \\    mode: staged
+    \\
+    \\commands:
+    \\  default: deny
+    \\  allow:
+    \\    - "git status"
+    \\    - "git diff *"
+    \\    - "git log *"
+    \\    - "ls *"
+    \\    - "pwd"
+    \\    - "which *"
+    \\    - "node --version"
+    \\    - "python3 --version"
+    \\    - "npm test*"
+    \\    - "npm run test*"
+    \\    - "pnpm test*"
+    \\    - "yarn test*"
+    \\    - "zig version"
+    \\    - "zig build test*"
+    \\    - "ryk version"
+    \\    - "ryk doctor *"
+    \\    - "ryk explain *"
+    \\  deny:
+    \\    - "rm -rf *"
+    \\    - "find * -delete"
+    \\    - "shred *"
+    \\    - "curl * | sh"
+    \\    - "wget * | bash"
+    \\    - "sudo *"
+    \\    - "su *"
+    \\    - "doas *"
+    \\    - "cat .env"
+    \\    - "cat ~/.ssh/*"
+    \\
+    \\network:
+    \\  mode: allowlist
+    \\  default: deny
+    \\  allow:
+    \\    - "api.github.com"
+    \\    - "*.github.com"
+    \\    - "registry.npmjs.org"
+    \\    - "pypi.org"
+    \\  deny:
+    \\    - "pastebin.com"
+    \\    - "*.ngrok.io"
+    \\    - "*.requestbin.net"
+    \\  detect_exfiltration:
+    \\    dns: true
+    \\    long_query_strings: true
+    \\    secret_patterns: true
+    \\
+    \\mcp:
+    \\  default: deny
+    \\  allow:
+    \\    - "*.search_*"
+    \\    - "*.list_*"
+    \\    - "*.get_*"
+    \\    - "glob"
+    \\    - "grep"
+    \\    - "list"
+    \\    - "read"
+    \\    - "todowrite"
+    \\    - "todoread"
+    \\  deny:
+    \\    - "*.delete_*"
+    \\    - "*.shell"
+    \\    - "*.run_command"
+    \\
+    \\audit:
+    \\  level: full
+    \\  redact_secrets: true
+    \\  tamper_evident: true
+    \\
+;
+
 const trusted_local_policy =
     \\# ryk preset: trusted-local
     \\# Less restrictive local preset for trusted repositories. Secret redaction and deny rules remain enabled.
@@ -225,6 +366,8 @@ const common_strict_rules =
     \\    - HOME
     \\    - LANG
     \\    - TERM
+    \\    - RYK_UNATTENDED
+    \\    - RYK_OPENCLAW_UNATTENDED
     \\  deny_patterns:
     \\    - "*TOKEN*"
     \\    - "*SECRET*"
@@ -701,13 +844,14 @@ test "strict preset documents mode strict and commands.allow sample" {
 }
 
 test "phase 18 agent presets are exposed with stable names" {
-    try std.testing.expectEqual(@as(usize, 14), agent_preset_infos.len);
+    try std.testing.expectEqual(@as(usize, 15), agent_preset_infos.len);
     try std.testing.expectEqual(AgentPreset.generic_agent, AgentPreset.parse("generic-agent").?);
     try std.testing.expectEqual(AgentPreset.github_actions, AgentPreset.parse("github-actions").?);
     try std.testing.expectEqual(AgentPreset.solo_dev, AgentPreset.parse("solo-dev").?);
     try std.testing.expectEqual(AgentPreset.strict_local, AgentPreset.parse("strict-local").?);
     try std.testing.expectEqual(AgentPreset.team_ci, AgentPreset.parse("team-ci").?);
     try std.testing.expectEqual(AgentPreset.openclaw_hermes, AgentPreset.parse("openclaw-hermes").?);
+    try std.testing.expectEqual(AgentPreset.unattended, AgentPreset.parse("unattended").?);
     try std.testing.expectEqual(AgentPreset.no_external_comms, AgentPreset.parse("no-external-comms").?);
     try std.testing.expect(AgentPreset.parse("not-a-preset") == null);
     for (agent_preset_infos) |info| {
@@ -715,6 +859,27 @@ test "phase 18 agent presets are exposed with stable names" {
         try std.testing.expect(std.mem.indexOf(u8, source, "version: 1") != null);
         try std.testing.expect(std.mem.indexOf(u8, source, "redact_secrets: true") != null);
     }
+}
+
+test "unattended preset is strict and never prompts" {
+    const source = agentPresetText(.unattended);
+    try std.testing.expect(std.mem.indexOf(u8, source, "# ryk preset: unattended") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "mode: strict") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "default: ask") == null);
+
+    const load = @import("load.zig");
+    var policy = try load.parseFromSlice(std.testing.allocator, source, "preset:unattended");
+    defer policy.deinit();
+    try std.testing.expectEqual(@import("schema.zig").Mode.strict, policy.mode);
+    try std.testing.expectEqual(@import("schema.zig").DecisionValue.deny, policy.env.default.?);
+    try std.testing.expectEqual(@import("schema.zig").DecisionValue.deny, policy.files.read.default.?);
+    try std.testing.expectEqual(@import("schema.zig").DecisionValue.deny, policy.files.write.default.?);
+    try std.testing.expectEqual(@import("schema.zig").DecisionValue.deny, policy.commands.default.?);
+    try std.testing.expectEqual(@import("schema.zig").DecisionValue.deny, policy.network.default.?);
+    try std.testing.expectEqual(@import("schema.zig").DecisionValue.deny, policy.mcp.default.?);
+    try std.testing.expectEqual(@as(usize, 0), policy.commands.ask.len);
+    try std.testing.expectEqual(@as(usize, 0), policy.network.ask.len);
+    try std.testing.expectEqual(@as(usize, 0), policy.mcp.ask.len);
 }
 
 test "no-external-comms preset includes effect denials" {

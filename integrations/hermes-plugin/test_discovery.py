@@ -181,6 +181,21 @@ class HermesPluginDiscoveryTests(unittest.TestCase):
         self.assertIn("FAIL-OPEN", warn_text)
         self.assertIn("RYK_HERMES_FAIL_OPEN=0", warn_text)
 
+    def test_unattended_overrides_fail_open(self) -> None:
+        ctx = mock.Mock()
+        exc = RuntimeError("ryk binary not found or too old for Hermes hooks")
+        with mock.patch.dict(
+            os.environ,
+            {"RYK_HERMES_FAIL_OPEN": "1", "RYK_UNATTENDED": "1"},
+            clear=False,
+        ):
+            with mock.patch("builtins.print") as printed:
+                result = _PLUGIN._handle_hook_error(ctx, "pre_tool_call", exc)
+        self.assertIsInstance(result, dict)
+        assert result is not None
+        self.assertEqual(result.get("action"), "block")
+        printed.assert_not_called()
+
     def test_pre_tool_call_blocks_hard_deny(self) -> None:
         ctx = mock.Mock()
         _PLUGIN._register(ctx, "pre_tool_call")
@@ -199,7 +214,13 @@ class HermesPluginDiscoveryTests(unittest.TestCase):
         _PLUGIN._register(ctx, "pre_tool_call")
         handler = ctx.register_hook.call_args.args[1]
         with mock.patch.dict(os.environ, {}, clear=False):
-            for key in ("CI", "RYK_CI", "RYK_NONINTERACTIVE"):
+            for key in (
+                "CI",
+                "RYK_CI",
+                "RYK_NONINTERACTIVE",
+                "RYK_UNATTENDED",
+                "RYK_HERMES_UNATTENDED",
+            ):
                 os.environ.pop(key, None)
             with mock.patch.object(
                 _PLUGIN,
@@ -233,6 +254,22 @@ class HermesPluginDiscoveryTests(unittest.TestCase):
                 result = handler(tool_name="terminal", args={"command": "rm -rf /tmp/x"})
         self.assertEqual(result.get("action"), "block")
         self.assertIn("approval required", result.get("message", "").lower())
+
+    def test_pre_tool_call_ask_hardens_to_block_when_unattended(self) -> None:
+        ctx = mock.Mock()
+        _PLUGIN._register(ctx, "pre_tool_call")
+        handler = ctx.register_hook.call_args.args[1]
+        with mock.patch.dict(os.environ, {"RYK_UNATTENDED": "1"}, clear=False):
+            for key in ("CI", "RYK_CI", "RYK_NONINTERACTIVE", "RYK_HERMES_UNATTENDED"):
+                os.environ.pop(key, None)
+            with mock.patch.object(
+                _PLUGIN,
+                "_call_ryk",
+                return_value={"decision": "ask", "message": "approval required by ryk"},
+            ):
+                result = handler(tool_name="terminal", args={"command": "git push"})
+        self.assertEqual(result.get("action"), "block")
+        self.assertIn("noninteractive", result.get("message", "").lower())
 
     def test_pre_tool_call_warn_is_not_silent_block(self) -> None:
         """warn must not be collapsed to permanent block; log and allow with semantic fidelity."""

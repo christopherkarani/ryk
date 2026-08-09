@@ -11,8 +11,14 @@ import json
 import os
 from typing import Any, Callable
 
-# Truthy env tokens for CI / noninteractive hardening of ask → block.
-_CI_ENV_KEYS = ("CI", "RYK_CI", "RYK_NONINTERACTIVE")
+# Truthy env tokens for CI / unattended hardening of ask → block.
+_CI_ENV_KEYS = (
+    "CI",
+    "RYK_CI",
+    "RYK_NONINTERACTIVE",
+    "RYK_UNATTENDED",
+    "RYK_HERMES_UNATTENDED",
+)
 _FALSY_ENV = frozenset({"0", "false", "no", "off", ""})
 
 # rule_key uses '|' so ryk rule_ids that contain ':' stay unambiguous.
@@ -20,7 +26,7 @@ _RULE_KEY_SEP = "|"
 
 
 def ci_mode(environ: dict[str, str] | None = None) -> bool:
-    """True when interactive approval cannot be answered (CI / noninteractive)."""
+    """True when interactive approval cannot be answered (CI / unattended)."""
     env = os.environ if environ is None else environ
     for key in _CI_ENV_KEYS:
         value = env.get(key, "").strip().lower()

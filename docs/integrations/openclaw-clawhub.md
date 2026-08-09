@@ -1,6 +1,6 @@
-# OpenClaw plugin distribution
+# OpenClaw plugin distribution (sunset)
 
-This page covers local package validation and registry distribution for the OpenClaw integration. A package install is not proof that enforcement is active. Current npm and ClawHub installs use OpenClaw's CLI-metadata path, where hooks do not enforce tool calls. Use `ryk openclaw` when process supervision is required.
+Npm and ClawHub distribution for the OpenClaw integration is sunset. Do not use a registry package for a new deployment. The supported path is the checksum-verified curl installer followed by `ryk unattended setup`; use `ryk run -- openclaw` when process supervision is required.
 
 ## Validate the local package
 
@@ -15,9 +15,9 @@ node -e "JSON.parse(require('fs').readFileSync('integrations/openclaw-plugin/ope
 
 Check the package contents before publishing. It should contain the compiled plugin, manifest, README, and package metadata. It should not contain install scripts, secrets, telemetry code, or MCP server configuration.
 
-## Registry publication
+## Historical registry notes
 
-Registry commands and publication status change independently of the ryk release. Follow the current [ClawHub documentation](https://docs.openclaw.ai/clawhub) and verify the package name and version in the registry before making a release claim.
+Registry commands and publication status are intentionally out of the supported deployment contract. Keep this page only for historical package validation context; do not publish or recommend registry installs.
 
 Keep the package version aligned with `VERSION`. Do not put credentials or registry tokens in this repository.
 

@@ -24,7 +24,17 @@ Available presets:
 - `strict-local`: strict local baseline with denied unknown commands/network.
 - `team-ci`: product policy pack for team CI baselines.
 - `openclaw-hermes`: product policy pack for OpenClaw and Hermes hook workflows.
+- `unattended`: strict permit-list fail-closed baseline for agents running without an operator. Commands outside the reviewed local-safe set are denied rather than waiting for approval.
 - `trusted-local`: more permissive local baseline for trusted repositories; secret redaction and deny rules remain active.
+
+For a dedicated Hermes/OpenClaw unattended setup, use:
+
+```bash
+ryk unattended setup --hosts hermes,openclaw
+ryk unattended health --json
+```
+
+The preset is safe for a Mac mini, VPS, or other non-interactive host: commands outside the reviewed permit list are denied, and both adapters deny approval-class requests when `RYK_UNATTENDED=1` (or `RYK_OPENCLAW_UNATTENDED=1`) is present. A successful file install is not proof that a long-running host has loaded the hook; restart the host and run `ryk unattended health --json`.
 
 Productized policy packs can also be inspected and applied through the policy command:
 

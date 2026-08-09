@@ -14,6 +14,24 @@ interface RykResponse {
   host_limitations?: string[];
 }
 
+interface OpenClawBlockResult {
+  block?: boolean;
+  blockReason?: string;
+}
+
+interface OpenClawGatewayRequest {
+  params?: unknown;
+  respond: (ok: boolean, payload?: unknown, error?: unknown) => void;
+}
+
+type OpenClawRegistrationMode =
+  | 'full'
+  | 'discovery'
+  | 'tool-discovery'
+  | 'setup-only'
+  | 'setup-runtime'
+  | 'cli-metadata';
+
 interface PluginLogger {
   debug?: (message: string) => void;
   info: (message: string) => void;
@@ -31,10 +49,17 @@ interface OpenClawPluginApi {
   version?: string;
   description?: string;
   source: string;
+  rootDir?: string;
+  registrationMode?: OpenClawRegistrationMode;
   config: unknown;
   pluginConfig?: Record<string, unknown>;
   runtime: unknown;
   logger: PluginLogger;
+  registerGatewayMethod?: (
+    method: string,
+    handler: (request: OpenClawGatewayRequest) => unknown | Promise<unknown>,
+    opts?: { scope?: string }
+  ) => void;
   on: <K extends string>(
     hookName: K,
     handler: (event: unknown, ctx: unknown) => unknown | Promise<unknown>,
@@ -50,15 +75,47 @@ const SECRET_KEYS = [
 
 const ALLOW_DECISIONS = new Set(['allow', 'warn', 'context_only']);
 
-/** Matches Zig `openclaw_status.enforcement_note` intent (prefer wrapper; npm unprotected). */
+/** Matches Zig `openclaw_status.enforcement_note` intent. */
 export const ENFORCEMENT_NOTE =
-  'unprotected for npm/ClawHub (hooks no-op); prefer wrapper: ryk run -- openclaw';
+  'supported install is curl-installed ryk + ryk unattended setup; npm/ClawHub paths are sunset; metadata passes are unprotected; prefer wrapper: ryk run -- openclaw';
 
-/** Standing warning text for npm/ClawHub unprotected installs. */
+/** Standing warning text for metadata/discovery passes where api.on is not live. */
 export const UNPROTECTED_NOOP_WARNING =
-  `[ryk] unprotected: npm/ClawHub/CLI-metadata install — OpenClaw wires api.on to a no-op, ` +
+  `[ryk] unprotected: OpenClaw did not provide a live full-runtime hook registration API, ` +
   `so before_tool_call / after_tool_call hooks will NOT fire and cannot block tools. ` +
   `Prefer wrapper: \`ryk run -- openclaw\` (${ENFORCEMENT_NOTE}).`;
+
+/** Gateway RPC used by unattended health to prove the active plugin registry. */
+export const LIVE_PROBE_METHOD = 'ryk.unattended';
+const LIVE_PROBE_COMMAND = ['rm', '-rf', '/'].join(' ');
+
+const KNOWN_REGISTRATION_MODES = new Set<OpenClawRegistrationMode>([
+  'full',
+  'discovery',
+  'tool-discovery',
+  'setup-only',
+  'setup-runtime',
+  'cli-metadata',
+]);
+
+const UNATTENDED_ENV_KEYS = [
+  'RYK_UNATTENDED',
+  'RYK_OPENCLAW_UNATTENDED',
+  'RYK_NONINTERACTIVE',
+  'RYK_CI',
+  'CI',
+] as const;
+const FALSY_ENV_VALUES = new Set(['', '0', 'false', 'no', 'off']);
+
+/** True when an approval cannot safely wait for a human response. */
+export function isUnattended(
+  environ: Record<string, string | undefined> = process.env
+): boolean {
+  return UNATTENDED_ENV_KEYS.some((key) => {
+    const value = environ[key]?.trim().toLowerCase() ?? '';
+    return value.length > 0 && !FALSY_ENV_VALUES.has(value);
+  });
+}
 
 function redactSecrets(data: unknown): unknown {
   if (data === null || data === undefined) return data;
@@ -219,8 +276,23 @@ export function normalizeOpenClawToolEvent(event: unknown): Record<string, unkno
   };
 }
 
-function failClosedBlock(reason: string, message: string): RykResponse {
+/** Extract the stable OpenClaw session identity used for ryk audit correlation. */
+export function openClawSessionId(ctx: unknown): string | undefined {
+  if (!ctx || typeof ctx !== 'object') return undefined;
+  const record = ctx as Record<string, unknown>;
+  for (const key of ['sessionKey', 'sessionId', 'runId']) {
+    if (typeof record[key] === 'string' && record[key].trim()) return record[key].trim();
+  }
+  return undefined;
+}
+
+function failClosedBlock(
+  reason: string,
+  message: string,
+  base: Partial<RykResponse> = {}
+): RykResponse {
   return {
+    ...base,
     decision: 'block',
     risk: 'high',
     category: 'unknown',
@@ -241,7 +313,8 @@ function softAllow(reason: string, message?: string): RykResponse {
 
 function normalizeBlockingDecision(
   decision: string,
-  base: Partial<RykResponse>
+  base: Partial<RykResponse>,
+  options: { unattended?: boolean } = {}
 ): RykResponse {
   if (decision === 'block' || decision === 'error') {
     return {
@@ -260,14 +333,18 @@ function normalizeBlockingDecision(
   }
   if (decision === 'ask') {
     return failClosedBlock(
-      'ryk_ask_unsupported',
-      'ryk requested interactive approval (ask); OpenClaw has no ask UX — blocking.'
+      options.unattended ? 'ryk_unattended_ask' : 'ryk_ask_unsupported',
+      options.unattended
+        ? 'ryk requested approval, but this OpenClaw process is unattended; blocking without waiting.'
+        : 'ryk requested interactive approval (ask), but this OpenClaw integration has no verified resumable approval contract; blocking.',
+      base
     );
   }
   if (!ALLOW_DECISIONS.has(decision)) {
     return failClosedBlock(
       'ryk_unrecognized_decision',
-      `ryk returned unrecognized decision "${decision}"; blocking as a precaution.`
+      `ryk returned unrecognized decision "${decision}"; blocking as a precaution.`,
+      base
     );
   }
   return {
@@ -287,9 +364,15 @@ function normalizeBlockingDecision(
  * Parse ryk hook stdout into a decision.
  * Non-blocking: soft-allow on empty/malformed.
  * Blocking: fail closed on empty/whitespace, parse errors, missing/non-string decision,
- * `ask`, and unrecognized decisions (no OpenClaw ask UX).
+ * `ask`, and unrecognized decisions. Approval is deliberately not translated
+ * into a host-native request until a live, versioned OpenClaw approval contract
+ * is available; an unknown host must never receive an unenforced ask.
  */
-export function parseHookResponse(stdout: string, blocking: boolean): RykResponse {
+export function parseHookResponse(
+  stdout: string,
+  blocking: boolean,
+  options: { unattended?: boolean } = {}
+): RykResponse {
   const fail = (reason: string, blockMsg: string, softMsg: string): RykResponse =>
     blocking ? failClosedBlock(reason, blockMsg) : softAllow(reason, softMsg);
 
@@ -348,7 +431,7 @@ export function parseHookResponse(stdout: string, blocking: boolean): RykRespons
     reason: typeof record.reason === 'string' ? record.reason : undefined,
     message: typeof record.message === 'string' ? record.message : undefined,
     rule: (record.rule as string | null | undefined) ?? undefined,
-  });
+  }, options);
 }
 
 async function callRyk(
@@ -357,7 +440,8 @@ async function callRyk(
   data: unknown,
   sessionId: string | undefined,
   blocking: boolean,
-  logger: PluginLogger | undefined
+  logger: PluginLogger | undefined,
+  options: { unattended?: boolean } = {}
 ): Promise<RykResponse> {
   const payload = buildPayload(event, data, sessionId);
   const payloadJson = JSON.stringify(payload);
@@ -375,7 +459,7 @@ async function callRyk(
       }
     );
 
-    return parseHookResponse(stdout, blocking);
+    return parseHookResponse(stdout, blocking, options);
   } catch (err: unknown) {
     const safeErr = redactSecrets({ message: (err as Error).message });
     logger?.error?.(`[ryk] Hook ${event} failed: ${(safeErr as { message: string }).message}`);
@@ -393,27 +477,30 @@ async function callRyk(
 }
 
 /**
- * Detect whether api.on is likely a no-op.
- * OpenClaw loads npm plugins with registrationMode "cli-metadata", where
- * api.on is wired to a no-op function. This is a known limitation.
- *
- * We use a path heuristic: if the plugin source contains "node_modules" or
- * ".openclaw/npm", it was installed via npm/ClawHub and hooks will not fire.
+ * Detect whether api.on is a live runtime registration surface.
+ * OpenClaw's current registrationMode is authoritative. Older hosts without
+ * that field are untrusted for enforcement and must use the wrapper path.
  */
 export function isOnNoop(api: OpenClawPluginApi): boolean {
   if (typeof api.on !== 'function') return true;
 
-  const source = api.source || '';
-  if (source.includes('node_modules') || source.includes('.openclaw/npm')) {
-    return true;
-  }
+  // OpenClaw's current API explicitly reports whether registration is live.
+  // Only `full` is a runtime hook path; discovery/setup/metadata passes must
+  // never be presented as enforcement.
+  if (api.registrationMode !== undefined) return api.registrationMode !== 'full';
 
-  return false;
+  // Legacy OpenClaw versions had no registrationMode. A callable api.on is
+  // not proof that it dispatches runtime hooks, so default to unprotected.
+  return true;
+}
+
+function hasUnknownRegistrationMode(api: OpenClawPluginApi): boolean {
+  const mode = api.registrationMode as string | undefined;
+  return mode !== undefined && !KNOWN_REGISTRATION_MODES.has(mode as OpenClawRegistrationMode);
 }
 
 export default function rykPlugin(api: OpenClawPluginApi): void {
   const cwd = process.cwd();
-  const sessionId = undefined;
   const rykBin = findRyk(cwd);
   const { logger } = api;
 
@@ -429,13 +516,27 @@ export default function rykPlugin(api: OpenClawPluginApi): void {
 
   if (onIsNoop) {
     logger?.warn?.(UNPROTECTED_NOOP_WARNING);
-    // npm/ClawHub installs wire api.on to a no-op. Registering a veto handler
-    // would claim fail-closed protection while hooks never fire. Prefer the
-    // wrapper path instead of a false sense of enforcement.
+    if (hasUnknownRegistrationMode(api)) {
+      logger?.warn?.(
+        `[ryk] OpenClaw returned an unknown registration mode (${String(api.registrationMode)}); ` +
+          'registering a fail-closed veto until the host contract is understood.'
+      );
+      api.on(
+        'before_tool_call',
+        async () => ({
+          block: true,
+          blockReason: 'ryk cannot verify the OpenClaw registration mode; blocking as a precaution.',
+        }),
+        { timeoutMs: 5_000 }
+      );
+      return;
+    }
+    // Registering a veto handler on a non-runtime API would claim fail-closed
+    // protection while hooks never fire. Prefer the wrapper path instead.
     if (!rykBin) {
       logger?.warn?.(
         '[ryk] Binary not found in PATH (or RYK_BIN). ' +
-          'npm/ClawHub install remains unprotected (hooks no-op); ' +
+          'OpenClaw plugin remains unprotected (hooks are not live); ' +
           'prefer wrapper: `ryk run -- openclaw`.'
       );
     }
@@ -462,46 +563,98 @@ export default function rykPlugin(api: OpenClawPluginApi): void {
 
   logger?.info?.(`[ryk] Plugin loaded. Binary: ${rykBin}`);
 
-  api.on('session_start', async (event) => {
+  const beforeToolCallHandler = async (
+    event: unknown,
+    ctx: unknown
+  ): Promise<OpenClawBlockResult | void> => {
+    const normalized = normalizeOpenClawToolEvent(event);
+    const response = await callRyk(
+      rykBin,
+      'tool.before',
+      normalized,
+      openClawSessionId(ctx) ?? openClawSessionId(event),
+      true,
+      logger,
+      {
+        unattended: isUnattended(),
+      }
+    );
+
+    if (response.decision === 'block') {
+      const msg = response.message || response.reason || 'ryk blocked this command.';
+      logger?.error?.(`[ryk] Blocked tool execution: ${msg}`);
+      return { block: true, blockReason: msg };
+    }
+
+    if (response.decision === 'warn') {
+      logger?.warn?.(`[ryk] Warning: ${response.message || response.reason}`);
+    }
+
+    // Do not return { params: undefined } — some hosts treat that as a rewrite.
+    return;
+  };
+
+  api.on('before_tool_call', beforeToolCallHandler, { timeoutMs: 20_000 });
+
+  if (typeof api.registerGatewayMethod === 'function') {
+    api.registerGatewayMethod(
+      LIVE_PROBE_METHOD,
+      async ({ respond }) => {
+        const denyCanary = await beforeToolCallHandler(
+          {
+            toolName: 'bash',
+            params: { command: LIVE_PROBE_COMMAND },
+          },
+          { sessionKey: 'ryk-unattended-health-probe' }
+        );
+        respond(true, {
+          ok: true,
+          plugin: 'ryk',
+          hook: 'before_tool_call',
+          registration: 'full-runtime',
+          enforcement: denyCanary?.block === true ? 'deny-canary-pass' : 'deny-canary-fail',
+        });
+      },
+      { scope: 'operator.read' }
+    );
+  } else {
+    logger?.warn?.(
+      '[ryk] OpenClaw full runtime has no Gateway probe registration API; ' +
+        'unattended health cannot verify the active plugin registry.'
+    );
+  }
+
+  api.on('session_start', async (event, ctx) => {
     logger?.info?.('[ryk] Plugin ready for session.');
     await callRyk(
       rykBin,
       'session.start',
       { session_id: (event as { sessionId?: string })?.sessionId },
-      sessionId,
+      openClawSessionId(ctx) ?? openClawSessionId(event),
       false,
       logger
     );
   });
 
-  // Host timeout is fail-open; keep CLI budget under the hook budget.
-  api.on(
-    'before_tool_call',
-    async (event) => {
-      const normalized = normalizeOpenClawToolEvent(event);
-      const response = await callRyk(rykBin, 'tool.before', normalized, sessionId, true, logger);
-
-      if (response.decision === 'block') {
-        const msg = response.message || response.reason || 'ryk blocked this command.';
-        logger?.error?.(`[ryk] Blocked tool execution: ${msg}`);
-        return { block: true, blockReason: msg };
-      }
-
-      if (response.decision === 'warn') {
-        logger?.warn?.(`[ryk] Warning: ${response.message || response.reason}`);
-      }
-
-      // Do not return { params: undefined } — some hosts treat that as a rewrite.
-      return;
-    },
-    { timeoutMs: 20_000 }
-  );
-
-  api.on('after_tool_call', async (event) => {
-    await callRyk(rykBin, 'tool.after', normalizeOpenClawToolEvent(event), sessionId, false, logger);
+  api.on('after_tool_call', async (event, ctx) => {
+    await callRyk(
+      rykBin,
+      'tool.after',
+      normalizeOpenClawToolEvent(event),
+      openClawSessionId(ctx) ?? openClawSessionId(event),
+      false,
+      logger
+    );
   });
 
-  api.on('session_end', async (event) => {
-    await callRyk(rykBin, 'session.end', event, sessionId, false, logger);
+  api.on('session_end', async (event, ctx) => {
+    await callRyk(
+      rykBin,
+      'session.end',
+      event,
+      openClawSessionId(ctx) ?? openClawSessionId(event),
+      false,
+      logger
+    );
   });
 }

@@ -132,6 +132,12 @@ def _fail_open_enabled() -> bool:
     fail-closed product default.
     New installs via `ryk plugin install hermes` write `.ryk_fail_stance` = fail-closed.
     """
+    # An unattended/CI process must never inherit a fail-open override. The
+    # no-human safety boundary dominates install stance and environment escape
+    # hatches so a stale supervisor setting cannot turn a missing guard into
+    # an allowed tool call.
+    if _mapping.ci_mode():
+        return False
     if "RYK_HERMES_FAIL_OPEN" in os.environ:
         parsed = _parse_fail_open_token(os.environ.get("RYK_HERMES_FAIL_OPEN", ""))
         if parsed is not None:

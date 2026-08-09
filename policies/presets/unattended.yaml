@@ -1,0 +1,132 @@
+# ryk preset: unattended
+# Fail-closed baseline for Hermes/OpenClaw and other agents running without an operator.
+# Strict permit-list mode never prompts: commands outside the reviewed safe set are denied.
+version: 1
+mode: strict
+
+workspace:
+  root: "."
+  write_mode: staged
+
+env:
+  inherit: false
+  default: deny
+  allow:
+    - PATH
+    - HOME
+    - LANG
+    - TERM
+    - RYK_UNATTENDED
+    - RYK_OPENCLAW_UNATTENDED
+  deny_patterns:
+    - "*TOKEN*"
+    - "*SECRET*"
+    - "*PASSWORD*"
+    - "*PASSWD*"
+    - "*PRIVATE*"
+    - "*KEY*"
+    - "AWS_*"
+    - "AZURE_*"
+    - "GITHUB_TOKEN"
+    - "GH_TOKEN"
+    - "OPENAI_API_KEY"
+    - "ANTHROPIC_API_KEY"
+    - "NPM_TOKEN"
+    - "PYPI_TOKEN"
+    - "SSH_AUTH_SOCK"
+
+files:
+  read:
+    default: deny
+    allow:
+      - "./**"
+    deny:
+      - "./.env"
+      - "./.env.*"
+      - "~/.ssh/**"
+      - "~/.aws/**"
+      - "~/.config/gh/**"
+      - "**/*credentials*"
+      - "**/*credential*"
+      - "**/*secret*"
+      - "**/*token*"
+  write:
+    default: deny
+    allow:
+      - "./**"
+    deny:
+      - "./.git/**"
+      - ".git/**"
+      - "./.ryk/**"
+      - ".ryk/**"
+    mode: staged
+
+commands:
+  default: deny
+  allow:
+    - "git status"
+    - "git diff *"
+    - "git log *"
+    - "ls *"
+    - "pwd"
+    - "which *"
+    - "node --version"
+    - "python3 --version"
+    - "npm test*"
+    - "npm run test*"
+    - "pnpm test*"
+    - "yarn test*"
+    - "zig version"
+    - "zig build test*"
+    - "ryk version"
+    - "ryk doctor *"
+    - "ryk explain *"
+  deny:
+    - "rm -rf *"
+    - "find * -delete"
+    - "shred *"
+    - "curl * | sh"
+    - "wget * | bash"
+    - "sudo *"
+    - "su *"
+    - "doas *"
+    - "cat .env"
+    - "cat ~/.ssh/*"
+network:
+  mode: allowlist
+  default: deny
+  allow:
+    - "api.github.com"
+    - "*.github.com"
+    - "registry.npmjs.org"
+    - "pypi.org"
+  deny:
+    - "pastebin.com"
+    - "*.ngrok.io"
+    - "*.requestbin.net"
+  detect_exfiltration:
+    dns: true
+    long_query_strings: true
+    secret_patterns: true
+
+mcp:
+  default: deny
+  allow:
+    - "*.search_*"
+    - "*.list_*"
+    - "*.get_*"
+    - "glob"
+    - "grep"
+    - "list"
+    - "read"
+    - "todowrite"
+    - "todoread"
+  deny:
+    - "*.delete_*"
+    - "*.shell"
+    - "*.run_command"
+
+audit:
+  level: full
+  redact_secrets: true
+  tamper_evident: true

@@ -38,11 +38,11 @@ Separators are `|` so rule ids that contain `:` stay unambiguous. Approving `cur
 
 ### CI / noninteractive
 
-When `CI`, `RYK_CI`, or `RYK_NONINTERACTIVE` is set truthily, ryk `ask` is hardened to Hermes `block` (no approval prompt). Hermes also fail-closes plugin-escalated approvals in non-interactive non-gateway contexts.
+When `CI`, `RYK_CI`, `RYK_NONINTERACTIVE`, `RYK_UNATTENDED`, or `RYK_HERMES_UNATTENDED` is set truthily, ryk `ask` is hardened to Hermes `block` (no approval prompt). These unattended signals also override `RYK_HERMES_FAIL_OPEN=1`; a missing ryk binary remains blocked. Hermes also fail-closes plugin-escalated approvals in non-interactive non-gateway contexts.
 
 ## Failure modes
 
-- **`pre_tool_call`**: Uses the mapping above. When ryk is missing, too old for Hermes hooks, or returns a Hermes host mismatch, the default is fail-closed. Set `RYK_HERMES_FAIL_OPEN=1` only when deliberately accepting unguarded tool execution.
+- **`pre_tool_call`**: Uses the mapping above. When ryk is missing, too old for Hermes hooks, or returns a Hermes host mismatch, the default is fail-closed. Set `RYK_HERMES_FAIL_OPEN=1` only for an attended deployment that deliberately accepts unguarded tool execution; unattended/CI signals always remain fail-closed.
 - **`pre_llm_call`**: **Context-only** — Hermes cannot veto the turn or open an approval dialog on this hook. ryk `warn` / `context_only` inject advisory notes. ryk `ask` and `block` inject **honest** notes that do **not** claim enforcement or auto-triggered approval; the strongest real gate for prompts remains `ryk run -- hermes ...`. Other ryk failures log a warning and continue without injecting policy context.
 - **Informational hooks** (`post_tool_call`, session lifecycle, etc.): Log warnings on ryk failure and never block Hermes.
 
@@ -50,13 +50,15 @@ The strongest local protection remains running Hermes through `ryk run -- hermes
 
 ## Install
 
-From the ryk repository:
+Supported deployment:
 
 ```sh
-ryk plugin install hermes --yes
+curl -fsSL https://rykanv.com/install | sh
+ryk unattended setup --hosts hermes
+ryk unattended health --json --hosts hermes
 ```
 
-Or manually:
+Source checkout development only:
 
 ```sh
 ryk plugin install hermes --yes
@@ -103,8 +105,8 @@ Environment:
 
 - `RYK_BIN` — force a specific ryk executable (must be executable on disk).
 - `RYK_ALLOW_WORKSPACE_BIN=1` — opt into repo-local `zig-out/bin/ryk` discovery for development/testing.
-- `RYK_HERMES_FAIL_OPEN` — only recognized truthy tokens (`1`, `true`, `yes`, `on`, `fail-open`, `open`) enable degraded fail-open behavior; missing, empty, false, and unknown values block `pre_tool_call`.
-- `CI` / `RYK_CI` / `RYK_NONINTERACTIVE` — when truthy, harden ryk `ask` on tools to Hermes `block`.
+- `RYK_HERMES_FAIL_OPEN` — only recognized truthy tokens (`1`, `true`, `yes`, `on`, `fail-open`, `open`) enable degraded fail-open behavior in attended mode; unattended/CI signals override it.
+- `CI` / `RYK_CI` / `RYK_NONINTERACTIVE` / `RYK_UNATTENDED` / `RYK_HERMES_UNATTENDED` — when truthy, harden ryk `ask` on tools to Hermes `block` and keep degraded execution fail-closed.
 
 ## Manual verification (CLI approve UI)
 

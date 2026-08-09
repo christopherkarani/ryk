@@ -77,7 +77,7 @@ pub const PacksSummary = struct {
 pub fn presetOptInPacks(preset: policy_mod.presets.AgentPreset) []const []const u8 {
     return switch (preset) {
         // Default / conservative coding agents: no surprise opt-ins.
-        .generic_agent, .solo_dev, .trusted_local, .mcp_dev => &.{},
+        .generic_agent, .solo_dev, .trusted_local, .mcp_dev, .unattended => &.{},
         // Coding agents: small safe package-manager pack.
         .claude_code, .codex, .cursor_agent, .opencode, .cline_roo => &.{"package_managers"},
         // Local strict: extra git paranoia on top of baseline.

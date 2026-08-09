@@ -237,6 +237,7 @@ pub const PluginDoctorReport = struct {
     workspace_root: []const u8,
     policy_present: bool,
     policy_valid: bool,
+    policy_mode: ?[]const u8 = null,
     policy_error: ?[]const u8,
     audit_replay_available: bool,
     mcp_support_status: []const u8,
@@ -361,11 +362,13 @@ pub fn collectPluginDoctorReportWithHermesSmoke(
     defer allocator.free(policy_path);
     var policy_present = false;
     var policy_valid = false;
+    var policy_mode: ?[]const u8 = null;
     var policy_error: ?[]const u8 = null;
     errdefer if (policy_error) |e| allocator.free(e);
     if (fileExistsAbsolute(io, policy_path)) {
         policy_present = true;
         if (core_api.loadPolicyFile(io, allocator, policy_path)) |loaded_policy| {
+            policy_mode = @tagName(loaded_policy.mode());
             var loaded = loaded_policy;
             loaded.deinit();
             policy_valid = true;
@@ -539,6 +542,7 @@ pub fn collectPluginDoctorReportWithHermesSmoke(
         .workspace_root = workspace_root,
         .policy_present = policy_present,
         .policy_valid = policy_valid,
+        .policy_mode = policy_mode,
         .policy_error = policy_error,
         .audit_replay_available = audit_replay_available,
         .mcp_support_status = mcp_support_status,
@@ -1550,13 +1554,16 @@ fn installCommand(io: std.Io, argv: []const []const u8, stdout: anytype, stderr:
                     opencode_install_attempted = true;
                 }
             } else if (t == .openclaw) {
-                // OpenClaw-specific install guidance
-                const install_command = try std.fmt.allocPrint(allocator, "openclaw plugins install {s}", .{plugin_dir});
-                defer allocator.free(install_command);
+                // OpenClaw-specific install guidance. The supported deployment
+                // path is the curl installer plus the unattended workflow;
+                // local host installation remains development-only.
                 try openclaw_status.writeInstallPaths(stdout);
                 if (dry_run) {
                     try stdout.writeAll("  action: no changes made (dry-run)\n");
-                    try stdout.print("  next step: run '{s}' if OpenClaw is installed\n", .{install_command});
+                    try stdout.writeAll("  supported deployment:\n");
+                    try stdout.writeAll("    curl -fsSL https://rykanv.com/install | sh\n");
+                    try stdout.writeAll("    ryk unattended setup --hosts openclaw\n");
+                    try stdout.writeAll("  source-checkout development only: openclaw plugins install <plugin_dir>\n");
                 } else {
                     if (!binaryInPath(io, allocator, "openclaw")) {
                         try stdout.writeAll("  action: failed (openclaw binary not found in PATH)\n");
@@ -1960,17 +1967,10 @@ pub fn detectOpenClawHostInstall(io: std.Io, allocator: std.mem.Allocator, openc
 }
 
 pub fn captureChildOutput(allocator: std.mem.Allocator, argv: []const []const u8) ![]u8 {
-    var threaded: std.Io.Threaded = .init_single_threaded;
-    const io = threaded.io();
-    const run_result = try std.process.run(allocator, io, .{
-        .argv = argv,
-        .stdout_limit = .limited(256 * 1024),
-        .stderr_limit = .limited(0),
-    });
-    defer allocator.free(run_result.stderr);
-    const term = run_result.term;
-    if (term != .exited or term.exited != 0) return error.ChildFailed;
-    return run_result.stdout;
+    var result = try child_process.runHostCommandCaptureTimed(allocator, argv, 10_000);
+    defer result.deinit(allocator);
+    if (result.timed_out or result.exit_code != 0) return error.ChildFailed;
+    return try allocator.dupe(u8, result.stdout);
 }
 
 pub fn hostPluginInstalledFromReport(host_name: []const u8, report: PluginDoctorReport) bool {
@@ -2634,7 +2634,7 @@ test "plugin doctor openclaw shows openclaw-specific section" {
     try std.testing.expectEqualStrings("", stderr_writer.buffered());
 }
 
-test "plugin doctor openclaw --json includes enforcement_note and hook_grade unverified" {
+test "plugin doctor openclaw --json includes sunset registry note" {
     var stdout_buf: [32768]u8 = undefined;
     var stderr_buf: [256]u8 = undefined;
     var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
@@ -2645,9 +2645,9 @@ test "plugin doctor openclaw --json includes enforcement_note and hook_grade unv
 
     const output = stdout_writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, output, "\"enforcement_note\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "unprotected") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "sunset") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "\"hook_grade\": \"unverified\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "\"npm_path\": \"unprotected\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"npm_path\": \"sunset\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "hook_enforcing") == null);
     try std.testing.expectEqualStrings("", stderr_writer.buffered());
 }
@@ -2868,6 +2868,9 @@ test "plugin install openclaw --dry-run reports safe preview" {
     try std.testing.expect(std.mem.indexOf(u8, output, "dry-run") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "no changes made") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Target: openclaw") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "curl -fsSL https://rykanv.com/install | sh") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "ryk unattended setup --hosts openclaw") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "source-checkout development only") != null);
     try std.testing.expectEqualStrings("", stderr_writer.buffered());
 }
 

@@ -386,10 +386,10 @@ fn parseDoctorOptions(argv: []const []const u8, stderr: anytype) !DoctorOptions 
                     "--preset",
                     name,
                     &.{
-                        "generic-agent", "claude-code",  "codex",           "cursor-agent",
-                        "opencode",      "cline-roo",    "mcp-dev",         "github-actions",
-                        "solo-dev",      "strict-local", "team-ci",         "openclaw-hermes",
-                        "trusted-local",
+                        "generic-agent", "claude-code",   "codex",   "cursor-agent",
+                        "opencode",      "cline-roo",     "mcp-dev", "github-actions",
+                        "solo-dev",      "strict-local",  "team-ci", "openclaw-hermes",
+                        "unattended",    "trusted-local",
                     },
                     "doctor",
                 );

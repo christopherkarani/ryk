@@ -6,6 +6,9 @@ import rykPlugin, {
   isOnNoop,
   normalizeOpenClawToolEvent,
   parseHookResponse,
+  isUnattended,
+  openClawSessionId,
+  LIVE_PROBE_METHOD,
   UNPROTECTED_NOOP_WARNING,
 } from '../src/index.ts';
 
@@ -18,6 +21,7 @@ function makeApi(overrides: Partial<Parameters<typeof rykPlugin>[0]> = {}) {
     error: mock.fn(),
   };
   const on = mock.fn();
+  const registerGatewayMethod = mock.fn();
   return {
     id: 'test',
     name: 'test-plugin',
@@ -25,7 +29,9 @@ function makeApi(overrides: Partial<Parameters<typeof rykPlugin>[0]> = {}) {
     config: {},
     runtime: {},
     logger,
+    registerGatewayMethod,
     on,
+    registrationMode: 'full',
     ...overrides,
   };
 }
@@ -86,24 +92,52 @@ describe('isOnNoop', () => {
     assert.strictEqual(isOnNoop(api as any), true);
   });
 
-  it('returns true when source contains node_modules', () => {
+  it('uses full registration mode when the plugin lives under node_modules', () => {
     const api = makeApi({ source: '/path/to/node_modules/ryk-openclaw-plugin' });
-    assert.strictEqual(isOnNoop(api), true);
-  });
-
-  it('returns true when source contains .openclaw/npm', () => {
-    const api = makeApi({ source: '/home/user/.openclaw/npm/ryk-openclaw-plugin' });
-    assert.strictEqual(isOnNoop(api), true);
-  });
-
-  it('returns false for bundled plugin sources', () => {
-    const api = makeApi({ source: '/Applications/OpenClaw.app/Contents/Plugins/ryk' });
     assert.strictEqual(isOnNoop(api), false);
   });
 
-  it('returns false when source is empty but on is a function', () => {
-    const api = makeApi({ source: '' });
-    assert.strictEqual(isOnNoop(api), false);
+  it('returns true for cli-metadata registration mode', () => {
+    const api = makeApi({
+      source: '/home/user/.openclaw/npm/ryk-openclaw-plugin',
+      registrationMode: 'cli-metadata',
+    });
+    assert.strictEqual(isOnNoop(api), true);
+  });
+
+  it('returns true for discovery registration mode', () => {
+    const api = makeApi({ registrationMode: 'discovery' });
+    assert.strictEqual(isOnNoop(api), true);
+  });
+
+  it('treats legacy APIs without registrationMode as unprotected', () => {
+    const api = makeApi({
+      source: '/home/user/.openclaw/npm/ryk-openclaw-plugin',
+      registrationMode: undefined,
+    });
+    assert.strictEqual(isOnNoop(api), true);
+  });
+
+  it('does not trust bundled sources without an explicit runtime mode', () => {
+    const api = makeApi({ source: '/Applications/OpenClaw.app/Contents/Plugins/ryk', registrationMode: undefined });
+    assert.strictEqual(isOnNoop(api), true);
+  });
+
+  it('does not trust an empty source without an explicit runtime mode', () => {
+    const api = makeApi({ source: '', registrationMode: undefined });
+    assert.strictEqual(isOnNoop(api), true);
+  });
+
+  it('keeps unknown registration modes fail-closed instead of silently unprotected', async () => {
+    const api = makeApi({ registrationMode: 'future-runtime' as any });
+    rykPlugin(api);
+    const beforeCall = (api.on as any).mock.calls.find(
+      (c: any) => c.arguments[0] === 'before_tool_call'
+    );
+    assert.ok(beforeCall, 'unknown modes must receive a fail-closed veto');
+    const result = await beforeCall.arguments[1]();
+    assert.strictEqual(result.block, true);
+    assert.match(String(result.blockReason), /registration mode/);
   });
 });
 
@@ -145,6 +179,27 @@ describe('parseHookResponse (fail-closed blocking path)', () => {
     );
     assert.strictEqual(r.decision, 'block');
     assert.strictEqual(r.reason, 'ryk_ask_unsupported');
+  });
+
+  it('ask decision blocks until a live resumable approval contract is verified', () => {
+    const r = parseHookResponse(
+      JSON.stringify({ decision: 'ask', reason: 'needs_approval', rule: 'policy.rule' }),
+      true,
+      {}
+    );
+    assert.strictEqual(r.decision, 'block');
+    assert.strictEqual(r.rule, 'policy.rule');
+    assert.strictEqual(r.reason, 'ryk_ask_unsupported');
+  });
+
+  it('ask decision blocks immediately in unattended mode', () => {
+    const r = parseHookResponse(
+      JSON.stringify({ decision: 'ask', reason: 'needs_approval' }),
+      true,
+      { unattended: true }
+    );
+    assert.strictEqual(r.decision, 'block');
+    assert.strictEqual(r.reason, 'ryk_unattended_ask');
   });
 
   it('unrecognized decision on blocking path → block', () => {
@@ -192,10 +247,48 @@ describe('normalizeOpenClawToolEvent', () => {
   });
 });
 
+describe('unattended helpers', () => {
+  it('recognizes explicit unattended environment signals', () => {
+    assert.strictEqual(isUnattended({ RYK_UNATTENDED: '1' }), true);
+    assert.strictEqual(isUnattended({ RYK_OPENCLAW_UNATTENDED: 'true' }), true);
+    assert.strictEqual(isUnattended({ RYK_UNATTENDED: '0', CI: 'false' }), false);
+  });
+
+  it('prefers OpenClaw sessionKey for ryk session correlation', () => {
+    assert.strictEqual(
+      openClawSessionId({ sessionKey: 'agent:main:hermes', sessionId: 'session-1' }),
+      'agent:main:hermes'
+    );
+    assert.strictEqual(openClawSessionId({ runId: 'run-1' }), 'run-1');
+    assert.strictEqual(openClawSessionId(undefined), undefined);
+  });
+
+});
+
 describe('rykPlugin', () => {
-  it('warns about unprotected noop api.on for npm installs', () => {
+  it('registers a live deny-canary probe on the full runtime path', () => {
+    const prevBin = process.env.RYK_BIN;
+    const prevAllow = process.env.RYK_ALLOW_WORKSPACE_BIN;
+    process.env.RYK_BIN = `${process.cwd()}/zig-out/bin/ryk`;
+    process.env.RYK_ALLOW_WORKSPACE_BIN = '1';
+    try {
+      const api = makeApi();
+      rykPlugin(api);
+      const gatewayCalls = (api.registerGatewayMethod as any).mock.calls;
+      assert.strictEqual(gatewayCalls.length, 1);
+      assert.strictEqual(gatewayCalls[0].arguments[0], LIVE_PROBE_METHOD);
+    } finally {
+      if (prevBin === undefined) delete process.env.RYK_BIN;
+      else process.env.RYK_BIN = prevBin;
+      if (prevAllow === undefined) delete process.env.RYK_ALLOW_WORKSPACE_BIN;
+      else process.env.RYK_ALLOW_WORKSPACE_BIN = prevAllow;
+    }
+  });
+
+  it('warns about unprotected cli-metadata api.on', () => {
     const api = makeApi({
       source: '/path/to/node_modules/ryk-openclaw-plugin',
+      registrationMode: 'cli-metadata',
     });
     rykPlugin(api);
 
@@ -271,7 +364,7 @@ describe('rykPlugin', () => {
     }
   });
 
-  it('does not register no-op veto handlers for npm installs when binary is missing', () => {
+  it('does not register no-op veto handlers for cli-metadata when binary is missing', () => {
     const prevBin = process.env.RYK_BIN;
     const prevAllow = process.env.RYK_ALLOW_WORKSPACE_BIN;
     process.env.RYK_BIN = '/tmp/ryk-definitely-missing-deadbeef';
@@ -280,6 +373,7 @@ describe('rykPlugin', () => {
     try {
       const api = makeApi({
         source: '/path/to/node_modules/ryk-openclaw-plugin',
+        registrationMode: 'cli-metadata',
       });
       rykPlugin(api);
 
@@ -287,7 +381,7 @@ describe('rykPlugin', () => {
       assert.strictEqual(
         onCalls.length,
         0,
-        'npm/ClawHub no-op api.on must not register handlers that claim fail-closed protection'
+        'cli-metadata api.on must not register handlers that claim fail-closed protection'
       );
       const warnCalls = (api.logger.warn as any).mock.calls;
       const unprotected = warnCalls.find(
@@ -303,11 +397,11 @@ describe('rykPlugin', () => {
     }
   });
 
-  it('registers lifecycle hooks even when api.on is suspected noop (when binary resolves)', () => {
-    // With a resolved binary on an npm path we still warn unprotected and
-    // refuse to register handlers on a known no-op api.on.
+  it('does not register lifecycle hooks for cli-metadata when binary resolves', () => {
+    // A metadata inspection pass must not claim enforcement, even if a binary exists.
     const api = makeApi({
       source: '/path/to/node_modules/ryk-openclaw-plugin',
+      registrationMode: 'cli-metadata',
     });
     // Ensure binary appears present so we exercise the binary-present branch.
     const prevBin = process.env.RYK_BIN;
@@ -318,7 +412,7 @@ describe('rykPlugin', () => {
       assert.strictEqual(
         onCalls.length,
         0,
-        'npm no-op path must not register lifecycle hooks'
+        'cli-metadata path must not register lifecycle hooks'
       );
     } finally {
       if (prevBin === undefined) delete process.env.RYK_BIN;
