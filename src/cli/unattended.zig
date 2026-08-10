@@ -5,6 +5,7 @@
 //! preset explicit for Mac mini/VPS deployments.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 const child_process = @import("child_process.zig");
 const exit_codes = @import("exit_codes.zig");
@@ -27,13 +28,69 @@ pub const total_health_timeout_ms: u32 = 25_000;
 // a wall-clock bound, not merely the point where cleanup begins.
 const health_cleanup_reserve_ms: u32 = 750;
 const health_worker_timeout_ms: u32 = total_health_timeout_ms - health_cleanup_reserve_ms;
+// Internal argv marker (never a public contract). Accepted only together with
+// the parent-set handshake env so operators cannot skip the wall-clock deadline
+// by passing the flag alone.
 const health_worker_flag = "--__ryk-health-worker";
+const health_worker_env = "RYK_AGENTS_HEALTH_WORKER";
 
 const RuntimeProbe = struct {
     configured: bool,
     live_verified: bool,
     note: []const u8,
 };
+
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+
+fn setProcessEnv(name: [*:0]const u8, value: ?[*:0]const u8) bool {
+    if (comptime builtin.os.tag == .windows) {
+        const kernel32 = struct {
+            extern "kernel32" fn SetEnvironmentVariableA(name: [*:0]const u8, value: ?[*:0]const u8) callconv(.winapi) std.os.windows.BOOL;
+        };
+        return kernel32.SetEnvironmentVariableA(name, value).toBool();
+    } else if (value) |present| {
+        return setenv(name, present, 1) == 0;
+    } else {
+        return unsetenv(name) == 0;
+    }
+}
+
+/// True only when the parent health deadline wrapper armed the handshake env.
+/// The public argv flag alone must never enter the unbounded inner path (M-15).
+fn healthWorkerHandshakeActive() bool {
+    if (comptime builtin.os.tag == .windows) {
+        var buf: [8]u8 = undefined;
+        const kernel32 = struct {
+            extern "kernel32" fn GetEnvironmentVariableA(
+                name: [*:0]const u8,
+                buffer: ?[*]u8,
+                size: std.os.windows.DWORD,
+            ) callconv(.winapi) std.os.windows.DWORD;
+        };
+        const n = kernel32.GetEnvironmentVariableA(health_worker_env, &buf, buf.len);
+        if (n == 0 or n >= buf.len) return false;
+        return std.mem.eql(u8, buf[0..n], "1");
+    }
+    const value = std.c.getenv(health_worker_env) orelse return false;
+    return std.mem.eql(u8, std.mem.span(value), "1");
+}
+
+/// Hermes hook smoke runs under the health CLI cwd (fixture payload has no
+/// daemon pin). It is diagnostic only and must not gate readiness as proof of
+/// the live Hermes process policy root (M-4). OpenClaw still uses smoke as a
+/// local hook-mapping signal alongside its separate Gateway identity/canary path.
+fn smokeCountsTowardHostReady(host: []const u8) bool {
+    return !std.mem.eql(u8, host, "hermes");
+}
+
+fn formatDoctorProbeFailureJson(buf: []u8, err_name: []const u8) ![]const u8 {
+    return std.fmt.bufPrint(
+        buf,
+        "{{\"schema_version\":1,\"preset\":\"unattended\",\"ready\":false,\"error\":\"doctor probe failed: {s}\"}}",
+        .{err_name},
+    );
+}
 
 fn hostRemediation(host: []const u8) []const u8 {
     if (std.mem.eql(u8, host, "hermes"))
@@ -138,6 +195,11 @@ fn healthCommandWithDeadline(
     worker_argv[3] = health_worker_flag;
     @memcpy(worker_argv[4..], argv);
 
+    // Arm handshake only for the nested worker. Public argv with
+    // --__ryk-health-worker alone never sets this env and therefore never
+    // skips the outer wall-clock deadline (M-15).
+    _ = setProcessEnv(health_worker_env, "1");
+    defer _ = setProcessEnv(health_worker_env, null);
     var result = child_process.runHostCommandCaptureTimed(allocator, worker_argv, health_worker_timeout_ms) catch {
         try writeHealthDeadlineFailure(stdout, healthArgsRequestJson(argv));
         return exit_codes.general;
@@ -299,8 +361,10 @@ fn healthCommand(
     stdout: anytype,
     stderr: anytype,
 ) !u8 {
-    for (argv) |arg| {
-        if (std.mem.eql(u8, arg, health_worker_flag)) return healthCommandInner(io, argv, stdout, stderr);
+    // Inner path is env-handshake only. A public `--__ryk-health-worker` flag
+    // without the parent-set env still takes the deadline wrapper (M-15).
+    if (healthWorkerHandshakeActive()) {
+        return healthCommandInner(io, argv, stdout, stderr);
     }
     return healthCommandWithDeadline(io, argv, stdout, stderr);
 }
@@ -369,7 +433,10 @@ fn healthCommandInner(
 
     var report = plugin.collectPluginDoctorReportForAgentsHealth(io, allocator) catch |err| {
         if (json_mode) {
-            try stdout.print("{{\"ready\":false,\"error\":\"doctor probe failed: {s}\"}}\n", .{@errorName(err)});
+            var fail_buf: [256]u8 = undefined;
+            const fail_json = formatDoctorProbeFailureJson(&fail_buf, @errorName(err)) catch
+                "{\"schema_version\":1,\"preset\":\"unattended\",\"ready\":false,\"error\":\"doctor probe failed\"}";
+            try stdout.print("{s}\n", .{fail_json});
         } else {
             try stderr.print("ryk agents health: doctor probe failed: {s}\n", .{@errorName(err)});
         }
@@ -409,6 +476,13 @@ fn healthCommandInner(
         try stdout.writeAll("Hosts:\n");
     }
 
+    // Smoke invokes `ryk hook` in this process tree under the operator health
+    // cwd. Report that workspace so dual-path (operator cwd vs live host root)
+    // is visible; Hermes never treats it as daemon readiness proof (M-4).
+    const smoke_workspace = std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator) catch
+        try allocator.dupe(u8, ".");
+    defer allocator.free(smoke_workspace);
+
     for (hosts, 0..) |host, host_index| {
         const identity_timeout = health_budget.nextTimeoutMs(io, 3_000);
         const host_binary = if (identity_timeout) |timeout_ms|
@@ -440,7 +514,8 @@ fn healthCommandInner(
         // live hook probe; its enabled-plugin result is the strongest available
         // signal and remains explicitly marked live-unverified in the report.
         const runtime_ready = probe.configured and probe.live_verified;
-        const host_ready = binary_detected and installed and smoke.bothPassed() and runtime_ready;
+        const smoke_ready = if (smokeCountsTowardHostReady(host)) smoke.bothPassed() else true;
+        const host_ready = binary_detected and installed and smoke_ready and runtime_ready;
         ready = ready and host_ready;
 
         if (json_mode) {
@@ -452,7 +527,11 @@ fn healthCommandInner(
                 if (binary_detected) "true" else "false",
                 if (installed) "true" else "false",
             });
-            try stdout.print(" \"smoke\": {{\"allow\": ", .{});
+            try stdout.writeAll(" \"smoke_workspace\": ");
+            try plugin.writeJsonString(stdout, smoke_workspace);
+            try stdout.print(", \"smoke_counts_toward_ready\": {s}, \"smoke\": {{\"allow\": ", .{
+                if (smokeCountsTowardHostReady(host)) "true" else "false",
+            });
             try plugin.writeJsonString(stdout, smoke.allow.toString());
             try stdout.print(", \"deny\": ", .{});
             try plugin.writeJsonString(stdout, smoke.deny.toString());
@@ -465,12 +544,14 @@ fn healthCommandInner(
             try plugin.writeJsonString(stdout, if (host_ready) "none" else hostRemediation(host));
             try stdout.print(", \"ready\": {s}}}", .{if (host_ready) "true" else "false"});
         } else {
-            try stdout.print("  {s}: binary={s}, installed={s}, smoke={s}/{s}, runtime={s}\n", .{
+            try stdout.print("  {s}: binary={s}, installed={s}, smoke={s}/{s} (workspace {s}{s}), runtime={s}\n", .{
                 host,
                 if (binary_detected) "yes" else "no",
                 if (installed) "yes" else "no",
                 smoke.allow.toString(),
                 smoke.deny.toString(),
+                smoke_workspace,
+                if (smokeCountsTowardHostReady(host)) "" else "; operator-cwd diagnostic only, not live-daemon proof",
                 probe.note,
             });
             if (!host_ready) try stdout.print("    remediation: {s}\n", .{hostRemediation(host)});
@@ -531,47 +612,82 @@ fn probeOpenClaw(allocator: std.mem.Allocator, io: std.Io, budget: HealthBudget,
         return .{ .configured = true, .live_verified = false, .note = "OpenClaw plugin hooks registered; Gateway RPC is not healthy" };
     };
     defer allocator.free(gateway);
+    // Identity is the permanent native readiness gate today. Upstream status does
+    // not expose a comparable process identity, so live_verified stays false and
+    // the dispatcher canary is not a current readiness requirement (M-17).
     if (!openClawGatewayIdentityBound(gateway)) {
-        return .{ .configured = true, .live_verified = false, .note = "OpenClaw Gateway RPC is reachable, but its running identity is not bound to the screened executable" };
+        return .{
+            .configured = true,
+            .live_verified = false,
+            .note = "OpenClaw Gateway RPC is reachable, but upstream does not expose a bound running identity; native ready stays false (dispatcher canary deferred until identity binds). Use `ryk run -- openclaw`.",
+        };
     }
 
-    // Runtime inspection loads modules but cannot prove that the already-running
-    // Gateway activated this plugin. Invoke the manifest-declared inert tool via
-    // the real Gateway dispatcher. Only a nonce-bound Ryk denial counts; a
-    // generic host refusal or the inert executor sentinel fails readiness.
+    // Future path only: once identity binding is real, prove the already-running
+    // Gateway activated this plugin via the inert tools.invoke canary. Nested
+    // canary must join the health worker process group so the outer watchdog
+    // can reap descendants (M-7).
+    return probeOpenClawDispatcherCanary(allocator, io, budget, binary, canonical_workspace);
+}
+
+/// Dispatcher canary after Gateway identity is bound. Not reached while
+/// `openClawGatewayIdentityBound` is hard-false; kept so identity landing does
+/// not reintroduce a private process-group orphan path.
+fn probeOpenClawDispatcherCanary(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    budget: HealthBudget,
+    binary: []const u8,
+    canonical_workspace: []const u8,
+) RuntimeProbe {
     const nonce = std.fmt.allocPrint(allocator, "ryk-health-{x}", .{budget.started.raw.nanoseconds}) catch {
-        return .{ .configured = true, .live_verified = false, .note = "Gateway RPC is healthy, but canary creation failed" };
+        return .{ .configured = true, .live_verified = false, .note = "Gateway identity bound, but canary creation failed" };
     };
     defer allocator.free(nonce);
     if (std.mem.indexOfAny(u8, canonical_workspace, "\"\\\n\r") != null) {
-        return .{ .configured = true, .live_verified = false, .note = "Gateway RPC is healthy, but the workspace path cannot be encoded safely" };
+        return .{ .configured = true, .live_verified = false, .note = "Gateway identity bound, but the workspace path cannot be encoded safely" };
     }
     const params = std.fmt.allocPrint(
         allocator,
         "{{\"name\":\"ryk_openclaw_canary\",\"args\":{{\"command\":\"rm -rf /\",\"nonce\":\"{s}\",\"cwd\":\"{s}\"}},\"sessionKey\":\"ryk-health\",\"idempotencyKey\":\"{s}\"}}",
         .{ nonce, canonical_workspace, nonce },
     ) catch {
-        return .{ .configured = true, .live_verified = false, .note = "Gateway RPC is healthy, but canary encoding failed" };
+        return .{ .configured = true, .live_verified = false, .note = "Gateway identity bound, but canary encoding failed" };
     };
     defer allocator.free(params);
     const timeout_ms = budget.nextTimeoutMs(io, 4_000) orelse
-        return .{ .configured = true, .live_verified = false, .note = "Gateway RPC is healthy, but the health deadline expired" };
-    var live_probe = child_process.runHostCommandCaptureTimed(allocator, &.{
+        return .{ .configured = true, .live_verified = false, .note = "Gateway identity bound, but the health deadline expired" };
+    var live_probe = captureJoinedHostCommand(allocator, &.{
         binary, "gateway", "call", "tools.invoke", "--params", params, "--json",
     }, timeout_ms) catch {
-        return .{ .configured = true, .live_verified = false, .note = "Gateway RPC is healthy, but the dispatcher canary is unavailable" };
+        return .{ .configured = true, .live_verified = false, .note = "Gateway identity bound, but the dispatcher canary is unavailable" };
     };
     defer live_probe.deinit(allocator);
     if (live_probe.timed_out or live_probe.output_overflow or !openClawDispatcherCanaryPassed(allocator, live_probe.stdout, live_probe.stderr, nonce)) {
-        return .{ .configured = true, .live_verified = false, .note = "Gateway RPC is healthy, but the real tool dispatcher did not prove Ryk enforcement" };
+        return .{ .configured = true, .live_verified = false, .note = "Gateway identity bound, but the real tool dispatcher did not prove Ryk enforcement" };
     }
-    return .{ .configured = true, .live_verified = true, .note = "OpenClaw Gateway dispatcher, before_tool_call denial, and RPC healthy" };
+    return .{ .configured = true, .live_verified = true, .note = "OpenClaw Gateway identity bound, dispatcher canary denial, and RPC healthy" };
+}
+
+/// Capture a nested host probe inside the health worker's process group so the
+/// outer SIGKILL/job boundary reaps descendants (M-7). Windows has no join API
+/// here; Job Object coverage remains on the outer timed capture.
+fn captureJoinedHostCommand(
+    allocator: std.mem.Allocator,
+    argv: []const []const u8,
+    timeout_ms: u32,
+) !child_process.HostCommandCaptureResult {
+    if (comptime builtin.os.tag == .windows) {
+        return child_process.runHostCommandCaptureTimed(allocator, argv, timeout_ms);
+    }
+    return child_process.runHostCommandCaptureTimedInCurrentProcessGroup(allocator, argv, timeout_ms);
 }
 
 /// OpenClaw's Gateway status/RPC contract currently proves dispatch through a
 /// Gateway, but does not expose an authoritative process identity that Ryk can
-/// compare with the screened executable. Keep readiness false until upstream
-/// supplies such a field and the comparison is implemented.
+/// compare with the screened executable. Permanent native gate: keep readiness
+/// false until upstream supplies such a field and the comparison is implemented.
+/// Dispatcher canary is intentionally not evaluated while this returns false.
 fn openClawGatewayIdentityBound(output: []const u8) bool {
     _ = output;
     return false;
@@ -717,7 +833,13 @@ fn probeHermes(allocator: std.mem.Allocator, io: std.Io, budget: HealthBudget, b
     if (!hermesListingHasEnabledRyk(allocator, listing)) {
         return .{ .configured = false, .live_verified = false, .note = "ryk is not reported enabled by Hermes" };
     }
-    return .{ .configured = true, .live_verified = false, .note = "ryk is enabled; Hermes has no live hook introspection command" };
+    // live_verified stays false: listing is not live-hook proof, and operator-cwd
+    // hook smoke (reported separately) is not the Hermes daemon policy root.
+    return .{
+        .configured = true,
+        .live_verified = false,
+        .note = "ryk is enabled; Hermes has no live hook introspection command (operator-cwd hook smoke is diagnostic only)",
+    };
 }
 
 fn hermesListingHasEnabledRyk(allocator: std.mem.Allocator, listing: []const u8) bool {
@@ -762,6 +884,27 @@ test "agents health JSON and total runtime have fixed bounds" {
     try std.testing.expect(health_worker_timeout_ms < total_health_timeout_ms);
 }
 
+test "health doctor-failure JSON includes schema_version and preset" {
+    var buf: [256]u8 = undefined;
+    const json = try formatDoctorProbeFailureJson(&buf, "OutOfMemory");
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"schema_version\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"preset\":\"unattended\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"ready\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "doctor probe failed: OutOfMemory") != null);
+}
+
+test "Hermes hook smoke does not count toward host ready; OpenClaw smoke does" {
+    try std.testing.expect(!smokeCountsTowardHostReady("hermes"));
+    try std.testing.expect(smokeCountsTowardHostReady("openclaw"));
+}
+
+test "public health worker flag is not a deadline bypass without handshake env" {
+    // Parent only arms RYK_AGENTS_HEALTH_WORKER around the nested spawn.
+    // Without that env, healthCommand always takes the outer deadline path.
+    try std.testing.expect(!healthWorkerHandshakeActive());
+    try std.testing.expect(std.mem.eql(u8, health_worker_flag, "--__ryk-health-worker"));
+}
+
 test "OpenClaw runtime inspection requires the live before_tool_call hook" {
     try std.testing.expect(openClawRuntimeInspectionHasBeforeTool(std.testing.allocator, "{\"plugin\":{\"status\":\"loaded\"},\"typedHooks\":[{\"name\":\"before_tool_call\"}]}"));
     try std.testing.expect(!openClawRuntimeInspectionHasBeforeTool(std.testing.allocator, "{\"plugin\":{\"status\":\"loaded\"},\"typedHooks\":[]}"));
@@ -791,9 +934,11 @@ test "OpenClaw dispatcher canary requires nonce-bound Ryk denial and no executor
     ));
 }
 
-test "OpenClaw Gateway readiness requires an independently bound running identity" {
+test "OpenClaw Gateway identity is the permanent native readiness gate until upstream binds" {
+    // Identity stays hard-false; canary is deferred and not a current readiness claim.
     try std.testing.expect(!openClawGatewayIdentityBound("{\"status\":\"ok\"}"));
     try std.testing.expect(!openClawGatewayIdentityBound("{\"pid\":1234}"));
+    try std.testing.expect(!openClawGatewayIdentityBound("{\"executable\":\"/usr/bin/openclaw\"}"));
 }
 
 test "OpenClaw JSON framing rejects an unbalanced brace flood in linear work" {

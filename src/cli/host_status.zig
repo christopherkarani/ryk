@@ -356,13 +356,23 @@ fn smokeTestHookPayloadWithBinary(
     expected_decision: []const u8,
     timeout_ms: u64,
 ) !bool {
-
-    const result = try child_process.runHostCommandInputCaptureTimed(
-        allocator,
-        &.{ ryk_bin, "hook", host, event },
-        fixture_json,
-        timeout_ms,
-    );
+    // Health-path smoke joins the parent process group so the agents-health
+    // outer watchdog can reap nested hook probes (M-7). Windows has no join
+    // API; use a private process group there.
+    const result = if (comptime @import("builtin").os.tag == .windows)
+        try child_process.runHostCommandInputCaptureTimed(
+            allocator,
+            &.{ ryk_bin, "hook", host, event },
+            fixture_json,
+            timeout_ms,
+        )
+    else
+        try child_process.runHostCommandInputCaptureTimedInCurrentProcessGroup(
+            allocator,
+            &.{ ryk_bin, "hook", host, event },
+            fixture_json,
+            timeout_ms,
+        );
     defer result.deinit(allocator);
     if (result.timed_out) return false;
     return interpretSmokeOutcome(host, expected_decision, result.exit_code, result.stdout, result.stderr);

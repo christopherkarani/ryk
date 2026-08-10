@@ -424,6 +424,17 @@ run_plugin_gate() {
     else
       echo "[agent-gate] no package-local test runner for ${d} (hooks/skills-only); skip"
     fi
+
+    # OpenClaw ships committed dist/; unit tests import src/. When that package
+    # is on the dirty path, also prove dist matches TypeScript (release assets).
+    if [[ "${d}" == "integrations/openclaw-plugin" ]]; then
+      if [[ "${dry_run}" -eq 1 ]]; then
+        echo "[agent-gate] dry-run: ./scripts/test-openclaw-release-assets.sh"
+      else
+        echo "[agent-gate] openclaw release assets"
+        ./scripts/test-openclaw-release-assets.sh
+      fi
+    fi
   done
 }
 

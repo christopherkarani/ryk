@@ -85,6 +85,14 @@ export declare function isUnattended(environ?: Record<string, string | undefined
  * PATH lookup is implemented directly so Windows does not depend on `which`.
  */
 export declare function findRyk(cwd?: string, platform?: NodeJS.Platform): string | null;
+/**
+ * Reject untrusted binary locations.
+ *
+ * Managed install roots (`~/.local/bin`, `~/.ryk/bin`) are allowed before the
+ * cwd-within plant check so a legitimate curl install still attests when the
+ * process cwd is `$HOME` (or another ancestor of those roots).
+ */
+export declare function isUntrustedCandidate(path: string, cwd?: string, allowWorkspaceOverride?: boolean): boolean;
 /** Validate the installer-generated path-bound checksum receipt. */
 export declare function installerProvenanceValid(binaryPath: string, receiptPath?: string): boolean;
 /** Normalize OpenClaw tool events into the envelope ryk hook understands. */

@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 from concurrent.futures import ThreadPoolExecutor
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -16,6 +17,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 _PLUGIN_PATH = Path(__file__).with_name("__init__.py")
@@ -168,6 +170,141 @@ class HermesPluginDiscoveryTests(unittest.TestCase):
                 os.environ, {"HOME": directory, "PATH": ""}, clear=True
             ):
                 self.assertEqual(_PLUGIN._ryk_candidates(), [])
+
+    def test_managed_local_bin_trusted_when_cwd_is_home(self) -> None:
+        """~/.local/bin/ryk must attest even when process cwd is $HOME."""
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            managed = home / ".local" / "bin"
+            managed.mkdir(parents=True)
+            binary = managed / "ryk"
+            binary.write_bytes(b"#!/bin/sh\n# ryk fixture\n")
+            binary.chmod(0o700)
+            digest = hashlib.sha256(binary.read_bytes()).hexdigest()
+            receipt = managed / ".ryk-provenance"
+            receipt.write_text(
+                "ryk-provenance-v1\n"
+                f"path={binary.resolve()}\n"
+                f"sha256={digest}\n",
+                encoding="utf-8",
+            )
+            with _chdir(str(home)), mock.patch.dict(
+                os.environ,
+                {"HOME": str(home), "PATH": "", "RYK_ALLOW_WORKSPACE_BIN": "0"},
+                clear=False,
+            ):
+                os.environ.pop("RYK_ALLOW_WORKSPACE_BIN", None)
+                self.assertTrue(_PLUGIN._candidate_is_trusted(binary))
+                self.assertEqual(_PLUGIN._ryk_executable(str(binary)), str(binary.resolve()))
+
+    def test_policy_workspace_cwd_prefers_marker_workspace_over_plugin_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            plugin_dir = Path(directory) / "plugin"
+            workspace = Path(directory) / "workspace"
+            plugin_dir.mkdir()
+            workspace.mkdir()
+            plugin_file = plugin_dir / "__init__.py"
+            plugin_file.write_text("# fixture\n", encoding="utf-8")
+            (plugin_dir / ".ryk_unattended").write_text(
+                "ryk-hermes-unattended-v1\n"
+                f"path={plugin_dir.resolve()}\n"
+                f"workspace={workspace.resolve()}\n",
+                encoding="utf-8",
+            )
+            with mock.patch.object(_PLUGIN, "__file__", str(plugin_file)), mock.patch.dict(
+                os.environ, {}, clear=False
+            ):
+                os.environ.pop("RYK_HERMES_WORKSPACE", None)
+                pinned = _PLUGIN._policy_workspace_cwd()
+            self.assertEqual(pinned, str(workspace.resolve()))
+
+    def test_policy_workspace_skips_integrity_only_plugin_path(self) -> None:
+        """Zig integrity path=<plugin-dir> is not a policy workspace pin."""
+        with tempfile.TemporaryDirectory() as directory:
+            plugin_dir = Path(directory) / "plugin"
+            plugin_dir.mkdir()
+            plugin_file = plugin_dir / "__init__.py"
+            plugin_file.write_text("# fixture\n", encoding="utf-8")
+            (plugin_dir / ".ryk_unattended").write_text(
+                "ryk-hermes-unattended-v1\n"
+                f"path={plugin_dir.resolve()}\n",
+                encoding="utf-8",
+            )
+            with mock.patch.object(_PLUGIN, "__file__", str(plugin_file)), mock.patch.dict(
+                os.environ, {}, clear=False
+            ):
+                os.environ.pop("RYK_HERMES_WORKSPACE", None)
+                self.assertIsNone(_PLUGIN._policy_workspace_cwd())
+
+    def test_call_ryk_passes_policy_workspace_as_cwd(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args=["ryk", "hook", "hermes", "pre_tool_call", "--ci"],
+            returncode=0,
+            stdout='{"decision":"allow"}\n',
+            stderr="",
+        )
+        captured: dict[str, Any] = {}
+
+        def fake_run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+            captured["argv"] = list(argv)
+            captured["cwd"] = kwargs.get("cwd")
+            return completed
+
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(_PLUGIN, "_find_ryk", return_value="/usr/local/bin/ryk"), mock.patch.object(
+                _PLUGIN, "_ryk_executable", return_value="/usr/local/bin/ryk"
+            ), mock.patch.object(_PLUGIN, "_is_unattended", return_value=True), mock.patch.object(
+                _PLUGIN, "_policy_workspace_cwd", return_value=directory
+            ), mock.patch.object(_PLUGIN, "_run_process_bounded", side_effect=fake_run):
+                _PLUGIN._call_ryk("pre_tool_call", {"tool_name": "terminal"})
+        self.assertEqual(captured["cwd"], directory)
+        self.assertIn("--ci", captured["argv"])
+
+    def test_cancel_process_io_closes_streams_not_raw_fileno(self) -> None:
+        process = mock.Mock()
+        stdout = mock.Mock()
+        stdout.fileno.return_value = 3
+        process.stdin = None
+        process.stdout = stdout
+        process.stderr = None
+        cancel = __import__("threading").Event()
+        with mock.patch.object(_PLUGIN.os, "close") as raw_close:
+            _PLUGIN._cancel_process_io(process, cancel)
+        self.assertTrue(cancel.is_set())
+        stdout.close.assert_called_once()
+        raw_close.assert_not_called()
+
+    def test_terminate_process_group_retries_wait_after_kill(self) -> None:
+        process = mock.Mock()
+        process.pid = 4242
+        process.stdin = process.stdout = process.stderr = None
+        waits = {"n": 0}
+
+        def fake_wait(timeout: float = None) -> int:  # type: ignore[assignment]
+            waits["n"] += 1
+            if waits["n"] < 3:
+                raise subprocess.TimeoutExpired(cmd=["ryk"], timeout=timeout or 0)
+            return 0
+
+        process.wait.side_effect = fake_wait
+        with mock.patch.object(_PLUGIN, "_kill_process_tree") as kill_tree:
+            _PLUGIN._terminate_process_group(process, None)
+        kill_tree.assert_called_once_with(process)
+        self.assertGreaterEqual(process.wait.call_count, 3)
+
+    def test_kill_process_tree_windows_uses_taskkill_and_process_kill(self) -> None:
+        process = mock.Mock()
+        process.pid = 99
+        with mock.patch.object(_PLUGIN.os, "name", "nt"), mock.patch.object(
+            _PLUGIN.subprocess, "run"
+        ) as run:
+            _PLUGIN._kill_process_tree(process)
+        run.assert_called_once()
+        args = run.call_args.args[0]
+        self.assertEqual(args[:2], ["taskkill", "/PID"])
+        self.assertIn("99", args)
+        self.assertIn("/T", args)
+        process.kill.assert_called()
 
     def test_call_ryk_rejects_non_object_success_response(self) -> None:
         completed = subprocess.CompletedProcess(
@@ -346,6 +483,69 @@ class HermesPluginDiscoveryTests(unittest.TestCase):
                 result = handler(tool_name="terminal", args={"command": "git push"})
         self.assertEqual(result.get("action"), "block")
         self.assertIn("noninteractive", result.get("message", "").lower())
+
+    def test_unattended_marker_hardens_ask_to_block_with_env_cleared(self) -> None:
+        """`.ryk_unattended` alone must drive ask→block even when CI env is absent."""
+        with tempfile.TemporaryDirectory() as directory:
+            plugin_file = Path(directory) / "__init__.py"
+            (Path(directory) / ".ryk_unattended").write_text(
+                "ryk-hermes-unattended-v1\npath=" + directory + "\n",
+                encoding="utf-8",
+            )
+            ctx = mock.Mock()
+            _PLUGIN._register(ctx, "pre_tool_call")
+            handler = ctx.register_hook.call_args.args[1]
+            cleared = {
+                key: ""
+                for key in (
+                    "CI",
+                    "RYK_CI",
+                    "RYK_NONINTERACTIVE",
+                    "RYK_UNATTENDED",
+                    "RYK_HERMES_UNATTENDED",
+                )
+            }
+            with mock.patch.object(_PLUGIN, "__file__", str(plugin_file)), mock.patch.dict(
+                os.environ, cleared, clear=False
+            ):
+                for key in cleared:
+                    os.environ.pop(key, None)
+                self.assertTrue(_PLUGIN._is_unattended())
+                with mock.patch.object(
+                    _PLUGIN,
+                    "_call_ryk",
+                    return_value={"decision": "ask", "message": "approval required by ryk"},
+                ):
+                    result = handler(tool_name="terminal", args={"command": "git push"})
+            self.assertEqual(result.get("action"), "block")
+            self.assertIn("noninteractive", result.get("message", "").lower())
+
+    def test_call_ryk_passes_ci_flag_when_unattended(self) -> None:
+        """Unattended hooks must invoke `ryk hook hermes … --ci`."""
+        completed = subprocess.CompletedProcess(
+            args=["ryk", "hook", "hermes", "pre_tool_call", "--ci"],
+            returncode=0,
+            stdout='{"decision":"allow"}\n',
+            stderr="",
+        )
+        captured: dict[str, Any] = {}
+
+        def fake_run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+            captured["argv"] = list(argv)
+            captured["cwd"] = kwargs.get("cwd")
+            return completed
+
+        with mock.patch.object(_PLUGIN, "_find_ryk", return_value="/usr/local/bin/ryk"), mock.patch.object(
+            _PLUGIN, "_ryk_executable", return_value="/usr/local/bin/ryk"
+        ), mock.patch.object(_PLUGIN, "_is_unattended", return_value=True), mock.patch.object(
+            _PLUGIN, "_policy_workspace_cwd", return_value=None
+        ), mock.patch.object(_PLUGIN, "_run_process_bounded", side_effect=fake_run):
+            response = _PLUGIN._call_ryk("pre_tool_call", {"tool_name": "terminal"})
+        self.assertEqual(response.get("decision"), "allow")
+        self.assertEqual(
+            captured["argv"],
+            ["/usr/local/bin/ryk", "hook", "hermes", "pre_tool_call", "--ci"],
+        )
 
     def test_pre_tool_call_warn_is_not_silent_block(self) -> None:
         """warn must not be collapsed to permanent block; log and allow with semantic fidelity."""

@@ -38,7 +38,7 @@ Separators are `|` so rule ids that contain `:` stay unambiguous. Approving `cur
 
 ### CI / noninteractive
 
-When `CI`, `RYK_CI`, `RYK_NONINTERACTIVE`, `RYK_UNATTENDED`, or `RYK_HERMES_UNATTENDED` is set truthily, ryk `ask` is hardened to Hermes `block` (no approval prompt). These unattended signals also override `RYK_HERMES_FAIL_OPEN=1`; a missing ryk binary remains blocked. Hermes also fail-closes plugin-escalated approvals in non-interactive non-gateway contexts.
+When `CI`, `RYK_CI`, `RYK_NONINTERACTIVE`, `RYK_UNATTENDED`, or `RYK_HERMES_UNATTENDED` is set truthily, **or** the install-time `.ryk_unattended` marker is present, ryk `ask` is hardened to Hermes `block` (no approval prompt). The live hook also passes `ryk hook hermes … --ci` so residual CLI-side ask (FM soft / stage) hardens inside ryk, not only in the host mapping layer. These unattended signals also override `RYK_HERMES_FAIL_OPEN=1`; a missing ryk binary remains blocked. Hermes also fail-closes plugin-escalated approvals in non-interactive non-gateway contexts.
 
 ## Failure modes
 
@@ -109,9 +109,10 @@ Environment:
 - `RYK_BIN` — select an absolute Ryk executable under `~/.local/bin` or `~/.ryk/bin`; managed binaries also require the installer's adjacent path-bound `.ryk-provenance` SHA-256 receipt, which is re-attested before each policy call. This is integrity evidence rather than a cryptographic signature, so same-user binary-and-receipt replacement is outside the trust claim. Repository-local binaries additionally require the development override below.
 - `RYK_ALLOW_WORKSPACE_BIN=1` — opt into repo-local `zig-out/bin/ryk` discovery for development/testing.
 - `RYK_HERMES_FAIL_OPEN` — only recognized truthy tokens (`1`, `true`, `yes`, `on`, `fail-open`, `open`) enable degraded fail-open behavior in attended mode; unattended/CI signals override it.
-- `CI` / `RYK_CI` / `RYK_NONINTERACTIVE` / `RYK_UNATTENDED` / `RYK_HERMES_UNATTENDED` — when truthy, harden ryk `ask` on tools to Hermes `block` and keep degraded execution fail-closed.
+- `CI` / `RYK_CI` / `RYK_NONINTERACTIVE` / `RYK_UNATTENDED` / `RYK_HERMES_UNATTENDED` — when truthy, harden ryk `ask` on tools to Hermes `block`, pass `--ci` to the hook CLI, and keep degraded execution fail-closed.
+- `RYK_HERMES_WORKSPACE` — optional absolute policy workspace for `ryk hook` subprocess cwd (pins policy discovery when the Hermes daemon cwd is not the setup tree).
 
-`ryk agents setup hermes` also writes a `.ryk_unattended` marker beside the installed plugin. That persistent marker forces fail-closed behavior even if the host process inherits a conflicting `RYK_HERMES_FAIL_OPEN=1` value.
+`ryk agents setup hermes` also writes a `.ryk_unattended` marker beside the installed plugin. That persistent marker forces fail-closed behavior and ask→block even if the host process clears CI env vars or inherits `RYK_HERMES_FAIL_OPEN=1`. Marker body may include `workspace=<abs path>` to pin the policy root for hook subprocesses; when absent, operators can set `RYK_HERMES_WORKSPACE`. Residual: current setup writes integrity `path=<plugin-dir>` (not the setup workspace), so without `workspace=` / env the hook still inherits the Hermes process cwd for policy walk — weaker than OpenClaw's `workspaceRoot` binding.
 
 ## Manual verification (CLI approve UI)
 

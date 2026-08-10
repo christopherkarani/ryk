@@ -236,6 +236,10 @@ pub fn runHostCommandTimedCwd(
     }
 
     const term = child.wait(io) catch {
+        // wait failed: kill/reap the direct child, then sweep the process
+        // group / job so descendants cannot outlive this call (M-8).
+        child.kill(io);
+        if (builtin.os.tag != .windows) std.posix.kill(-child_id, std.posix.SIG.KILL) catch {};
         finished.store(true, .release);
         if (watcher) |w| w.join();
         terminateWindowsJob(windows_job);
@@ -247,8 +251,14 @@ pub fn runHostCommandTimedCwd(
             .stderr = null,
         };
     };
+    // Host install/setup CLIs may spawn descendants in the same process group.
+    // Match capture: after reaping the primary child, SIGKILL the group so
+    // orphans cannot outlive the timeout boundary (M-11).
+    if (builtin.os.tag != .windows) std.posix.kill(-child_id, std.posix.SIG.KILL) catch {};
     finished.store(true, .release);
     if (watcher) |w| w.join();
+    // Close (and kill-on-close) only after the watcher has joined so it cannot
+    // TerminateJobObject a closed HANDLE.
     closeWindowsJob(windows_job);
 
     const exit_code: u8 = switch (term) {
@@ -286,6 +296,19 @@ pub fn runHostCommandCaptureTimedInCurrentProcessGroup(
 ) !HostCommandCaptureResult {
     if (comptime builtin.os.tag == .windows) return error.UnsupportedPlatform;
     return runHostCommandInputCaptureTimedInternal(allocator, argv, "", timeout_ms, true, false);
+}
+
+/// Hook-style stdin capture that joins the caller's POSIX process group.
+/// Same health-worker contract as `runHostCommandCaptureTimedInCurrentProcessGroup`:
+/// the outer watchdog owns the group, so nested probes cannot outlive a deadline.
+pub fn runHostCommandInputCaptureTimedInCurrentProcessGroup(
+    allocator: std.mem.Allocator,
+    argv: []const []const u8,
+    stdin_bytes: []const u8,
+    timeout_ms: u64,
+) !HostCommandCaptureResult {
+    if (comptime builtin.os.tag == .windows) return error.UnsupportedPlatform;
+    return runHostCommandInputCaptureTimedInternal(allocator, argv, stdin_bytes, timeout_ms, true, false);
 }
 
 const DrainContext = struct {
@@ -630,10 +653,10 @@ fn runHostCommandInputCaptureTimedInternal(
     // capture pipes. Reap the entire dedicated process group before joining
     // drain threads so a background child cannot keep health blocked forever.
     if (builtin.os.tag != .windows and kill_process_group_after_wait) std.posix.kill(-child_id, std.posix.SIG.KILL) catch {};
-    if (builtin.os.tag == .windows) {
-        terminateWindowsJob(windows_job);
-        closeWindowsJob(windows_job);
-    }
+    // Order: finished → join watcher → then terminate/close the Windows job.
+    // Closing the job handle before the watcher joins races TerminateJobObject
+    // on a closed HANDLE (M-6). Kill-on-close still reaps job members once we
+    // close after the join, so pipe-holding descendants cannot pin drains.
     finished.store(true, .release);
     if (timed_out.load(.acquire)) {
         drain_cancel.store(true, .release);
@@ -644,6 +667,10 @@ fn runHostCommandInputCaptureTimedInternal(
         drain_cancel.store(true, .release);
     }
     if (watcher) |thread| thread.join();
+    if (builtin.os.tag == .windows) {
+        terminateWindowsJob(windows_job);
+        closeWindowsJob(windows_job);
+    }
     stdout_thread.join();
     stderr_thread.join();
     stdout_context.file.close(io);
@@ -951,4 +978,38 @@ test "child_process: timeout escalates when child ignores TERM" {
     const res = try runHostCommandTimed(std.testing.allocator, &argv, 50, null, null);
     defer deinitHostCommandResult(res, std.testing.allocator);
     try std.testing.expect(res.timed_out);
+}
+
+test "child_process: timed success reaps process-group descendants" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(tmp_path);
+    const pid_path = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "orphan.pid" });
+    defer std.testing.allocator.free(pid_path);
+
+    const res = try runHostCommandTimed(
+        std.testing.allocator,
+        &.{
+            "sh",
+            "-c",
+            "sh -c 'trap '' TERM; sleep 30' & printf '%s' \"$!\" > \"$1\"; exit 0",
+            "ryk-child-process-test",
+            pid_path,
+        },
+        5_000,
+        null,
+        null,
+    );
+    defer deinitHostCommandResult(res, std.testing.allocator);
+
+    try std.testing.expect(!res.timed_out);
+    try std.testing.expectEqual(@as(u8, 0), res.exit_code);
+    const pid_text = try tmp.dir.readFileAlloc(std.testing.io, "orphan.pid", std.testing.allocator, .limited(32));
+    defer std.testing.allocator.free(pid_text);
+    const descendant_pid = try std.fmt.parseInt(i32, std.mem.trim(u8, pid_text, " \t\r\n"), 10);
+    defer std.posix.kill(descendant_pid, std.posix.SIG.KILL) catch {};
+    try std.testing.expectError(error.ProcessNotFound, std.posix.kill(descendant_pid, @enumFromInt(0)));
 }

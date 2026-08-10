@@ -235,10 +235,26 @@ function isWithin(candidate, root) {
     const normalizedRoot = root.replaceAll('\\', '/').replace(/\/$/, '');
     return normalizedCandidate === normalizedRoot || normalizedCandidate.startsWith(`${normalizedRoot}/`);
 }
-function isUntrustedCandidate(path, cwd, allowWorkspaceOverride = process.env.RYK_ALLOW_WORKSPACE_BIN === '1') {
+/**
+ * Reject untrusted binary locations.
+ *
+ * Managed install roots (`~/.local/bin`, `~/.ryk/bin`) are allowed before the
+ * cwd-within plant check so a legitimate curl install still attests when the
+ * process cwd is `$HOME` (or another ancestor of those roots).
+ */
+export function isUntrustedCandidate(path, cwd, allowWorkspaceOverride = process.env.RYK_ALLOW_WORKSPACE_BIN === '1') {
     const canonical = canonicalPath(path).replaceAll('\\', '/');
     if (canonical.includes('/node_modules/.bin/'))
         return true;
+    // Managed installer roots win over workspace-plant rejection. Without this,
+    // cwd=$HOME treats ~/.local/bin/ryk as a workspace plant and fail-opens when
+    // resolution falls through.
+    const managedRoots = [
+        canonicalPath(resolve(homedir(), '.local', 'bin')),
+        canonicalPath(resolve(homedir(), '.ryk', 'bin')),
+    ];
+    if (managedRoots.some((root) => isWithin(canonical, root)))
+        return false;
     const workspace = canonicalPath(cwd ?? process.cwd());
     if (isWithin(canonical, workspace)) {
         return !allowWorkspaceOverride;
@@ -252,11 +268,7 @@ function isUntrustedCandidate(path, cwd, allowWorkspaceOverride = process.env.RY
         if (isWithin(canonical, root))
             return true;
     }
-    const managedRoots = [
-        canonicalPath(resolve(homedir(), '.local', 'bin')),
-        canonicalPath(resolve(homedir(), '.ryk', 'bin')),
-    ];
-    return !managedRoots.some((root) => isWithin(canonical, root));
+    return true;
 }
 /** Validate the installer-generated path-bound checksum receipt. */
 export function installerProvenanceValid(binaryPath, receiptPath = join(resolve(binaryPath, '..'), '.ryk-provenance')) {
@@ -517,6 +529,44 @@ async function callRyk(rykBin, event, data, sessionId, blocking, logger, options
             : softAllow('ryk_hook_error', 'ryk hook failed; allowing because this event is non-blocking.');
     }
 }
+/**
+ * Best-effort process-tree kill for a hook child.
+ * POSIX: kill the dedicated process group when detached.
+ * Windows: taskkill /T (tree) then fall back to child.kill.
+ */
+function killHookProcessTree(child, signal, detached) {
+    if (!child.pid)
+        return;
+    try {
+        if (process.platform === 'win32') {
+            try {
+                execFileSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], {
+                    stdio: 'ignore',
+                    timeout: 2_000,
+                    windowsHide: true,
+                });
+                return;
+            }
+            catch {
+                // taskkill missing or process already gone — fall through.
+            }
+            try {
+                child.kill(signal);
+            }
+            catch {
+                // Already reaped.
+            }
+            return;
+        }
+        if (detached)
+            process.kill(-child.pid, signal);
+        else
+            child.kill(signal);
+    }
+    catch {
+        // Already reaped.
+    }
+}
 function runRykHookProcess(executable, args, input, timeoutMs, cwd) {
     return new Promise((resolvePromise, rejectPromise) => {
         const detached = process.platform !== 'win32';
@@ -533,15 +583,7 @@ function runRykHookProcess(executable, args, input, timeoutMs, cwd) {
         let timeoutTimer;
         let settled = false;
         const killGroup = (signal) => {
-            try {
-                if (detached && child.pid)
-                    process.kill(-child.pid, signal);
-                else
-                    child.kill(signal);
-            }
-            catch {
-                // Already reaped.
-            }
+            killHookProcessTree(child, signal, detached);
         };
         const destroyPipes = () => {
             child.stdin.destroy();
@@ -696,13 +738,10 @@ export default function rykPlugin(api) {
     if (onIsNoop) {
         logger?.warn?.(UNPROTECTED_NOOP_WARNING);
         if (hasUnknownRegistrationMode(api)) {
+            // Unknown modes are not a live full-runtime surface. Do not register veto
+            // handlers: api.on may be a no-op and would falsely claim fail-closed.
             logger?.warn?.(`[ryk] OpenClaw returned an unknown registration mode (${String(api.registrationMode)}); ` +
-                'registering a fail-closed veto until the host contract is understood.');
-            api.on('before_tool_call', async () => ({
-                block: true,
-                blockReason: 'ryk cannot verify the OpenClaw registration mode; blocking as a precaution.',
-            }), { timeoutMs: 5_000 });
-            return;
+                'treating as unprotected (hooks not registered). Prefer wrapper: `ryk run -- openclaw`.');
         }
         // Registering a veto handler on a non-runtime API would claim fail-closed
         // protection while hooks never fire. Prefer the wrapper path instead.

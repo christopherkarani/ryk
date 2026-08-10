@@ -105,6 +105,8 @@ _MAX_PAYLOAD_NODES = 4096
 _MAX_PAYLOAD_STRING_CHARS = 16 * 1024
 _MAX_LOG_MESSAGE_CHARS = 2048
 _PROCESS_CLEANUP_GRACE_SECONDS = 0.25
+_PROCESS_REAP_DEADLINE_SECONDS = 2.0
+_PROCESS_REAP_SLICE_SECONDS = 0.25
 _PRE_TOOL_CALL_FAILURE_MESSAGE = "ryk could not verify this Hermes tool call; blocked fail-closed."
 _SECRET_TEXT_RE = re.compile(
     r"(?i)\b(password|passwd|pwd|token|api[_-]?key|apikey|api[_-]?secret|secret|"
@@ -118,17 +120,67 @@ class _ProcessOutputLimitError(subprocess.SubprocessError):
 
 
 def _cancel_process_io(process: subprocess.Popen[bytes], cancel: threading.Event | None = None) -> None:
+    """Signal readers to stop and close Python-owned pipes (no raw fileno close)."""
     if cancel is not None:
         cancel.set()
-    if os.name == "nt":
-        return
     for stream in (process.stdin, process.stdout, process.stderr):
         if stream is None:
             continue
         try:
-            os.close(stream.fileno())
+            stream.close()
         except (OSError, ValueError):
             pass
+
+
+def _kill_process_tree(process: subprocess.Popen[bytes]) -> None:
+    """Best-effort kill of the hook child and any descendants."""
+    if os.name == "nt":
+        pid = process.pid
+        if pid:
+            try:
+                # Windows: kill the process tree; AttributeError-safe for killpg.
+                subprocess.run(
+                    ["taskkill", "/PID", str(pid), "/T", "/F"],
+                    capture_output=True,
+                    timeout=5,
+                    check=False,
+                )
+            except (OSError, subprocess.SubprocessError):
+                pass
+        try:
+            process.kill()
+        except OSError:
+            pass
+        return
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, AttributeError, OSError):
+        try:
+            process.kill()
+        except OSError:
+            pass
+
+
+def _reap_process(process: subprocess.Popen[bytes], *, deadline_seconds: float = _PROCESS_REAP_DEADLINE_SECONDS) -> None:
+    """Wait for the child with retries after kill; do not abandon lightly."""
+    deadline = time.monotonic() + deadline_seconds
+    while True:
+        try:
+            process.wait(timeout=_PROCESS_REAP_SLICE_SECONDS)
+            return
+        except subprocess.TimeoutExpired:
+            if time.monotonic() >= deadline:
+                try:
+                    process.kill()
+                except OSError:
+                    pass
+                try:
+                    process.wait(timeout=_PROCESS_REAP_SLICE_SECONDS)
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+                return
+        except OSError:
+            return
 
 
 def _terminate_process_group(
@@ -136,18 +188,9 @@ def _terminate_process_group(
     cancel: threading.Event | None = None,
 ) -> None:
     """Kill the hook process/session and cancel any inherited pipe readers."""
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
-        try:
-            process.kill()
-        except OSError:
-            pass
+    _kill_process_tree(process)
     _cancel_process_io(process, cancel)
-    try:
-        process.wait(timeout=1)
-    except (OSError, subprocess.TimeoutExpired):
-        pass
+    _reap_process(process)
 
 
 def _run_process_bounded(
@@ -156,18 +199,25 @@ def _run_process_bounded(
     input_text: str,
     timeout: float,
     output_limit: int = _MAX_POLICY_OUTPUT_BYTES,
+    cwd: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run a hook with bounded pipes and whole-process-group timeout cleanup."""
-    process = subprocess.Popen(
-        argv,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        start_new_session=True,
-    )
-    assert process.stdin is not None
-    assert process.stdout is not None
-    assert process.stderr is not None
+    popen_kwargs: dict[str, Any] = {
+        "stdin": subprocess.PIPE,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "start_new_session": True,
+    }
+    if cwd is not None:
+        popen_kwargs["cwd"] = cwd
+    process = subprocess.Popen(argv, **popen_kwargs)
+    if process.stdin is None or process.stdout is None or process.stderr is None:
+        try:
+            process.kill()
+        except OSError:
+            pass
+        _reap_process(process)
+        raise RuntimeError("ryk subprocess pipes were not created")
 
     overflow = threading.Event()
     cancel = threading.Event()
@@ -194,7 +244,8 @@ def _run_process_bounded(
                         return
                     destination.extend(chunk)
                 return
-            while True:
+            # Windows: blocking reads; cancel closes the stream so read returns.
+            while not cancel.is_set():
                 chunk = stream.read(8192)
                 if not chunk:
                     return
@@ -304,15 +355,92 @@ def _stance_file_fail_open() -> bool | None:
     return None
 
 
-def _unattended_install_marker_present() -> bool:
-    base = Path(__file__).resolve().parent
+def _plugin_install_base() -> Path:
+    return Path(__file__).resolve().parent
+
+
+def _unattended_marker_path() -> Path | None:
+    base = _plugin_install_base()
     for name in _UNATTENDED_MARKER_FILENAMES:
+        path = base / name
         try:
-            if (base / name).is_file():
-                return True
+            if path.is_file():
+                return path
         except OSError:
             continue
-    return False
+    return None
+
+
+def _unattended_install_marker_present() -> bool:
+    return _unattended_marker_path() is not None
+
+
+def _unattended_marker_fields() -> dict[str, str]:
+    """Parse key=value lines from the install-time unattended marker body."""
+    path = _unattended_marker_path()
+    if path is None:
+        return {}
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {}
+    fields: dict[str, str] = {}
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, value = stripped.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if key and value and key not in fields:
+            fields[key] = value
+    return fields
+
+
+def _canonical_existing_dir(raw: str) -> str | None:
+    try:
+        path = Path(raw).expanduser()
+        if not path.is_absolute():
+            return None
+        resolved = path.resolve(strict=True)
+        if not resolved.is_dir():
+            return None
+        return str(resolved)
+    except OSError:
+        return None
+
+
+def _policy_workspace_cwd() -> str | None:
+    """Pinned policy workspace for ryk hook subprocesses when known.
+
+    Preference: marker ``workspace=`` → env ``RYK_HERMES_WORKSPACE`` → marker
+    ``path=`` when that path is an existing directory *and* is not the plugin
+    install root (Zig currently writes plugin-dir integrity ``path=``; that is
+    not a policy workspace pin). Residual: without a pin, hooks inherit the
+    Hermes process cwd (dual-path risk vs OpenClaw workspaceRoot).
+    """
+    fields = _unattended_marker_fields()
+    plugin_base = str(_plugin_install_base().resolve())
+    for candidate in (
+        fields.get("workspace"),
+        os.environ.get("RYK_HERMES_WORKSPACE"),
+        fields.get("path"),
+    ):
+        if not candidate:
+            continue
+        pinned = _canonical_existing_dir(candidate)
+        if pinned is None:
+            continue
+        # Skip integrity-only path= that points at the plugin install dir.
+        if pinned == plugin_base or pinned == str(Path(plugin_base).resolve()):
+            continue
+        return pinned
+    return None
+
+
+def _is_unattended() -> bool:
+    """True when CI env or the persistent `.ryk_unattended` install marker is set."""
+    return _mapping.ci_mode(unattended_marker=_unattended_install_marker_present())
 
 
 def _fail_open_enabled() -> bool:
@@ -326,9 +454,7 @@ def _fail_open_enabled() -> bool:
     # no-human safety boundary dominates install stance and environment escape
     # hatches so a stale supervisor setting cannot turn a missing guard into
     # an allowed tool call.
-    if _mapping.ci_mode():
-        return False
-    if _unattended_install_marker_present():
+    if _is_unattended():
         return False
     if "RYK_HERMES_FAIL_OPEN" in os.environ:
         parsed = _parse_fail_open_token(os.environ.get("RYK_HERMES_FAIL_OPEN", ""))
@@ -485,6 +611,13 @@ def _path_is_within(path: Path, root: Path) -> bool:
 
 
 def _candidate_is_trusted(path: Path) -> bool:
+    """Trust managed install roots before cwd-within plant rejection.
+
+    Managed roots (``~/.local/bin``, ``~/.ryk/bin``) must win when the Hermes
+    process cwd is ``$HOME`` (or another ancestor of those roots); otherwise a
+    legitimate curl install is treated as a workspace plant and discovery
+    fail-opens when no other binary attests.
+    """
     try:
         canonical = path.resolve(strict=True)
         stat = canonical.stat()
@@ -494,23 +627,28 @@ def _candidate_is_trusted(path: Path) -> bool:
             Path("/tmp").resolve(),
             Path("/private/tmp").resolve(),
         }
+        managed_roots = {
+            (Path.home() / ".local" / "bin").resolve(),
+            (Path.home() / ".ryk" / "bin").resolve(),
+        }
     except OSError:
         return False
     if "node_modules/.bin" in canonical.as_posix():
         return False
-    if any(_path_is_within(canonical, root) for root in temp_roots):
-        return False
-    if _path_is_within(canonical, workspace) and os.environ.get("RYK_ALLOW_WORKSPACE_BIN") != "1":
-        return False
-    managed_roots = {
-        (Path.home() / ".local" / "bin").resolve(),
-        (Path.home() / ".ryk" / "bin").resolve(),
-    }
+    in_managed = any(_path_is_within(canonical, root) for root in managed_roots)
     workspace_override = (
         os.environ.get("RYK_ALLOW_WORKSPACE_BIN") == "1"
         and _path_is_within(canonical, workspace)
     )
-    if not any(_path_is_within(canonical, root) for root in managed_roots) and not workspace_override:
+    # Managed install roots win over temp and workspace-plant rejects so
+    # cwd=$HOME (or a test HOME under /tmp) does not discard ~/.local/bin/ryk.
+    if in_managed:
+        pass
+    elif workspace_override:
+        pass
+    elif any(_path_is_within(canonical, root) for root in temp_roots):
+        return False
+    else:
         return False
     if os.name != "nt":
         if stat.st_mode & 0o111 == 0 or stat.st_mode & 0o022 != 0:
@@ -787,11 +925,19 @@ def _call_ryk(event: str, data: Any) -> dict[str, Any]:
             "refusing the Hermes policy call"
         )
 
+    argv = [ryk, "hook", "hermes", event]
+    # Unattended/CI must pass --ci so residual ryk ask (FM soft, stage→ask)
+    # hardens inside the CLI, not only in the host mapping layer.
+    if _is_unattended():
+        argv.append("--ci")
+    policy_cwd = _policy_workspace_cwd()
+
     try:
         completed = _run_process_bounded(
-            [ryk, "hook", "hermes", event],
+            argv,
             input_text=_payload(event, data),
             timeout=15 if event in POLICY_EVENTS else 10,
+            cwd=policy_cwd,
         )
     except OSError as exc:
         raise RuntimeError(f"failed to run ryk at {ryk}: {exc}") from exc
@@ -847,6 +993,7 @@ def _map_pre_tool_call(
         tool_name,
         tool_input,
         log_warn=lambda msg: _log_policy_warn(ctx, msg),
+        unattended_marker=_unattended_install_marker_present(),
     )
 
 

@@ -3,7 +3,7 @@ import assert from 'node:assert';
 import { createHash } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import rykPlugin, {
   CANARY_BLOCK_PREFIX,
@@ -12,6 +12,7 @@ import rykPlugin, {
   INERT_CANARY_TOOL,
   INERT_CANARY_COMMAND,
   isOnNoop,
+  isUntrustedCandidate,
   MAX_HOOK_PAYLOAD_BYTES,
   normalizeOpenClawToolEvent,
   parseHookResponse,
@@ -151,6 +152,31 @@ describe('findRyk', () => {
     }
   });
 
+  it('allows managed ~/.local/bin before cwd-within reject when cwd is $HOME', () => {
+    const managed = join(homedir(), '.local', 'bin', 'ryk');
+    assert.strictEqual(
+      isUntrustedCandidate(managed, homedir(), false),
+      false,
+      'curl-installed ryk under ~/.local/bin must remain trusted when cwd is $HOME'
+    );
+    assert.strictEqual(
+      isUntrustedCandidate(managed, homedir(), true),
+      false,
+      'managed roots stay trusted with workspace override enabled'
+    );
+    const homePlant = join(homedir(), `.ryk-openclaw-home-plant-${process.pid}`, 'ryk');
+    assert.strictEqual(
+      isUntrustedCandidate(homePlant, homedir(), false),
+      true,
+      'non-managed plants under $HOME must still be rejected'
+    );
+  });
+
+  it('allows managed ~/.ryk/bin before cwd-within reject when cwd is $HOME', () => {
+    const managed = join(homedir(), '.ryk', 'bin', 'ryk');
+    assert.strictEqual(isUntrustedCandidate(managed, homedir(), false), false);
+  });
+
   it('rejects a self-reporting ryk binary planted in a temporary directory by default', () => {
     const previousBin = process.env.RYK_BIN;
     const previousWorkspace = process.env.RYK_ALLOW_WORKSPACE_BIN;
@@ -240,16 +266,23 @@ describe('isOnNoop', () => {
     assert.strictEqual(isOnNoop(api), true);
   });
 
-  it('keeps unknown registration modes fail-closed instead of silently unprotected', async () => {
+  it('treats unknown registration modes like known non-full (warn unprotected, no veto handlers)', () => {
     const api = makeApi({ registrationMode: 'future-runtime' as any });
     rykPlugin(api);
     const beforeCall = (api.on as any).mock.calls.find(
       (c: any) => c.arguments[0] === 'before_tool_call'
     );
-    assert.ok(beforeCall, 'unknown modes must receive a fail-closed veto');
-    const result = await beforeCall.arguments[1]();
-    assert.strictEqual(result.block, true);
-    assert.match(String(result.blockReason), /registration mode/);
+    assert.strictEqual(
+      beforeCall,
+      undefined,
+      'unknown modes must not register veto handlers (api.on may be no-op)'
+    );
+    const warnText = (api.logger.warn as any).mock.calls
+      .map((c: any) => String(c.arguments[0]))
+      .join('\n');
+    assert.match(warnText, /unprotected/i);
+    assert.match(warnText, /unknown registration mode/i);
+    assert.match(warnText, /ryk run -- openclaw/);
   });
 });
 

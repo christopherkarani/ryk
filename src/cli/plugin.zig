@@ -2930,7 +2930,13 @@ fn parseThreePartVersion(output: []const u8, prefix: []const u8) ?[3]u32 {
 }
 
 pub fn hostBinaryIdentityMatchesTimed(allocator: std.mem.Allocator, host: []const u8, binary: []const u8, timeout_ms: u32) bool {
-    var result = child_process.runHostCommandCaptureTimed(allocator, &.{ binary, "--version" }, timeout_ms) catch return false;
+    // Prefer join-parent so agents-health nested probes stay in the worker's
+    // process group (outer SIGKILL cannot orphan host --version CLIs). Fall
+    // back to a private group only when join-parent is unavailable (Windows).
+    var result = if (comptime builtin.os.tag == .windows)
+        child_process.runHostCommandCaptureTimed(allocator, &.{ binary, "--version" }, timeout_ms) catch return false
+    else
+        child_process.runHostCommandCaptureTimedInCurrentProcessGroup(allocator, &.{ binary, "--version" }, timeout_ms) catch return false;
     defer result.deinit(allocator);
     if (result.timed_out or result.output_overflow or result.exit_code != 0) return false;
     if (std.mem.eql(u8, host, "openclaw")) {

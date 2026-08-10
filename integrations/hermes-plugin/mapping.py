@@ -45,8 +45,19 @@ def _bounded_text(value: Any, default: str, limit: int = _MAX_MESSAGE_CHARS) -> 
     return redacted[: limit - len(suffix)] + suffix
 
 
-def ci_mode(environ: dict[str, str] | None = None) -> bool:
-    """True when interactive approval cannot be answered (CI / unattended)."""
+def ci_mode(
+    environ: dict[str, str] | None = None,
+    *,
+    unattended_marker: bool = False,
+) -> bool:
+    """True when interactive approval cannot be answered (CI / unattended).
+
+    ``unattended_marker`` is the persistent install-time `.ryk_unattended` flag
+    (I/O lives in the adapter). When set, ask hardens to block even if CI env
+    vars were cleared by a long-lived Hermes daemon.
+    """
+    if unattended_marker:
+        return True
     env = os.environ if environ is None else environ
     for key in _CI_ENV_KEYS:
         value = env.get(key, "").strip().lower()
@@ -135,12 +146,13 @@ def map_pre_tool_call(
     *,
     log_warn: Callable[[str], None] | None = None,
     environ: dict[str, str] | None = None,
+    unattended_marker: bool = False,
 ) -> dict[str, Any] | None:
     """Map ryk decision → Hermes pre_tool_call directive.
 
     - allow → None (proceed)
     - block → {"action": "block", ...}
-    - ask → {"action": "approve", ...} or block under CI
+    - ask → {"action": "approve", ...} or block under CI / unattended marker
     - warn → log advisory + None (not collapsed to block)
     - other → fail-closed block
     """
@@ -159,7 +171,7 @@ def map_pre_tool_call(
         }
     if decision == "ask":
         message = format_tool_message(response, default="approval required by ryk")
-        if ci_mode(environ):
+        if ci_mode(environ, unattended_marker=unattended_marker):
             return {
                 "action": "block",
                 "message": (
