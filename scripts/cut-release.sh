@@ -482,6 +482,8 @@ const files = [
   'integrations/openclaw-plugin/openclaw.plugin.json',
   'packaging/scoop/ryk.json',
   'packaging/winget/ryk.yaml',
+  'packaging/homebrew/Formula/ryk.rb',
+  'packaging/npm/package.json',
 ];
 for (const file of files) {
   const source = fs.readFileSync(file, 'utf8');
