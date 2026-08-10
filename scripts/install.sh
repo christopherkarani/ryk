@@ -161,10 +161,9 @@ reject_symlink_components() {
   done
 }
 
-# Binary destinations support one managed exception: an existing final symlink
-# may point at an older ryk binary. The staged `mv` replaces that link itself,
-# but would move into a directory symlink, so validate the parents and final
-# destination separately.
+# Binary destinations may replace an existing final symlink. The staged `mv`
+# replaces that link itself and never follows its target; validate the parents
+# separately so a symlinked directory cannot redirect the install.
 reject_symlink_parents() {
   checked_path="$1"
   checked_label="$2"
@@ -393,10 +392,6 @@ validate_binary_destination() {
   fi
 
   if [ -L "$validate_destination" ]; then
-    if ! managed_runtime_version >/dev/null; then
-      fail "refusing symlinked binary destination path: $validate_destination" \
-        "Remove the link or complete a managed ryk install under ${SHARE_DIR}, then retry."
-    fi
     return 0
   fi
 

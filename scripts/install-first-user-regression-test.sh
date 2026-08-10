@@ -447,8 +447,23 @@ printf 'untouched\n' > "${victim_file}"
 binary_final_dir="${tmp_root}/binary-final"
 mkdir -p "${binary_final_dir}"
 ln -s "${victim_file}" "${binary_final_dir}/ryk"
-assert_rejected_without_touching \
-  "binary-final-symlink" "${binary_final_dir}" "${tmp_root}/binary-final-share" "${victim_file}"
+if ! HOME="${home}" \
+  SHELL=/bin/sh \
+  RYK_VERSION="${VERSION}" \
+  RYK_ARTIFACT_DIR="${artifact_dir}" \
+  RYK_INSTALL_DIR="${binary_final_dir}" \
+  RYK_SHARE_DIR="${tmp_root}/binary-final-share" \
+  RYK_INSTALL_FORCE=1 \
+  RYK_INSTALL_SKIP_ONBOARD=1 \
+  sh "${INSTALL_SH}" >/dev/null 2>&1; then
+  fail "binary-final-symlink: installer rejected a final binary symlink"
+fi
+[[ ! -L "${binary_final_dir}/ryk" ]] ||
+  fail "binary-final-symlink: installer left the destination symlink in place"
+[[ -f "${binary_final_dir}/ryk" ]] ||
+  fail "binary-final-symlink: installer did not install a regular binary"
+[[ "$(cat "${victim_file}")" == "untouched" ]] ||
+  fail "binary-final-symlink: installer modified the symlink target"
 
 binary_product_dir="${tmp_root}/binary-product-final"
 mkdir -p "${binary_product_dir}"
@@ -490,7 +505,10 @@ chmod 0755 "${malicious_target}"
 malicious_dir="${tmp_root}/malicious-final"
 mkdir -p "${malicious_dir}"
 ln -s "${malicious_target}" "${malicious_dir}/ryk"
-if HOME="${home}" \
+# Replacing a final binary symlink must never follow or execute its target.
+# This is the recovery path for stale/legacy `~/.local/bin/ryk` links that do
+# not have a matching managed runtime marker yet.
+if ! HOME="${home}" \
   SHELL=/bin/sh \
   RYK_VERSION="${VERSION}" \
   RYK_ARTIFACT_DIR="${artifact_dir}" \
@@ -500,10 +518,14 @@ if HOME="${home}" \
   RYK_INSTALL_FORCE=1 \
   RYK_INSTALL_SKIP_ONBOARD=1 \
   sh "${INSTALL_SH}" >"${tmp_root}/malicious.out" 2>&1; then
-  fail "malicious-final-symlink: installer accepted an executable non-ryk link"
+  fail "unmanaged-final-symlink: installer rejected a final binary symlink"
 fi
+[[ ! -L "${malicious_dir}/ryk" ]] ||
+  fail "unmanaged-final-symlink: installer left the destination symlink in place"
+[[ -f "${malicious_dir}/ryk" ]] ||
+  fail "unmanaged-final-symlink: installer did not install a regular binary"
 [[ ! -e "${malicious_marker}" ]] ||
-  fail "malicious-final-symlink: installer executed the existing destination"
+  fail "unmanaged-final-symlink: installer executed the existing destination"
 
 binary_parent_target="${tmp_root}/binary-parent-target"
 mkdir -p "${binary_parent_target}"
