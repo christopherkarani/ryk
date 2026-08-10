@@ -6,8 +6,11 @@
 
 const std = @import("std");
 
+const child_process = @import("child_process.zig");
 const exit_codes = @import("exit_codes.zig");
 const core_api = @import("ryk_core").api;
+const policy_mod = @import("ryk_core").policy;
+const ensure = @import("ensure.zig");
 const help = @import("help.zig");
 const host_status = @import("host_status.zig");
 const onboarding = @import("onboarding.zig");
@@ -17,6 +20,14 @@ const suggestions = @import("suggestions.zig");
 
 pub const default_preset = "unattended";
 pub const default_hosts = "hermes,openclaw";
+pub const max_health_json_bytes: usize = 64 * 1024;
+pub const total_health_timeout_ms: u32 = 25_000;
+// The child runner uses a bounded TERM-to-KILL cleanup window. Reserve that
+// window inside the public command-wide deadline so the reported deadline is
+// a wall-clock bound, not merely the point where cleanup begins.
+const health_cleanup_reserve_ms: u32 = 750;
+const health_worker_timeout_ms: u32 = total_health_timeout_ms - health_cleanup_reserve_ms;
+const health_worker_flag = "--__ryk-health-worker";
 
 const RuntimeProbe = struct {
     configured: bool,
@@ -24,10 +35,42 @@ const RuntimeProbe = struct {
     note: []const u8,
 };
 
+fn hostRemediation(host: []const u8) []const u8 {
+    if (std.mem.eql(u8, host, "hermes"))
+        return "Restart Hermes, rerun health, and use `ryk run -- hermes ...` until live callback evidence is available.";
+    return "Upgrade/restart OpenClaw, rerun health, and use `ryk run -- openclaw` until Gateway enforcement is verified.";
+}
+
 const ExistingPolicyStatus = struct {
     mode: []const u8,
     unattended_contract: bool,
 };
+
+const HealthBudget = struct {
+    started: std.Io.Clock.Timestamp,
+
+    fn init(io: std.Io) HealthBudget {
+        return .{ .started = std.Io.Clock.Timestamp.now(io, .awake) };
+    }
+
+    fn nextTimeoutMs(self: HealthBudget, io: std.Io, per_probe_cap_ms: u32) ?u32 {
+        const elapsed_ns: i128 = @max(@as(i128, self.started.durationFromNow(io).raw.nanoseconds), 0);
+        const total_ns: i128 = @as(i128, health_worker_timeout_ms) * std.time.ns_per_ms;
+        if (elapsed_ns >= total_ns) return null;
+        const remaining_ms: i128 = @max(@divFloor(total_ns - elapsed_ns, std.time.ns_per_ms), 1);
+        return @intCast(@min(remaining_ms, @as(i128, per_probe_cap_ms)));
+    }
+};
+
+fn captureWithinHealthBudget(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    budget: HealthBudget,
+    argv: []const []const u8,
+) ![]u8 {
+    const timeout_ms = budget.nextTimeoutMs(io, 4_000) orelse return error.HealthDeadlineExceeded;
+    return plugin.captureChildOutputTimedInCurrentProcessGroup(allocator, argv, timeout_ms);
+}
 
 pub fn command(
     io: std.Io,
@@ -37,19 +80,90 @@ pub fn command(
     stderr: anytype,
 ) !u8 {
     if (argv.len == 0 or std.mem.eql(u8, argv[0], "--help") or std.mem.eql(u8, argv[0], "-h")) {
-        _ = try help.writeCommand(io, stdout, "unattended");
+        _ = try help.writeCommand(io, stdout, "agents");
         return exit_codes.success;
     }
 
-    if (std.mem.eql(u8, argv[0], "setup") or std.mem.eql(u8, argv[0], "install")) {
+    if (std.mem.eql(u8, argv[0], "setup")) {
         return setupCommand(io, cwd, argv[1..], stdout, stderr);
     }
-    if (std.mem.eql(u8, argv[0], "health") or std.mem.eql(u8, argv[0], "check")) {
+    if (std.mem.eql(u8, argv[0], "health")) {
         return healthCommand(io, argv[1..], stdout, stderr);
     }
 
-    try suggestions.writeUnknownSubcommand(stderr, "ryk unattended", argv[0], &.{ "setup", "health", "install", "check" }, "unattended");
+    try suggestions.writeUnknownSubcommand(stderr, "ryk agents", argv[0], &.{ "setup", "health" }, "agents");
     return exit_codes.usage;
+}
+
+fn healthArgsRequestJson(argv: []const []const u8) bool {
+    for (argv) |arg| if (std.mem.eql(u8, arg, "--json")) return true;
+    return false;
+}
+
+fn writeHealthDeadlineFailure(stdout: anytype, json_mode: bool) !void {
+    if (json_mode) {
+        try stdout.writeAll("{\"schema_version\":1,\"preset\":\"unattended\",\"ready\":false,\"error\":\"health command deadline exceeded\"}\n");
+    } else {
+        try stdout.writeAll("Ryk agents health: command-wide deadline exceeded; protection is not ready.\n");
+    }
+}
+
+fn writeHealthOutputFailure(stdout: anytype, json_mode: bool) !void {
+    if (json_mode) {
+        try stdout.writeAll("{\"schema_version\":1,\"preset\":\"unattended\",\"ready\":false,\"error\":\"health output exceeded bound\"}\n");
+    } else {
+        try stdout.writeAll("Ryk agents health: output exceeded the command bound; protection is not ready.\n");
+    }
+}
+
+fn healthCommandWithDeadline(
+    io: std.Io,
+    argv: []const []const u8,
+    stdout: anytype,
+    stderr: anytype,
+) !u8 {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const allocator = gpa_state.allocator();
+    const self_exe = std.process.executablePathAlloc(io, allocator) catch {
+        try writeHealthDeadlineFailure(stdout, healthArgsRequestJson(argv));
+        return exit_codes.general;
+    };
+    defer allocator.free(self_exe);
+    const worker_argv = try allocator.alloc([]const u8, argv.len + 4);
+    defer allocator.free(worker_argv);
+    worker_argv[0] = self_exe;
+    worker_argv[1] = "agents";
+    worker_argv[2] = "health";
+    worker_argv[3] = health_worker_flag;
+    @memcpy(worker_argv[4..], argv);
+
+    var result = child_process.runHostCommandCaptureTimed(allocator, worker_argv, health_worker_timeout_ms) catch {
+        try writeHealthDeadlineFailure(stdout, healthArgsRequestJson(argv));
+        return exit_codes.general;
+    };
+    defer result.deinit(allocator);
+    if (result.timed_out) {
+        try writeHealthDeadlineFailure(stdout, healthArgsRequestJson(argv));
+        return exit_codes.general;
+    }
+    if (result.output_overflow) {
+        try writeHealthOutputFailure(stdout, healthArgsRequestJson(argv));
+        return exit_codes.general;
+    }
+    try stdout.writeAll(result.stdout);
+    try stderr.writeAll(result.stderr);
+    return result.exit_code;
+}
+
+fn parseHostSelection(allocator: std.mem.Allocator, argv: []const []const u8) ![]u8 {
+    if (argv.len == 0) return allocator.dupe(u8, default_hosts);
+    if (argv.len != 1) return error.InvalidHostSelection;
+    const host = argv[0];
+    if (!std.mem.eql(u8, host, "hermes") and !std.mem.eql(u8, host, "openclaw")) {
+        return error.UnsupportedHost;
+    }
+    return allocator.dupe(u8, host);
 }
 
 fn setupCommand(
@@ -59,34 +173,43 @@ fn setupCommand(
     stdout: anytype,
     stderr: anytype,
 ) !u8 {
-    var hosts_csv: []const u8 = default_hosts;
-    var index: usize = 0;
-    while (index < argv.len) : (index += 1) {
-        const arg = argv[index];
-        if (std.mem.eql(u8, arg, "--hosts")) {
-            index += 1;
-            if (index >= argv.len) {
-                try stderr.writeAll("ryk unattended setup: --hosts requires a comma-separated host list.\n");
-                return exit_codes.usage;
-            }
-            hosts_csv = argv[index];
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
-            _ = try help.writeCommand(io, stdout, "unattended");
-            return exit_codes.success;
-        }
-        try suggestions.writeUnknownOption(stderr, "ryk unattended setup", arg, &.{ "--hosts", "--help", "-h" }, "unattended");
-        return exit_codes.usage;
-    }
-
-    // Validate before start mutates policy or host installation state.
     var gpa_state: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa_state.deinit();
     const allocator = gpa_state.allocator();
+    var positional_host: ?[]const u8 = null;
+    var index: usize = 0;
+    while (index < argv.len) : (index += 1) {
+        const arg = argv[index];
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            _ = try help.writeCommand(io, stdout, "agents");
+            return exit_codes.success;
+        }
+        if (std.mem.startsWith(u8, arg, "-")) {
+            try suggestions.writeUnknownOption(stderr, "ryk agents setup", arg, &.{ "--help", "-h" }, "agents");
+            return exit_codes.usage;
+        }
+        if (positional_host != null) {
+            try stderr.writeAll("ryk agents setup: choose at most one host: hermes or openclaw.\n");
+            return exit_codes.usage;
+        }
+        positional_host = arg;
+    }
+
+    const selection = if (positional_host) |host| &[_][]const u8{host} else &[_][]const u8{};
+    const hosts_csv = parseHostSelection(allocator, selection) catch |err| switch (err) {
+        error.UnsupportedHost => {
+            try stderr.writeAll("ryk agents setup: host must be hermes or openclaw.\n");
+            return exit_codes.usage;
+        },
+        error.InvalidHostSelection => return exit_codes.usage,
+        else => return err,
+    };
+    defer allocator.free(hosts_csv);
+
+    // Validate before start mutates policy or host installation state.
     const hosts = onboarding.parseHostsCsv(allocator, hosts_csv) catch |err| {
         if (err == error.UnsupportedHost) {
-            try stderr.print("ryk unattended setup: unsupported host in '{s}'; use hermes and/or openclaw.\n", .{hosts_csv});
+            try stderr.print("ryk agents setup: unsupported host in '{s}'; use hermes or openclaw.\n", .{hosts_csv});
             return exit_codes.usage;
         }
         return err;
@@ -94,7 +217,7 @@ fn setupCommand(
     defer onboarding.deinitHostList(allocator, hosts);
     for (hosts) |host| {
         if (!std.mem.eql(u8, host, "hermes") and !std.mem.eql(u8, host, "openclaw")) {
-            try stderr.print("ryk unattended setup: host '{s}' is outside this workflow; use hermes and/or openclaw.\n", .{host});
+            try stderr.print("ryk agents setup: host '{s}' is outside this workflow; use hermes or openclaw.\n", .{host});
             return exit_codes.usage;
         }
     }
@@ -103,32 +226,71 @@ fn setupCommand(
     // is correct for general onboarding, but unattended setup must not report a
     // successful always-on deployment while leaving an attended ask policy in
     // place. Require an explicit policy replacement by the operator instead.
-    const existing_policy = existingPolicyStatus(io, cwd, allocator) catch {
-        try stderr.writeAll("ryk unattended setup: existing policy is unreadable or invalid; refusing host mutation.\n");
+    var existing_policy = existingPolicyStatus(io, cwd, allocator) catch {
+        try stderr.writeAll("ryk agents setup: existing policy is unreadable or invalid; refusing host mutation.\n");
         try stderr.writeAll("  review and replace it explicitly with: ryk init --preset unattended --force\n");
         return exit_codes.general;
     };
+    if (existing_policy == null) {
+        var outcome = try ensure.runEnsure(io, allocator, cwd, .{
+            .from_install = false,
+            .quiet = true,
+            .preset = default_preset,
+            .skip_verify = true,
+            .skip_host_wire = true,
+        }, stdout, stderr);
+        defer outcome.deinit(allocator);
+        if (!outcome.core_ok) {
+            try stderr.writeAll("ryk agents setup: unattended policy creation failed; refusing host mutation.\n");
+            return exit_codes.general;
+        }
+        existing_policy = existingPolicyStatus(io, cwd, allocator) catch {
+            try stderr.writeAll("ryk agents setup: created policy failed validation; refusing host mutation.\n");
+            return exit_codes.general;
+        };
+        if (existing_policy == null or !existing_policy.?.unattended_contract) {
+            try stderr.writeAll("ryk agents setup: created policy does not match the reviewed unattended preset; refusing host mutation.\n");
+            return exit_codes.general;
+        }
+    }
     if (existing_policy) |status| {
         if (!policyModeAllowsUnattended(status.mode)) {
             try stderr.print(
-                "ryk unattended setup: existing policy mode is '{s}'; unattended setup requires strict fail-closed mode.\n",
+                "ryk agents setup: existing policy mode is '{s}'; unattended setup requires strict fail-closed mode.\n",
                 .{status.mode},
             );
             try stderr.writeAll("  review and replace it explicitly with: ryk init --preset unattended --force\n");
             return exit_codes.general;
         }
         if (!status.unattended_contract) {
-            try stderr.writeAll("ryk unattended setup: existing strict policy does not satisfy the unattended deny-by-default contract.\n");
+            try stderr.writeAll("ryk agents setup: existing policy is not semantically equal to the reviewed unattended preset.\n");
             try stderr.writeAll("  review and replace it explicitly with: ryk init --preset unattended --force\n");
             return exit_codes.general;
         }
     }
 
-    return start.runStart(io, cwd, .{
+    for (hosts) |host| {
+        if (!std.mem.eql(u8, host, "hermes")) continue;
+        plugin.prepareHermesUnattendedInstall(io, allocator) catch |err| {
+            try stderr.print("ryk agents setup: Hermes fail-closed preparation failed before activation: {s}.\n", .{@errorName(err)});
+            return exit_codes.general;
+        };
+    }
+
+    const setup_code = try start.runStart(io, cwd, .{
         .auto = true,
         .preset = default_preset,
         .hosts_csv = hosts_csv,
     }, stdout, stderr, null, null);
+    if (setup_code != exit_codes.success) return setup_code;
+    for (hosts) |host| {
+        if (!std.mem.eql(u8, host, "hermes")) continue;
+        plugin.hardenHermesUnattendedInstall(io, allocator) catch |err| {
+            try stderr.print("ryk agents setup: Hermes unattended hardening failed: {s}.\n", .{@errorName(err)});
+            return exit_codes.general;
+        };
+    }
+    return exit_codes.success;
 }
 
 fn healthCommand(
@@ -137,38 +299,62 @@ fn healthCommand(
     stdout: anytype,
     stderr: anytype,
 ) !u8 {
-    var hosts_csv: []const u8 = default_hosts;
+    for (argv) |arg| {
+        if (std.mem.eql(u8, arg, health_worker_flag)) return healthCommandInner(io, argv, stdout, stderr);
+    }
+    return healthCommandWithDeadline(io, argv, stdout, stderr);
+}
+
+fn healthCommandInner(
+    io: std.Io,
+    argv: []const []const u8,
+    stdout: anytype,
+    stderr: anytype,
+) !u8 {
+    const health_budget = HealthBudget.init(io);
     var json_mode = false;
+    var positional_host: ?[]const u8 = null;
     var index: usize = 0;
     while (index < argv.len) : (index += 1) {
         const arg = argv[index];
+        if (std.mem.eql(u8, arg, health_worker_flag)) continue;
         if (std.mem.eql(u8, arg, "--json")) {
             json_mode = true;
             continue;
         }
-        if (std.mem.eql(u8, arg, "--hosts")) {
-            index += 1;
-            if (index >= argv.len) {
-                try stderr.writeAll("ryk unattended health: --hosts requires a comma-separated host list.\n");
-                return exit_codes.usage;
-            }
-            hosts_csv = argv[index];
-            continue;
-        }
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
-            _ = try help.writeCommand(io, stdout, "unattended");
+            _ = try help.writeCommand(io, stdout, "agents");
             return exit_codes.success;
         }
-        try suggestions.writeUnknownOption(stderr, "ryk unattended health", arg, &.{ "--hosts", "--json", "--help", "-h" }, "unattended");
-        return exit_codes.usage;
+        if (std.mem.startsWith(u8, arg, "-")) {
+            try suggestions.writeUnknownOption(stderr, "ryk agents health", arg, &.{ "--json", "--help", "-h" }, "agents");
+            return exit_codes.usage;
+        }
+        if (positional_host != null) {
+            try stderr.writeAll("ryk agents health: choose at most one host: hermes or openclaw.\n");
+            return exit_codes.usage;
+        }
+        positional_host = arg;
     }
 
     var gpa_state: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa_state.deinit();
     const allocator = gpa_state.allocator();
+    const self_exe = std.process.executablePathAlloc(io, allocator) catch null;
+    defer if (self_exe) |path| allocator.free(path);
+    const selection = if (positional_host) |host| &[_][]const u8{host} else &[_][]const u8{};
+    const hosts_csv = parseHostSelection(allocator, selection) catch |err| switch (err) {
+        error.UnsupportedHost => {
+            try stderr.writeAll("ryk agents health: host must be hermes or openclaw.\n");
+            return exit_codes.usage;
+        },
+        error.InvalidHostSelection => return exit_codes.usage,
+        else => return err,
+    };
+    defer allocator.free(hosts_csv);
     const hosts = onboarding.parseHostsCsv(allocator, hosts_csv) catch |err| {
         if (err == error.UnsupportedHost) {
-            try stderr.print("ryk unattended health: unsupported host in '{s}'; use hermes and/or openclaw.\n", .{hosts_csv});
+            try stderr.print("ryk agents health: unsupported host in '{s}'; use hermes or openclaw.\n", .{hosts_csv});
             return exit_codes.usage;
         }
         return err;
@@ -176,16 +362,16 @@ fn healthCommand(
     defer onboarding.deinitHostList(allocator, hosts);
     for (hosts) |host| {
         if (!std.mem.eql(u8, host, "hermes") and !std.mem.eql(u8, host, "openclaw")) {
-            try stderr.print("ryk unattended health: host '{s}' is outside this workflow; use hermes and/or openclaw.\n", .{host});
+            try stderr.print("ryk agents health: host '{s}' is outside this workflow; use hermes or openclaw.\n", .{host});
             return exit_codes.usage;
         }
     }
 
-    var report = plugin.collectPluginDoctorReportWithHermesSmoke(io, allocator, false) catch |err| {
+    var report = plugin.collectPluginDoctorReportForAgentsHealth(io, allocator) catch |err| {
         if (json_mode) {
             try stdout.print("{{\"ready\":false,\"error\":\"doctor probe failed: {s}\"}}\n", .{@errorName(err)});
         } else {
-            try stderr.print("ryk unattended health: doctor probe failed: {s}\n", .{@errorName(err)});
+            try stderr.print("ryk agents health: doctor probe failed: {s}\n", .{@errorName(err)});
         }
         return exit_codes.general;
     };
@@ -210,7 +396,7 @@ fn healthCommand(
         try stdout.print(", \"unattended_contract\": {s}}},\n", .{if (policy_contract) "true" else "false"});
         try stdout.writeAll("  \"hosts\": [\n");
     } else {
-        try stdout.writeAll("Ryk unattended health\n\n");
+        try stdout.writeAll("Ryk agents health\n\n");
         try stdout.print("Preset: {s}\n", .{default_preset});
         if (report.policy_present and report.policy_valid) {
             try stdout.print("Policy: valid (mode {s}, unattended contract={s})\n", .{
@@ -224,13 +410,31 @@ fn healthCommand(
     }
 
     for (hosts, 0..) |host, host_index| {
-        const binary_detected = if (std.mem.eql(u8, host, "hermes")) report.host_binaries.hermes else report.host_binaries.openclaw;
-        const installed = plugin.hostPluginInstalledFromReport(host, report);
-        const smoke = host_status.runHostSmokePair(allocator, host) catch host_status.HostSmokePair{};
-        const probe = if (std.mem.eql(u8, host, "openclaw"))
-            probeOpenClaw(allocator)
+        const identity_timeout = health_budget.nextTimeoutMs(io, 3_000);
+        const host_binary = if (identity_timeout) |timeout_ms|
+            plugin.trustedHostBinaryTimed(io, allocator, host, timeout_ms) catch null
         else
-            probeHermes(allocator);
+            null;
+        defer if (host_binary) |path| allocator.free(path);
+        const binary_detected = host_binary != null;
+        const installed = plugin.hostPluginInstalledFromReport(host, report);
+        const smoke_timeout = health_budget.nextTimeoutMs(io, 6_000);
+        const smoke = if (self_exe != null and smoke_timeout != null)
+            host_status.runHostSmokePairWithBinaryTimed(
+                allocator,
+                self_exe.?,
+                host,
+                @max(@as(u64, smoke_timeout.?) / 2, 1),
+            ) catch host_status.HostSmokePair{}
+        else
+            host_status.HostSmokePair{};
+        const probe = if (host_binary) |binary|
+            if (std.mem.eql(u8, host, "openclaw"))
+                probeOpenClaw(allocator, io, health_budget, binary)
+            else
+                probeHermes(allocator, io, health_budget, binary)
+        else
+            RuntimeProbe{ .configured = false, .live_verified = false, .note = "trusted host executable not found" };
         // OpenClaw has a bounded Gateway RPC probe, so a loaded plugin without
         // a healthy Gateway is not ready. Hermes currently exposes no equivalent
         // live hook probe; its enabled-plugin result is the strongest available
@@ -257,6 +461,8 @@ fn healthCommand(
                 if (probe.live_verified) "true" else "false",
             });
             try plugin.writeJsonString(stdout, probe.note);
+            try stdout.writeAll(", \"remediation\": ");
+            try plugin.writeJsonString(stdout, if (host_ready) "none" else hostRemediation(host));
             try stdout.print(", \"ready\": {s}}}", .{if (host_ready) "true" else "false"});
         } else {
             try stdout.print("  {s}: binary={s}, installed={s}, smoke={s}/{s}, runtime={s}\n", .{
@@ -267,6 +473,7 @@ fn healthCommand(
                 smoke.deny.toString(),
                 probe.note,
             });
+            if (!host_ready) try stdout.print("    remediation: {s}\n", .{hostRemediation(host)});
         }
     }
 
@@ -274,61 +481,100 @@ fn healthCommand(
         try stdout.print("\n  ],\n  \"ready\": {s}\n}}\n", .{if (ready) "true" else "false"});
     } else {
         try stdout.print("\nOverall: {s}\n", .{if (ready) "healthy" else "not ready"});
-        if (!ready) try stdout.writeAll("Remediation: ryk unattended setup, then restart the agent host(s) and rerun this check.\n");
+        if (!ready) try stdout.writeAll("Remediation: follow each host-specific wrapper fallback above; setup alone cannot manufacture live-hook evidence.\n");
     }
     return if (ready) exit_codes.success else exit_codes.general;
 }
 
-fn probeOpenClaw(allocator: std.mem.Allocator) RuntimeProbe {
-    // A positive plugin hook count is only a metadata/configuration signal.
-    // Readiness additionally requires a runtime inspection result proving the
-    // enforcement hook and a healthy Gateway RPC.
-    const info = plugin.captureChildOutput(allocator, &.{ "openclaw", "plugins", "info", "ryk", "--json" }) catch {
-        return .{ .configured = false, .live_verified = false, .note = "runtime plugin info failed; hook registration is unverified" };
-    };
-    defer allocator.free(info);
-    if (!openClawInfoHasLoadedHooks(allocator, info)) {
-        return .{ .configured = false, .live_verified = false, .note = "runtime plugin is not loaded with registered hooks" };
-    }
-
-    const inspection = plugin.captureChildOutput(allocator, &.{ "openclaw", "plugins", "inspect", "ryk", "--runtime", "--json" }) catch {
-        return .{ .configured = true, .live_verified = false, .note = "plugin metadata is loaded; runtime hook inspection is unavailable" };
+fn probeOpenClaw(allocator: std.mem.Allocator, io: std.Io, budget: HealthBudget, binary: []const u8) RuntimeProbe {
+    // Current OpenClaw aliases `plugins info` to `plugins inspect`, whose JSON
+    // is nested. Use the authoritative runtime inspection once; metadata-only
+    // or discovery registration never counts as enforcement.
+    const inspection = captureWithinHealthBudget(allocator, io, budget, &.{ binary, "plugins", "inspect", "ryk", "--runtime", "--json" }) catch {
+        return .{ .configured = false, .live_verified = false, .note = "OpenClaw runtime hook inspection is unavailable" };
     };
     defer allocator.free(inspection);
+    const bundled_root = plugin.resolveOpenClawBundleRoot(io, allocator) catch {
+        return .{ .configured = false, .live_verified = false, .note = "reviewed OpenClaw bundle is unavailable" };
+    };
+    defer allocator.free(bundled_root);
+    if (!plugin.openClawInstalledBundleMatches(io, allocator, inspection, bundled_root)) {
+        return .{ .configured = false, .live_verified = false, .note = "OpenClaw runtime plugin is not the receipt-bound reviewed Ryk bundle" };
+    }
     if (!openClawRuntimeInspectionHasBeforeTool(allocator, inspection)) {
-        return .{ .configured = true, .live_verified = false, .note = "OpenClaw runtime inspection did not prove before_tool_call" };
+        return .{ .configured = false, .live_verified = false, .note = "OpenClaw runtime inspection did not prove a loaded before_tool_call hook" };
     }
 
-    const gateway = plugin.captureChildOutput(allocator, &.{ "openclaw", "gateway", "status", "--deep", "--require-rpc" }) catch {
+    const binding_output = captureWithinHealthBudget(allocator, io, budget, &.{
+        binary,
+        "config",
+        "get",
+        "plugins.entries.ryk.config.workspaceRoot",
+        "--json",
+    }) catch {
+        return .{ .configured = false, .live_verified = false, .note = "OpenClaw operator-controlled workspace binding is unavailable" };
+    };
+    defer allocator.free(binding_output);
+    const configured_workspace = plugin.parseOpenClawWorkspaceBinding(allocator, binding_output) catch {
+        return .{ .configured = false, .live_verified = false, .note = "OpenClaw workspace binding is missing or not an absolute JSON string" };
+    };
+    defer allocator.free(configured_workspace);
+    const canonical_workspace = std.Io.Dir.cwd().realPathFileAlloc(io, configured_workspace, allocator) catch {
+        return .{ .configured = false, .live_verified = false, .note = "OpenClaw workspace binding does not resolve to an existing directory" };
+    };
+    defer allocator.free(canonical_workspace);
+    if (!std.mem.eql(u8, configured_workspace, canonical_workspace)) {
+        return .{ .configured = false, .live_verified = false, .note = "OpenClaw workspace binding is not canonical" };
+    }
+
+    const gateway = captureWithinHealthBudget(allocator, io, budget, &.{ binary, "gateway", "status", "--deep", "--require-rpc", "--json" }) catch {
         return .{ .configured = true, .live_verified = false, .note = "OpenClaw plugin hooks registered; Gateway RPC is not healthy" };
     };
-    allocator.free(gateway);
-
-    // `plugins inspect --runtime` loads a discovery registry and therefore
-    // cannot prove that the long-lived Gateway activated the plugin. The
-    // adapter registers this read-only method only on the full runtime path;
-    // a successful RPC is the bounded live activation handshake.
-    const live_probe = plugin.captureChildOutput(allocator, &.{
-        "openclaw", "gateway", "call", "ryk.unattended", "--params", "{\"probe\":\"unattended\"}", "--json",
-    }) catch {
-        return .{ .configured = true, .live_verified = false, .note = "Gateway RPC is healthy, but the active ryk plugin probe is unavailable" };
-    };
-    defer allocator.free(live_probe);
-    if (!openClawLiveProbeSucceeded(allocator, live_probe)) {
-        return .{ .configured = true, .live_verified = false, .note = "Gateway RPC is healthy, but the active ryk plugin probe did not confirm full runtime registration" };
+    defer allocator.free(gateway);
+    if (!openClawGatewayIdentityBound(gateway)) {
+        return .{ .configured = true, .live_verified = false, .note = "OpenClaw Gateway RPC is reachable, but its running identity is not bound to the screened executable" };
     }
-    return .{ .configured = true, .live_verified = true, .note = "OpenClaw full runtime registration, deny canary, and Gateway RPC healthy" };
+
+    // Runtime inspection loads modules but cannot prove that the already-running
+    // Gateway activated this plugin. Invoke the manifest-declared inert tool via
+    // the real Gateway dispatcher. Only a nonce-bound Ryk denial counts; a
+    // generic host refusal or the inert executor sentinel fails readiness.
+    const nonce = std.fmt.allocPrint(allocator, "ryk-health-{x}", .{budget.started.raw.nanoseconds}) catch {
+        return .{ .configured = true, .live_verified = false, .note = "Gateway RPC is healthy, but canary creation failed" };
+    };
+    defer allocator.free(nonce);
+    if (std.mem.indexOfAny(u8, canonical_workspace, "\"\\\n\r") != null) {
+        return .{ .configured = true, .live_verified = false, .note = "Gateway RPC is healthy, but the workspace path cannot be encoded safely" };
+    }
+    const params = std.fmt.allocPrint(
+        allocator,
+        "{{\"name\":\"ryk_openclaw_canary\",\"args\":{{\"command\":\"rm -rf /\",\"nonce\":\"{s}\",\"cwd\":\"{s}\"}},\"sessionKey\":\"ryk-health\",\"idempotencyKey\":\"{s}\"}}",
+        .{ nonce, canonical_workspace, nonce },
+    ) catch {
+        return .{ .configured = true, .live_verified = false, .note = "Gateway RPC is healthy, but canary encoding failed" };
+    };
+    defer allocator.free(params);
+    const timeout_ms = budget.nextTimeoutMs(io, 4_000) orelse
+        return .{ .configured = true, .live_verified = false, .note = "Gateway RPC is healthy, but the health deadline expired" };
+    var live_probe = child_process.runHostCommandCaptureTimed(allocator, &.{
+        binary, "gateway", "call", "tools.invoke", "--params", params, "--json",
+    }, timeout_ms) catch {
+        return .{ .configured = true, .live_verified = false, .note = "Gateway RPC is healthy, but the dispatcher canary is unavailable" };
+    };
+    defer live_probe.deinit(allocator);
+    if (live_probe.timed_out or live_probe.output_overflow or !openClawDispatcherCanaryPassed(allocator, live_probe.stdout, live_probe.stderr, nonce)) {
+        return .{ .configured = true, .live_verified = false, .note = "Gateway RPC is healthy, but the real tool dispatcher did not prove Ryk enforcement" };
+    }
+    return .{ .configured = true, .live_verified = true, .note = "OpenClaw Gateway dispatcher, before_tool_call denial, and RPC healthy" };
 }
 
-fn openClawInfoHasLoadedHooks(allocator: std.mem.Allocator, output: []const u8) bool {
-    var parsed = parseFirstJsonValue(allocator, output) orelse return false;
-    defer parsed.deinit();
-    if (parsed.value != .object) return false;
-    const object = parsed.value.object;
-    const status = object.get("status") orelse return false;
-    if (status != .string or !std.mem.eql(u8, status.string, "loaded")) return false;
-    const hook_count = object.get("hookCount") orelse return false;
-    return hook_count == .integer and hook_count.integer > 0;
+/// OpenClaw's Gateway status/RPC contract currently proves dispatch through a
+/// Gateway, but does not expose an authoritative process identity that Ryk can
+/// compare with the screened executable. Keep readiness false until upstream
+/// supplies such a field and the comparison is implemented.
+fn openClawGatewayIdentityBound(output: []const u8) bool {
+    _ = output;
+    return false;
 }
 
 fn openClawRuntimeInspectionHasBeforeTool(allocator: std.mem.Allocator, output: []const u8) bool {
@@ -350,37 +596,35 @@ fn openClawRuntimeInspectionHasBeforeTool(allocator: std.mem.Allocator, output: 
     return false;
 }
 
-fn openClawLiveProbeSucceeded(allocator: std.mem.Allocator, output: []const u8) bool {
-    var parsed = parseFirstJsonValue(allocator, output) orelse return false;
+fn openClawDispatcherCanaryPassed(allocator: std.mem.Allocator, stdout: []const u8, stderr: []const u8, nonce: []const u8) bool {
+    const marker_prefix = "RYK_CANARY_BLOCK:";
+    const executor_ran = std.mem.indexOf(u8, stdout, "inert-tool-executor") != null or
+        std.mem.indexOf(u8, stderr, "inert-tool-executor") != null or
+        std.mem.indexOf(u8, stdout, "Ryk inert OpenClaw canary completed") != null or
+        std.mem.indexOf(u8, stderr, "Ryk inert OpenClaw canary completed") != null;
+    if (executor_ran) return false;
+
+    var parsed = parseFirstJsonValue(allocator, stdout) orelse return false;
     defer parsed.deinit();
     if (parsed.value != .object) return false;
     const object = parsed.value.object;
     const ok = object.get("ok") orelse return false;
-    const plugin_name = object.get("plugin") orelse return false;
-    const hook = object.get("hook") orelse return false;
-    const registration = object.get("registration") orelse return false;
-    const enforcement = object.get("enforcement") orelse return false;
-    return ok == .bool and ok.bool and
-        plugin_name == .string and std.mem.eql(u8, plugin_name.string, "ryk") and
-        hook == .string and std.mem.eql(u8, hook.string, "before_tool_call") and
-        registration == .string and std.mem.eql(u8, registration.string, "full-runtime") and
-        enforcement == .string and std.mem.eql(u8, enforcement.string, "deny-canary-pass");
+    const tool_name = object.get("toolName") orelse return false;
+    const error_value = object.get("error") orelse return false;
+    if (ok != .bool or ok.bool or tool_name != .string or
+        !std.mem.eql(u8, tool_name.string, "ryk_openclaw_canary") or error_value != .object) return false;
+    const code = error_value.object.get("code") orelse return false;
+    const message = error_value.object.get("message") orelse return false;
+    return code == .string and std.mem.eql(u8, code.string, "forbidden") and
+        message == .string and message.string.len == marker_prefix.len + nonce.len and
+        std.mem.startsWith(u8, message.string, marker_prefix) and
+        std.mem.eql(u8, message.string[marker_prefix.len..], nonce);
 }
 
 fn parseFirstJsonValue(allocator: std.mem.Allocator, output: []const u8) ?std.json.Parsed(std.json.Value) {
-    var search_from: usize = 0;
-    while (std.mem.indexOfAnyPos(u8, output, search_from, "[{")) |candidate_start| {
-        const end = jsonDocumentEnd(output, candidate_start) orelse {
-            search_from = candidate_start + 1;
-            continue;
-        };
-        if (std.json.parseFromSlice(std.json.Value, allocator, output[candidate_start..end], .{})) |parsed| {
-            return parsed;
-        } else |_| {
-            search_from = candidate_start + 1;
-        }
-    }
-    return null;
+    const candidate_start = std.mem.indexOfAny(u8, output, "[{") orelse return null;
+    const end = jsonDocumentEnd(output, candidate_start) orelse return null;
+    return std.json.parseFromSlice(std.json.Value, allocator, output[candidate_start..end], .{}) catch null;
 }
 
 fn jsonDocumentEnd(output: []const u8, document_start: usize) ?usize {
@@ -437,6 +681,11 @@ fn ruleSetIsDenyByDefault(rule_set: anytype) bool {
 }
 
 fn isUnattendedPolicy(policy: anytype) bool {
+    if (comptime @TypeOf(policy.*) == policy_mod.schema.Policy) {
+        var reviewed = policy_mod.load.loadAgentPreset(policy.allocator, .unattended) catch return false;
+        defer reviewed.deinit();
+        return policy_mod.presets.unattendedSemanticsEqual(policy, &reviewed);
+    }
     if (policy.mode != .strict) return false;
     if (policy.env.inherit) return false;
     if (policy.files.write_mode != .staged) return false;
@@ -460,8 +709,8 @@ fn serviceFallbackIsFailClosed(service: anytype) bool {
     return true;
 }
 
-fn probeHermes(allocator: std.mem.Allocator) RuntimeProbe {
-    const listing = plugin.captureChildOutput(allocator, &.{ "hermes", "plugins", "list", "--enabled", "--json" }) catch {
+fn probeHermes(allocator: std.mem.Allocator, io: std.Io, budget: HealthBudget, binary: []const u8) RuntimeProbe {
+    const listing = captureWithinHealthBudget(allocator, io, budget, &.{ binary, "plugins", "list", "--enabled", "--json" }) catch {
         return .{ .configured = false, .live_verified = false, .note = "Hermes plugin list failed; activation is unverified" };
     };
     defer allocator.free(listing);
@@ -493,15 +742,24 @@ test "unattended defaults target both autonomous hosts" {
     try std.testing.expectEqualStrings("hermes,openclaw", default_hosts);
 }
 
-test "openclaw runtime probe accepts a loaded positive hook count" {
-    const info =
-        \\{"status": "loaded", "hookCount": 4}
-    ;
-    try std.testing.expect(openClawInfoHasLoadedHooks(std.testing.allocator, info));
-    try std.testing.expect(openClawInfoHasLoadedHooks(std.testing.allocator, "[plugins] loaded\n{\"status\":\"loaded\",\"hookCount\":4}\n[plugins] done"));
-    try std.testing.expect(!openClawInfoHasLoadedHooks(std.testing.allocator,
-        \\{"status":"loaded","hookCount":0}
-    ));
+test "agents setup accepts one positional host and defaults to both" {
+    const defaults = try parseHostSelection(std.testing.allocator, &.{});
+    defer std.testing.allocator.free(defaults);
+    try std.testing.expectEqualStrings(default_hosts, defaults);
+
+    const hermes = try parseHostSelection(std.testing.allocator, &.{"hermes"});
+    defer std.testing.allocator.free(hermes);
+    try std.testing.expectEqualStrings("hermes", hermes);
+
+    const openclaw = try parseHostSelection(std.testing.allocator, &.{"openclaw"});
+    defer std.testing.allocator.free(openclaw);
+    try std.testing.expectEqualStrings("openclaw", openclaw);
+}
+
+test "agents health JSON and total runtime have fixed bounds" {
+    try std.testing.expect(max_health_json_bytes <= 64 * 1024);
+    try std.testing.expect(total_health_timeout_ms <= 30_000);
+    try std.testing.expect(health_worker_timeout_ms < total_health_timeout_ms);
 }
 
 test "OpenClaw runtime inspection requires the live before_tool_call hook" {
@@ -509,13 +767,39 @@ test "OpenClaw runtime inspection requires the live before_tool_call hook" {
     try std.testing.expect(!openClawRuntimeInspectionHasBeforeTool(std.testing.allocator, "{\"plugin\":{\"status\":\"loaded\"},\"typedHooks\":[]}"));
 }
 
-test "OpenClaw live probe requires the full runtime handshake" {
-    try std.testing.expect(openClawLiveProbeSucceeded(std.testing.allocator,
-        \\{"ok":true,"plugin":"ryk","hook":"before_tool_call","registration":"full-runtime","enforcement":"deny-canary-pass"}
+test "OpenClaw dispatcher canary requires nonce-bound Ryk denial and no executor sentinel" {
+    try std.testing.expect(openClawDispatcherCanaryPassed(std.testing.allocator,
+        "{\"ok\":false,\"toolName\":\"ryk_openclaw_canary\",\"error\":{\"code\":\"forbidden\",\"message\":\"RYK_CANARY_BLOCK:nonce-1\"}}",
+        "",
+        "nonce-1",
     ));
-    try std.testing.expect(!openClawLiveProbeSucceeded(std.testing.allocator,
-        \\{"ok":true,"plugin":"ryk","hook":"before_tool_call","registration":"full-runtime","enforcement":"deny-canary-fail"}
+    try std.testing.expect(!openClawDispatcherCanaryPassed(std.testing.allocator, "forbidden", "", "nonce-1"));
+    try std.testing.expect(!openClawDispatcherCanaryPassed(std.testing.allocator,
+        "{\"ok\":false,\"toolName\":\"ryk_openclaw_canary\",\"error\":{\"code\":\"forbidden\",\"message\":\"RYK_CANARY_BLOCK:wrong\"}}",
+        "",
+        "nonce-1",
     ));
+    try std.testing.expect(!openClawDispatcherCanaryPassed(std.testing.allocator,
+        "{\"ok\":false,\"toolName\":\"ryk_openclaw_canary\",\"error\":{\"code\":\"forbidden\",\"message\":\"RYK_CANARY_BLOCK:nonce-1\"},\"evidence\":\"inert-tool-executor\"}",
+        "",
+        "nonce-1",
+    ));
+    try std.testing.expect(!openClawDispatcherCanaryPassed(std.testing.allocator,
+        "{\"ok\":false,\"toolName\":\"ryk_openclaw_canary\",\"nonce\":\"nonce-1\",\"error\":{\"code\":\"forbidden\",\"message\":\"RYK_CANARY_BLOCK:\"}}",
+        "",
+        "nonce-1",
+    ));
+}
+
+test "OpenClaw Gateway readiness requires an independently bound running identity" {
+    try std.testing.expect(!openClawGatewayIdentityBound("{\"status\":\"ok\"}"));
+    try std.testing.expect(!openClawGatewayIdentityBound("{\"pid\":1234}"));
+}
+
+test "OpenClaw JSON framing rejects an unbalanced brace flood in linear work" {
+    var flood: [max_health_json_bytes]u8 = undefined;
+    @memset(&flood, '{');
+    try std.testing.expect(parseFirstJsonValue(std.testing.allocator, &flood) == null);
 }
 
 test "Hermes runtime probe requires the exact enabled ryk entry" {
@@ -607,4 +891,16 @@ test "unattended contract rejects unsafe posture overrides" {
     policy.network.mode = .allowlist;
     policy.audit.tamper_evident = false;
     try std.testing.expect(!isUnattendedPolicy(&policy));
+}
+
+test "unattended contract rejects broad custom allow rules" {
+    var reviewed = try policy_mod.load.loadAgentPreset(std.testing.allocator, .unattended);
+    defer reviewed.deinit();
+    try std.testing.expect(isUnattendedPolicy(&reviewed));
+
+    const broad = [_][]const u8{"*"};
+    const reviewed_allow = reviewed.commands.allow;
+    reviewed.commands.allow = &broad;
+    try std.testing.expect(!isUnattendedPolicy(&reviewed));
+    reviewed.commands.allow = reviewed_allow;
 }

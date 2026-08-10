@@ -438,6 +438,37 @@ safe_install() {
   install_stage=""
 }
 
+write_binary_provenance() {
+  provenance_destination="$INSTALL_DIR/.ryk-provenance"
+  reject_symlink_components "$INSTALL_DIR" "binary provenance directory"
+  provenance_stage="$(mktemp "$INSTALL_DIR/.ryk-provenance.XXXXXX")" ||
+    fail "could not create binary provenance staging file" \
+      "The installer requires a writable managed binary directory."
+  canonical_destination="$(cd "$(dirname "$DESTINATION")" 2>/dev/null && pwd -P)/$(basename "$DESTINATION")" || {
+    rm -f "$provenance_stage"
+    fail "could not resolve the installed binary path"
+  }
+  binary_digest="$(sha256_file "$DESTINATION")" || {
+    rm -f "$provenance_stage"
+    fail "could not hash the installed ryk binary"
+  }
+  {
+    printf 'ryk-provenance-v1\n'
+    printf 'path=%s\n' "$canonical_destination"
+    printf 'sha256=%s\n' "$binary_digest"
+  } > "$provenance_stage" || {
+    rm -f "$provenance_stage"
+    fail "could not write the installed binary provenance receipt"
+  }
+  chmod 0600 "$provenance_stage" || {
+    rm -f "$provenance_stage"
+    fail "could not protect the installed binary provenance receipt"
+  }
+  replace_path_without_following_destination "$provenance_stage" "$provenance_destination" ||
+    fail "could not atomically install the binary provenance receipt"
+  provenance_stage=""
+}
+
 install_runtime_assets() {
   extract_root="$1"
 
@@ -737,6 +768,7 @@ fi
   "Unexpected archive layout for ${ARTIFACT}."
 
 safe_install "$FOUND_BIN" "$DESTINATION"
+write_binary_provenance
 install_runtime_assets "$EXTRACT_ROOT"
 step_done "Install binaries + runtime" "ryk + assets"
 

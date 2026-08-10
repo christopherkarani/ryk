@@ -336,15 +336,81 @@ pub fn smokeTestHookPayload(
     const ryk_bin = try resolveSmokeBinary(io, allocator) orelse return error.SmokeBinaryUnavailable;
     defer allocator.free(ryk_bin);
 
+    return smokeTestHookPayloadWithBinary(
+        allocator,
+        ryk_bin,
+        host,
+        event,
+        fixture_json,
+        expected_decision,
+        5_000,
+    );
+}
+
+fn smokeTestHookPayloadWithBinary(
+    allocator: std.mem.Allocator,
+    ryk_bin: []const u8,
+    host: []const u8,
+    event: []const u8,
+    fixture_json: []const u8,
+    expected_decision: []const u8,
+    timeout_ms: u64,
+) !bool {
+
     const result = try child_process.runHostCommandInputCaptureTimed(
         allocator,
         &.{ ryk_bin, "hook", host, event },
         fixture_json,
-        5_000,
+        timeout_ms,
     );
     defer result.deinit(allocator);
     if (result.timed_out) return false;
     return interpretSmokeOutcome(host, expected_decision, result.exit_code, result.stdout, result.stderr);
+}
+
+/// Health-specific smoke using the running ryk executable and a caller-owned
+/// deadline slice. This avoids trusting RYK_BIN and keeps the total health
+/// command bounded across both allow and deny probes.
+pub fn runHostSmokePairWithBinaryTimed(
+    allocator: std.mem.Allocator,
+    ryk_bin: []const u8,
+    host: []const u8,
+    timeout_each_ms: u64,
+) !HostSmokePair {
+    const event = shellGate(host);
+    if (std.mem.eql(u8, event, "unknown") or
+        std.mem.eql(u8, host, "pi") or
+        std.mem.eql(u8, host, "cursor"))
+    {
+        return .{};
+    }
+
+    const allow_fixture = try buildHookFixture(allocator, host, event, safe_smoke_command);
+    defer allocator.free(allow_fixture);
+    const deny_fixture = try buildHookFixture(allocator, host, event, danger_smoke_command);
+    defer allocator.free(deny_fixture);
+    const allow_ok = smokeTestHookPayloadWithBinary(
+        allocator,
+        ryk_bin,
+        host,
+        event,
+        allow_fixture,
+        "allow",
+        timeout_each_ms,
+    ) catch false;
+    const deny_ok = smokeTestHookPayloadWithBinary(
+        allocator,
+        ryk_bin,
+        host,
+        event,
+        deny_fixture,
+        "block",
+        timeout_each_ms,
+    ) catch false;
+    return .{
+        .allow = if (allow_ok) .pass else .fail,
+        .deny = if (deny_ok) .pass else .fail,
+    };
 }
 
 pub fn runHostSmokePair(allocator: std.mem.Allocator, host: []const u8) !HostSmokePair {

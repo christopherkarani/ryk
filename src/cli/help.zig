@@ -127,23 +127,24 @@ pub const commands =
             },
         },
         .{
-            .name = "unattended",
+            .name = "agents",
             .summary = "Install and health-check Hermes/OpenClaw unattended agents",
-            .usage = "ryk unattended <setup|health> [--hosts hermes,openclaw] [--json]",
+            .usage = "ryk agents <setup|health> [hermes|openclaw] [--json]",
             .category = .getting_started,
             .public = true,
             .examples = &.{
-                "ryk unattended setup",
-                "ryk unattended setup --hosts hermes,openclaw",
-                "ryk unattended health --json",
+                "ryk agents setup",
+                "ryk agents setup hermes",
+                "ryk agents setup openclaw",
+                "ryk agents health --json",
             },
             .details = &.{
                 "First-class setup for always-on Hermes and OpenClaw agents on Mac minis, VPSs, and other non-interactive hosts.",
                 "Setup creates or preserves the fail-closed `unattended` strict policy, installs the selected host adapters, and runs the existing setup verification path.",
                 "Health uses bounded host CLI probes and never waits for an operator. A missing, stale, or unresponsive host is reported as not ready.",
                 "Risk decisions that would normally ask are denied when RYK_UNATTENDED, RYK_NONINTERACTIVE, RYK_CI, or CI is truthy.",
-                "OpenClaw hook enforcement requires full runtime registration, runtime hook inspection, a healthy Gateway RPC, and the live `ryk.unattended` probe. Metadata/discovery passes are explicitly unprotected; use `ryk run -- openclaw` when that proof is unavailable.",
-                "Use `ryk unattended health --json` from launchd, systemd, cron, or a VPS supervisor.",
+                "OpenClaw readiness requires the receipt-bound reviewed bundle, full runtime registration, runtime hook inspection, a healthy Gateway RPC, a bound running Gateway identity, and a nonce-bound denial through Gateway `tools.invoke`. Metadata/discovery passes are explicitly unprotected; when upstream identity or live dispatch proof is unavailable, use `ryk run -- openclaw`.",
+                "Use `ryk agents health --json` from launchd, systemd, cron, or a VPS supervisor.",
             },
         },
         .{
@@ -815,7 +816,7 @@ pub const commands =
     };
 
 /// Prefix of Safe Launch teaching order (host aliases inserted after stop).
-const public_help_prefix = [_][]const u8{ "start", "unattended", "stop" };
+const public_help_prefix = [_][]const u8{ "start", "agents", "stop" };
 /// Suffix of Safe Launch teaching order (after host aliases).
 /// Day-2 loop: doctor → packs → allowlist, then review/forensics/explain/update.
 const public_help_suffix = [_][]const u8{ "doctor", "packs", "allowlist", "replay", "scan", "explain", "update", "telemetry" };
@@ -852,7 +853,7 @@ pub fn writeWithMode(io: std.Io, writer: anytype, mode: WriteMode) !void {
     const public_tasks = [_]Task{
         .{ .label = "Get protected", .cmd = "ryk doctor --fix" },
         .{ .label = "Guided setup", .cmd = "ryk start" },
-        .{ .label = "Always-on setup", .cmd = "ryk unattended setup" },
+        .{ .label = "Always-on setup", .cmd = "ryk agents setup" },
         .{ .label = "Run an agent", .cmd = "ryk claude  (or: codex | pi | opencode | openclaw | hermes | grok)" },
         .{ .label = "Diagnose", .cmd = "ryk doctor" },
         .{ .label = "Review session", .cmd = "ryk replay" },
@@ -863,7 +864,7 @@ pub fn writeWithMode(io: std.Io, writer: anytype, mode: WriteMode) !void {
     const all_tasks = [_]Task{
         .{ .label = "Get protected", .cmd = "ryk doctor --fix" },
         .{ .label = "Guided setup", .cmd = "ryk start" },
-        .{ .label = "Always-on setup", .cmd = "ryk unattended setup" },
+        .{ .label = "Always-on setup", .cmd = "ryk agents setup" },
         .{ .label = "Diagnose", .cmd = "ryk doctor" },
         .{ .label = "Why blocked?", .cmd = "ryk explain \"…\"" },
         .{ .label = "Run an agent", .cmd = "ryk claude  (or: codex | pi | opencode | openclaw | hermes | grok)" },

@@ -4,11 +4,21 @@
   "version": "1.2.11",
   "description": "Runtime guardrails for OpenClaw workflows via the ryk CLI.",
   "activation": {
-    "onCapabilities": ["hook"]
+    "onCapabilities": ["hook", "tool"]
+  },
+  "contracts": {
+    "tools": ["ryk_openclaw_canary"]
   },
   "configSchema": {
     "type": "object",
-    "properties": {},
+    "properties": {
+      "workspaceRoot": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Canonical workspace root configured by ryk agents setup. Tool input cannot override it."
+      }
+    },
+    "required": ["workspaceRoot"],
     "additionalProperties": false
   }
 }

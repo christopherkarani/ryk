@@ -30,11 +30,15 @@ Available presets:
 For a dedicated Hermes/OpenClaw unattended setup, use:
 
 ```bash
-ryk unattended setup --hosts hermes,openclaw
-ryk unattended health --json
+ryk agents setup
+ryk agents health --json
 ```
 
-The preset is safe for a Mac mini, VPS, or other non-interactive host: commands outside the reviewed permit list are denied, and both adapters deny approval-class requests when `RYK_UNATTENDED=1` (or `RYK_OPENCLAW_UNATTENDED=1`) is present. A successful file install is not proof that a long-running host has loaded the hook; restart the host and run `ryk unattended health --json`.
+The preset is safe for a Mac mini, VPS, or other non-interactive host: commands outside the reviewed permit list are denied, and both adapters deny approval-class requests when `RYK_UNATTENDED=1` (or a host-specific unattended signal) is present. A successful file install is not proof that a long-running host has loaded the hook; restart the host and run `ryk agents health --json`.
+
+Native host hooks deliberately deny file-write tools under this preset. `write_mode: staged` applies only when an operation runs through Ryk's mediated file path; a host-native write cannot be redirected into Ryk's staging area by policy alone. Run the agent through `ryk run -- ...` when it must make staged workspace changes.
+
+Ryk does not currently generate launchd or systemd units. Use `ryk agents health --json` from an existing supervisor, cron, or monitoring service. Native service-unit generation remains a release gap rather than an implied setup side effect.
 
 Productized policy packs can also be inspected and applied through the policy command:
 

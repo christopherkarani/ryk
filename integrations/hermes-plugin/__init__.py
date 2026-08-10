@@ -3,10 +3,16 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
+import select
+import signal
 import shutil
 import subprocess
+import tempfile
+import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -88,9 +94,182 @@ _ryk_cache_path: str | None = None
 
 
 _FAIL_STANCE_FILENAMES = (".ryk_fail_stance",)
+_UNATTENDED_MARKER_FILENAMES = (".ryk_unattended",)
 _FAIL_CLOSED_TOKENS = frozenset({"0", "false", "no", "off", "fail-closed", "closed"})
 _FAIL_OPEN_TOKENS = frozenset({"1", "true", "yes", "on", "fail-open", "open"})
 _RYK_VERSION_RE = re.compile(r"^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$")
+_MAX_PAYLOAD_BYTES = 64 * 1024
+_MAX_POLICY_OUTPUT_BYTES = 64 * 1024
+_MAX_PAYLOAD_DEPTH = 32
+_MAX_PAYLOAD_NODES = 4096
+_MAX_PAYLOAD_STRING_CHARS = 16 * 1024
+_MAX_LOG_MESSAGE_CHARS = 2048
+_PROCESS_CLEANUP_GRACE_SECONDS = 0.25
+_PRE_TOOL_CALL_FAILURE_MESSAGE = "ryk could not verify this Hermes tool call; blocked fail-closed."
+_SECRET_TEXT_RE = re.compile(
+    r"(?i)\b(password|passwd|pwd|token|api[_-]?key|apikey|api[_-]?secret|secret|"
+    r"authorization|credential|access[_-]?token|refresh[_-]?token)\b"
+    r"\s*[:=]\s*(?:bearer\s+)?[^\s,;]+|\bbearer\s+[^\s,;]+"
+)
+
+
+class _ProcessOutputLimitError(subprocess.SubprocessError):
+    pass
+
+
+def _cancel_process_io(process: subprocess.Popen[bytes], cancel: threading.Event | None = None) -> None:
+    if cancel is not None:
+        cancel.set()
+    if os.name == "nt":
+        return
+    for stream in (process.stdin, process.stdout, process.stderr):
+        if stream is None:
+            continue
+        try:
+            os.close(stream.fileno())
+        except (OSError, ValueError):
+            pass
+
+
+def _terminate_process_group(
+    process: subprocess.Popen[bytes],
+    cancel: threading.Event | None = None,
+) -> None:
+    """Kill the hook process/session and cancel any inherited pipe readers."""
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        try:
+            process.kill()
+        except OSError:
+            pass
+    _cancel_process_io(process, cancel)
+    try:
+        process.wait(timeout=1)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def _run_process_bounded(
+    argv: list[str],
+    *,
+    input_text: str,
+    timeout: float,
+    output_limit: int = _MAX_POLICY_OUTPUT_BYTES,
+) -> subprocess.CompletedProcess[str]:
+    """Run a hook with bounded pipes and whole-process-group timeout cleanup."""
+    process = subprocess.Popen(
+        argv,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    assert process.stdin is not None
+    assert process.stdout is not None
+    assert process.stderr is not None
+
+    overflow = threading.Event()
+    cancel = threading.Event()
+    stdout_buffer = bytearray()
+    stderr_buffer = bytearray()
+
+    def read_stream(stream: Any, destination: bytearray) -> None:
+        try:
+            if os.name != "nt":
+                descriptor = stream.fileno()
+                os.set_blocking(descriptor, False)
+                while not cancel.is_set():
+                    ready, _, _ = select.select([descriptor], [], [], 0.05)
+                    if not ready:
+                        continue
+                    try:
+                        chunk = os.read(descriptor, 8192)
+                    except BlockingIOError:
+                        continue
+                    if not chunk:
+                        return
+                    if len(destination) + len(chunk) > output_limit:
+                        overflow.set()
+                        return
+                    destination.extend(chunk)
+                return
+            while True:
+                chunk = stream.read(8192)
+                if not chunk:
+                    return
+                if len(destination) + len(chunk) > output_limit:
+                    overflow.set()
+                    return
+                destination.extend(chunk)
+        except (OSError, ValueError):
+            return
+        finally:
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+    def write_input() -> None:
+        try:
+            process.stdin.write(input_text.encode("utf-8"))
+            process.stdin.flush()
+        except (BrokenPipeError, OSError):
+            pass
+        finally:
+            try:
+                process.stdin.close()
+            except OSError:
+                pass
+
+    readers = (
+        threading.Thread(target=read_stream, args=(process.stdout, stdout_buffer), daemon=True),
+        threading.Thread(target=read_stream, args=(process.stderr, stderr_buffer), daemon=True),
+    )
+    writer = threading.Thread(target=write_input, daemon=True)
+    for thread in readers:
+        thread.start()
+    writer.start()
+
+    deadline = time.monotonic() + timeout
+    while process.poll() is None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            _terminate_process_group(process, cancel)
+            writer.join(timeout=_PROCESS_CLEANUP_GRACE_SECONDS)
+            for thread in readers:
+                thread.join(timeout=_PROCESS_CLEANUP_GRACE_SECONDS)
+            raise subprocess.TimeoutExpired(argv, timeout)
+        if overflow.wait(timeout=min(0.02, remaining)):
+            _terminate_process_group(process, cancel)
+            writer.join(timeout=_PROCESS_CLEANUP_GRACE_SECONDS)
+            for thread in readers:
+                thread.join(timeout=_PROCESS_CLEANUP_GRACE_SECONDS)
+            raise _ProcessOutputLimitError("ryk subprocess output limit exceeded")
+
+    # Once the parent has exited, pipe holders are no longer part of the
+    # command's useful work. Give inherited descriptors their own short,
+    # bounded drain window instead of spending the remaining command deadline
+    # waiting for a detached descendant.
+    writer.join(timeout=_PROCESS_CLEANUP_GRACE_SECONDS)
+    for thread in readers:
+        thread.join(timeout=_PROCESS_CLEANUP_GRACE_SECONDS)
+    if overflow.is_set():
+        _terminate_process_group(process, cancel)
+        raise _ProcessOutputLimitError("ryk subprocess output limit exceeded")
+    if writer.is_alive() or any(thread.is_alive() for thread in readers):
+        _terminate_process_group(process, cancel)
+        writer.join(timeout=_PROCESS_CLEANUP_GRACE_SECONDS)
+        for thread in readers:
+            thread.join(timeout=_PROCESS_CLEANUP_GRACE_SECONDS)
+        raise subprocess.TimeoutExpired(argv, timeout)
+
+    return subprocess.CompletedProcess(
+        argv,
+        process.returncode,
+        stdout_buffer.decode("utf-8"),
+        stderr_buffer.decode("utf-8"),
+    )
 
 
 def _parse_fail_open_token(raw: str) -> bool | None:
@@ -125,18 +304,31 @@ def _stance_file_fail_open() -> bool | None:
     return None
 
 
+def _unattended_install_marker_present() -> bool:
+    base = Path(__file__).resolve().parent
+    for name in _UNATTENDED_MARKER_FILENAMES:
+        try:
+            if (base / name).is_file():
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def _fail_open_enabled() -> bool:
     """Allow Hermes to proceed without ryk only when explicitly configured.
 
-    Precedence: RYK_HERMES_FAIL_OPEN env (when set) → install stance file →
-    fail-closed product default.
-    New installs via `ryk plugin install hermes` write `.ryk_fail_stance` = fail-closed.
+    Precedence: active CI/unattended environment or `.ryk_unattended` marker →
+    RYK_HERMES_FAIL_OPEN env → install stance file → fail-closed default.
+    `ryk agents setup hermes` writes the persistent unattended marker.
     """
     # An unattended/CI process must never inherit a fail-open override. The
     # no-human safety boundary dominates install stance and environment escape
     # hatches so a stale supervisor setting cannot turn a missing guard into
     # an allowed tool call.
     if _mapping.ci_mode():
+        return False
+    if _unattended_install_marker_present():
         return False
     if "RYK_HERMES_FAIL_OPEN" in os.environ:
         parsed = _parse_fail_open_token(os.environ.get("RYK_HERMES_FAIL_OPEN", ""))
@@ -150,22 +342,96 @@ def _fail_open_enabled() -> bool:
     return False
 
 
-def _redact(value: Any) -> Any:
-    if isinstance(value, dict):
-        result: dict[str, Any] = {}
-        for key, item in value.items():
-            if any(secret in str(key).lower() for secret in SECRET_KEYS):
-                result[key] = "[REDACTED]"
-            else:
-                result[key] = _redact(item)
-        return result
-    if isinstance(value, list):
-        return [_redact(item) for item in value]
-    return value
+def _redact(
+    value: Any,
+    *,
+    _depth: int = 0,
+    _active: set[int] | None = None,
+    _budget: list[int] | None = None,
+) -> Any:
+    """Return a bounded JSON-safe value with secret-key values removed.
+
+    Rejecting unsafe payloads is intentional: pre_tool_call must block rather
+    than send a partial policy request that could change the decision.
+    """
+    if _depth > _MAX_PAYLOAD_DEPTH:
+        raise ValueError("Hermes hook payload exceeds maximum depth")
+    if _active is None:
+        _active = set()
+    if _budget is None:
+        _budget = [0, 0]
+    _budget[0] += 1
+    if _budget[0] > _MAX_PAYLOAD_NODES:
+        raise ValueError("Hermes hook payload contains too many values")
+
+    if value is None or isinstance(value, (bool, int)):
+        return value
+    if isinstance(value, float):
+        if value != value or value in (float("inf"), float("-inf")):
+            raise ValueError("Hermes hook payload contains a non-finite number")
+        return value
+    if isinstance(value, str):
+        if len(value) > _MAX_PAYLOAD_STRING_CHARS:
+            raise ValueError("Hermes hook payload contains an oversized string")
+        _budget[1] += len(value)
+        if _budget[1] > _MAX_PAYLOAD_BYTES:
+            raise ValueError("Hermes hook payload exceeds maximum size")
+        return value
+
+    if not isinstance(value, (dict, list, tuple)):
+        raise TypeError(f"unsupported Hermes hook payload type: {type(value).__name__}")
+    identity = id(value)
+    if identity in _active:
+        raise ValueError("Hermes hook payload contains a cycle")
+    _active.add(identity)
+    try:
+        if isinstance(value, dict):
+            result: dict[str, Any] = {}
+            for key, item in value.items():
+                if not isinstance(key, str):
+                    raise TypeError("Hermes hook payload keys must be strings")
+                if any(secret in key.lower() for secret in SECRET_KEYS):
+                    result[key] = "[REDACTED]"
+                else:
+                    result[key] = _redact(
+                        item,
+                        _depth=_depth + 1,
+                        _active=_active,
+                        _budget=_budget,
+                    )
+            return result
+        return [
+            _redact(
+                item,
+                _depth=_depth + 1,
+                _active=_active,
+                _budget=_budget,
+            )
+            for item in value
+        ]
+    finally:
+        _active.remove(identity)
+
+
+def _bounded_log_text(value: Any, default: str = "ryk Hermes hook failed") -> str:
+    if not isinstance(value, str) or not value.strip():
+        value = default
+    redacted = _SECRET_TEXT_RE.sub(lambda match: f"{match.group(1) or 'bearer'}=[REDACTED]", value)
+    if len(redacted) <= _MAX_LOG_MESSAGE_CHARS:
+        return redacted
+    suffix = "...[truncated]"
+    return redacted[: _MAX_LOG_MESSAGE_CHARS - len(suffix)] + suffix
+
+
+def _pre_tool_call_failure() -> dict[str, str]:
+    return {"action": "block", "message": _PRE_TOOL_CALL_FAILURE_MESSAGE}
 
 
 def _error_has_marker(error: BaseException, markers: tuple[str, ...]) -> bool:
-    message = str(error)
+    try:
+        message = str(error)
+    except Exception:
+        return False
     return any(marker in message for marker in markers)
 
 
@@ -197,13 +463,99 @@ def _hook_smoke_passes(stdout: str) -> bool:
 
 
 def _ryk_executable(candidate: str) -> str | None:
+    if not Path(candidate).is_absolute():
+        return None
     try:
         path = Path(candidate).resolve()
     except OSError:
         return None
     if not path.is_file() or not os.access(path, os.X_OK):
         return None
+    if not _candidate_is_trusted(path):
+        return None
     return str(path)
+
+
+def _path_is_within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _candidate_is_trusted(path: Path) -> bool:
+    try:
+        canonical = path.resolve(strict=True)
+        stat = canonical.stat()
+        workspace = Path.cwd().resolve()
+        temp_roots = {
+            Path(tempfile.gettempdir()).resolve(),
+            Path("/tmp").resolve(),
+            Path("/private/tmp").resolve(),
+        }
+    except OSError:
+        return False
+    if "node_modules/.bin" in canonical.as_posix():
+        return False
+    if any(_path_is_within(canonical, root) for root in temp_roots):
+        return False
+    if _path_is_within(canonical, workspace) and os.environ.get("RYK_ALLOW_WORKSPACE_BIN") != "1":
+        return False
+    managed_roots = {
+        (Path.home() / ".local" / "bin").resolve(),
+        (Path.home() / ".ryk" / "bin").resolve(),
+    }
+    workspace_override = (
+        os.environ.get("RYK_ALLOW_WORKSPACE_BIN") == "1"
+        and _path_is_within(canonical, workspace)
+    )
+    if not any(_path_is_within(canonical, root) for root in managed_roots) and not workspace_override:
+        return False
+    if os.name != "nt":
+        if stat.st_mode & 0o111 == 0 or stat.st_mode & 0o022 != 0:
+            return False
+        getuid = getattr(os, "getuid", None)
+        if callable(getuid) and stat.st_uid != getuid():
+            return False
+    # Explicit workspace fixtures are intentionally allowed for development
+    # and tests. Every installer-managed executable must carry a path-bound
+    # checksum receipt generated by scripts/install.sh or install.ps1.
+    if not workspace_override and not _installer_provenance_valid(canonical):
+        return False
+    return True
+
+
+def _installer_provenance_valid(binary: Path, receipt: Path | None = None) -> bool:
+    """Validate the installer's path-bound checksum receipt for ``binary``."""
+    try:
+        canonical = binary.resolve(strict=True)
+        receipt_path = receipt or canonical.with_name(".ryk-provenance")
+        if receipt_path.is_symlink():
+            return False
+        if receipt_path.stat().st_size > 4096:
+            return False
+        lines = receipt_path.read_text(encoding="utf-8").splitlines()
+        fields: dict[str, str] = {}
+        for line in lines:
+            if not line:
+                continue
+            if "=" not in line:
+                if line != "ryk-provenance-v1" or fields:
+                    return False
+                continue
+            key, value = line.split("=", 1)
+            if key in fields or key not in {"path", "sha256"} or not value:
+                return False
+            fields[key] = value
+        if set(fields) != {"path", "sha256"} or fields["path"] != str(canonical):
+            return False
+        if len(fields["sha256"]) != 64 or any(c not in "0123456789abcdef" for c in fields["sha256"].lower()):
+            return False
+        actual = hashlib.sha256(canonical.read_bytes()).hexdigest()
+        return actual == fields["sha256"].lower()
+    except (OSError, ValueError, UnicodeError):
+        return False
 
 
 def _is_workspace_candidate(candidate: str) -> bool:
@@ -221,15 +573,12 @@ def _is_workspace_candidate(candidate: str) -> bool:
 
 def _has_ryk_identity(ryk: str) -> bool:
     try:
-        completed = subprocess.run(
+        completed = _run_process_bounded(
             [ryk, "version", "--json"],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            input_text="",
             timeout=3,
-            check=False,
         )
-    except OSError:
+    except (OSError, subprocess.SubprocessError, UnicodeError):
         return False
     if completed.returncode != 0:
         return False
@@ -250,16 +599,12 @@ def _supports_hermes_host(ryk: str) -> bool:
     if not _has_ryk_identity(ryk):
         return False
     try:
-        completed = subprocess.run(
+        completed = _run_process_bounded(
             [ryk, "hook", "hermes", "pre_tool_call"],
-            input=_HERMES_SMOKE_PAYLOAD,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            input_text=_HERMES_SMOKE_PAYLOAD,
             timeout=10,
-            check=False,
         )
-    except OSError:
+    except (OSError, subprocess.SubprocessError, UnicodeError):
         return False
     if completed.returncode != 0:
         return False
@@ -332,7 +677,7 @@ def _find_ryk() -> str | None:
 
 def _warn_degraded(ctx: Any, event: str, message: str) -> None:
     """Always surface degraded-path warnings — never silent fail-open."""
-    full = f"[ryk-hermes] {message}"
+    full = f"[ryk-hermes] {_bounded_log_text(message)}"
     logger = getattr(ctx, "logger", None)
     if logger and hasattr(logger, "warning"):
         logger.warning(full)
@@ -343,13 +688,7 @@ def _warn_degraded(ctx: Any, event: str, message: str) -> None:
 def _handle_hook_error(ctx: Any, event: str, exc: BaseException) -> Any:
     if event == "pre_tool_call" and _is_degraded_ryk_error(exc):
         if not _fail_open_enabled():
-            return {
-                "action": "block",
-                "message": (
-                    f"ryk unavailable for Hermes pre_tool_call: {exc} "
-                    "(set RYK_HERMES_FAIL_OPEN=1 to allow without guardrails)"
-                ),
-            }
+            return _pre_tool_call_failure()
         _warn_degraded(
             ctx,
             event,
@@ -359,10 +698,7 @@ def _handle_hook_error(ctx: Any, event: str, exc: BaseException) -> Any:
         )
         return None
     if event == "pre_tool_call":
-        return {
-            "action": "block",
-            "message": f"ryk unavailable for Hermes pre_tool_call: {exc}",
-        }
+        return _pre_tool_call_failure()
     if _error_has_marker(exc, _HERMES_HOST_MISMATCH_MARKERS):
         _warn_degraded(
             ctx,
@@ -372,10 +708,15 @@ def _handle_hook_error(ctx: Any, event: str, exc: BaseException) -> Any:
         )
         return None
     logger = getattr(ctx, "logger", None)
+    try:
+        raw_error = str(exc)
+    except Exception:
+        raw_error = "hook failed"
+    error_message = _bounded_log_text(raw_error)
     if logger and hasattr(logger, "warning"):
-        logger.warning("ryk Hermes hook failed for %s: %s", event, exc)
+        logger.warning("ryk Hermes hook failed for %s: %s", event, error_message)
     else:
-        print(f"warning: [ryk-hermes] hook failed for {event}: {exc}", flush=True)
+        print(f"warning: [ryk-hermes] hook failed for {event}: {error_message}", flush=True)
     return None
 
 
@@ -411,7 +752,7 @@ def _event_payload(event: str, hook_args: tuple[Any, ...], hook_kwargs: dict[str
 
 
 def _payload(event: str, data: Any) -> str:
-    return json.dumps(
+    payload = json.dumps(
         {
             "version": 1,
             "host": "hermes",
@@ -420,7 +761,11 @@ def _payload(event: str, data: Any) -> str:
             "timestamp": datetime.now(timezone.utc).isoformat(),
         },
         separators=(",", ":"),
+        allow_nan=False,
     )
+    if len(payload.encode("utf-8")) > _MAX_PAYLOAD_BYTES:
+        raise ValueError("Hermes hook payload exceeds maximum size")
+    return payload
 
 
 def _call_ryk(event: str, data: Any) -> dict[str, Any]:
@@ -431,20 +776,35 @@ def _call_ryk(event: str, data: Any) -> dict[str, Any]:
             "Install ryk or set RYK_BIN to an absolute executable path."
         )
 
+    # The discovery result is cached for the plugin lifetime, so re-attest the
+    # path immediately before every policy call. This narrows the replacement
+    # window between discovery and use; it does not claim cryptographic
+    # authenticity when a same-user actor can rewrite both binary and receipt.
+    revalidated = _ryk_executable(ryk)
+    if revalidated != ryk:
+        raise RuntimeError(
+            "ryk executable provenance or identity could not be re-attested; "
+            "refusing the Hermes policy call"
+        )
+
     try:
-        completed = subprocess.run(
+        completed = _run_process_bounded(
             [ryk, "hook", "hermes", event],
-            input=_payload(event, data),
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            input_text=_payload(event, data),
             timeout=15 if event in POLICY_EVENTS else 10,
-            check=False,
         )
     except OSError as exc:
         raise RuntimeError(f"failed to run ryk at {ryk}: {exc}") from exc
+    if not isinstance(completed.stdout, str) or not isinstance(completed.stderr, str):
+        raise RuntimeError("ryk returned invalid process output")
+    if len(completed.stdout.encode("utf-8")) > _MAX_POLICY_OUTPUT_BYTES:
+        raise RuntimeError("ryk policy output exceeded the response limit")
+    if len(completed.stderr.encode("utf-8")) > _MAX_POLICY_OUTPUT_BYTES:
+        raise RuntimeError("ryk diagnostic output exceeded the response limit")
     if completed.returncode != 0:
-        raise RuntimeError(completed.stderr.strip() or f"ryk exited {completed.returncode}")
+        # Child diagnostics may contain command arguments or provider secrets.
+        # The policy boundary needs the exit status, never verbatim stderr.
+        raise RuntimeError(f"ryk exited {completed.returncode}")
     # F21: empty successful stdout is not an allow — fail closed so fail-open stance applies.
     if not completed.stdout.strip():
         raise RuntimeError(
@@ -462,7 +822,7 @@ def _call_ryk(event: str, data: Any) -> dict[str, Any]:
 
 def _log_policy_warn(ctx: Any, message: str) -> None:
     """Surface an advisory policy warn — not a degraded/fail-open path."""
-    full = f"[ryk-hermes] {message}"
+    full = f"[ryk-hermes] {_bounded_log_text(message)}"
     logger = getattr(ctx, "logger", None)
     if logger and hasattr(logger, "warning"):
         logger.warning(full)
@@ -492,21 +852,25 @@ def _map_pre_tool_call(
 
 def _register(ctx: Any, event: str) -> None:
     def handler(*args: Any, **kwargs: Any) -> Any:
-        payload = _event_payload(event, args, kwargs)
         try:
+            payload = _event_payload(event, args, kwargs)
             response = _call_ryk(event, payload)
-        except (RuntimeError, json.JSONDecodeError, subprocess.SubprocessError, OSError) as exc:
-            return _handle_hook_error(ctx, event, exc)
-
-        if event == "pre_tool_call":
-            tool_name = str(payload.get("tool_name") or kwargs.get("tool_name") or "")
-            tool_input = payload.get("tool_input")
-            if tool_input is None:
-                tool_input = kwargs.get("args") or kwargs.get("params") or {}
-            return _map_pre_tool_call(ctx, response, tool_name, tool_input)
-        if event == "pre_llm_call":
-            return _map_pre_llm_call(response)
-        return None
+            if event == "pre_tool_call":
+                tool_name = str(payload.get("tool_name") or kwargs.get("tool_name") or "")
+                tool_input = payload.get("tool_input")
+                if tool_input is None:
+                    tool_input = kwargs.get("args") or kwargs.get("params") or {}
+                return _map_pre_tool_call(ctx, response, tool_name, tool_input)
+            if event == "pre_llm_call":
+                return _map_pre_llm_call(response)
+            return None
+        except Exception as exc:
+            try:
+                return _handle_hook_error(ctx, event, exc)
+            except Exception:
+                # The host hook contract is more important than diagnostics:
+                # no logger, formatter, or exception object may escape a tool gate.
+                return _pre_tool_call_failure() if event == "pre_tool_call" else None
 
     ctx.register_hook(event, handler)
 

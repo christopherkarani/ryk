@@ -17,6 +17,10 @@ env:
     - LANG
     - TERM
     - RYK_UNATTENDED
+    - RYK_NONINTERACTIVE
+    - RYK_CI
+    - CI
+    - RYK_HERMES_UNATTENDED
     - RYK_OPENCLAW_UNATTENDED
   deny_patterns:
     - "*TOKEN*"
@@ -43,6 +47,17 @@ files:
     deny:
       - "./.env"
       - "./.env.*"
+      - "**/.env"
+      - "**/.env.*"
+      - "./.git/**"
+      - ".git/**"
+      - "**/.git/**"
+      - "./.ryk/**"
+      - ".ryk/**"
+      - "**/.ryk/**"
+      - "**/.npmrc"
+      - "**/.pypirc"
+      - "**/.netrc"
       - "~/.ssh/**"
       - "~/.aws/**"
       - "~/.config/gh/**"
@@ -52,34 +67,39 @@ files:
       - "**/*token*"
   write:
     default: deny
-    allow:
-      - "./**"
     deny:
       - "./.git/**"
       - ".git/**"
+      - "**/.git/**"
       - "./.ryk/**"
       - ".ryk/**"
+      - "**/.ryk/**"
+      - "./.env"
+      - "./.env.*"
+      - "**/.env"
+      - "**/.env.*"
+      - "**/.npmrc"
+      - "**/.pypirc"
+      - "**/.netrc"
+      - "**/*credentials*"
+      - "**/*credential*"
+      - "**/*secret*"
+      - "**/*token*"
     mode: staged
 
 commands:
   default: deny
   allow:
     - "git status"
-    - "git diff *"
-    - "git log *"
     - "ls *"
     - "pwd"
     - "which *"
     - "node --version"
     - "python3 --version"
-    - "npm test*"
-    - "npm run test*"
-    - "pnpm test*"
-    - "yarn test*"
     - "zig version"
-    - "zig build test*"
     - "ryk version"
-    - "ryk doctor *"
+    - "ryk doctor"
+    - "ryk doctor --json"
     - "ryk explain *"
   deny:
     - "rm -rf *"
@@ -125,6 +145,12 @@ mcp:
     - "*.delete_*"
     - "*.shell"
     - "*.run_command"
+
+effects:
+  default: deny
+  allow:
+    - fs.read
+    - shell.exec
 
 audit:
   level: full

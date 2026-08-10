@@ -1,6 +1,6 @@
 # OpenClaw plugin distribution (sunset)
 
-Npm and ClawHub distribution for the OpenClaw integration is sunset. Do not use a registry package for a new deployment. The supported path is the checksum-verified curl installer followed by `ryk unattended setup`; use `ryk run -- openclaw` when process supervision is required.
+Npm and ClawHub distribution for the OpenClaw integration is sunset. Do not use a registry package for a new deployment. The supported path is the checksum-verified curl installer followed by `ryk agents setup openclaw`; use `ryk run -- openclaw` when native runtime proof is unavailable.
 
 ## Validate the local package
 

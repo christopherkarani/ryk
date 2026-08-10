@@ -23,7 +23,7 @@ None of the host packages adds MCP server behavior or telemetry.
 | Codex | Plugin and hook configuration | Enforcement depends on the Codex hook surface and version. |
 | Claude Code | Plugin and hook configuration | Enforcement depends on the Claude Code hook surface and version. |
 | OpenCode | Plugin and hook configuration | OpenCode hooks must fire for a decision to affect a tool call. |
-| OpenClaw | Plugin and hook configuration | Registry installs are sunset; use the curl-installed ryk binary plus `ryk unattended setup`. Metadata/discovery passes remain unprotected. |
+| OpenClaw | Plugin and hook configuration | Registry installs are sunset; use the curl-installed ryk binary plus `ryk agents setup openclaw`. Metadata/discovery passes remain unprotected. |
 | Cursor | Host discovery and preset support | Use the process wrapper when the host does not expose a blocking hook. |
 | Pi, Hermes | Native ryk launchers | The launcher starts the host as a ryk-managed child process. |
 

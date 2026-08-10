@@ -505,7 +505,7 @@ fn writeSuccessEndCard(
             stdout,
             .warn,
             "Setup complete — unattended activation pending",
-            "Run `ryk unattended health --json` before relying on this host while nobody is present.",
+            "Run `ryk agents health --json` before relying on this host while nobody is present.",
         );
     } else if (!ask_equivalent) {
         // Prefer honest residual over silent overclaim when existing observe/trusted policy was kept.
@@ -576,7 +576,7 @@ fn writeSuccessEndCard(
             const mark: []const u8 = if (!ok)
                 "failed"
             else if (unattended)
-                "configured; run ryk unattended health --json"
+                "configured; run ryk agents health --json"
             else if (std.mem.eql(u8, host, "openclaw"))
                 "configured; wrapper required: ryk run -- openclaw"
             else if (verification) |v|
@@ -853,7 +853,7 @@ test "start unattended completion never claims active protection before health" 
     const written = output.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "You're now protected by ryk") == null);
     try std.testing.expect(std.mem.indexOf(u8, written, "unattended activation pending") != null);
-    try std.testing.expect(std.mem.indexOf(u8, written, "ryk unattended health --json") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "ryk agents health --json") != null);
 }
 
 test "start reports failure when daemon required but unavailable" {

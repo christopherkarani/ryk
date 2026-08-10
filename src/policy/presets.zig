@@ -1,4 +1,5 @@
 const std = @import("std");
+const schema = @import("schema.zig");
 
 pub const Preset = enum {
     observe,
@@ -97,6 +98,62 @@ pub fn agentPresetText(preset: AgentPreset) []const u8 {
         .trusted_local => trusted_local_policy,
         .no_external_comms => no_external_comms_policy,
     };
+}
+
+fn stringListEqual(left: []const []const u8, right: []const []const u8) bool {
+    if (left.len != right.len) return false;
+    for (left, right) |a, b| {
+        if (!std.mem.eql(u8, a, b)) return false;
+    }
+    return true;
+}
+
+fn ruleSetEqual(left: schema.RuleSet, right: schema.RuleSet) bool {
+    return left.default == right.default and
+        stringListEqual(left.allow, right.allow) and
+        stringListEqual(left.deny, right.deny) and
+        stringListEqual(left.ask, right.ask);
+}
+
+/// Equality for the security-reviewed unattended contract. Source paths,
+/// allocators, and YAML formatting are intentionally ignored; every policy
+/// decision surface is compared against the canonical preset semantics.
+pub fn unattendedSemanticsEqual(left: *const schema.Policy, right: *const schema.Policy) bool {
+    if (left.version_value != right.version_value or left.mode != right.mode) return false;
+    if (!std.mem.eql(u8, left.workspace.root, right.workspace.root) or
+        left.workspace.write_mode != right.workspace.write_mode) return false;
+    if (left.env.inherit != right.env.inherit or left.env.default != right.env.default or
+        !stringListEqual(left.env.allow, right.env.allow) or
+        !stringListEqual(left.env.deny_patterns, right.env.deny_patterns) or
+        !stringListEqual(left.env.ask, right.env.ask)) return false;
+    if (left.files.write_mode != right.files.write_mode or
+        !ruleSetEqual(left.files.read, right.files.read) or
+        !ruleSetEqual(left.files.write, right.files.write) or
+        !ruleSetEqual(left.commands, right.commands)) return false;
+    if (left.network.effectiveMode() != right.network.effectiveMode() or
+        left.network.effectiveBackend() != right.network.effectiveBackend() or
+        left.network.default != right.network.default or
+        !stringListEqual(left.network.allow, right.network.allow) or
+        !stringListEqual(left.network.deny, right.network.deny) or
+        !stringListEqual(left.network.ask, right.network.ask) or
+        left.network.detect_exfiltration.dns != right.network.detect_exfiltration.dns or
+        left.network.detect_exfiltration.long_query_strings != right.network.detect_exfiltration.long_query_strings or
+        left.network.detect_exfiltration.secret_patterns != right.network.detect_exfiltration.secret_patterns) return false;
+    if (left.credentials.default_broker != null or right.credentials.default_broker != null or
+        left.credentials.brokers.len != 0 or right.credentials.brokers.len != 0 or
+        left.credentials.refs.len != 0 or right.credentials.refs.len != 0 or
+        left.credentials.grants.len != 0 or right.credentials.grants.len != 0 or
+        left.services.len != 0 or right.services.len != 0) return false;
+    if (!ruleSetEqual(left.mcp, right.mcp)) return false;
+    if (left.effects.configured != right.effects.configured or
+        left.effects.default != right.effects.default or
+        left.effects.classifier != right.effects.classifier or
+        !stringListEqual(left.effects.allow, right.effects.allow) or
+        !stringListEqual(left.effects.deny, right.effects.deny) or
+        !stringListEqual(left.effects.ask, right.effects.ask)) return false;
+    return left.audit.level == right.audit.level and
+        left.audit.redact_secrets == right.audit.redact_secrets and
+        left.audit.tamper_evident == right.audit.tamper_evident;
 }
 
 pub fn text(preset: Preset) []const u8 {
@@ -231,6 +288,10 @@ const unattended_policy =
     \\    - LANG
     \\    - TERM
     \\    - RYK_UNATTENDED
+    \\    - RYK_NONINTERACTIVE
+    \\    - RYK_CI
+    \\    - CI
+    \\    - RYK_HERMES_UNATTENDED
     \\    - RYK_OPENCLAW_UNATTENDED
     \\  deny_patterns:
     \\    - "*TOKEN*"
@@ -257,6 +318,17 @@ const unattended_policy =
     \\    deny:
     \\      - "./.env"
     \\      - "./.env.*"
+    \\      - "**/.env"
+    \\      - "**/.env.*"
+    \\      - "./.git/**"
+    \\      - ".git/**"
+    \\      - "**/.git/**"
+    \\      - "./.ryk/**"
+    \\      - ".ryk/**"
+    \\      - "**/.ryk/**"
+    \\      - "**/.npmrc"
+    \\      - "**/.pypirc"
+    \\      - "**/.netrc"
     \\      - "~/.ssh/**"
     \\      - "~/.aws/**"
     \\      - "~/.config/gh/**"
@@ -266,34 +338,39 @@ const unattended_policy =
     \\      - "**/*token*"
     \\  write:
     \\    default: deny
-    \\    allow:
-    \\      - "./**"
     \\    deny:
     \\      - "./.git/**"
     \\      - ".git/**"
+    \\      - "**/.git/**"
     \\      - "./.ryk/**"
     \\      - ".ryk/**"
+    \\      - "**/.ryk/**"
+    \\      - "./.env"
+    \\      - "./.env.*"
+    \\      - "**/.env"
+    \\      - "**/.env.*"
+    \\      - "**/.npmrc"
+    \\      - "**/.pypirc"
+    \\      - "**/.netrc"
+    \\      - "**/*credentials*"
+    \\      - "**/*credential*"
+    \\      - "**/*secret*"
+    \\      - "**/*token*"
     \\    mode: staged
     \\
     \\commands:
     \\  default: deny
     \\  allow:
     \\    - "git status"
-    \\    - "git diff *"
-    \\    - "git log *"
     \\    - "ls *"
     \\    - "pwd"
     \\    - "which *"
     \\    - "node --version"
     \\    - "python3 --version"
-    \\    - "npm test*"
-    \\    - "npm run test*"
-    \\    - "pnpm test*"
-    \\    - "yarn test*"
     \\    - "zig version"
-    \\    - "zig build test*"
     \\    - "ryk version"
-    \\    - "ryk doctor *"
+    \\    - "ryk doctor"
+    \\    - "ryk doctor --json"
     \\    - "ryk explain *"
     \\  deny:
     \\    - "rm -rf *"
@@ -340,6 +417,12 @@ const unattended_policy =
     \\    - "*.delete_*"
     \\    - "*.shell"
     \\    - "*.run_command"
+    \\
+    \\effects:
+    \\  default: deny
+    \\  allow:
+    \\    - fs.read
+    \\    - shell.exec
     \\
     \\audit:
     \\  level: full
@@ -829,7 +912,6 @@ test "yolo preset is YOLO seatbelt with mode yolo and sample allowlist body" {
     try std.testing.expect(std.mem.indexOf(u8, source, "git status") != null);
 
     const load = @import("load.zig");
-    const schema = @import("schema.zig");
     var policy = try load.parseFromSlice(std.testing.allocator, source, "builtin:yolo");
     defer policy.deinit();
     try std.testing.expectEqual(schema.Mode.yolo, policy.mode);
@@ -877,9 +959,31 @@ test "unattended preset is strict and never prompts" {
     try std.testing.expectEqual(@import("schema.zig").DecisionValue.deny, policy.commands.default.?);
     try std.testing.expectEqual(@import("schema.zig").DecisionValue.deny, policy.network.default.?);
     try std.testing.expectEqual(@import("schema.zig").DecisionValue.deny, policy.mcp.default.?);
+    try std.testing.expect(policy.effects.configured);
+    try std.testing.expectEqual(@import("schema.zig").DecisionValue.deny, policy.effects.default.?);
     try std.testing.expectEqual(@as(usize, 0), policy.commands.ask.len);
     try std.testing.expectEqual(@as(usize, 0), policy.network.ask.len);
     try std.testing.expectEqual(@as(usize, 0), policy.mcp.ask.len);
+    try std.testing.expectEqual(@as(usize, 0), policy.effects.ask.len);
+    try std.testing.expectEqual(@as(usize, 0), policy.files.write.allow.len);
+    try std.testing.expect(std.mem.indexOf(u8, source, "**/.git/**") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "**/.npmrc") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "npm test") == null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "zig build test") == null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "git diff *") == null);
+}
+
+test "unattended embedded and on-disk presets have the same reviewed semantics" {
+    const load = @import("load.zig");
+    var embedded = try load.loadAgentPreset(std.testing.allocator, .unattended);
+    defer embedded.deinit();
+    var disk = try load.loadFile(
+        std.testing.io,
+        std.testing.allocator,
+        "policies/presets/unattended.yaml",
+    );
+    defer disk.deinit();
+    try std.testing.expect(unattendedSemanticsEqual(&embedded, &disk));
 }
 
 test "no-external-comms preset includes effect denials" {

@@ -38,18 +38,18 @@
   },
   "openclaw": {
     "extensions": [
-      "./src/index.ts"
+      "./dist/index.js"
     ],
     "runtimeExtensions": [
       "./dist/index.js"
     ],
     "compat": {
-      "pluginApi": ">=2026.3.13",
-      "minGatewayVersion": "2026.3.13"
+      "pluginApi": ">=2026.8.1",
+      "minGatewayVersion": "2026.8.1"
     },
     "build": {
-      "openclawVersion": "2026.3.13",
-      "pluginSdkVersion": "2026.3.13"
+      "openclawVersion": "2026.8.1",
+      "pluginSdkVersion": "2026.8.1"
     }
   },
   "devDependencies": {

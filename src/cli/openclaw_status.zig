@@ -1,6 +1,6 @@
 //! OpenClaw protection honesty for doctor/install surfaces.
 //! Standing product claim until live-host E2E exists: the supported OpenClaw
-//! deployment starts with the curl-installed ryk binary and `ryk unattended`.
+//! deployment starts with the curl-installed ryk binary and `ryk agents`.
 //! Registry/npm paths are sunset and metadata/discovery passes are unprotected.
 
 const std = @import("std");
@@ -8,7 +8,7 @@ const core = @import("ryk_core").core;
 
 /// Shared enforcement note (plain + JSON). Single source of truth for doctor copy.
 pub const enforcement_note =
-    "supported install is curl-installed ryk + ryk unattended setup; npm/ClawHub paths are sunset; metadata/discovery passes are unprotected; prefer wrapper: ryk run -- openclaw";
+    "supported install is curl-installed ryk + ryk agents setup openclaw; npm/ClawHub paths are sunset; metadata/discovery passes are unprotected; prefer wrapper: ryk run -- openclaw";
 
 /// Hook grade until real-host E2E proves veto. Not a boolean "enforcing" claim.
 pub const hook_grade = "unverified";
@@ -26,9 +26,9 @@ pub fn writeDoctorHonesty(stdout: anytype) !void {
     try stdout.print("  enforcement: {s}\n", .{enforcement_note});
     try stdout.writeAll("  hook grade: unverified (no live host E2E); installed != protected\n");
     try stdout.print("  supported install: {s}\n", .{supported_install_command});
-    try stdout.writeAll("  next: ryk unattended setup --hosts openclaw\n");
+    try stdout.writeAll("  next: ryk agents setup openclaw\n");
     try stdout.writeAll("  note: npm/ClawHub distribution is sunset; CLI metadata/discovery passes are unprotected\n");
-    try stdout.writeAll("  verify: openclaw plugins inspect ryk --runtime --json; openclaw gateway status --deep --require-rpc; openclaw gateway call ryk.unattended --json\n");
+    try stdout.writeAll("  verify: ryk agents health openclaw --json (receipt-bound bundle + runtime inspection + Gateway identity + tools.invoke canary)\n");
 }
 
 /// Append OpenClaw honesty fields inside an existing `openclaw_paths` JSON object
@@ -49,7 +49,7 @@ pub fn writePathsJsonHonesty(stdout: anytype) !void {
 pub fn writeInstallPaths(stdout: anytype) !void {
     try stdout.writeAll("  install paths for OpenClaw:\n");
     try stdout.print("    supported: {s}\n", .{supported_install_command});
-    try stdout.writeAll("    configure: ryk unattended setup --hosts openclaw\n");
+    try stdout.writeAll("    configure: ryk agents setup openclaw\n");
     try stdout.print("    fallback:  {s}  (wrapper)\n", .{preferred_wrapper});
     try stdout.writeAll("    npm/ClawHub: sunset; do not use for deployment\n");
 }

@@ -165,7 +165,7 @@ fn suggestCommand(unknown: []const u8) ?[]const u8 {
 /// receive the shared entry banner (would double-print).
 /// `scan` keeps the progress phase banner-free (spinner only); durable brand
 /// lives on the result scorecard / alt-screen TUI header.
-const self_banner_commands = [_][]const u8{ "version", "--version", "help", "run", "start", "unattended", "scan" };
+const self_banner_commands = [_][]const u8{ "version", "--version", "help", "run", "start", "agents", "scan" };
 
 /// Commands whose output is always machine/raw (JSON, generated scripts, export
 /// lines, long-running servers) — never receive the human brand banner.
@@ -511,7 +511,11 @@ fn runWithCwdUsing(
         return run_command.commandWithEnv(io, environ_map, argv[1..], stdout, stderr);
     }
     if (std.mem.eql(u8, command, "start")) return start.command(io, cwd, argv[1..], stdout, stderr);
-    if (std.mem.eql(u8, command, "unattended")) return unattended.command(io, cwd, argv[1..], stdout, stderr);
+    if (std.mem.eql(u8, command, "agents")) return unattended.command(io, cwd, argv[1..], stdout, stderr);
+    if (std.mem.eql(u8, command, "unattended")) {
+        try stderr.writeAll("ryk unattended was removed; use `ryk agents setup` or `ryk agents health`.\n");
+        return exit_codes.usage;
+    }
     // Hard-remove public onboarding peers: single door is `ryk start`.
     if (std.mem.eql(u8, command, "quickstart") or std.mem.eql(u8, command, "setup")) {
         try help.writeRemovedOnboardingPeer(stderr, command);
@@ -2156,6 +2160,24 @@ test "setup dispatch is hard-removed and points to ryk start" {
     try std.testing.expectEqual(exit_codes.usage, code);
     try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "ryk start") != null);
     try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "removed") != null or std.mem.indexOf(u8, stderr_writer.buffered(), "Use") != null);
+}
+
+test "agents is the only public unattended workflow command" {
+    var stdout_buf: [8192]u8 = undefined;
+    var stderr_buf: [2048]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+
+    const help_code = try testRun(&.{ "help", "agents" }, &stdout_writer, &stderr_writer);
+    try std.testing.expectEqual(exit_codes.success, help_code);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "ryk agents setup") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "ryk unattended") == null);
+
+    stdout_writer = .fixed(&stdout_buf);
+    stderr_writer = .fixed(&stderr_buf);
+    const old_code = try testRun(&.{"unattended"}, &stdout_writer, &stderr_writer);
+    try std.testing.expectEqual(exit_codes.usage, old_code);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "ryk agents") != null);
 }
 
 test "stop dispatch is the public disable command" {

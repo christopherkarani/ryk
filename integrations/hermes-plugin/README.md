@@ -43,10 +43,13 @@ When `CI`, `RYK_CI`, `RYK_NONINTERACTIVE`, `RYK_UNATTENDED`, or `RYK_HERMES_UNAT
 ## Failure modes
 
 - **`pre_tool_call`**: Uses the mapping above. When ryk is missing, too old for Hermes hooks, or returns a Hermes host mismatch, the default is fail-closed. Set `RYK_HERMES_FAIL_OPEN=1` only for an attended deployment that deliberately accepts unguarded tool execution; unattended/CI signals always remain fail-closed.
+- **Boundary failures**: Cyclic, unsupported, deeply nested, or oversized hook payloads are rejected before Ryk is started. Empty, malformed, oversized, timed-out, or failed Ryk responses return Hermes' exact non-empty block shape: `{"action":"block","message":"..."}`. Policy responses and diagnostics are bounded, and child stderr is never copied into the tool result.
 - **`pre_llm_call`**: **Context-only** — Hermes cannot veto the turn or open an approval dialog on this hook. ryk `warn` / `context_only` inject advisory notes. ryk `ask` and `block` inject **honest** notes that do **not** claim enforcement or auto-triggered approval; the strongest real gate for prompts remains `ryk run -- hermes ...`. Other ryk failures log a warning and continue without injecting policy context.
 - **Informational hooks** (`post_tool_call`, session lifecycle, etc.): Log warnings on ryk failure and never block Hermes.
 
 The strongest local protection remains running Hermes through `ryk run -- hermes ...`, because the wrapper can enforce command-level behavior outside the plugin lifecycle.
+
+Hermes currently exposes no authoritative live callback-introspection probe. `ryk agents health hermes --json` can report the plugin installed and configured, but it intentionally keeps `ready=false` until Hermes provides live registration evidence. The unattended preset also denies native file-write tools; use the wrapper for Ryk-mediated staged changes and authoritative workspace binding.
 
 ## Install
 
@@ -54,8 +57,8 @@ Supported deployment:
 
 ```sh
 curl -fsSL https://rykanv.com/install | sh
-ryk unattended setup --hosts hermes
-ryk unattended health --json --hosts hermes
+ryk agents setup hermes
+ryk agents health hermes --json
 ```
 
 Source checkout development only:
@@ -103,10 +106,12 @@ Only regular files that are executable, identify as `product: ryk` via `ryk vers
 
 Environment:
 
-- `RYK_BIN` — force a specific ryk executable (must be executable on disk).
+- `RYK_BIN` — select an absolute Ryk executable under `~/.local/bin` or `~/.ryk/bin`; managed binaries also require the installer's adjacent path-bound `.ryk-provenance` SHA-256 receipt, which is re-attested before each policy call. This is integrity evidence rather than a cryptographic signature, so same-user binary-and-receipt replacement is outside the trust claim. Repository-local binaries additionally require the development override below.
 - `RYK_ALLOW_WORKSPACE_BIN=1` — opt into repo-local `zig-out/bin/ryk` discovery for development/testing.
 - `RYK_HERMES_FAIL_OPEN` — only recognized truthy tokens (`1`, `true`, `yes`, `on`, `fail-open`, `open`) enable degraded fail-open behavior in attended mode; unattended/CI signals override it.
 - `CI` / `RYK_CI` / `RYK_NONINTERACTIVE` / `RYK_UNATTENDED` / `RYK_HERMES_UNATTENDED` — when truthy, harden ryk `ask` on tools to Hermes `block` and keep degraded execution fail-closed.
+
+`ryk agents setup hermes` also writes a `.ryk_unattended` marker beside the installed plugin. That persistent marker forces fail-closed behavior even if the host process inherits a conflicting `RYK_HERMES_FAIL_OPEN=1` value.
 
 ## Manual verification (CLI approve UI)
 

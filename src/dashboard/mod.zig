@@ -460,8 +460,8 @@ fn writePluginCardJson(
     if (std.mem.eql(u8, id, "openclaw")) {
         try writeStringArray(writer, &.{
             "curl -fsSL https://rykanv.com/install | sh",
-            "ryk unattended setup --hosts openclaw",
-            "ryk unattended health --json --hosts openclaw",
+            "ryk agents setup openclaw",
+            "ryk agents health openclaw --json",
             "ryk run -- openclaw",
         });
     } else {
@@ -766,7 +766,7 @@ test "status json includes policy and protected agent cards" {
     try std.testing.expect(std.mem.indexOf(u8, out.items, "\"hermes\"") != null);
     // Phase 7 Safe Launch: plugin setup_commands must not re-teach demoted doors.
     try std.testing.expect(std.mem.indexOf(u8, out.items, "ryk setup") == null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "ryk unattended setup --hosts openclaw") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "ryk agents setup openclaw") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "curl -fsSL https://rykanv.com/install | sh") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "openclaw plugins install clawhub:") == null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "ryk hermes") != null);

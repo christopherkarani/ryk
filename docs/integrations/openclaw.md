@@ -37,16 +37,20 @@ The supported deployment path is the checksum-verified curl installer followed b
 
 ```bash
 curl -fsSL https://rykanv.com/install | sh
-ryk unattended setup --hosts openclaw
-ryk unattended health --json --hosts openclaw
+ryk agents setup openclaw
+ryk agents health openclaw --json
 ```
 
 This path installs the ryk binary and its native OpenClaw integration assets. Do not treat a copied plugin directory or a registry package as a supported deployment.
-The health command is ready only when the plugin is loaded, runtime inspection proves `before_tool_call`, the Gateway RPC is healthy, and the active Gateway answers the plugin's `ryk.unattended` probe with a deny canary. The canary runs the ryk callback against a synthetic dangerous command without executing it; it proves the active plugin callback and policy path, not a real agent tool execution.
+The health command is ready only when the installed plugin is the receipt-bound reviewed bundle, runtime inspection proves `before_tool_call`, the Gateway RPC is healthy, the running Gateway identity is bound to the screened OpenClaw executable, and the active Gateway routes a nonce-bound deny canary through `tools.invoke`. The manifest-declared canary tool is inert and never executes its command argument. Readiness requires the real dispatcher to return the exact Ryk denial marker and rejects both generic host denials and the inert executor sentinel.
+
+Setup writes the canonical workspace to `plugins.entries.ryk.config.workspaceRoot`. The adapter always discovers policy from that operator-controlled root and treats tool-supplied `cwd` only as action data. The canary must name the same configured workspace. This proves the Gateway dispatcher and Ryk policy path for that workspace. It does not prove a model-selected agent turn. Native file-write tools remain denied by the unattended preset; use `ryk run -- openclaw` when the session needs Ryk-mediated staged changes.
+
+The installer's adjacent SHA-256 receipt and the managed bundle receipt are integrity checks, not cryptographic signatures. They reject ordinary path, mode, symlink, and content substitutions and are revalidated at use or health time, but a same-user actor able to rewrite both an executable or adapter tree and its receipt is outside the trust claim. Native readiness remains false when upstream cannot bind the running Gateway identity; use the wrapper fallback in that case.
 
 ### Sunset registry paths
 
-Npm and ClawHub distribution paths are sunset and must not be used for new Mac mini/VPS deployments. Metadata/discovery passes are unprotected because OpenClaw does not provide live hook registration there. Existing installations should migrate to the curl installer plus `ryk unattended setup`.
+Npm and ClawHub distribution paths are sunset and must not be used for new Mac mini/VPS deployments. Metadata/discovery passes are unprotected because OpenClaw does not provide live hook registration there. Existing installations should migrate to the curl installer plus `ryk agents setup openclaw`.
 
 For historical packaging notes only, see [openclaw-clawhub.md](openclaw-clawhub.md).
 
@@ -83,7 +87,7 @@ For live runtime proof, also run:
 ```bash
 openclaw plugins inspect ryk --runtime --json
 openclaw gateway status --deep --require-rpc
-openclaw gateway call ryk.unattended --json
+ryk agents health openclaw --json
 ```
 
 Older OpenClaw builds may not provide runtime inspection or the live plugin probe. In that case health remains not ready and the wrapper is the enforced fallback:
@@ -91,6 +95,8 @@ Older OpenClaw builds may not provide runtime inspection or the live plugin prob
 ```bash
 ryk run -- openclaw
 ```
+
+OpenClaw 2026.8.1's status contract does not currently expose an authoritative running executable identity that Ryk can compare with the screened CLI. Until that upstream contract exists, Ryk deliberately keeps OpenClaw `ready=false` and requires the wrapper fallback; setup or plugin file presence is not readiness evidence.
 
 ### Plugin manifest
 

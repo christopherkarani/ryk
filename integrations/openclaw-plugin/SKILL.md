@@ -23,12 +23,13 @@ ryk registers lifecycle hooks that call the ryk CLI for policy decisions:
 - `session.start`, `session.end` — informational logging
 - `tool.after` — audit logging
 
-If a tool is blocked, ryk throws an error that prevents execution. OpenClaw does not currently expose dedicated permission lifecycle hooks to this plugin; permission-like blocking is handled through `tool.before` before the tool call executes.
+If a tool is blocked, the plugin returns OpenClaw's terminal `{ block: true }` result before execution. OpenClaw does not currently expose dedicated permission lifecycle hooks to this plugin; permission-like blocking is handled through `tool.before` before the tool call executes.
 
 ## Prerequisites
 
 - ryk CLI must be installed and available on `PATH`
 - Run `ryk doctor` to verify installation
+- Run `ryk agents setup openclaw`, then `ryk agents health openclaw --json`
 
 ## Example policy behavior
 
@@ -56,7 +57,8 @@ Dangerous command (`rm -rf *`):
 - **Thin wrapper**: All policy decisions are made by the ryk CLI
 - **No duplicated logic**: The plugin does not reimplement policy
 - **Secret redaction**: Keys matching `password`, `token`, `secret`, `api_key` are replaced with `[REDACTED]` before sending to ryk
-- **Graceful degradation**: If ryk CLI is missing, the plugin warns and skips hooks
+- **Fail closed in full runtime**: If the ryk CLI is missing or cannot be attested, the plugin registers a blocking `before_tool_call` veto
+- **Inert dispatcher canary**: `ryk_openclaw_canary` proves the Gateway tool path with a nonce-bound Ryk denial and never executes its input
 - **Honest limits**: Hooks are advisory; the strongest protection is `ryk run -- openclaw`
 
 ## Don't use ryk for
