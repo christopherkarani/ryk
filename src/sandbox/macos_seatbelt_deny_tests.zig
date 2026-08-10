@@ -1793,7 +1793,11 @@ test "real FS: hermes nested uv python exec under launch grants" {
     defer if (prepared.sbpl_z) |p| allocator.free(p);
     try std.testing.expectEqual(.prepared, prepared.status);
     const sbpl_z = prepared.sbpl_z.?;
-    try std.testing.expect(std.mem.indexOf(u8, sbpl_z, "/.local/share/uv/python/") != null);
+    // Classic uv layout or Hermes-managed runtime cpython (generation/cpython-…).
+    const has_nested_python_grant = std.mem.indexOf(u8, sbpl_z, "/.local/share/uv/python/") != null or
+        std.mem.indexOf(u8, sbpl_z, "/.hermes-runtime/python/") != null or
+        std.mem.indexOf(u8, sbpl_z, "/cpython-") != null;
+    try std.testing.expect(has_nested_python_grant);
 
     const real_z = try allocator.dupeZ(u8, real_py);
     defer allocator.free(real_z);

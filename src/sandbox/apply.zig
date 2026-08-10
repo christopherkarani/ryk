@@ -2905,8 +2905,9 @@ test "expandShellWrapperLaunch rewrites hermes-style exec to realpath python" {
 }
 
 test "collectLaunchInstallRoPaths real host hermes grants uv cpython when present" {
-    // Live host residual: hermes wrapper execs venv python → uv cpython under
-    // ~/.local/share/uv/python/…. Prove collection finds that install root.
+    // Live host residual: hermes wrapper execs venv python → nested cpython under
+    // either classic uv (`~/.local/share/uv/python/…`) or Hermes-managed runtime
+    // (`…/.hermes-runtime/python/generation-…/cpython-…`). Prove collection finds it.
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -2925,18 +2926,21 @@ test "collectLaunchInstallRoPaths real host hermes grants uv cpython when presen
     const ro = try collectLaunchInstallRoPaths(io, allocator, wrapper, &env_map);
     defer freeLaunchInstallRoPaths(allocator, ro);
 
-    var found_uv = false;
+    var found_nested_python = false;
     for (ro) |p| {
-        if (std.mem.indexOf(u8, p, "/.local/share/uv/python/") != null) {
-            found_uv = true;
+        if (std.mem.indexOf(u8, p, "/.local/share/uv/python/") != null or
+            std.mem.indexOf(u8, p, "/.hermes-runtime/python/") != null or
+            std.mem.indexOf(u8, p, "/cpython-") != null)
+        {
+            found_nested_python = true;
             break;
         }
     }
-    if (!found_uv) {
+    if (!found_nested_python) {
         std.debug.print("hermes install RO paths ({d}):\n", .{ro.len});
         for (ro) |p| std.debug.print("  {s}\n", .{p});
     }
-    try std.testing.expect(found_uv);
+    try std.testing.expect(found_nested_python);
 
     const execs = try collectLaunchExecPaths(io, allocator, wrapper, &env_map);
     defer freeLaunchExecPaths(allocator, execs);
@@ -2962,7 +2966,10 @@ test "collectLaunchInstallRoPaths real host hermes grants uv cpython when presen
         defer compiled.deinit();
         const sbpl = try macos_profile.renderSbpl(allocator, &compiled);
         defer allocator.free(sbpl);
-        try std.testing.expect(std.mem.indexOf(u8, sbpl, "/.local/share/uv/python/") != null);
+        const has_nested_python_grant = std.mem.indexOf(u8, sbpl, "/.local/share/uv/python/") != null or
+            std.mem.indexOf(u8, sbpl, "/.hermes-runtime/python/") != null or
+            std.mem.indexOf(u8, sbpl, "/cpython-") != null;
+        try std.testing.expect(has_nested_python_grant);
         try std.testing.expect(std.mem.indexOf(u8, sbpl, "file-read*") != null);
         try std.testing.expect(std.mem.indexOf(u8, sbpl, "process-exec") != null);
     }
