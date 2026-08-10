@@ -480,6 +480,8 @@ const files = [
   'integrations/codex-plugin/.codex-plugin/plugin.json',
   'integrations/claude-code-plugin/.claude-plugin/plugin.json',
   'integrations/openclaw-plugin/openclaw.plugin.json',
+  'packaging/scoop/ryk.json',
+  'packaging/winget/ryk.yaml',
 ];
 for (const file of files) {
   const source = fs.readFileSync(file, 'utf8');

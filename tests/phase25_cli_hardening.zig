@@ -48,6 +48,8 @@ test "phase25 Windows package templates match nested zip layout" {
 }
 
 test "phase25 npm package is honest while checksum placeholders remain" {
+    // npm is not an active distribution channel (curl/GitHub Release only). Templates
+    // remain as legacy packaging inputs and must stay honest about that residual.
     const package_json = try readFile(std.testing.allocator, "packaging/npm/package.json");
     defer std.testing.allocator.free(package_json);
     const wrapper = try readFile(std.testing.allocator, "packaging/npm/bin/ryk.js");
@@ -57,7 +59,11 @@ test "phase25 npm package is honest while checksum placeholders remain" {
 
     try std.testing.expect(std.mem.indexOf(u8, package_json, "npm launcher for the Zig-built ryk binary") != null);
     try std.testing.expect(std.mem.indexOf(u8, wrapper, "missing release checksums") != null);
-    try std.testing.expect(std.mem.indexOf(u8, readme, "fails closed") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, readme, "not an active") != null or
+            std.mem.indexOf(u8, readme, "Legacy npm") != null or
+            std.mem.indexOf(u8, readme, "fails closed") != null,
+    );
 }
 
 test "phase25 MCP docs distinguish proxy stdin and list observation" {
