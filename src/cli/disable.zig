@@ -186,7 +186,7 @@ pub fn disableOpenCode(io: std.Io, allocator: std.mem.Allocator, stdout: anytype
 
 pub fn disableOpenClaw(io: std.Io, allocator: std.mem.Allocator, stdout: anytype) !bool {
     if (plugin.binaryInPath(io, allocator, "openclaw")) {
-        try stdout.writeAll("  openclaw: running 'openclaw plugins uninstall ryk-openclaw-plugin' (10s timeout)...\n");
+        try stdout.writeAll("  openclaw: running 'openclaw plugins uninstall ryk' (10s timeout)...\n");
 
         const status = runOpenClawUninstall(allocator) catch |err| blk: {
             try stdout.print("  host uninstall: failed ({s})\n", .{@errorName(err)});
@@ -370,7 +370,7 @@ fn overwriteTextFile(io: std.Io, path: []const u8, content: []const u8) !void {
 
 pub fn runOpenClawUninstall(allocator: std.mem.Allocator) !u8 {
     const child_process = @import("child_process.zig");
-    const argv = [_][]const u8{ "openclaw", "plugins", "uninstall", "ryk-openclaw-plugin" };
+    const argv = [_][]const u8{ "openclaw", "plugins", "uninstall", "ryk" };
 
     // Use the robust timed runner (10s) so a stuck/broken/misbehaving openclaw
     // cannot hang `ryk uninstall` or `ryk stop` forever.
@@ -386,7 +386,7 @@ pub fn runOpenClawUninstall(allocator: std.mem.Allocator) !u8 {
 
 pub fn runHermesDisable(allocator: std.mem.Allocator) !u8 {
     const child_process = @import("child_process.zig");
-    const argv = [_][]const u8{ "hermes", "plugins", "disable", "ryk"};
+    const argv = [_][]const u8{ "hermes", "plugins", "disable", "ryk" };
 
     const res = try child_process.runHostCommandTimed(allocator, &argv, 10_000, null, null);
     defer child_process.deinitHostCommandResult(res, allocator);
@@ -476,7 +476,8 @@ test "cursor cleanup only rewrites canonical ryk hook registrations" {
     defer std.testing.allocator.free(hooks_path);
 
     const canonical = try std.Io.Dir.createFileAbsolute(std.testing.io, hooks_path, .{});
-    try canonical.writeStreamingAll(std.testing.io,
+    try canonical.writeStreamingAll(
+        std.testing.io,
         "{\"version\":1,\"hooks\":{\"beforeShellExecution\":[{\"command\":\"/tmp/ryk-pre-shell.py\"}]}}",
     );
     canonical.close(std.testing.io);
@@ -494,7 +495,8 @@ test "cursor cleanup only rewrites canonical ryk hook registrations" {
     try std.testing.expect(std.mem.indexOf(u8, disabled, "\"beforeShellExecution\": []") != null);
 
     const mixed = try std.Io.Dir.createFileAbsolute(std.testing.io, hooks_path, .{ .truncate = true });
-    try mixed.writeStreamingAll(std.testing.io,
+    try mixed.writeStreamingAll(
+        std.testing.io,
         "{\"metadata\":\"ryk\",\"hooks\":{\"beforeShellExecution\":[{\"command\":\"/tmp/ryk-pre-shell.py\"},{\"command\":\"/tmp/user-hook.sh\"}]}}",
     );
     mixed.close(std.testing.io);
@@ -511,7 +513,8 @@ test "cursor cleanup only rewrites canonical ryk hook registrations" {
     try std.testing.expect(std.mem.indexOf(u8, mixed_disabled, "\"metadata\": \"ryk\"") != null);
 
     const legacy = try std.Io.Dir.createFileAbsolute(std.testing.io, hooks_path, .{ .truncate = true });
-    try legacy.writeStreamingAll(std.testing.io,
+    try legacy.writeStreamingAll(
+        std.testing.io,
         "{\"version\":1,\"hooks\":{\"beforeShellExecution\":[{\"command\":\"/tmp/orca-pre-shell.py\"}]}}",
     );
     legacy.close(std.testing.io);

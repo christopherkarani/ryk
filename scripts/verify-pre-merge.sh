@@ -17,6 +17,14 @@ echo "[verify-pre-merge] Fast gate"
 echo "[verify-pre-merge] Full test suite (plugins/setup/fuzz)"
 ./scripts/zig build test
 
+# OpenClaw ships committed dist/; require freshness when plugin deps are present.
+if [[ -x integrations/openclaw-plugin/node_modules/.bin/tsc ]]; then
+  echo "[verify-pre-merge] OpenClaw release assets"
+  ./scripts/test-openclaw-release-assets.sh
+else
+  echo "[verify-pre-merge] skip openclaw release assets (plugin node_modules/.bin/tsc missing)"
+fi
+
 echo "[verify-pre-merge] First-user install and uninstall regressions"
 ./scripts/install-first-user-regression-test.sh
 ./scripts/uninstall-first-user-regression-test.sh

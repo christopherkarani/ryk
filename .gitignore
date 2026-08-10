@@ -39,6 +39,10 @@ __pycache__/
 dist/
 dist-dry-run/
 dist-prerelease/
+!integrations/openclaw-plugin/dist/
+!integrations/openclaw-plugin/dist/index.js
+!integrations/openclaw-plugin/dist/index.d.ts
+!integrations/openclaw-plugin/dist/index.d.ts.map
 .release-zig/
 .release-clean-*
 .release-npm-cache/

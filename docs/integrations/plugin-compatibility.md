@@ -23,7 +23,7 @@ None of the host packages adds MCP server behavior or telemetry.
 | Codex | Plugin and hook configuration | Enforcement depends on the Codex hook surface and version. |
 | Claude Code | Plugin and hook configuration | Enforcement depends on the Claude Code hook surface and version. |
 | OpenCode | Plugin and hook configuration | OpenCode hooks must fire for a decision to affect a tool call. |
-| OpenClaw | Plugin and hook configuration | npm and ClawHub installs currently load in CLI-metadata mode, where hooks do not enforce tools. |
+| OpenClaw | Plugin and hook configuration | Registry installs are sunset; use the curl-installed ryk binary plus `ryk agents setup openclaw`. Metadata/discovery passes remain unprotected. |
 | Cursor | Host discovery and preset support | Use the process wrapper when the host does not expose a blocking hook. |
 | Pi, Hermes | Native ryk launchers | The launcher starts the host as a ryk-managed child process. |
 
@@ -37,7 +37,7 @@ Hooks are useful integration points, but they cannot protect actions the host ne
 
 ## Versioning
 
-The repository release version is `1.2.9`. Versioned plugin manifests in the tree are checked against `VERSION` during release verification. Keep the CLI and plugin packages aligned when preparing a release.
+The repository release version is `1.2.11`. Versioned plugin manifests in the tree are checked against `VERSION` during release verification. Keep the CLI and plugin packages aligned when preparing a release.
 
 Official marketplace or registry availability is not recorded here. Check the relevant registry at release time instead of relying on a stale repository claim.
 

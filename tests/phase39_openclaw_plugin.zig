@@ -13,6 +13,8 @@ const manifest_path = plugin_dir ++ "/openclaw.plugin.json";
 const package_json_path = plugin_dir ++ "/package.json";
 const tsconfig_path = plugin_dir ++ "/tsconfig.json";
 const source_path = plugin_dir ++ "/src/index.ts";
+const dist_source_path = plugin_dir ++ "/dist/index.js";
+const dist_types_path = plugin_dir ++ "/dist/index.d.ts";
 const readme_path = plugin_dir ++ "/README.md";
 
 // ---------------------------------------------------------------------------
@@ -85,6 +87,22 @@ test "openclaw plugin manifest has configSchema" {
     try std.testing.expect(std.mem.eql(u8, config_schema.object.get("type").?.string, "object"));
 }
 
+test "openclaw plugin manifest declares the inert dispatcher canary tool" {
+    var dbg_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = dbg_state.deinit();
+    const allocator = dbg_state.allocator();
+
+    const content = try readFile(allocator, manifest_path);
+    defer allocator.free(content);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, content, .{});
+    defer parsed.deinit();
+
+    const contracts = parsed.value.object.get("contracts").?.object;
+    const tools = contracts.get("tools").?.array;
+    try std.testing.expectEqual(@as(usize, 1), tools.items.len);
+    try std.testing.expectEqualStrings("ryk_openclaw_canary", tools.items[0].string);
+}
+
 // ---------------------------------------------------------------------------
 // Package.json tests
 // ---------------------------------------------------------------------------
@@ -124,7 +142,42 @@ test "openclaw package.json has openclaw field" {
     try std.testing.expect(openclaw.get("runtimeExtensions") != null);
 }
 
-test "openclaw package.json has correct name" {
+test "openclaw package install entry uses the built tracked runtime" {
+    var dbg_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = dbg_state.deinit();
+    const allocator = dbg_state.allocator();
+
+    const content = try readFile(allocator, package_json_path);
+    defer allocator.free(content);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, content, .{});
+    defer parsed.deinit();
+
+    const openclaw = parsed.value.object.get("openclaw").?.object;
+    const extensions = openclaw.get("extensions").?.array;
+    try std.testing.expectEqual(@as(usize, 1), extensions.items.len);
+    try std.testing.expectEqualStrings("./dist/index.js", extensions.items[0].string);
+}
+
+test "openclaw package.json requires the verified 2026.8.1 host API" {
+    var dbg_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = dbg_state.deinit();
+    const allocator = dbg_state.allocator();
+
+    const content = try readFile(allocator, package_json_path);
+    defer allocator.free(content);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, content, .{});
+    defer parsed.deinit();
+
+    const openclaw = parsed.value.object.get("openclaw").?.object;
+    const compat = openclaw.get("compat").?.object;
+    const build = openclaw.get("build").?.object;
+    try std.testing.expectEqualStrings(">=2026.8.1", compat.get("pluginApi").?.string);
+    try std.testing.expectEqualStrings("2026.8.1", compat.get("minGatewayVersion").?.string);
+    try std.testing.expectEqualStrings("2026.8.1", build.get("openclawVersion").?.string);
+    try std.testing.expectEqualStrings("2026.8.1", build.get("pluginSdkVersion").?.string);
+}
+
+test "openclaw package.json has canonical native name" {
     var dbg_state: std.heap.DebugAllocator(.{}) = .init;
     defer _ = dbg_state.deinit();
     const allocator = dbg_state.allocator();
@@ -136,7 +189,7 @@ test "openclaw package.json has correct name" {
     defer parsed.deinit();
 
     const name = parsed.value.object.get("name").?.string;
-    try std.testing.expectEqualStrings("ryk-openclaw-plugin", name);
+    try std.testing.expectEqualStrings("ryk", name);
 }
 
 test "openclaw package.json main points to dist/index.js" {
@@ -272,14 +325,14 @@ test "openclaw plugin dist index.js exists" {
     const content = try readFile(std.testing.allocator, package_json_path);
     defer std.testing.allocator.free(content);
     try std.testing.expect(std.mem.indexOf(u8, content, "\"main\": \"dist/index.js\"") != null);
-    try std.testing.expect(fileExists(source_path));
+    try std.testing.expect(fileExists(dist_source_path));
 }
 
 test "openclaw plugin dist index.d.ts exists" {
     const content = try readFile(std.testing.allocator, package_json_path);
     defer std.testing.allocator.free(content);
     try std.testing.expect(std.mem.indexOf(u8, content, "\"types\": \"dist/index.d.ts\"") != null);
-    try std.testing.expect(fileExists(tsconfig_path));
+    try std.testing.expect(fileExists(dist_types_path));
 }
 
 // ---------------------------------------------------------------------------
@@ -306,13 +359,13 @@ test "openclaw plugin README states no MCP server behavior" {
     try std.testing.expect(std.mem.indexOf(u8, content, "does not add MCP server behavior") != null);
 }
 
-test "openclaw plugin README has npm install instructions demoted as unprotected" {
+test "openclaw plugin README marks registry installs sunset" {
     const content = try readFile(std.testing.allocator, readme_path);
     defer std.testing.allocator.free(content);
 
-    try std.testing.expect(std.mem.indexOf(u8, content, "openclaw plugins install npm:ryk-openclaw-plugin") != null);
-    try std.testing.expect(std.mem.indexOf(u8, content, "NOT recommended for security") != null or
-        std.mem.indexOf(u8, content, "unprotected") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "Npm and ClawHub distribution paths are sunset") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "openclaw plugins install npm:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "openclaw plugins install clawhub:") == null);
 }
 
 test "openclaw plugin README does not claim npm publication happened" {

@@ -11,6 +11,7 @@ const cli = @import("mod.zig");
 const telemetry = @import("../telemetry.zig");
 const plugin_install = @import("plugin_install.zig");
 const child_process = @import("child_process.zig");
+const daemon_trust = @import("daemon_trust.zig");
 const resource_root = @import("ryk").resource_root;
 const env_util = @import("ryk").env_util;
 const tui = @import("ryk").tui;
@@ -18,6 +19,22 @@ const suggestions = @import("suggestions.zig");
 const host_status = @import("host_status.zig");
 const openclaw_status = @import("openclaw_status.zig");
 const interactive = @import("interactive.zig");
+
+const hermes_managed_receipt_filename = ".ryk-managed-v1";
+const hermes_unattended_marker_filename = ".ryk_unattended";
+const openclaw_managed_receipt_filename = ".ryk-managed-openclaw-v1";
+const openclaw_bundle_file_names = [_][]const u8{
+    "openclaw.plugin.json",
+    "package.json",
+    "dist/index.js",
+    "dist/index.d.ts",
+};
+// Exact hashes for the pre-receipt Ryk bundle. This bounded legacy allowance
+// lets an existing, unmodified Ryk install migrate once without accepting
+// copied manifest text as ownership evidence.
+const hermes_legacy_manifest_sha256 = "9276b8a93a46772e5b0511b10ed699675dbc606be26fba98e35521aff761ca53";
+const hermes_legacy_source_sha256 = "1eb89889cf8ec15392c6c0a6a30b602d924b72cb754af80864ca79203d3545b2";
+const hermes_legacy_mapping_sha256 = "7753c18b13f036c702ca57a815b4c3f97823907243f79cea94bb7aed501d4221";
 
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern "c" fn unsetenv(name: [*:0]const u8) c_int;
@@ -237,6 +254,7 @@ pub const PluginDoctorReport = struct {
     workspace_root: []const u8,
     policy_present: bool,
     policy_valid: bool,
+    policy_mode: ?[]const u8 = null,
     policy_error: ?[]const u8,
     audit_replay_available: bool,
     mcp_support_status: []const u8,
@@ -352,6 +370,24 @@ pub fn collectPluginDoctorReportWithHermesSmoke(
     allocator: std.mem.Allocator,
     hermes_smoke_override: ?bool,
 ) !PluginDoctorReport {
+    return collectPluginDoctorReportWithOptions(io, allocator, hermes_smoke_override, true);
+}
+
+/// Filesystem-only inventory for the bounded agents health command. Runtime
+/// host probes are performed separately under one shared deadline.
+pub fn collectPluginDoctorReportForAgentsHealth(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+) !PluginDoctorReport {
+    return collectPluginDoctorReportWithOptions(io, allocator, false, false);
+}
+
+fn collectPluginDoctorReportWithOptions(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    hermes_smoke_override: ?bool,
+    allow_openclaw_cli_probe: bool,
+) !PluginDoctorReport {
     const cwd: [:0]u8 = std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator) catch try allocator.dupeZ(u8, ".");
     errdefer allocator.free(cwd);
     const workspace_root = supervisor.resolveWorkspaceRoot(io, allocator, null, ".") catch try allocator.dupe(u8, cwd);
@@ -361,11 +397,13 @@ pub fn collectPluginDoctorReportWithHermesSmoke(
     defer allocator.free(policy_path);
     var policy_present = false;
     var policy_valid = false;
+    var policy_mode: ?[]const u8 = null;
     var policy_error: ?[]const u8 = null;
     errdefer if (policy_error) |e| allocator.free(e);
     if (fileExistsAbsolute(io, policy_path)) {
         policy_present = true;
         if (core_api.loadPolicyFile(io, allocator, policy_path)) |loaded_policy| {
+            policy_mode = @tagName(loaded_policy.mode());
             var loaded = loaded_policy;
             loaded.deinit();
             policy_valid = true;
@@ -428,7 +466,7 @@ pub fn collectPluginDoctorReportWithHermesSmoke(
         .config_references_plugin = false, // Safe detection deferred
     };
 
-    const openclaw_paths = try detectOpenClawHostInstall(io, allocator, host_bins.openclaw);
+    const openclaw_paths = try detectOpenClawHostInstall(io, allocator, host_bins.openclaw, allow_openclaw_cli_probe);
 
     const hermes_plugin_dir = try resolveBundledPath(io, allocator, "integrations/hermes-plugin");
     defer allocator.free(hermes_plugin_dir);
@@ -539,6 +577,7 @@ pub fn collectPluginDoctorReportWithHermesSmoke(
         .workspace_root = workspace_root,
         .policy_present = policy_present,
         .policy_valid = policy_valid,
+        .policy_mode = policy_mode,
         .policy_error = policy_error,
         .audit_replay_available = audit_replay_available,
         .mcp_support_status = mcp_support_status,
@@ -1550,25 +1589,44 @@ fn installCommand(io: std.Io, argv: []const []const u8, stdout: anytype, stderr:
                     opencode_install_attempted = true;
                 }
             } else if (t == .openclaw) {
-                // OpenClaw-specific install guidance
-                const install_command = try std.fmt.allocPrint(allocator, "openclaw plugins install {s}", .{plugin_dir});
-                defer allocator.free(install_command);
+                // OpenClaw-specific install guidance. The supported deployment
+                // path is the curl installer plus the unattended workflow;
+                // local host installation remains development-only.
                 try openclaw_status.writeInstallPaths(stdout);
                 if (dry_run) {
                     try stdout.writeAll("  action: no changes made (dry-run)\n");
-                    try stdout.print("  next step: run '{s}' if OpenClaw is installed\n", .{install_command});
+                    try stdout.writeAll("  supported deployment:\n");
+                    try stdout.writeAll("    curl -fsSL https://rykanv.com/install | sh\n");
+                    try stdout.writeAll("    ryk agents setup openclaw\n");
+                    try stdout.writeAll("  source-checkout development only: openclaw plugins install <plugin_dir>\n");
                 } else {
-                    if (!binaryInPath(io, allocator, "openclaw")) {
-                        try stdout.writeAll("  action: failed (openclaw binary not found in PATH)\n");
+                    const host_binary = try trustedHostBinary(io, allocator, "openclaw");
+                    defer if (host_binary) |path| allocator.free(path);
+                    if (host_binary == null) {
+                        try stdout.writeAll("  action: failed (trusted OpenClaw 2026.8.1+ binary not found)\n");
                         return exit_codes.general;
                     }
-                    const status = try runOpenClawInstall(allocator, plugin_dir);
+                    const status = try runOpenClawInstall(allocator, host_binary.?, plugin_dir);
                     if (status == 0) {
                         try stdout.writeAll("  action: installed via openclaw host command\n");
                     } else {
                         try stdout.print("  action: failed (openclaw exit code: {d})\n", .{status});
                         return exit_codes.child_failure;
                     }
+                    // Bind the host-reported install location to the exact
+                    // reviewed bundle that was supplied to the host. Health
+                    // refuses to treat a modified or relocated plugin as the
+                    // installed Ryk adapter.
+                    writeOpenClawManagedReceipt(io, allocator, host_binary.?, plugin_dir) catch |err| {
+                        try stdout.print("  action: failed to attest the installed OpenClaw bundle ({s})\n", .{@errorName(err)});
+                        return exit_codes.child_failure;
+                    };
+                    const config_status = try runOpenClawConfigureWorkspace(allocator, host_binary.?, workspace_root);
+                    if (config_status != 0 or !try runOpenClawWorkspaceBindingMatches(allocator, host_binary.?, workspace_root)) {
+                        try stdout.print("  action: failed to bind OpenClaw policy workspace (exit code: {d})\n", .{config_status});
+                        return exit_codes.child_failure;
+                    }
+                    try stdout.print("  workspace: policy binding pinned to {s}\n", .{workspace_root});
                 }
             } else if (t == .hermes) {
                 const destination_path = try hermesUserPluginRoot(allocator);
@@ -1579,12 +1637,10 @@ fn installCommand(io: std.Io, argv: []const []const u8, stdout: anytype, stderr:
                 defer allocator.free(source_source);
                 const mapping_source = try std.fs.path.join(allocator, &.{ plugin_dir, "mapping.py" });
                 defer allocator.free(mapping_source);
-                const manifest_destination = try std.fs.path.join(allocator, &.{ destination_path, "plugin.yaml" });
-                defer allocator.free(manifest_destination);
                 const source_destination = try std.fs.path.join(allocator, &.{ destination_path, "__init__.py" });
                 defer allocator.free(source_destination);
-                const mapping_destination = try std.fs.path.join(allocator, &.{ destination_path, "mapping.py" });
-                defer allocator.free(mapping_destination);
+                const stance_destination = try std.fs.path.join(allocator, &.{ destination_path, host_status.hermes_fail_stance_filename });
+                defer allocator.free(stance_destination);
                 // Existing install: plugin source already present (hybrid L4 — do not silent-flip).
                 const hermes_was_existing = fileExistsAbsolute(io, source_destination);
 
@@ -1598,6 +1654,10 @@ fn installCommand(io: std.Io, argv: []const []const u8, stdout: anytype, stderr:
                         try stdout.writeAll("  fail stance (new install): fail-closed via .ryk_fail_stance\n");
                     }
                 } else {
+                    if (!hermesManagedDestination(io, allocator, destination_path)) {
+                        try stdout.print("  action: failed (existing plugin directory is not Ryk-owned: {s})\n", .{destination_path});
+                        return exit_codes.general;
+                    }
                     if (!fileExistsAbsolute(io, manifest_source) or
                         !fileExistsAbsolute(io, source_source) or
                         !fileExistsAbsolute(io, mapping_source))
@@ -1605,34 +1665,21 @@ fn installCommand(io: std.Io, argv: []const []const u8, stdout: anytype, stderr:
                         try stdout.writeAll("  action: failed (Hermes plugin files missing)\n");
                         return exit_codes.general;
                     }
-                    const manifest_installed = installFileIfSafe(allocator, manifest_source, manifest_destination) catch |err| switch (err) {
-                        error.RefusingToOverwriteDifferentFile => {
-                            try stdout.print("  action: failed (destination exists and differs: {s})\n", .{manifest_destination});
-                            return exit_codes.general;
-                        },
-                        else => return err,
-                    };
-                    const source_installed = installFileIfSafe(allocator, source_source, source_destination) catch |err| switch (err) {
-                        error.RefusingToOverwriteDifferentFile => {
-                            try stdout.print("  action: failed (destination exists and differs: {s})\n", .{source_destination});
-                            return exit_codes.general;
-                        },
-                        else => return err,
-                    };
-                    const mapping_installed = installFileIfSafe(allocator, mapping_source, mapping_destination) catch |err| switch (err) {
-                        error.RefusingToOverwriteDifferentFile => {
-                            try stdout.print("  action: failed (destination exists and differs: {s})\n", .{mapping_destination});
-                            return exit_codes.general;
-                        },
-                        else => return err,
-                    };
-                    if (manifest_installed or source_installed or mapping_installed) {
+                    // This directory is Ryk-owned. Stage the complete adapter
+                    // tree and commit it as one bounded directory transaction.
+                    const bundle_changed = try installHermesBundleAtomically(
+                        io,
+                        allocator,
+                        plugin_dir,
+                        destination_path,
+                    );
+                    if (bundle_changed) {
                         try stdout.print("  action: installed to {s}\n", .{destination_path});
                     } else {
                         try stdout.print("  action: already up-to-date at {s}\n", .{destination_path});
                     }
                     // Hybrid L4: new installs get fail-closed stance file; existing keep prior stance/default.
-                    if (!hermes_was_existing) {
+                    if (!hermes_was_existing and !fileExistsAbsolute(io, stance_destination)) {
                         try writeHermesFailClosedStance(allocator, destination_path);
                         try stdout.writeAll("  fail stance: fail-closed (new install default)\n");
                         try stdout.writeAll("    → Written: ~/.hermes/plugins/ryk/.ryk_fail_stance\n");
@@ -1641,8 +1688,10 @@ fn installCommand(io: std.Io, argv: []const []const u8, stdout: anytype, stderr:
                         try stdout.writeAll("  fail stance: left unchanged (existing install; missing/invalid stance is fail-closed)\n");
                         try stdout.writeAll("    → Explicit degraded override: export RYK_HERMES_FAIL_OPEN=1  # or: ryk run -- hermes\n");
                     }
-                    if (binaryInPath(io, allocator, "hermes")) {
-                        const status = try runHermesEnable(allocator);
+                    const host_binary = try trustedHostBinary(io, allocator, "hermes");
+                    defer if (host_binary) |path| allocator.free(path);
+                    if (host_binary) |binary| {
+                        const status = try runHermesEnable(allocator, binary);
                         if (status == 0) {
                             try stdout.writeAll("  enable: completed via hermes plugins enable ryk\n");
                         } else {
@@ -1899,7 +1948,12 @@ fn openClawPluginEntryMatches(value: std.json.Value) bool {
     return false;
 }
 
-pub fn detectOpenClawHostInstall(io: std.Io, allocator: std.mem.Allocator, openclaw_in_path: bool) !OpenClawHostInstall {
+pub fn detectOpenClawHostInstall(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    openclaw_in_path: bool,
+    allow_host_cli_probe: bool,
+) !OpenClawHostInstall {
     var env_map = env_util.createProcessMap(allocator) catch {
         return .{
             .host_plugin_installed = false,
@@ -1937,7 +1991,7 @@ pub fn detectOpenClawHostInstall(io: std.Io, allocator: std.mem.Allocator, openc
     var host_plugin_installed = manifest_exists and package_exists and source_exists;
     var detection_note: []const u8 = "checked host extension directory";
 
-    if (!host_plugin_installed and openclaw_in_path) {
+    if (!host_plugin_installed and openclaw_in_path and allow_host_cli_probe) {
         const list_output = captureChildOutput(allocator, &.{ "openclaw", "plugins", "list", "--json" }) catch null;
         if (list_output) |output| {
             defer allocator.free(output);
@@ -1948,6 +2002,8 @@ pub fn detectOpenClawHostInstall(io: std.Io, allocator: std.mem.Allocator, openc
         }
     } else if (!openclaw_in_path) {
         detection_note = "openclaw binary not found in PATH";
+    } else if (!host_plugin_installed) {
+        detection_note = "host CLI probe deferred to bounded health runtime checks";
     }
 
     return .{
@@ -1960,17 +2016,29 @@ pub fn detectOpenClawHostInstall(io: std.Io, allocator: std.mem.Allocator, openc
 }
 
 pub fn captureChildOutput(allocator: std.mem.Allocator, argv: []const []const u8) ![]u8 {
-    var threaded: std.Io.Threaded = .init_single_threaded;
-    const io = threaded.io();
-    const run_result = try std.process.run(allocator, io, .{
-        .argv = argv,
-        .stdout_limit = .limited(256 * 1024),
-        .stderr_limit = .limited(0),
-    });
-    defer allocator.free(run_result.stderr);
-    const term = run_result.term;
-    if (term != .exited or term.exited != 0) return error.ChildFailed;
-    return run_result.stdout;
+    return captureChildOutputTimed(allocator, argv, 10_000);
+}
+
+pub fn captureChildOutputTimed(
+    allocator: std.mem.Allocator,
+    argv: []const []const u8,
+    timeout_ms: u32,
+) ![]u8 {
+    var result = try child_process.runHostCommandCaptureTimed(allocator, argv, timeout_ms);
+    defer result.deinit(allocator);
+    if (result.timed_out or result.output_overflow or result.exit_code != 0) return error.ChildFailed;
+    return try allocator.dupe(u8, result.stdout);
+}
+
+pub fn captureChildOutputTimedInCurrentProcessGroup(
+    allocator: std.mem.Allocator,
+    argv: []const []const u8,
+    timeout_ms: u32,
+) ![]u8 {
+    var result = try child_process.runHostCommandCaptureTimedInCurrentProcessGroup(allocator, argv, timeout_ms);
+    defer result.deinit(allocator);
+    if (result.timed_out or result.output_overflow or result.exit_code != 0) return error.ChildFailed;
+    return try allocator.dupe(u8, result.stdout);
 }
 
 pub fn hostPluginInstalledFromReport(host_name: []const u8, report: PluginDoctorReport) bool {
@@ -2166,6 +2234,228 @@ pub fn installFileIfSafe(allocator: std.mem.Allocator, source_path: []const u8, 
     );
 }
 
+fn installManagedFile(allocator: std.mem.Allocator, source_path: []const u8, destination_path: []const u8) !bool {
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const io = threaded.io();
+    return plugin_install.installFileIfSafe(
+        io,
+        allocator,
+        source_path,
+        destination_path,
+        true,
+    );
+}
+
+fn sha256Hex(bytes: []const u8) [64]u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    return std.fmt.bytesToHex(digest, .lower);
+}
+
+fn readHermesFile(io: std.Io, allocator: std.mem.Allocator, root: []const u8, name: []const u8) ?[]u8 {
+    const path = std.fs.path.join(allocator, &.{ root, name }) catch return null;
+    defer allocator.free(path);
+    return std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(8 * 1024 * 1024)) catch null;
+}
+
+fn hermesRegularFileNoSymlink(io: std.Io, allocator: std.mem.Allocator, root: []const u8, name: []const u8) bool {
+    const path = std.fs.path.join(allocator, &.{ root, name }) catch return false;
+    defer allocator.free(path);
+    const stat = std.Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch return false;
+    return stat.kind == .file;
+}
+
+fn receiptField(receipt: []const u8, key: []const u8) ?[]const u8 {
+    var lines = std.mem.splitScalar(u8, receipt, '\n');
+    if (!std.mem.eql(u8, std.mem.trim(u8, lines.next() orelse return null, "\r"), "ryk-hermes-managed-v1")) return null;
+    var found: ?[]const u8 = null;
+    while (lines.next()) |line| {
+        const clean = std.mem.trim(u8, line, "\r");
+        if (clean.len == 0) continue;
+        if (std.mem.startsWith(u8, clean, key) and clean.len > key.len and clean[key.len] == '=') {
+            if (found != null) return null;
+            found = clean[key.len + 1 ..];
+        }
+    }
+    return found;
+}
+
+fn hermesReceiptMatches(io: std.Io, allocator: std.mem.Allocator, plugin_dir: []const u8) bool {
+    const canonical = std.Io.Dir.cwd().realPathFileAlloc(io, plugin_dir, allocator) catch return false;
+    defer allocator.free(canonical);
+    if (!std.mem.eql(u8, canonical, plugin_dir)) return false;
+    if (!hermesRegularFileNoSymlink(io, allocator, plugin_dir, hermes_managed_receipt_filename)) return false;
+    const receipt = readHermesFile(io, allocator, plugin_dir, hermes_managed_receipt_filename) orelse return false;
+    defer allocator.free(receipt);
+    const path = receiptField(receipt, "path") orelse return false;
+    if (!std.mem.eql(u8, path, canonical)) return false;
+    const names = [_][]const u8{ "plugin.yaml", "__init__.py", "mapping.py" };
+    for (names) |name| {
+        if (!hermesRegularFileNoSymlink(io, allocator, plugin_dir, name)) return false;
+        const expected_key = std.fmt.allocPrint(allocator, "{s}_sha256", .{name}) catch return false;
+        defer allocator.free(expected_key);
+        const expected = receiptField(receipt, expected_key) orelse return false;
+        const bytes = readHermesFile(io, allocator, plugin_dir, name) orelse return false;
+        defer allocator.free(bytes);
+        const actual = sha256Hex(bytes);
+        if (!std.mem.eql(u8, expected, &actual)) return false;
+    }
+    return true;
+}
+
+fn hermesPreflightMarkerMatches(io: std.Io, allocator: std.mem.Allocator, plugin_dir: []const u8) bool {
+    const canonical = std.Io.Dir.cwd().realPathFileAlloc(io, plugin_dir, allocator) catch return false;
+    defer allocator.free(canonical);
+    const marker = readHermesFile(io, allocator, plugin_dir, hermes_unattended_marker_filename) orelse return false;
+    defer allocator.free(marker);
+    var expected: [std.fs.max_path_bytes + 64]u8 = undefined;
+    const expected_text = std.fmt.bufPrint(&expected, "ryk-hermes-unattended-v1\npath={s}\n", .{canonical}) catch return false;
+    if (!std.mem.eql(u8, marker, expected_text)) return false;
+
+    // A preflight marker is only a capability for the empty activation
+    // directory created by this setup transaction. It is not ownership proof
+    // for a populated tree: a same-user writer must not be able to plant the
+    // marker beside arbitrary Python and have setup overwrite it.
+    var dir = std.Io.Dir.cwd().openDir(io, plugin_dir, .{ .iterate = true, .follow_symlinks = false }) catch return false;
+    defer dir.close(io);
+    var it = dir.iterate();
+    while (it.next(io) catch return false) |entry| {
+        if (entry.kind != .file) return false;
+        if (!std.mem.eql(u8, entry.name, hermes_unattended_marker_filename) and
+            !std.mem.eql(u8, entry.name, host_status.hermes_fail_stance_filename))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn hermesLegacyBundleMatches(io: std.Io, allocator: std.mem.Allocator, plugin_dir: []const u8) bool {
+    const entries = [_]struct { name: []const u8, hash: []const u8 }{
+        .{ .name = "plugin.yaml", .hash = hermes_legacy_manifest_sha256 },
+        .{ .name = "__init__.py", .hash = hermes_legacy_source_sha256 },
+        .{ .name = "mapping.py", .hash = hermes_legacy_mapping_sha256 },
+    };
+    for (entries) |entry| {
+        if (!hermesRegularFileNoSymlink(io, allocator, plugin_dir, entry.name)) return false;
+        const bytes = readHermesFile(io, allocator, plugin_dir, entry.name) orelse return false;
+        defer allocator.free(bytes);
+        const actual = sha256Hex(bytes);
+        if (!std.mem.eql(u8, &actual, entry.hash)) return false;
+    }
+    return true;
+}
+
+fn installHermesBundleAtomically(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    source_dir: []const u8,
+    destination_dir: []const u8,
+) !bool {
+    if (!hermesManagedDestination(io, allocator, destination_dir)) return error.RefusingToOverwriteUnownedPlugin;
+
+    const source_names = [_][]const u8{ "plugin.yaml", "__init__.py", "mapping.py" };
+    var source_bytes: [3][]u8 = undefined;
+    var loaded: usize = 0;
+    defer for (source_bytes[0..loaded]) |bytes| allocator.free(bytes);
+    for (source_names, 0..) |name, index| {
+        const source_path = try std.fs.path.join(allocator, &.{ source_dir, name });
+        defer allocator.free(source_path);
+        source_bytes[index] = try std.Io.Dir.cwd().readFileAlloc(io, source_path, allocator, .limited(8 * 1024 * 1024));
+        loaded += 1;
+    }
+
+    const existing = dirExists(destination_dir);
+    if (existing and hermesReceiptMatches(io, allocator, destination_dir)) {
+        var current = true;
+        for (source_names, 0..) |name, index| {
+            const installed = readHermesFile(io, allocator, destination_dir, name) orelse {
+                current = false;
+                break;
+            };
+            defer allocator.free(installed);
+            current = current and std.mem.eql(u8, installed, source_bytes[index]);
+        }
+        if (current) return false;
+    }
+
+    const parent = std.fs.path.dirname(destination_dir) orelse return error.InvalidPath;
+    const stamp = std.Io.Clock.Timestamp.now(io, .awake).raw.nanoseconds;
+    const stage = try std.fmt.allocPrint(allocator, "{s}/.ryk-hermes-stage-{d}", .{ parent, stamp });
+    defer allocator.free(stage);
+    try std.Io.Dir.cwd().createDirPath(io, stage);
+    var stage_owned = true;
+    defer if (stage_owned) std.Io.Dir.cwd().deleteTree(io, stage) catch {};
+
+    for (source_names, 0..) |name, index| {
+        const stage_path = try std.fs.path.join(allocator, &.{ stage, name });
+        defer allocator.free(stage_path);
+        _ = try plugin_install.installTextIfSafe(io, allocator, source_bytes[index], stage_path, false);
+    }
+
+    // destination_dir is an absolute path under the operator's home. It does
+    // not exist during the first staged install, so its lexical path is the
+    // canonical path we bind into the receipt; symlinked existing roots were
+    // rejected by hermesReceiptMatches before upgrades reach this point.
+    const canonical_destination = destination_dir;
+    const manifest_hash = sha256Hex(source_bytes[0]);
+    const source_hash = sha256Hex(source_bytes[1]);
+    const mapping_hash = sha256Hex(source_bytes[2]);
+    const receipt = try std.fmt.allocPrint(
+        allocator,
+        "ryk-hermes-managed-v1\npath={s}\nplugin.yaml_sha256={s}\n__init__.py_sha256={s}\nmapping.py_sha256={s}\n",
+        .{ canonical_destination, &manifest_hash, &source_hash, &mapping_hash },
+    );
+    defer allocator.free(receipt);
+    const receipt_path = try std.fs.path.join(allocator, &.{ stage, hermes_managed_receipt_filename });
+    defer allocator.free(receipt_path);
+    _ = try plugin_install.installTextIfSafe(io, allocator, receipt, receipt_path, false);
+
+    const stage_stance_path = try std.fs.path.join(allocator, &.{ stage, host_status.hermes_fail_stance_filename });
+    defer allocator.free(stage_stance_path);
+    const stance_path = try std.fs.path.join(allocator, &.{ destination_dir, host_status.hermes_fail_stance_filename });
+    defer allocator.free(stance_path);
+    var stance_owned: ?[]u8 = null;
+    const stance: []const u8 = if (std.Io.Dir.cwd().readFileAlloc(io, stance_path, allocator, .limited(8 * 1024))) |bytes| blk: {
+        stance_owned = bytes;
+        break :blk bytes;
+    } else |_| "fail-closed\n# Managed by `ryk agents setup hermes`.\n";
+    defer if (stance_owned) |bytes| allocator.free(bytes);
+    _ = try plugin_install.installTextIfSafe(io, allocator, stance, stage_stance_path, false);
+
+    const marker_path = try std.fs.path.join(allocator, &.{ destination_dir, hermes_unattended_marker_filename });
+    defer allocator.free(marker_path);
+    const stage_marker_path = try std.fs.path.join(allocator, &.{ stage, hermes_unattended_marker_filename });
+    defer allocator.free(stage_marker_path);
+    if (std.Io.Dir.cwd().access(io, marker_path, .{})) |_| {
+        const marker = try std.Io.Dir.cwd().readFileAlloc(io, marker_path, allocator, .limited(8 * 1024));
+        defer allocator.free(marker);
+        _ = try plugin_install.installTextIfSafe(io, allocator, marker, stage_marker_path, false);
+    } else |_| {}
+
+    // Revalidate ownership after the complete replacement tree is staged and
+    // immediately before any destination rename. This rejects a destination
+    // that changed during source preparation instead of moving it to backup
+    // based only on the initial preflight result.
+    if (!hermesManagedDestination(io, allocator, destination_dir)) return error.RefusingToOverwriteUnownedPlugin;
+    if (!existing and dirExists(destination_dir)) return error.HermesDestinationAppeared;
+
+    if (!existing) {
+        try std.Io.Dir.renameAbsolute(stage, destination_dir, io);
+        stage_owned = false;
+        return true;
+    }
+
+    const backup = try std.fmt.allocPrint(allocator, "{s}/.ryk-hermes-backup-{d}", .{ parent, stamp });
+    defer allocator.free(backup);
+    try std.Io.Dir.renameAbsolute(destination_dir, backup, io);
+    errdefer std.Io.Dir.renameAbsolute(backup, destination_dir, io) catch {};
+    try std.Io.Dir.renameAbsolute(stage, destination_dir, io);
+    stage_owned = false;
+    std.Io.Dir.cwd().deleteTree(io, backup) catch {};
+    return true;
+}
+
 pub fn filesEqual(allocator: std.mem.Allocator, lhs_path: []const u8, rhs_path: []const u8) !bool {
     var threaded: std.Io.Threaded = .init_single_threaded;
     const io = threaded.io();
@@ -2176,18 +2466,372 @@ pub fn filesEqual(allocator: std.mem.Allocator, lhs_path: []const u8, rhs_path: 
     return std.mem.eql(u8, lhs, rhs);
 }
 
-pub fn runOpenClawInstall(allocator: std.mem.Allocator, plugin_dir: []const u8) !u8 {
-    const argv = [_][]const u8{ "openclaw", "plugins", "install", plugin_dir };
+pub fn runOpenClawInstall(allocator: std.mem.Allocator, host_binary: []const u8, plugin_dir: []const u8) !u8 {
+    // The source is the reviewed bundle shipped inside the curl-installed ryk
+    // distribution. Current OpenClaw requires --force for non-interactive local
+    // source confirmation and uses it to replace the same installed id safely.
+    const argv = [_][]const u8{ host_binary, "plugins", "install", plugin_dir, "--force" };
     const result = try child_process.runHostCommandTimed(allocator, &argv, 10_000, null, null);
     defer child_process.deinitHostCommandResult(result, allocator);
     return if (result.timed_out) 255 else result.exit_code;
 }
 
-pub fn runHermesEnable(allocator: std.mem.Allocator) !u8 {
-    const argv = [_][]const u8{ "hermes", "plugins", "enable", "ryk" };
+pub fn runOpenClawConfigureWorkspace(allocator: std.mem.Allocator, host_binary: []const u8, workspace_root: []const u8) !u8 {
+    const argv = [_][]const u8{
+        host_binary,
+        "config",
+        "set",
+        "plugins.entries.ryk.config.workspaceRoot",
+        workspace_root,
+    };
     const result = try child_process.runHostCommandTimed(allocator, &argv, 10_000, null, null);
     defer child_process.deinitHostCommandResult(result, allocator);
     return if (result.timed_out) 255 else result.exit_code;
+}
+
+/// Read back the value written by the upstream OpenClaw config command. A
+/// successful writer exit alone is not evidence that the binding persisted.
+pub fn runOpenClawWorkspaceBindingMatches(allocator: std.mem.Allocator, host_binary: []const u8, workspace_root: []const u8) !bool {
+    const argv = [_][]const u8{
+        host_binary,
+        "config",
+        "get",
+        "plugins.entries.ryk.config.workspaceRoot",
+        "--json",
+    };
+    var result = try child_process.runHostCommandCaptureTimed(allocator, &argv, 10_000);
+    defer result.deinit(allocator);
+    if (result.timed_out or result.output_overflow or result.exit_code != 0) return false;
+    const configured = parseOpenClawWorkspaceBinding(allocator, result.stdout) catch return false;
+    defer allocator.free(configured);
+    return openClawWorkspaceBindingMatches(workspace_root, configured);
+}
+
+pub fn openClawWorkspaceBindingMatches(expected_root: []const u8, configured_root: []const u8) bool {
+    return std.fs.path.isAbsolute(expected_root) and
+        std.fs.path.isAbsolute(configured_root) and
+        std.mem.eql(u8, expected_root, configured_root);
+}
+
+pub fn parseOpenClawWorkspaceBinding(allocator: std.mem.Allocator, output: []const u8) ![]u8 {
+    const text = std.mem.trim(u8, output, " \t\r\n");
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, text, .{});
+    defer parsed.deinit();
+    if (parsed.value != .string or !std.fs.path.isAbsolute(parsed.value.string)) return error.InvalidOpenClawWorkspaceBinding;
+    return allocator.dupe(u8, parsed.value.string);
+}
+
+fn openClawInstalledRootFromInspection(allocator: std.mem.Allocator, output: []const u8) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, std.mem.trim(u8, output, " \t\r\n"), .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidOpenClawInspection;
+    const plugin_value = parsed.value.object.get("plugin") orelse return error.InvalidOpenClawInspection;
+    if (plugin_value != .object) return error.InvalidOpenClawInspection;
+    const root_value = plugin_value.object.get("rootDir") orelse return error.InvalidOpenClawInspection;
+    if (root_value != .string or !std.fs.path.isAbsolute(root_value.string)) return error.InvalidOpenClawInspection;
+    return allocator.dupe(u8, root_value.string);
+}
+
+fn openClawBundleReceiptField(receipt: []const u8, key: []const u8) ?[]const u8 {
+    var lines = std.mem.splitScalar(u8, receipt, '\n');
+    if (!std.mem.eql(u8, std.mem.trim(u8, lines.next() orelse return null, "\r"), "ryk-openclaw-managed-v1")) return null;
+    var found: ?[]const u8 = null;
+    while (lines.next()) |line| {
+        const clean = std.mem.trim(u8, line, "\r");
+        if (clean.len == 0) continue;
+        if (std.mem.startsWith(u8, clean, key) and clean.len > key.len and clean[key.len] == '=') {
+            if (found != null) return null;
+            found = clean[key.len + 1 ..];
+        }
+    }
+    return found;
+}
+
+fn openClawRegularFileNoSymlink(io: std.Io, allocator: std.mem.Allocator, root: []const u8, name: []const u8) bool {
+    const path = std.fs.path.join(allocator, &.{ root, name }) catch return false;
+    defer allocator.free(path);
+    const stat = std.Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch return false;
+    return stat.kind == .file;
+}
+
+fn openClawInstalledRootMatches(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    installed_root: []const u8,
+    bundled_root: []const u8,
+) bool {
+    const canonical = std.Io.Dir.cwd().realPathFileAlloc(io, installed_root, allocator) catch return false;
+    defer allocator.free(canonical);
+    if (!std.mem.eql(u8, canonical, installed_root)) return false;
+    if (!openClawRegularFileNoSymlink(io, allocator, installed_root, openclaw_managed_receipt_filename)) return false;
+    const receipt_path = std.fs.path.join(allocator, &.{ installed_root, openclaw_managed_receipt_filename }) catch return false;
+    defer allocator.free(receipt_path);
+    const receipt = std.Io.Dir.cwd().readFileAlloc(io, receipt_path, allocator, .limited(16 * 1024)) catch return false;
+    defer allocator.free(receipt);
+    const path = openClawBundleReceiptField(receipt, "path") orelse return false;
+    if (!std.mem.eql(u8, path, canonical)) return false;
+    for (openclaw_bundle_file_names) |name| {
+        const expected_path = std.fs.path.join(allocator, &.{ bundled_root, name }) catch return false;
+        defer allocator.free(expected_path);
+        const installed_path = std.fs.path.join(allocator, &.{ installed_root, name }) catch return false;
+        defer allocator.free(installed_path);
+        if (!openClawRegularFileNoSymlink(io, allocator, bundled_root, name) or
+            !openClawRegularFileNoSymlink(io, allocator, installed_root, name)) return false;
+        const expected = std.Io.Dir.cwd().readFileAlloc(io, expected_path, allocator, .limited(16 * 1024 * 1024)) catch return false;
+        defer allocator.free(expected);
+        const installed = std.Io.Dir.cwd().readFileAlloc(io, installed_path, allocator, .limited(16 * 1024 * 1024)) catch return false;
+        defer allocator.free(installed);
+        const hash = sha256Hex(expected);
+        const key = std.fmt.allocPrint(allocator, "{s}_sha256", .{name}) catch return false;
+        defer allocator.free(key);
+        const recorded = openClawBundleReceiptField(receipt, key) orelse return false;
+        if (!std.mem.eql(u8, recorded, &hash) or !std.mem.eql(u8, expected, installed)) return false;
+    }
+    return true;
+}
+
+/// Write a Ryk-authored receipt after OpenClaw reports the actual installed
+/// root. Health later compares the installed files with the reviewed bundle,
+/// so a receipt containing hashes of modified host files cannot self-authorize.
+pub fn writeOpenClawManagedReceipt(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    host_binary: []const u8,
+    bundled_root: []const u8,
+) !void {
+    const output = try captureChildOutputTimed(allocator, &.{ host_binary, "plugins", "inspect", "ryk", "--json" }, 10_000);
+    defer allocator.free(output);
+    const installed_root = try openClawInstalledRootFromInspection(allocator, output);
+    defer allocator.free(installed_root);
+    const canonical = try std.Io.Dir.cwd().realPathFileAlloc(io, installed_root, allocator);
+    defer allocator.free(canonical);
+    if (!std.mem.eql(u8, canonical, installed_root)) return error.RefusingSymlinkPluginPath;
+
+    var hashes: [openclaw_bundle_file_names.len][64]u8 = undefined;
+    for (openclaw_bundle_file_names, 0..) |name, index| {
+        const path = try std.fs.path.join(allocator, &.{ bundled_root, name });
+        defer allocator.free(path);
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(16 * 1024 * 1024));
+        defer allocator.free(bytes);
+        hashes[index] = sha256Hex(bytes);
+    }
+    const receipt = try std.fmt.allocPrint(
+        allocator,
+        "ryk-openclaw-managed-v1\npath={s}\nopenclaw.plugin.json_sha256={s}\npackage.json_sha256={s}\ndist/index.js_sha256={s}\ndist/index.d.ts_sha256={s}\n",
+        .{ canonical, &hashes[0], &hashes[1], &hashes[2], &hashes[3] },
+    );
+    defer allocator.free(receipt);
+    const receipt_path = try std.fs.path.join(allocator, &.{ installed_root, openclaw_managed_receipt_filename });
+    defer allocator.free(receipt_path);
+    _ = try plugin_install.installTextIfSafe(io, allocator, receipt, receipt_path, true);
+}
+
+pub fn openClawInstalledBundleMatches(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    inspection: []const u8,
+    bundled_root: []const u8,
+) bool {
+    const installed_root = openClawInstalledRootFromInspection(allocator, inspection) catch return false;
+    defer allocator.free(installed_root);
+    return openClawInstalledRootMatches(io, allocator, installed_root, bundled_root);
+}
+
+pub fn resolveOpenClawBundleRoot(io: std.Io, allocator: std.mem.Allocator) ![]u8 {
+    return resolveBundledPath(io, allocator, "integrations/openclaw-plugin");
+}
+
+test "OpenClaw workspace binding accepts only the canonical configured root" {
+    try std.testing.expect(openClawWorkspaceBindingMatches("/workspace/project", "/workspace/project"));
+    try std.testing.expect(!openClawWorkspaceBindingMatches("/workspace/project", "/workspace/other"));
+    try std.testing.expect(!openClawWorkspaceBindingMatches("/workspace/project", "project"));
+}
+
+test "OpenClaw workspace binding readback requires an absolute JSON string" {
+    const binding = try parseOpenClawWorkspaceBinding(std.testing.allocator, "\"/workspace/project\"\n");
+    defer std.testing.allocator.free(binding);
+    try std.testing.expectEqualStrings("/workspace/project", binding);
+    try std.testing.expectError(
+        error.InvalidOpenClawWorkspaceBinding,
+        parseOpenClawWorkspaceBinding(std.testing.allocator, "\"relative\"\n"),
+    );
+    try std.testing.expectError(
+        error.InvalidOpenClawWorkspaceBinding,
+        parseOpenClawWorkspaceBinding(std.testing.allocator, "null\n"),
+    );
+}
+
+test "OpenClaw config binding is exact, idempotent, read-back verified, and failure propagates" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const script = try std.fs.path.join(std.testing.allocator, &.{ root, "openclaw" });
+    defer std.testing.allocator.free(script);
+    const script_body = "#!/bin/sh\n" ++
+        "state=\"$(dirname \"$0\")/state\"\n" ++
+        "if [ \"$1\" = config ] && [ \"$2\" = set ]; then printf '%s' \"$*\" > \"$(dirname \"$0\")/argv\"; printf '%s' \"$4\" > \"$state\"; exit 0; fi\n" ++
+        "if [ \"$1\" = config ] && [ \"$2\" = get ]; then printf '\\\"%s\\\"\\n' \"$(cat \"$state\")\"; exit 0; fi\n" ++
+        "exit 23\n";
+    var file = try std.Io.Dir.cwd().createFile(std.testing.io, script, .{});
+    try file.writeStreamingAll(std.testing.io, script_body);
+    if (builtin.os.tag != .windows) try file.setPermissions(std.testing.io, .executable_file);
+    file.close(std.testing.io);
+
+    try std.testing.expectEqual(@as(u8, 0), try runOpenClawConfigureWorkspace(std.testing.allocator, script, root));
+    try std.testing.expect(try runOpenClawWorkspaceBindingMatches(std.testing.allocator, script, root));
+    const state_path = try std.fs.path.join(std.testing.allocator, &.{ root, "state" });
+    defer std.testing.allocator.free(state_path);
+    var state_file = try std.Io.Dir.cwd().createFile(std.testing.io, state_path, .{ .truncate = true });
+    defer state_file.close(std.testing.io);
+    try state_file.writeStreamingAll(std.testing.io, "/wrong/workspace");
+    try std.testing.expect(!try runOpenClawWorkspaceBindingMatches(std.testing.allocator, script, root));
+    const argv_path = try std.fs.path.join(std.testing.allocator, &.{ root, "argv" });
+    defer std.testing.allocator.free(argv_path);
+    const argv_log = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, argv_path, std.testing.allocator, .limited(1024));
+    defer std.testing.allocator.free(argv_log);
+    var expected_log_buf: [std.fs.max_path_bytes + 128]u8 = undefined;
+    const expected_log = try std.fmt.bufPrint(&expected_log_buf, "config set plugins.entries.ryk.config.workspaceRoot {s}", .{root});
+    try std.testing.expectEqualStrings(expected_log, argv_log);
+    try std.testing.expectEqual(@as(u8, 0), try runOpenClawConfigureWorkspace(std.testing.allocator, script, root));
+    try std.testing.expect(try runOpenClawWorkspaceBindingMatches(std.testing.allocator, script, root));
+
+    const failing = try std.fs.path.join(std.testing.allocator, &.{ root, "openclaw-fail" });
+    defer std.testing.allocator.free(failing);
+    var failing_file = try std.Io.Dir.cwd().createFile(std.testing.io, failing, .{});
+    try failing_file.writeStreamingAll(std.testing.io, "#!/bin/sh\nexit 23\n");
+    if (builtin.os.tag != .windows) try failing_file.setPermissions(std.testing.io, .executable_file);
+    failing_file.close(std.testing.io);
+    try std.testing.expectEqual(@as(u8, 23), try runOpenClawConfigureWorkspace(std.testing.allocator, failing, root));
+}
+
+test "OpenClaw installed bundle requires an exact receipt-bound reviewed tree" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "bundled/dist");
+    try tmp.dir.createDirPath(std.testing.io, "installed/dist");
+
+    const data = [_][]const u8{
+        "{\"id\":\"ryk\"}\n",
+        "{\"name\":\"ryk\"}\n",
+        "export const hook = true;\n",
+        "export declare const hook: boolean;\n",
+    };
+    for (openclaw_bundle_file_names, 0..) |name, index| {
+        const bundled_path = try std.fmt.allocPrint(std.testing.allocator, "bundled/{s}", .{name});
+        defer std.testing.allocator.free(bundled_path);
+        const installed_path = try std.fmt.allocPrint(std.testing.allocator, "installed/{s}", .{name});
+        defer std.testing.allocator.free(installed_path);
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = bundled_path, .data = data[index] });
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = installed_path, .data = data[index] });
+    }
+
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const bundled = try std.fs.path.join(std.testing.allocator, &.{ root, "bundled" });
+    defer std.testing.allocator.free(bundled);
+    const installed = try std.fs.path.join(std.testing.allocator, &.{ root, "installed" });
+    defer std.testing.allocator.free(installed);
+
+    var hashes: [openclaw_bundle_file_names.len][64]u8 = undefined;
+    for (data, 0..) |bytes, index| hashes[index] = sha256Hex(bytes);
+    const receipt = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "ryk-openclaw-managed-v1\npath={s}\nopenclaw.plugin.json_sha256={s}\npackage.json_sha256={s}\ndist/index.js_sha256={s}\ndist/index.d.ts_sha256={s}\n",
+        .{ installed, &hashes[0], &hashes[1], &hashes[2], &hashes[3] },
+    );
+    defer std.testing.allocator.free(receipt);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "installed/.ryk-managed-openclaw-v1", .data = receipt });
+
+    try std.testing.expect(openClawInstalledRootMatches(std.testing.io, std.testing.allocator, installed, bundled));
+    try tmp.dir.deleteFile(std.testing.io, "installed/dist/index.js");
+    try tmp.dir.symLink(std.testing.io, "../../bundled/dist/index.js", "installed/dist/index.js", .{});
+    try std.testing.expect(!openClawInstalledRootMatches(std.testing.io, std.testing.allocator, installed, bundled));
+    try tmp.dir.deleteFile(std.testing.io, "installed/dist/index.js");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "installed/dist/index.js", .data = "tampered\n" });
+    try std.testing.expect(!openClawInstalledRootMatches(std.testing.io, std.testing.allocator, installed, bundled));
+}
+
+pub fn runHermesEnable(allocator: std.mem.Allocator, host_binary: []const u8) !u8 {
+    const argv = [_][]const u8{ host_binary, "plugins", "enable", "ryk" };
+    const result = try child_process.runHostCommandTimed(allocator, &argv, 10_000, null, null);
+    defer child_process.deinitHostCommandResult(result, allocator);
+    return if (result.timed_out) 255 else result.exit_code;
+}
+
+fn hermesManagedDestination(io: std.Io, allocator: std.mem.Allocator, plugin_dir: []const u8) bool {
+    if (!dirExists(plugin_dir)) return true;
+    const canonical = std.Io.Dir.cwd().realPathFileAlloc(io, plugin_dir, allocator) catch return false;
+    defer allocator.free(canonical);
+    if (!std.mem.eql(u8, canonical, plugin_dir)) return false;
+    return hermesReceiptMatches(io, allocator, plugin_dir) or
+        hermesPreflightMarkerMatches(io, allocator, plugin_dir) or
+        hermesLegacyBundleMatches(io, allocator, plugin_dir);
+}
+
+/// Write the unattended stance before the Hermes adapter is installed or
+/// enabled. This closes the activation window where an inherited fail-open
+/// override could otherwise win.
+pub fn prepareHermesUnattendedInstall(io: std.Io, allocator: std.mem.Allocator) !void {
+    const plugin_dir = try hermesUserPluginRoot(allocator);
+    defer allocator.free(plugin_dir);
+    if (!hermesManagedDestination(io, allocator, plugin_dir)) return error.RefusingToOverwriteUnownedPlugin;
+    const stance_path = try std.fs.path.join(allocator, &.{ plugin_dir, host_status.hermes_fail_stance_filename });
+    defer allocator.free(stance_path);
+    _ = try plugin_install.installTextIfSafe(
+        io,
+        allocator,
+        "fail-closed\n# Managed by `ryk agents setup hermes`; unattended marker overrides fail-open env.\n",
+        stance_path,
+        true,
+    );
+    const marker_path = try std.fs.path.join(allocator, &.{ plugin_dir, ".ryk_unattended" });
+    defer allocator.free(marker_path);
+    const canonical_plugin_dir = try std.Io.Dir.cwd().realPathFileAlloc(io, plugin_dir, allocator);
+    defer allocator.free(canonical_plugin_dir);
+    const marker = try std.fmt.allocPrint(
+        allocator,
+        "ryk-hermes-unattended-v1\npath={s}\n",
+        .{canonical_plugin_dir},
+    );
+    defer allocator.free(marker);
+    _ = try plugin_install.installTextIfSafe(
+        io,
+        allocator,
+        marker,
+        marker_path,
+        true,
+    );
+}
+
+fn runHermesDisableLegacy(allocator: std.mem.Allocator, host_binary: []const u8) !u8 {
+    const argv = [_][]const u8{ host_binary, "plugins", "disable", "orca" };
+    const result = try child_process.runHostCommandTimed(allocator, &argv, 10_000, null, null);
+    defer child_process.deinitHostCommandResult(result, allocator);
+    return if (result.timed_out) 255 else result.exit_code;
+}
+
+/// Persist the no-human stance after `ryk agents setup hermes`. This marker
+/// outranks attended fail-open environment overrides in the Hermes adapter.
+/// The exact legacy ryk-owned `orca` plugin is disabled to avoid two veto
+/// callbacks with discovery-order-dependent behavior.
+pub fn hardenHermesUnattendedInstall(io: std.Io, allocator: std.mem.Allocator) !void {
+    try prepareHermesUnattendedInstall(io, allocator);
+    const plugin_dir = try hermesUserPluginRoot(allocator);
+    defer allocator.free(plugin_dir);
+
+    const plugins_root = std.fs.path.dirname(plugin_dir) orelse return;
+    const legacy_manifest = try std.fs.path.join(allocator, &.{ plugins_root, "orca", "plugin.yaml" });
+    defer allocator.free(legacy_manifest);
+    const legacy_is_ryk = fileContains(allocator, legacy_manifest, "name: orca") and
+        fileContains(allocator, legacy_manifest, "ryk runtime guardrails");
+    if (legacy_is_ryk) {
+        const host_binary = try trustedHostBinary(io, allocator, "hermes");
+        defer if (host_binary) |path| allocator.free(path);
+        if (host_binary == null or try runHermesDisableLegacy(allocator, host_binary.?) != 0)
+            return error.LegacyHermesDisableFailed;
+    }
 }
 
 pub fn fileContains(allocator: std.mem.Allocator, path: []const u8, needle: []const u8) bool {
@@ -2239,6 +2883,174 @@ pub fn binaryInPath(io: std.Io, allocator: std.mem.Allocator, binary_name: []con
     const path_value = path_owned orelse return false;
     defer allocator.free(path_value);
     return binaryOnSearchPath(io, allocator, path_value, binary_name);
+}
+
+fn pathIsWithin(root: []const u8, candidate: []const u8) bool {
+    if (root.len == 0) return false;
+    if (std.mem.eql(u8, root, candidate)) return true;
+    if (!std.mem.startsWith(u8, candidate, root) or candidate.len <= root.len) return false;
+    return candidate[root.len] == std.fs.path.sep;
+}
+
+/// Resolve a host executable once and pin health probes to its canonical path.
+/// Workspace and temporary binaries are rejected, as are group/world-writable
+/// executables, so a PATH-prepended self-reporting script cannot make health
+/// claim that a host is ready.
+pub fn resolveTrustedHostBinary(io: std.Io, allocator: std.mem.Allocator, binary_name: []const u8) !?[:0]u8 {
+    var env_map = try env_util.createProcessMap(allocator);
+    defer env_map.deinit();
+    const path_owned = (try env_util.getOwned(&env_map, allocator, "PATH")) orelse return null;
+    defer allocator.free(path_owned);
+    const tmp_owned = try env_util.getOwned(&env_map, allocator, "TMPDIR");
+    defer if (tmp_owned) |path| allocator.free(path);
+    const home_owned = try env_util.getOwned(&env_map, allocator, "HOME");
+    defer if (home_owned) |path| allocator.free(path);
+    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(cwd);
+
+    return resolveTrustedHostBinaryOnSearchPath(io, allocator, path_owned, binary_name, cwd, tmp_owned, home_owned);
+}
+
+fn versionTupleAtLeast(actual: [3]u32, minimum: [3]u32) bool {
+    for (actual, minimum) |a, b| {
+        if (a != b) return a > b;
+    }
+    return true;
+}
+
+fn parseThreePartVersion(output: []const u8, prefix: []const u8) ?[3]u32 {
+    const start = (std.mem.indexOf(u8, output, prefix) orelse return null) + prefix.len;
+    const tail = output[start..];
+    const end = std.mem.indexOfAny(u8, tail, " \t\r\n") orelse tail.len;
+    var parts = std.mem.splitScalar(u8, tail[0..end], '.');
+    var version: [3]u32 = undefined;
+    for (&version) |*part| part.* = std.fmt.parseInt(u32, parts.next() orelse return null, 10) catch return null;
+    if (parts.next() != null) return null;
+    return version;
+}
+
+pub fn hostBinaryIdentityMatchesTimed(allocator: std.mem.Allocator, host: []const u8, binary: []const u8, timeout_ms: u32) bool {
+    // Prefer join-parent so agents-health nested probes stay in the worker's
+    // process group (outer SIGKILL cannot orphan host --version CLIs). Fall
+    // back to a private group only when join-parent is unavailable (Windows).
+    var result = if (comptime builtin.os.tag == .windows)
+        child_process.runHostCommandCaptureTimed(allocator, &.{ binary, "--version" }, timeout_ms) catch return false
+    else
+        child_process.runHostCommandCaptureTimedInCurrentProcessGroup(allocator, &.{ binary, "--version" }, timeout_ms) catch return false;
+    defer result.deinit(allocator);
+    if (result.timed_out or result.output_overflow or result.exit_code != 0) return false;
+    if (std.mem.eql(u8, host, "openclaw")) {
+        const version = parseThreePartVersion(result.stdout, "OpenClaw ") orelse return false;
+        return versionTupleAtLeast(version, .{ 2026, 8, 1 });
+    }
+    if (std.mem.eql(u8, host, "hermes")) {
+        const version = parseThreePartVersion(result.stdout, "Hermes Agent v") orelse return false;
+        return versionTupleAtLeast(version, .{ 0, 19, 1 });
+    }
+    return false;
+}
+
+pub fn hostBinaryIdentityMatches(allocator: std.mem.Allocator, host: []const u8, binary: []const u8) bool {
+    return hostBinaryIdentityMatchesTimed(allocator, host, binary, 3_000);
+}
+
+pub fn trustedHostBinary(io: std.Io, allocator: std.mem.Allocator, host: []const u8) !?[:0]u8 {
+    return trustedHostBinaryTimed(io, allocator, host, 3_000);
+}
+
+pub fn trustedHostBinaryTimed(io: std.Io, allocator: std.mem.Allocator, host: []const u8, timeout_ms: u32) !?[:0]u8 {
+    const binary = try resolveTrustedHostBinary(io, allocator, host) orelse return null;
+    if (!hostBinaryIdentityMatchesTimed(allocator, host, binary, timeout_ms)) {
+        allocator.free(binary);
+        return null;
+    }
+    return binary;
+}
+
+fn trustedHostInstallLocation(allocator: std.mem.Allocator, host: []const u8, canonical: []const u8, home: ?[]const u8) bool {
+    const system_roots = [_][]const u8{
+        "/bin",
+        "/usr/bin",
+        "/usr/local/bin",
+        "/opt/homebrew/bin",
+        "/usr/lib/node_modules/openclaw",
+        "/usr/local/lib/node_modules/openclaw",
+        "/opt/homebrew/lib/node_modules/openclaw",
+    };
+    for (system_roots) |root| {
+        if (pathIsWithin(root, canonical)) return true;
+    }
+    const home_path = home orelse return false;
+    // OpenClaw official git/installer layouts land the CLI wrapper in
+    // ~/.local/bin and the package under ~/.local/src/openclaw. Hermes already
+    // trusted ~/.local/bin; keep OpenClaw on the same managed PATH root plus
+    // legacy npm-global trees.
+    const relative_roots: []const []const u8 = if (std.mem.eql(u8, host, "hermes"))
+        &.{ ".local/bin", ".hermes/hermes-agent/venv/bin" }
+    else if (std.mem.eql(u8, host, "openclaw"))
+        &.{
+            ".local/bin",
+            ".local/src/openclaw",
+            ".local/lib/node_modules/openclaw",
+            ".npm-global/lib/node_modules/openclaw",
+        }
+    else
+        &.{};
+    for (relative_roots) |relative| {
+        const root = std.fs.path.join(allocator, &.{ home_path, relative }) catch continue;
+        defer allocator.free(root);
+        if (pathIsWithin(root, canonical)) return true;
+    }
+    return false;
+}
+
+fn resolveTrustedHostBinaryOnSearchPath(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    path_value: []const u8,
+    binary_name: []const u8,
+    cwd: []const u8,
+    tmp_root: ?[]const u8,
+    home: ?[]const u8,
+) !?[:0]u8 {
+    var parts = std.mem.splitScalar(u8, path_value, std.fs.path.delimiter);
+    while (parts.next()) |dir| {
+        if (dir.len == 0) continue;
+        const suffixes: []const []const u8 = if (builtin.os.tag == .windows) &.{ "", ".exe" } else &.{""};
+        for (suffixes) |suffix| {
+            const name = try std.fmt.allocPrint(allocator, "{s}{s}", .{ binary_name, suffix });
+            defer allocator.free(name);
+            const candidate = try std.fs.path.join(allocator, &.{ dir, name });
+            defer allocator.free(candidate);
+            const canonical = std.Io.Dir.cwd().realPathFileAlloc(io, candidate, allocator) catch continue;
+            errdefer allocator.free(canonical);
+            const stat = std.Io.Dir.cwd().statFile(io, canonical, .{}) catch {
+                allocator.free(canonical);
+                continue;
+            };
+            if (stat.kind != .file or pathIsWithin(cwd, canonical) or
+                pathIsWithin("/tmp", canonical) or pathIsWithin("/private/tmp", canonical) or
+                (tmp_root != null and pathIsWithin(std.mem.trimEnd(u8, tmp_root.?, "/"), canonical)) or
+                !trustedHostInstallLocation(allocator, binary_name, canonical, home))
+            {
+                allocator.free(canonical);
+                continue;
+            }
+            if (builtin.os.tag != .windows) {
+                const mode = stat.permissions.toMode();
+                if ((mode & 0o111) == 0 or (mode & 0o022) != 0) {
+                    allocator.free(canonical);
+                    continue;
+                }
+                if (daemon_trust.assessEnvOverridePath(io, allocator, canonical) != .trusted) {
+                    allocator.free(canonical);
+                    continue;
+                }
+            }
+            return canonical;
+        }
+    }
+    return null;
 }
 
 pub fn writeJsonString(writer: anytype, value: []const u8) !void {
@@ -2540,6 +3352,61 @@ test "binaryOnSearchPath finds names on a synthetic PATH" {
     try std.testing.expect(binaryOnSearchPath(io, allocator, dir_path, "fake-host-bin"));
 }
 
+test "trusted host resolution rejects a temporary self-reporting binary" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    try tmp.dir.writeFile(io, .{ .sub_path = "openclaw", .data = "#!/bin/sh\nexit 0\n" });
+    const tmp_path = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(tmp_path);
+    const fake_path = try std.fs.path.join(allocator, &.{ tmp_path, "openclaw" });
+    defer allocator.free(fake_path);
+    const fake_path_z = try allocator.dupeZ(u8, fake_path);
+    defer allocator.free(fake_path_z);
+    if (std.c.chmod(fake_path_z.ptr, 0o755) != 0) return error.SkipZigTest;
+
+    const resolved = try resolveTrustedHostBinaryOnSearchPath(
+        io,
+        allocator,
+        tmp_path,
+        "openclaw",
+        "/workspace",
+        tmp_path,
+        "/home/test",
+    );
+    defer if (resolved) |path| allocator.free(path);
+    try std.testing.expect(resolved == null);
+}
+
+test "trusted host resolver preserves canonical path allocation ownership" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const resolved = try resolveTrustedHostBinary(std.testing.io, std.testing.allocator, "sh");
+    defer if (resolved) |path| std.testing.allocator.free(path);
+    try std.testing.expect(resolved != null);
+    try std.testing.expect(std.fs.path.isAbsolute(resolved.?));
+}
+
+test "trusted host version parsing enforces the verified OpenClaw floor" {
+    try std.testing.expectEqual([3]u32{ 2026, 8, 1 }, parseThreePartVersion("OpenClaw 2026.8.1 (abc)", "OpenClaw ").?);
+    try std.testing.expect(versionTupleAtLeast(.{ 2026, 8, 1 }, .{ 2026, 8, 1 }));
+    try std.testing.expect(versionTupleAtLeast(.{ 2026, 9, 0 }, .{ 2026, 8, 1 }));
+    try std.testing.expect(!versionTupleAtLeast(.{ 2026, 3, 13 }, .{ 2026, 8, 1 }));
+    try std.testing.expect(parseThreePartVersion("not OpenClaw", "OpenClaw ") == null);
+    try std.testing.expect(versionTupleAtLeast(parseThreePartVersion("Hermes Agent v0.19.1", "Hermes Agent v").?, .{ 0, 19, 1 }));
+    try std.testing.expect(!versionTupleAtLeast(parseThreePartVersion("Hermes Agent v0.19.0", "Hermes Agent v").?, .{ 0, 19, 1 }));
+}
+
+test "trusted host locations reject arbitrary home PATH entries" {
+    try std.testing.expect(!trustedHostInstallLocation(std.testing.allocator, "openclaw", "/home/test/fake-bin/openclaw", "/home/test"));
+    try std.testing.expect(trustedHostInstallLocation(std.testing.allocator, "hermes", "/home/test/.local/bin/hermes", "/home/test"));
+    try std.testing.expect(trustedHostInstallLocation(std.testing.allocator, "openclaw", "/opt/homebrew/lib/node_modules/openclaw/openclaw.mjs", "/home/test"));
+    // Official git/installer OpenClaw: wrapper in ~/.local/bin and package under ~/.local/src/openclaw.
+    try std.testing.expect(trustedHostInstallLocation(std.testing.allocator, "openclaw", "/home/test/.local/bin/openclaw", "/home/test"));
+    try std.testing.expect(trustedHostInstallLocation(std.testing.allocator, "openclaw", "/home/test/.local/src/openclaw/dist/entry.js", "/home/test"));
+}
+
 test "plugin doctor --json emits valid JSON" {
     var stdout_buf: [16384]u8 = undefined;
     var stderr_buf: [256]u8 = undefined;
@@ -2634,7 +3501,7 @@ test "plugin doctor openclaw shows openclaw-specific section" {
     try std.testing.expectEqualStrings("", stderr_writer.buffered());
 }
 
-test "plugin doctor openclaw --json includes enforcement_note and hook_grade unverified" {
+test "plugin doctor openclaw --json includes sunset registry note" {
     var stdout_buf: [32768]u8 = undefined;
     var stderr_buf: [256]u8 = undefined;
     var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
@@ -2645,9 +3512,9 @@ test "plugin doctor openclaw --json includes enforcement_note and hook_grade unv
 
     const output = stdout_writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, output, "\"enforcement_note\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "unprotected") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "sunset") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "\"hook_grade\": \"unverified\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "\"npm_path\": \"unprotected\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"npm_path\": \"sunset\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "hook_enforcing") == null);
     try std.testing.expectEqualStrings("", stderr_writer.buffered());
 }
@@ -2868,6 +3735,9 @@ test "plugin install openclaw --dry-run reports safe preview" {
     try std.testing.expect(std.mem.indexOf(u8, output, "dry-run") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "no changes made") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Target: openclaw") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "curl -fsSL https://rykanv.com/install | sh") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "ryk agents setup openclaw") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "source-checkout development only") != null);
     try std.testing.expectEqualStrings("", stderr_writer.buffered());
 }
 
@@ -2923,6 +3793,156 @@ test "Hermes managed file install rejects symlinked parent and final file" {
     );
     defer std.testing.allocator.free(preserved);
     try std.testing.expectEqualStrings("keep", preserved);
+}
+
+test "Hermes managed file install upgrades stale Ryk-owned content" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "source.py", .data = "current" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "installed.py", .data = "stale" });
+
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const source = try std.fs.path.join(std.testing.allocator, &.{ root, "source.py" });
+    defer std.testing.allocator.free(source);
+    const installed = try std.fs.path.join(std.testing.allocator, &.{ root, "installed.py" });
+    defer std.testing.allocator.free(installed);
+
+    try std.testing.expect(try installManagedFile(std.testing.allocator, source, installed));
+    try std.testing.expect(!(try installManagedFile(std.testing.allocator, source, installed)));
+    const content = try tmp.dir.readFileAlloc(
+        std.testing.io,
+        "installed.py",
+        std.testing.allocator,
+        .limited(64),
+    );
+    defer std.testing.allocator.free(content);
+    try std.testing.expectEqualStrings("current", content);
+}
+
+test "Hermes managed destination requires a path-bound receipt, not copied metadata" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "plugin.yaml",
+        .data = "name: ryk\ndescription: unrelated user plugin\n",
+    });
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    try std.testing.expect(!hermesManagedDestination(std.testing.io, std.testing.allocator, root));
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "plugin.yaml",
+        .data = "name: ryk\ndescription: ryk runtime guardrails for Hermes Agent.\n",
+    });
+    try std.testing.expect(!hermesManagedDestination(std.testing.io, std.testing.allocator, root));
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = ".ryk-managed-v1",
+        .data = "ryk-hermes-managed-v1\npath=/not-this-directory\n",
+    });
+    try std.testing.expect(!hermesManagedDestination(std.testing.io, std.testing.allocator, root));
+}
+
+test "Hermes preflight marker cannot own a populated destination" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "installed");
+
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, "installed", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const marker = try std.fmt.allocPrint(std.testing.allocator, "ryk-hermes-unattended-v1\npath={s}\n", .{root});
+    defer std.testing.allocator.free(marker);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "installed/.ryk_unattended", .data = marker });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".ryk_fail_stance", .data = "fail-closed\n" });
+
+    try std.testing.expect(hermesManagedDestination(std.testing.io, std.testing.allocator, root));
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "installed/attacker.py", .data = "arbitrary\n" });
+    try std.testing.expect(!hermesManagedDestination(std.testing.io, std.testing.allocator, root));
+}
+
+test "Hermes bundle upgrade commits a complete receipt-bound tree and is idempotent" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "source");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "source/plugin.yaml", .data = "name: ryk\nversion: 1\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "source/__init__.py", .data = "source-v1\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "source/mapping.py", .data = "mapping-v1\n" });
+
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const source = try std.fs.path.join(std.testing.allocator, &.{ root, "source" });
+    defer std.testing.allocator.free(source);
+    const destination = try std.fs.path.join(std.testing.allocator, &.{ root, "installed" });
+    defer std.testing.allocator.free(destination);
+
+    try std.testing.expect(try installHermesBundleAtomically(std.testing.io, std.testing.allocator, source, destination));
+    try std.testing.expect(hermesManagedDestination(std.testing.io, std.testing.allocator, destination));
+    try std.testing.expect(!try installHermesBundleAtomically(std.testing.io, std.testing.allocator, source, destination));
+
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "source/plugin.yaml", .data = "name: ryk\nversion: 2\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "source/__init__.py", .data = "source-v2\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "source/mapping.py", .data = "mapping-v2\n" });
+    try std.testing.expect(try installHermesBundleAtomically(std.testing.io, std.testing.allocator, source, destination));
+
+    const installed_names = [_][]const u8{ "plugin.yaml", "__init__.py", "mapping.py" };
+    for (installed_names) |name| {
+        const path = try std.fs.path.join(std.testing.allocator, &.{ destination, name });
+        defer std.testing.allocator.free(path);
+        const contents = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, std.testing.allocator, .limited(1024));
+        defer std.testing.allocator.free(contents);
+        try std.testing.expect(std.mem.indexOf(u8, contents, "v2") != null or std.mem.indexOf(u8, contents, "version: 2") != null);
+    }
+}
+
+test "Hermes managed receipt rejects symlinked adapter files" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "source");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "source/plugin.yaml", .data = "name: ryk\nversion: 1\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "source/__init__.py", .data = "source-v1\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "source/mapping.py", .data = "mapping-v1\n" });
+
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const source = try std.fs.path.join(std.testing.allocator, &.{ root, "source" });
+    defer std.testing.allocator.free(source);
+    const destination = try std.fs.path.join(std.testing.allocator, &.{ root, "installed" });
+    defer std.testing.allocator.free(destination);
+
+    try std.testing.expect(try installHermesBundleAtomically(std.testing.io, std.testing.allocator, source, destination));
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "outside.py", .data = "source-v1\n" });
+    try tmp.dir.deleteFile(std.testing.io, "installed/__init__.py");
+    try tmp.dir.symLink(std.testing.io, "../outside.py", "installed/__init__.py", .{});
+    try std.testing.expect(!hermesManagedDestination(std.testing.io, std.testing.allocator, destination));
+}
+
+test "Hermes bundle staging leaves the installed tree unchanged when a source file fails" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "source");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "source/plugin.yaml", .data = "name: ryk\nversion: 1\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "source/__init__.py", .data = "source-v1\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "source/mapping.py", .data = "mapping-v1\n" });
+
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const source = try std.fs.path.join(std.testing.allocator, &.{ root, "source" });
+    defer std.testing.allocator.free(source);
+    const destination = try std.fs.path.join(std.testing.allocator, &.{ root, "installed" });
+    defer std.testing.allocator.free(destination);
+
+    try std.testing.expect(try installHermesBundleAtomically(std.testing.io, std.testing.allocator, source, destination));
+    try tmp.dir.deleteFile(std.testing.io, "source/mapping.py");
+    try std.testing.expectError(
+        error.FileNotFound,
+        installHermesBundleAtomically(std.testing.io, std.testing.allocator, source, destination),
+    );
+    const preserved = try tmp.dir.readFileAlloc(std.testing.io, "installed/__init__.py", std.testing.allocator, .limited(1024));
+    defer std.testing.allocator.free(preserved);
+    try std.testing.expectEqualStrings("source-v1\n", preserved);
 }
 
 test "plugin install all --dry-run reports all five targets" {

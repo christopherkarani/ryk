@@ -156,7 +156,7 @@ fn parseOptions(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: a
                 return error.Usage;
             }
             const preset = policy_mod.presets.AgentPreset.parse(argv[index]) orelse {
-                try suggestions.writeInvalidValue(stderr, "ryk init", "--preset", argv[index], &.{ "generic-agent", "claude-code", "codex", "cursor-agent", "opencode", "cline-roo", "mcp-dev", "github-actions", "solo-dev", "strict-local", "team-ci", "openclaw-hermes", "trusted-local" }, "init");
+                try suggestions.writeInvalidValue(stderr, "ryk init", "--preset", argv[index], &.{ "generic-agent", "claude-code", "codex", "cursor-agent", "opencode", "cline-roo", "mcp-dev", "github-actions", "solo-dev", "strict-local", "team-ci", "openclaw-hermes", "unattended", "trusted-local" }, "init");
                 return error.Usage;
             };
             options.preset = preset;

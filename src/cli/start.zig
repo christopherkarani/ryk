@@ -77,7 +77,11 @@ pub fn runStart(
     // Auto-select best available setup path — no interactive grade menu.
     // Active protection wording is deferred until after ensure (existing mode may differ).
     const protection = resolveProtectionMode(flags);
-    try stdout.writeAll("Setup path: Ask on risk (auto).\n");
+    if (std.mem.eql(u8, flags.preset, "unattended")) {
+        try stdout.writeAll("Setup path: Unattended fail-closed (auto).\n");
+    } else {
+        try stdout.writeAll("Setup path: Ask on risk (auto).\n");
+    }
     try stdout.writeAll("  Existing policy is preserved; claims below follow the policy file mode.\n\n");
 
     var doctor_report = try plugin.collectPluginDoctorReport(io, allocator);
@@ -242,7 +246,7 @@ pub fn runStart(
 
     try stdout.writeAll("\n");
     if (failures > 0) {
-        try writeFailureSummary(io, stdout, selected_hosts.items, configured_hosts.items, daemon_check, verification, protection_active, policy_mode);
+        try writeFailureSummary(io, stdout, selected_hosts.items, configured_hosts.items, daemon_check, verification, protection_active, flags.preset, policy_mode);
         return exit_codes.general;
     }
 
@@ -489,9 +493,20 @@ fn writeSuccessEndCard(
 ) !void {
     const mode = policy_mode orelse "unknown";
     const ask_equivalent = policyModeIsAskEquivalent(mode);
-    const claim_ready = protectionClaimReady(protection, selected_hosts, verification, ask_equivalent);
+    const unattended = std.mem.eql(u8, preset, "unattended");
+    // Unattended setup may configure a host, but it cannot claim active
+    // protection until the dedicated health command proves live enforcement.
+    const claim_ready = !unattended and protectionClaimReady(protection, selected_hosts, verification, ask_equivalent);
     if (claim_ready) {
         try tui.render.callout(io, stdout, .success, "You're now protected by ryk", "The installed fail-closed integration chain passed verification.");
+    } else if (unattended) {
+        try tui.render.callout(
+            io,
+            stdout,
+            .warn,
+            "Setup complete — unattended activation pending",
+            "Run `ryk agents health --json` before relying on this host while nobody is present.",
+        );
     } else if (!ask_equivalent) {
         // Prefer honest residual over silent overclaim when existing observe/trusted policy was kept.
         const residual_body = try std.fmt.allocPrint(
@@ -560,6 +575,8 @@ fn writeSuccessEndCard(
             const ok = hostInList(host, configured_hosts);
             const mark: []const u8 = if (!ok)
                 "failed"
+            else if (unattended)
+                "configured; run ryk agents health --json"
             else if (std.mem.eql(u8, host, "openclaw"))
                 "configured; wrapper required: ryk run -- openclaw"
             else if (verification) |v|
@@ -618,6 +635,7 @@ fn writeFailureSummary(
     daemon_check: onboarding.DaemonCheck,
     verification: ?onboarding.VerificationOutcome,
     protection_active: bool,
+    preset: []const u8,
     policy_mode: ?[]const u8,
 ) !void {
     try style.maybeColor(io, stdout, style.Style.red, "Setup incomplete");
@@ -631,7 +649,11 @@ fn writeFailureSummary(
             try stdout.print("Protection posture: mode={s} (not Ask)\n", .{mode});
         }
     } else {
-        try stdout.writeAll("Protection posture: setup path Ask on risk (auto); policy mode unread\n");
+        if (std.mem.eql(u8, preset, "unattended")) {
+            try stdout.writeAll("Protection posture: setup path Unattended fail-closed (auto); policy mode unread\n");
+        } else {
+            try stdout.writeAll("Protection posture: setup path Ask on risk (auto); policy mode unread\n");
+        }
     }
     try stdout.print("Protection active now: {s}\n", .{if (protection_active) "partially or fully" else "no"});
     try stdout.print("Daemon: {s} — {s}\n", .{ daemon_check.status.label(), daemon_check.detail });
@@ -792,6 +814,46 @@ test "start OpenClaw completion is explicit about wrapper-required evidence" {
     try std.testing.expect(std.mem.indexOf(u8, written, "You're now protected by ryk") == null);
     try std.testing.expect(std.mem.indexOf(u8, written, "activation evidence pending") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "ryk run -- openclaw") != null);
+}
+
+test "start unattended completion never claims active protection before health" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+
+    const verification = onboarding.VerificationOutcome{
+        .safe_allowed = true,
+        .dangerous_denied = true,
+        .hook_verified = true,
+        .host_evidence = .native,
+        .detail = "setup smoke passed",
+    };
+    const daemon_check = onboarding.DaemonCheck{
+        .status = .compatible,
+        .detail = "in-process",
+        .remediation = "none",
+    };
+    var output_buffer: [16 * 1024]u8 = undefined;
+    var output: std.Io.Writer = .fixed(&output_buffer);
+    try writeSuccessEndCard(
+        std.testing.io,
+        std.testing.allocator,
+        &output,
+        root,
+        "unattended",
+        .command_guard,
+        &.{ "hermes", "openclaw" },
+        &.{ "hermes", "openclaw" },
+        daemon_check,
+        verification,
+        "strict",
+    );
+
+    const written = output.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "You're now protected by ryk") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "unattended activation pending") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "ryk agents health --json") != null);
 }
 
 test "start reports failure when daemon required but unavailable" {

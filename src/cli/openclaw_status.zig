@@ -1,19 +1,22 @@
 //! OpenClaw protection honesty for doctor/install surfaces.
-//! Standing product claim until live-host E2E exists (Wave 1): npm/ClawHub is
-//! unprotected; hook grade is unverified; prefer wrapper `ryk run -- openclaw`.
+//! Standing product claim until live-host E2E exists: the supported OpenClaw
+//! deployment starts with the curl-installed ryk binary and `ryk agents`.
+//! Registry/npm paths are sunset and metadata/discovery passes are unprotected.
 
 const std = @import("std");
 const core = @import("ryk_core").core;
 
 /// Shared enforcement note (plain + JSON). Single source of truth for doctor copy.
 pub const enforcement_note =
-    "unprotected for npm/ClawHub (hooks no-op); prefer wrapper: ryk run -- openclaw";
+    "supported install is curl-installed ryk + ryk agents setup openclaw; npm/ClawHub paths are sunset; metadata/discovery passes are unprotected; prefer wrapper: ryk run -- openclaw";
 
 /// Hook grade until real-host E2E proves veto. Not a boolean "enforcing" claim.
 pub const hook_grade = "unverified";
 
-/// npm/ClawHub install path label (hooks no-op in CLI-metadata mode).
-pub const npm_path_label = "unprotected";
+/// Registry install paths are retained as an explicit sunset marker.
+pub const npm_path_label = "sunset";
+
+pub const supported_install_command = "curl -fsSL https://rykanv.com/install | sh";
 
 /// Preferred protection path (grade wrapper).
 pub const preferred_wrapper = "ryk run -- openclaw";
@@ -22,8 +25,10 @@ pub const preferred_wrapper = "ryk run -- openclaw";
 pub fn writeDoctorHonesty(stdout: anytype) !void {
     try stdout.print("  enforcement: {s}\n", .{enforcement_note});
     try stdout.writeAll("  hook grade: unverified (no live host E2E); installed != protected\n");
-    try stdout.writeAll("  install: use 'ryk plugin install openclaw --dry-run' to preview (plumbing only)\n");
-    try stdout.writeAll("  note: npm/ClawHub package ryk-openclaw-plugin is published for distribution; not an enforcement install\n");
+    try stdout.print("  supported install: {s}\n", .{supported_install_command});
+    try stdout.writeAll("  next: ryk agents setup openclaw\n");
+    try stdout.writeAll("  note: npm/ClawHub distribution is sunset; CLI metadata/discovery passes are unprotected\n");
+    try stdout.writeAll("  verify: ryk agents health openclaw --json (receipt-bound bundle + runtime inspection + Gateway identity + tools.invoke canary)\n");
 }
 
 /// Append OpenClaw honesty fields inside an existing `openclaw_paths` JSON object
@@ -43,17 +48,18 @@ pub fn writePathsJsonHonesty(stdout: anytype) !void {
 /// Install-path guidance (dry-run / install openclaw).
 pub fn writeInstallPaths(stdout: anytype) !void {
     try stdout.writeAll("  install paths for OpenClaw:\n");
-    try stdout.print("    preferred protection: {s}  (wrapper; not npm)\n", .{preferred_wrapper});
-    try stdout.writeAll("    local:   openclaw plugins install ./integrations/openclaw-plugin\n");
-    try stdout.writeAll("    npm:     openclaw plugins install npm:ryk-openclaw-plugin (published; unprotected — hooks no-op)\n");
-    try stdout.writeAll("    clawhub: openclaw plugins install clawhub:ryk-openclaw-plugin (published; unprotected — hooks no-op)\n");
+    try stdout.print("    supported: {s}\n", .{supported_install_command});
+    try stdout.writeAll("    configure: ryk agents setup openclaw\n");
+    try stdout.print("    fallback:  {s}  (wrapper)\n", .{preferred_wrapper});
+    try stdout.writeAll("    npm/ClawHub: sunset; do not use for deployment\n");
 }
 
 test "openclaw honesty constants are stable tokens" {
-    try std.testing.expect(std.mem.indexOf(u8, enforcement_note, "unprotected") != null);
+    try std.testing.expect(std.mem.indexOf(u8, enforcement_note, "metadata") != null);
     try std.testing.expect(std.mem.indexOf(u8, enforcement_note, preferred_wrapper) != null);
     try std.testing.expectEqualStrings("unverified", hook_grade);
-    try std.testing.expectEqualStrings("unprotected", npm_path_label);
+    try std.testing.expectEqualStrings("sunset", npm_path_label);
+    try std.testing.expect(std.mem.indexOf(u8, supported_install_command, "curl") != null);
 }
 
 test "writeDoctorHonesty includes enforcement and wrapper" {
@@ -61,7 +67,7 @@ test "writeDoctorHonesty includes enforcement and wrapper" {
     var w: std.Io.Writer = .fixed(&buf);
     try writeDoctorHonesty(&w);
     const out = w.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, out, "unprotected") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "sunset") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, preferred_wrapper) != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "installed != protected") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "hook grade: unverified") != null);
@@ -74,6 +80,6 @@ test "writePathsJsonHonesty uses hook_grade not hook_enforcing" {
     const out = w.buffered();
     try std.testing.expect(std.mem.indexOf(u8, out, "\"enforcement_note\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"hook_grade\": \"unverified\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"npm_path\": \"unprotected\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"npm_path\": \"sunset\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "hook_enforcing") == null);
 }

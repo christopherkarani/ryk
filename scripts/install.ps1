@@ -348,6 +348,15 @@ try {
         }
     }
     Copy-Item -LiteralPath $binary.FullName -Destination $destination -Force
+    $canonicalDestination = [System.IO.Path]::GetFullPath($destination)
+    $binaryDigest = (Get-FileHash -Algorithm SHA256 -LiteralPath $destination).Hash.ToLowerInvariant()
+    $provenanceStage = Join-Path $InstallDir (".ryk-provenance." + [Guid]::NewGuid().ToString("N") + ".tmp")
+    @(
+        "ryk-provenance-v1",
+        "path=$canonicalDestination",
+        "sha256=$binaryDigest"
+    ) | Set-Content -LiteralPath $provenanceStage -Encoding utf8NoBOM
+    Move-Item -LiteralPath $provenanceStage -Destination (Join-Path $InstallDir ".ryk-provenance") -Force
     Install-RuntimeAssets $extractRoot.FullName
     Write-StepDone "Install binaries + runtime" "ryk.exe + assets (CLI-only; shell_engine in-process)"
 

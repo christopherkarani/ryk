@@ -31,21 +31,20 @@ ryk must be installed separately. The plugin does not bundle the ryk CLI.
 
 ## Install instructions
 
-### npm install
+### Supported install
 
-Add to your `opencode.json`:
-
-```json
-{
-  "$schema": "https://opencode.ai/config.json",
-  "plugin": ["ryk-opencode-plugin"]
-}
-```
-
-Then install:
+The supported ryk installation path is the curl installer. The npm registry
+path for ryk plugins is sunset and must not be used for new deployments.
 
 ```bash
-npm install ryk-opencode-plugin
+curl -fsSL https://rykanv.com/install | sh
+ryk plugin install opencode --yes
+```
+
+For the strongest protection, launch the host through ryk:
+
+```bash
+ryk opencode
 ```
 
 ### Build ryk
@@ -197,17 +196,12 @@ cat tests/plugin-fixtures/opencode/tool_execute_before_command_safe.json \
 
 Remove the plugin from your OpenCode configuration:
 
-1. Delete the npm package:
-   ```bash
-   npm uninstall ryk-opencode-plugin
-   ```
-
-2. Or delete the local project plugin:
+1. Delete the local project plugin:
    ```bash
    rm .opencode/plugins/ryk.ts
    ```
 
-3. Or delete the global plugin:
+2. Or delete the global plugin:
    ```bash
    rm ~/.config/opencode/plugins/ryk.ts
    ```

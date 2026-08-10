@@ -14,7 +14,7 @@ From a clean checkout:
 
 The repository is pinned to Zig `0.16.0` (use `./scripts/zig` or `direnv allow` if system `zig` differs). After policy or CLI changes, run `./scripts/test-fast.sh`; run `./scripts/zig build test` before opening a PR. Release installs are covered in [install.md](install.md).
 
-For a package install (Homebrew, install script), see [install.md](install.md), then continue from step 2 with `ryk` (or `ryk` alias) on your `PATH`.
+For a release install, use the checksum-verified curl installer in [install.md](install.md), then continue from step 2 with `ryk` (or `ryk` alias) on your `PATH`.
 
 ## 2. Get Protected
 

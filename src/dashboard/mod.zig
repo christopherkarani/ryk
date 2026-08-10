@@ -456,14 +456,13 @@ fn writePluginCardJson(
     try writer.writeAll(",\"doctor_command\":");
     try core.util.writeJsonString(writer, doctor_command);
     try writer.writeAll(",\"setup_commands\":[");
-    // Safe Launch taught path only — ryk start + host aliases + status (not demoted setup/init/run).
+    // OpenClaw gets the curl-only unattended path; the wrapper remains the hard boundary fallback.
     if (std.mem.eql(u8, id, "openclaw")) {
         try writeStringArray(writer, &.{
-            "ryk start",
-            "openclaw plugins install clawhub:ryk-openclaw-plugin",
-            "ryk plugin doctor openclaw",
-            "ryk openclaw",
-            "ryk status",
+            "curl -fsSL https://rykanv.com/install | sh",
+            "ryk agents setup openclaw",
+            "ryk agents health openclaw --json",
+            "ryk run -- openclaw",
         });
     } else {
         try writeStringArray(writer, &.{
@@ -767,8 +766,9 @@ test "status json includes policy and protected agent cards" {
     try std.testing.expect(std.mem.indexOf(u8, out.items, "\"hermes\"") != null);
     // Phase 7 Safe Launch: plugin setup_commands must not re-teach demoted doors.
     try std.testing.expect(std.mem.indexOf(u8, out.items, "ryk setup") == null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "ryk start") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "ryk openclaw") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "ryk agents setup openclaw") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "curl -fsSL https://rykanv.com/install | sh") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "openclaw plugins install clawhub:") == null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "ryk hermes") != null);
 }
 

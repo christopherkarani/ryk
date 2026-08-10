@@ -96,8 +96,8 @@ pub const commands =
             .details = &.{
                 "Creates .ryk/policy.yaml from a practical editable preset.",
                 "Also enables preset-mapped safety packs in project `.ryk.toml` (git repo) or user config (additive; never wipes customizations).",
-                "Presets: generic-agent, claude-code, codex, cursor-agent, opencode, cline-roo, mcp-dev, github-actions, solo-dev, strict-local, team-ci, openclaw-hermes, trusted-local.",
-                "Pack map: generic-agent/solo-dev/trusted-local/mcp-dev = baseline only; claude-code/codex/… = package_managers; team-ci/github-actions/openclaw-hermes = containers + k8s + terraform (+ GHA for CI); strict-local = strict_git.",
+                "Presets: generic-agent, claude-code, codex, cursor-agent, opencode, cline-roo, mcp-dev, github-actions, solo-dev, strict-local, team-ci, openclaw-hermes, unattended, trusted-local.",
+                "Pack map: generic-agent/solo-dev/trusted-local/mcp-dev/unattended = baseline only; claude-code/codex/… = package_managers; team-ci/github-actions/openclaw-hermes = containers + k8s + terraform (+ GHA for CI); strict-local = strict_git.",
                 "Refuses to overwrite an existing policy unless --force is provided.",
                 "Use --quiet to suppress informational output in scripts.",
             },
@@ -124,6 +124,27 @@ pub const commands =
                 "Compatibility flags --yes and --no-interact also select non-interactive mode.",
                 "Next steps after start: ryk <agent> · ryk doctor · ryk replay.",
                 "Re-run safely to repair or update an existing setup.",
+            },
+        },
+        .{
+            .name = "agents",
+            .summary = "Install and health-check Hermes/OpenClaw unattended agents",
+            .usage = "ryk agents <setup|health> [hermes|openclaw] [--json]",
+            .category = .getting_started,
+            .public = true,
+            .examples = &.{
+                "ryk agents setup",
+                "ryk agents setup hermes",
+                "ryk agents setup openclaw",
+                "ryk agents health --json",
+            },
+            .details = &.{
+                "First-class setup for always-on Hermes and OpenClaw agents on Mac minis, VPSs, and other non-interactive hosts.",
+                "Setup creates or preserves the fail-closed `unattended` strict policy, installs the selected host adapters, and runs the existing setup verification path.",
+                "Health uses bounded host CLI probes and never waits for an operator. A missing, stale, or unresponsive host is reported as not ready.",
+                "Risk decisions that would normally ask are denied when RYK_UNATTENDED, RYK_NONINTERACTIVE, RYK_CI, or CI is truthy.",
+                "OpenClaw readiness requires the receipt-bound reviewed bundle, full runtime registration, runtime hook inspection, a healthy Gateway RPC, a bound running Gateway identity, and a nonce-bound denial through Gateway `tools.invoke`. Metadata/discovery passes are explicitly unprotected; when upstream identity or live dispatch proof is unavailable, use `ryk run -- openclaw`.",
+                "Use `ryk agents health --json` from launchd, systemd, cron, or a VPS supervisor.",
             },
         },
         .{
@@ -552,7 +573,7 @@ pub const commands =
             "Hosts: codex, claude, cursor, opencode, openclaw, hermes. Defaults to all if no host is specified.",
             "Cursor: removes the ryk shell hook wrapper and disables simple ryk-only hooks.json files.",
             "OpenCode: removes .opencode/plugins/ryk.ts and ~/.config/opencode/plugins/ryk.ts",
-            "OpenClaw: runs 'openclaw plugins uninstall ryk-openclaw-plugin'",
+            "OpenClaw: runs 'openclaw plugins uninstall ryk'",
             "Hermes: runs 'hermes plugins disable ryk' and removes ~/.hermes/plugins/ryk/",
             "Codex / Claude: removes known plugin paths (host-managed install locations).",
             "Restart protection later with: ryk start",
@@ -674,8 +695,8 @@ pub const commands =
                 "  --version <semver> Install a specific release instead of latest.",
                 "  --json             Machine-readable status.",
                 "  --force            Allow curl installer on package-managed installs, or downgrade with --version.",
-                "Homebrew/npm/scoop/winget installs print the package-manager upgrade command instead of",
-                "overwriting the binary (use --force to override).",
+                "Legacy Homebrew/npm/scoop/winget installs are not upgraded through their package manager.",
+                "Migrate them to the supported curl installer (use --force to overwrite in place).",
                 "See also: docs/install.md",
             },
         },
@@ -795,7 +816,7 @@ pub const commands =
     };
 
 /// Prefix of Safe Launch teaching order (host aliases inserted after stop).
-const public_help_prefix = [_][]const u8{ "start", "stop" };
+const public_help_prefix = [_][]const u8{ "start", "agents", "stop" };
 /// Suffix of Safe Launch teaching order (after host aliases).
 /// Day-2 loop: doctor → packs → allowlist, then review/forensics/explain/update.
 const public_help_suffix = [_][]const u8{ "doctor", "packs", "allowlist", "replay", "scan", "explain", "update", "telemetry" };
@@ -832,6 +853,7 @@ pub fn writeWithMode(io: std.Io, writer: anytype, mode: WriteMode) !void {
     const public_tasks = [_]Task{
         .{ .label = "Get protected", .cmd = "ryk doctor --fix" },
         .{ .label = "Guided setup", .cmd = "ryk start" },
+        .{ .label = "Always-on setup", .cmd = "ryk agents setup" },
         .{ .label = "Run an agent", .cmd = "ryk claude  (or: codex | pi | opencode | openclaw | hermes | grok)" },
         .{ .label = "Diagnose", .cmd = "ryk doctor" },
         .{ .label = "Review session", .cmd = "ryk replay" },
@@ -842,6 +864,7 @@ pub fn writeWithMode(io: std.Io, writer: anytype, mode: WriteMode) !void {
     const all_tasks = [_]Task{
         .{ .label = "Get protected", .cmd = "ryk doctor --fix" },
         .{ .label = "Guided setup", .cmd = "ryk start" },
+        .{ .label = "Always-on setup", .cmd = "ryk agents setup" },
         .{ .label = "Diagnose", .cmd = "ryk doctor" },
         .{ .label = "Why blocked?", .cmd = "ryk explain \"…\"" },
         .{ .label = "Run an agent", .cmd = "ryk claude  (or: codex | pi | opencode | openclaw | hermes | grok)" },

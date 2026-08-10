@@ -97,6 +97,7 @@ target_platforms_json() {
 
 copy_cli_payload() {
   root="$1"
+  ./scripts/test-openclaw-release-assets.sh
   [ -f "ryk-pi/extensions/ryk.ts" ] || {
     printf 'error: bundled Pi extension is missing ryk-pi/extensions/ryk.ts\n' >&2
     exit 1

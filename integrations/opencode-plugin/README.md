@@ -25,21 +25,14 @@ Windows:
 ryk plugin install opencode --yes
 ```
 
-## Install from npm
+## Supported install
 
-Add to your `opencode.json`:
-
-```json
-{
-  "$schema": "https://opencode.ai/config.json",
-  "plugin": ["ryk-opencode-plugin"]
-}
-```
-
-Then install dependencies:
+The supported ryk installation path is the curl installer. The npm registry
+path for ryk plugins is sunset and must not be used for new deployments.
 
 ```bash
-npm install ryk-opencode-plugin
+curl -fsSL https://rykanv.com/install | sh
+ryk plugin install opencode --yes
 ```
 
 The strongest local protection remains running OpenCode through `ryk run -- opencode`; the OpenCode plugin provides native hooks and guardrails inside OpenCode.
@@ -158,12 +151,9 @@ ryk replay --session last --verify
 
 ## Uninstall
 
-Remove the plugin from your OpenCode configuration:
+Remove the local plugin from your OpenCode configuration:
 
 ```bash
-# npm package
-npm uninstall ryk-opencode-plugin
-
 # Project-local file
 rm .opencode/plugins/ryk.ts
 

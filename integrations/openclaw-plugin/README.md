@@ -7,7 +7,8 @@ OpenClaw plugin wrapper for ryk runtime guardrails.
 | Path | Grade | Blocks tools? |
 |------|-------|---------------|
 | `ryk run -- openclaw` | **`wrapper`** (supported) | Yes — process launched under ryk |
-| npm / ClawHub / CLI-metadata plugin install | **`unprotected`** | **No** — OpenClaw wires `api.on` to a no-op; hooks never fire |
+| curl-installed ryk + `ryk agents setup openclaw` | **supported `hook` path** | Runtime hooks when OpenClaw full registration and Gateway dispatch are proven |
+| CLI-metadata / discovery pass | **`unprotected`** | No — OpenClaw wires `api.on` to a no-op |
 | Local / bundled plugin path | **unverified `hook`** | Only if the host actually registers and honors hooks (not proven by install alone) |
 
 **Never treat “plugin installed” as protection.** For mediation you can rely on today, use:
@@ -22,24 +23,24 @@ Grades: see the main README [protection grades](../../README.md#protection-grade
 
 This plugin adds ryk-native lifecycle hooks to OpenClaw when the host exposes real `api.on` registration. It calls the ryk CLI for policy checks, audit logging, and runtime safety decisions without duplicating policy logic.
 
-The ryk CLI remains the source of truth for all policy decisions. When hooks do not fire (npm/ClawHub), this package cannot enforce anything.
+The ryk CLI remains the source of truth for all policy decisions. When hooks do not fire (metadata/discovery), this package cannot enforce anything.
 
 ## Prerequisites
 
 - ryk CLI built and available in PATH (run `ryk doctor` to verify)
 - OpenClaw host installed
 
-ryk is not bundled into this plugin package. Fast setup (install plumbing, not enforcement proof):
+The supported setup starts with the curl-installed ryk binary:
 
 ```bash
-ryk plugin install openclaw --yes
+curl -fsSL https://rykanv.com/install | sh
+ryk agents setup openclaw
+ryk agents health openclaw --json
 ```
 
-Windows:
+OpenClaw 2026.8.1 is the minimum verified host and plugin API version. Older OpenClaw builds do not provide the dispatcher contract used by Ryk health and must remain not ready.
 
-```powershell
-ryk plugin install openclaw --yes
-```
+Health is ready only when the installed plugin is the receipt-bound reviewed bundle, runtime inspection proves `before_tool_call`, the Gateway RPC is healthy, the running Gateway identity is bound to the screened OpenClaw executable, and Gateway `tools.invoke` routes the manifest-declared `ryk_openclaw_canary` tool through the real tool dispatcher. The canary tool executor is inert: it never passes its synthetic command to a shell or any other executor.
 
 ## Supported protection path
 
@@ -49,7 +50,7 @@ ryk run -- openclaw
 
 This is the primary recommended path (grade **`wrapper`**). It does not depend on OpenClaw plugin hooks firing.
 
-## Install from local path (optional plumbing)
+## Source checkout path (development only)
 
 If you have OpenClaw installed locally:
 
@@ -63,21 +64,13 @@ Or:
 ryk plugin install openclaw
 ```
 
-Local install is still **not** a claim of live **`hook`** enforcement. Prefer `ryk run -- openclaw`. Confirm with `ryk plugin doctor openclaw` (installed ≠ protected).
+This path is for development and manual adapter work. It is not the supported Mac mini/VPS deployment path. Confirm runtime registration with `ryk agents health openclaw --json`.
 
-## Install from npm / ClawHub — unprotected
+## Npm / ClawHub sunset
 
-These paths install metadata and may look successful, but in current OpenClaw **CLI-metadata** mode `api.on` is a no-op. Lifecycle hooks **do not fire**. Classification: **`unprotected`**.
+Npm and ClawHub distribution paths are sunset and must not be used for new deployments. Existing installations should migrate to the curl installer and `ryk agents setup openclaw`.
 
-```bash
-# NOT recommended for security — unprotected (hooks no-op)
-openclaw plugins install npm:ryk-openclaw-plugin
-openclaw plugins install clawhub:ryk-openclaw-plugin
-```
-
-`--dangerously-force-unsafe-install` only bypasses OpenClaw’s security scanner so the package can load; it does **not** enable hook enforcement. Do not use it as a security install step.
-
-For submission details (packaging only), see `docs/integrations/openclaw-clawhub.md`.
+Metadata/discovery passes remain **`unprotected`** because `api.on` is not live. Do not use a registry install as a security step.
 
 ## Verify install (honest doctor)
 
@@ -85,7 +78,31 @@ For submission details (packaging only), see `docs/integrations/openclaw-clawhub
 ryk plugin doctor openclaw
 ```
 
-Doctor reports host binary, extension paths, and whether a host plugin appears installed. **Installed does not mean protected.** Expect an enforcement note that npm/ClawHub is **`unprotected`** and that the preferred path is `ryk run -- openclaw`.
+Doctor reports host binary, extension paths, and whether a host plugin appears installed. **Installed does not mean protected.** Use the bounded agents health check and then verify the live OpenClaw runtime:
+
+```bash
+openclaw plugins inspect ryk --runtime --json
+openclaw gateway status --deep --require-rpc
+openclaw gateway call tools.invoke --params '{"name":"ryk_openclaw_canary","args":{"command":"rm -rf /","nonce":"ryk-health","cwd":"/absolute/workspace"}}' --json
+```
+
+The last command sends a dangerous-looking string only to the inert canary tool. The normal Gateway dispatcher must run `before_tool_call` first. A genuine Ryk denial returns the upstream RPC envelope `{"ok":false,"toolName":"ryk_openclaw_canary","error":{"code":"forbidden","message":"RYK_CANARY_BLOCK:ryk-health"}}`. Health must match that exact nonce-bound marker; a generic host denial is not Ryk evidence. Even if a broken policy allows the call, the inert executor returns `executed: false` with evidence `inert-tool-executor` and never executes or reflects the string.
+
+`ryk agents setup openclaw` stores the canonical workspace in the plugin's `workspaceRoot` config. The adapter starts Ryk only in that operator-controlled directory; a tool's `cwd` parameter cannot select another policy. Health supplies the same workspace in its canary and rejects a mismatch. The unattended policy denies host-native file writes; its staged-write setting only applies to Ryk-mediated operations. Use `ryk run -- openclaw` for sessions that need staged workspace changes.
+
+If runtime inspection or either live probe is unavailable, health remains not ready. Use `ryk run -- openclaw` for enforced wrapper protection.
+
+OpenClaw 2026.8.1 does not currently expose the authoritative running executable identity needed for Ryk to bind a healthy Gateway to the screened CLI. Ryk therefore keeps `ready=false` until that upstream contract is available; setup and installed-file presence never substitute for it.
+
+## What each probe proves
+
+| Evidence | Probe | What it proves | What it does not prove |
+|----------|-------|----------------|------------------------|
+| Callback | None | No callback-only proof is accepted; the legacy plugin callback was removed | Gateway tool dispatch or agent-tool execution |
+| Gateway dispatch | `tools.invoke` with `ryk_openclaw_canary` | The upstream Gateway dispatcher finds the manifest tool and traverses the normal tool-policy and hook path | A model or agent chose and invoked a tool |
+| Agent tool | A real agent turn selecting a tool | End-to-end agent-to-tool execution for that installed host | Not established by either health probe |
+
+Health reports Gateway-dispatch evidence, not callback evidence. It must not report live agent-tool evidence unless a real agent turn was observed separately.
 
 ## Hooks included
 
@@ -94,13 +111,13 @@ When hooks actually register (not npm CLI-metadata), the plugin calls `ryk hook 
 | Event | When it fires | Behavior |
 |-------|---------------|----------|
 | `session.start` | At the start of an OpenClaw session | Informational (readiness log) |
-| `tool.before` | Before OpenClaw invokes a tool | **Blocking when hooks fire** — empty/malformed/`ask` fail closed to block |
+| `tool.before` | Before OpenClaw invokes a tool | **Blocking when hooks fire** — empty/malformed/`ask` fail closed; legacy and metadata passes are unprotected |
 | `tool.after` | After OpenClaw finishes using a tool | Informational (audit only) |
 | `session.end` | When the session ends | Informational (audit only) |
 
-OpenClaw does not currently expose dedicated permission lifecycle hooks to this plugin. Permission-like blocking is handled through `tool.before` **only if** `before_tool_call` runs.
+OpenClaw’s `before_tool_call` result can evolve across host versions. This adapter only relies on the stable blocking shape, and handles permission-like `ask` decisions as blocks until a live resumable-approval contract is validated. Blocking is effective **only if** `before_tool_call` runs.
 
-**Do not claim `tool.before` is blocking for npm/ClawHub installs** — those installs are **`unprotected`**.
+**Do not claim `tool.before` is blocking for metadata/discovery passes** — those passes are **`unprotected`**.
 
 ## How hooks call ryk
 
@@ -108,9 +125,12 @@ Each hook sends a JSON payload to `ryk hook openclaw <event>` via stdin and read
 
 - empty or whitespace-only stdout → **block**
 - JSON parse failure or missing `decision` → **block**
-- `decision: "ask"` or unrecognized → **block** (no OpenClaw ask UX / approve-and-resume yet — documented host limitation; do not fake context notes as approval)
+- `decision: "ask"` → **block** until a live, versioned OpenClaw resumable-approval contract is validated; this prevents an unknown host from silently proceeding
+- unrecognized → **block**
 - `decision: "block"` → block
 - `decision: "allow"` / `"warn"` → allow (warn logs only)
+- cyclic or BigInt input → **block before spawning ryk**
+- payload larger than 1 MiB → **block before spawning ryk**
 
 Human-readable logs go to stderr.
 
@@ -169,23 +189,28 @@ This plugin does not mutate host configuration, so uninstalling is safe.
 
 ## Known limitations
 
-- **npm/ClawHub/global installs are `unprotected`.** OpenClaw loads them with `registrationMode: "cli-metadata"`, where `api.on` is a no-op. Hooks never fire; the plugin cannot block tools. Supported protection: `ryk run -- openclaw` (**`wrapper`**).
+- **Metadata/discovery passes are `unprotected`.** OpenClaw reports a non-full registration mode and `api.on` is a no-op. Hooks never fire; the plugin cannot block tools. Supported setup: curl installer + `ryk agents setup openclaw`; fallback protection is `ryk run -- openclaw` (**`wrapper`**).
+- OpenClaw 2026.8.1 is the verified floor for manifest tool ownership plus Gateway `tools.invoke` dispatcher evidence.
+- Managed Ryk executable discovery requires the installer's path-bound SHA-256 receipt; a self-reporting binary is not accepted. The cached path is re-attested before each hook. This checksum receipt is integrity evidence, not a cryptographic signature: a same-user actor able to rewrite both the binary and receipt remains outside the trust claim.
+- The current OpenClaw status contract lacks the running-Gateway executable identity needed for readiness, so the wrapper remains the required fallback until upstream exposes it.
+- Callback proof and Gateway-dispatch proof are not live agent-tool execution proof.
 - Local/bundled install does not by itself prove **`hook`** grade without live-host E2E.
 - Hooks are advisory for informational events; blocking depends on OpenClaw honoring hook return values.
 - Plugin installation depends on OpenClaw version and plugin loading mechanism.
 - The plugin does not collect telemetry itself. Hook, plugin, and machine-readable calls are excluded from release CLI telemetry; a user-invoked `ryk run -- openclaw` wrapper may record only the fixed anonymous CLI metadata described in [`../../docs/telemetry.md`](../../docs/telemetry.md).
-- npm package name prepared: `ryk-openclaw-plugin`. ClawHub package published for distribution — distribution ≠ enforcement.
+- Npm/ClawHub distribution is sunset; the supported deployment path is the curl installer plus `ryk agents setup openclaw`.
 
 ## Security model
 
 - This plugin calls the ryk CLI; it does not reimplement policy logic.
 - No raw secrets are persisted in plugin files.
 - Secrets are redacted from payloads before sending to ryk (keys matching `password`, `token`, `secret`, `api_key`, etc. are replaced with `[REDACTED]`).
-- Blocking hooks fail closed on empty/malformed/`ask` responses.
+- Blocking hooks fail closed on empty/malformed/`ask` responses, cyclic or BigInt input, and payloads larger than 1 MiB.
+- Child-process error details are withheld from logs so stderr cannot smuggle secrets into operator output.
 - Human logs go to stderr.
-- CI mode never prompts.
+- Unattended mode never prompts.
 - This plugin does not claim stronger enforcement than OpenClaw hooks actually provide.
-- Non-enforcing installs are labeled **`unprotected`**, not soft-warned “green” installs.
+- Non-enforcing metadata/discovery passes are labeled **`unprotected`**, not soft-warned “green” installs.
 
 ## No MCP server behavior
 
@@ -195,4 +220,4 @@ The OpenClaw plugin does not add MCP server behavior.
 
 OpenClaw’s plugin security scanner may block packages that use `child_process`. The ryk plugin needs that only to call the local `ryk` binary.
 
-Bypassing the scanner (for example with `--dangerously-force-unsafe-install`) is **not** a security recommendation and does **not** turn an npm install into an enforcing install. Prefer `ryk run -- openclaw`.
+Registry security-scanner bypasses are not part of the supported deployment path. Use the curl installer plus `ryk agents setup openclaw`, or `ryk run -- openclaw` as the wrapper fallback.

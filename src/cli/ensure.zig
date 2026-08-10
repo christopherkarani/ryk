@@ -681,7 +681,10 @@ fn installOneHostInner(
     };
     return switch (plugin.verifyHostInstallAfterChild(io, allocator, host_id, code)) {
         .failed => .failed,
-        .installed, .installed_after_child_failure => .installed,
+        .installed => .installed,
+        // Stale files are not proof that a failed host command activated the
+        // bundled adapter. Always surface the child failure to setup.
+        .installed_after_child_failure => .failed,
     };
 }
 

@@ -24,7 +24,21 @@ Available presets:
 - `strict-local`: strict local baseline with denied unknown commands/network.
 - `team-ci`: product policy pack for team CI baselines.
 - `openclaw-hermes`: product policy pack for OpenClaw and Hermes hook workflows.
+- `unattended`: strict permit-list fail-closed baseline for agents running without an operator. Commands outside the reviewed local-safe set are denied rather than waiting for approval.
 - `trusted-local`: more permissive local baseline for trusted repositories; secret redaction and deny rules remain active.
+
+For a dedicated Hermes/OpenClaw unattended setup, use:
+
+```bash
+ryk agents setup
+ryk agents health --json
+```
+
+The preset is safe for a Mac mini, VPS, or other non-interactive host: commands outside the reviewed permit list are denied, and both adapters deny approval-class requests when `RYK_UNATTENDED=1` (or a host-specific unattended signal) is present. A successful file install is not proof that a long-running host has loaded the hook; restart the host and run `ryk agents health --json`.
+
+Native host hooks deliberately deny file-write tools under this preset. `write_mode: staged` applies only when an operation runs through Ryk's mediated file path; a host-native write cannot be redirected into Ryk's staging area by policy alone. Run the agent through `ryk run -- ...` when it must make staged workspace changes.
+
+Ryk does not currently generate launchd or systemd units. Use `ryk agents health --json` from an existing supervisor, cron, or monitoring service. Native service-unit generation remains a release gap rather than an implied setup side effect.
 
 Productized policy packs can also be inspected and applied through the policy command:
 

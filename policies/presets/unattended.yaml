@@ -1,0 +1,158 @@
+# ryk preset: unattended
+# Fail-closed baseline for Hermes/OpenClaw and other agents running without an operator.
+# Strict permit-list mode never prompts: commands outside the reviewed safe set are denied.
+version: 1
+mode: strict
+
+workspace:
+  root: "."
+  write_mode: staged
+
+env:
+  inherit: false
+  default: deny
+  allow:
+    - PATH
+    - HOME
+    - LANG
+    - TERM
+    - RYK_UNATTENDED
+    - RYK_NONINTERACTIVE
+    - RYK_CI
+    - CI
+    - RYK_HERMES_UNATTENDED
+    - RYK_OPENCLAW_UNATTENDED
+  deny_patterns:
+    - "*TOKEN*"
+    - "*SECRET*"
+    - "*PASSWORD*"
+    - "*PASSWD*"
+    - "*PRIVATE*"
+    - "*KEY*"
+    - "AWS_*"
+    - "AZURE_*"
+    - "GITHUB_TOKEN"
+    - "GH_TOKEN"
+    - "OPENAI_API_KEY"
+    - "ANTHROPIC_API_KEY"
+    - "NPM_TOKEN"
+    - "PYPI_TOKEN"
+    - "SSH_AUTH_SOCK"
+
+files:
+  read:
+    default: deny
+    allow:
+      - "./**"
+    deny:
+      - "./.env"
+      - "./.env.*"
+      - "**/.env"
+      - "**/.env.*"
+      - "./.git/**"
+      - ".git/**"
+      - "**/.git/**"
+      - "./.ryk/**"
+      - ".ryk/**"
+      - "**/.ryk/**"
+      - "**/.npmrc"
+      - "**/.pypirc"
+      - "**/.netrc"
+      - "~/.ssh/**"
+      - "~/.aws/**"
+      - "~/.config/gh/**"
+      - "**/*credentials*"
+      - "**/*credential*"
+      - "**/*secret*"
+      - "**/*token*"
+  write:
+    default: deny
+    deny:
+      - "./.git/**"
+      - ".git/**"
+      - "**/.git/**"
+      - "./.ryk/**"
+      - ".ryk/**"
+      - "**/.ryk/**"
+      - "./.env"
+      - "./.env.*"
+      - "**/.env"
+      - "**/.env.*"
+      - "**/.npmrc"
+      - "**/.pypirc"
+      - "**/.netrc"
+      - "**/*credentials*"
+      - "**/*credential*"
+      - "**/*secret*"
+      - "**/*token*"
+    mode: staged
+
+commands:
+  default: deny
+  allow:
+    - "git status"
+    - "ls *"
+    - "pwd"
+    - "which *"
+    - "node --version"
+    - "python3 --version"
+    - "zig version"
+    - "ryk version"
+    - "ryk doctor"
+    - "ryk doctor --json"
+    - "ryk explain *"
+  deny:
+    - "rm -rf *"
+    - "find * -delete"
+    - "shred *"
+    - "curl * | sh"
+    - "wget * | bash"
+    - "sudo *"
+    - "su *"
+    - "doas *"
+    - "cat .env"
+    - "cat ~/.ssh/*"
+network:
+  mode: allowlist
+  default: deny
+  allow:
+    - "api.github.com"
+    - "*.github.com"
+    - "registry.npmjs.org"
+    - "pypi.org"
+  deny:
+    - "pastebin.com"
+    - "*.ngrok.io"
+    - "*.requestbin.net"
+  detect_exfiltration:
+    dns: true
+    long_query_strings: true
+    secret_patterns: true
+
+mcp:
+  default: deny
+  allow:
+    - "*.search_*"
+    - "*.list_*"
+    - "*.get_*"
+    - "glob"
+    - "grep"
+    - "list"
+    - "read"
+    - "todowrite"
+    - "todoread"
+  deny:
+    - "*.delete_*"
+    - "*.shell"
+    - "*.run_command"
+
+effects:
+  default: deny
+  allow:
+    - fs.read
+    - shell.exec
+
+audit:
+  level: full
+  redact_secrets: true
+  tamper_evident: true

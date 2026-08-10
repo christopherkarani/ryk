@@ -22,6 +22,7 @@ pub const install_ps1_url_main = "https://raw.githubusercontent.com/christopherk
 pub const install_script_url = install_script_url_main;
 pub const install_ps1_url = install_ps1_url_main;
 pub const docs_install_url = "https://github.com/christopherkarani/ryk/blob/main/docs/install.md";
+pub const supported_install_command = "curl -fsSL https://rykanv.com/install | sh";
 
 /// Pin installer script to the release tag that matches `target_version` (no leading `v`).
 pub fn installScriptUrlForVersion(allocator: std.mem.Allocator, target_version: []const u8, windows: bool) ![]u8 {
@@ -222,11 +223,7 @@ pub fn channelAllowsInstaller(channel: InstallChannel, force: bool) bool {
 
 pub fn packageManagerHint(channel: InstallChannel) []const u8 {
     return switch (channel) {
-        .homebrew => "brew upgrade ryk",
-        .npm => "npm update -g @rykan/ryk",
-        .scoop => "scoop update ryk",
-        .winget => "winget upgrade ryk",
-        .curl_installer, .unknown => "curl -fsSL https://raw.githubusercontent.com/christopherkarani/ryk/main/scripts/install.sh | sh",
+        .homebrew, .npm, .scoop, .winget, .curl_installer, .unknown => supported_install_command,
     };
 }
 
@@ -436,12 +433,12 @@ pub fn command(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: an
                 .target = target,
                 .channel = @tagName(channel),
                 .action = "none",
-                .message = hint,
+                .message = "package-managed install detected; migrate with the supported curl installer",
             });
         } else {
             try stderr.print("ryk update: this binary looks package-managed ({s}).\n", .{@tagName(channel)});
-            try stderr.print("Upgrade with your package manager instead:\n  {s}\n", .{hint});
-            try stderr.writeAll("To force the curl installer anyway: ryk update --force --yes\n");
+            try stderr.print("The supported install path is:\n  {s}\n", .{hint});
+            try stderr.writeAll("Use it to migrate this install, or run: ryk update --force --yes\n");
         }
         return exit_codes.usage;
     }
@@ -1018,7 +1015,10 @@ test "shouldProceedWithInstall upgrade downgrade rules" {
 
 test "packageManagerHint is non-empty" {
     try std.testing.expect(packageManagerHint(.homebrew).len > 0);
-    try std.testing.expect(std.mem.indexOf(u8, packageManagerHint(.npm), "@rykan/ryk") != null);
+    try std.testing.expectEqualStrings(supported_install_command, packageManagerHint(.homebrew));
+    try std.testing.expectEqualStrings(supported_install_command, packageManagerHint(.npm));
+    try std.testing.expectEqualStrings(supported_install_command, packageManagerHint(.scoop));
+    try std.testing.expectEqualStrings(supported_install_command, packageManagerHint(.winget));
 }
 
 test "tagFromReleaseUrl strips path prefix and v" {
