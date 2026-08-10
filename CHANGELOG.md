@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.2.13] - 2026-08-10
+
+## What's Changed
+* feat(agents): unattended Hermes/OpenClaw setup and health by @christopherkarani in https://github.com/christopherkarani/ryk/pull/115
+
+
+**Full Changelog**: https://github.com/christopherkarani/ryk/compare/v1.2.12...v1.2.13
+
 ## [1.2.12] - 2026-08-08
 
 **Full Changelog**: https://github.com/christopherkarani/ryk/compare/v1.2.11...v1.2.12

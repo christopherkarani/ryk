@@ -1,6 +1,6 @@
 .{
     .name = .ryk,
-    .version = "1.2.12",
+    .version = "1.2.13",
     .fingerprint = 0x8ca91f43a74e384b, // Changing this has security and trust implications.
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
