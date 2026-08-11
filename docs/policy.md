@@ -10,7 +10,7 @@ Commands accept `--policy <path>`. Without it, ryk discovers `.ryk/policy.yaml` 
 ./zig-out/bin/ryk init --preset generic-agent
 ./zig-out/bin/ryk policy check .ryk/policy.yaml
 
-> **Quick-install note**: The generated policy is the conservative embedded variant (network `default: deny`, broad secret read denys, dual-path .git/.ryk protection). It is designed to be edited after init. See the "What to expect" guidance in quickstart.md.
+> **Quick-install note**: Coding defaults (`generic-agent` and coding host presets) use **DCG-style** gating: `mode: strict`, empty `commands.allow` (matrix-only), `commands.default: allow`, network `default: deny`, broad secret read denys, dual-path .git/.ryk protection. Normal work is not ask-gated; packs/hard fence block danger. Designed to be edited after init. See the "What to expect" guidance in quickstart.md.
 ```
 
 ## Modes
@@ -18,8 +18,9 @@ Commands accept `--policy <path>`. Without it, ryk discovers `.ryk/policy.yaml` 
 - `observe`: log decisions without blocking supported actions.
 - `ask`: prompt for risky actions when interactive.
 - `yolo`: **YOLO + seatbelt** — first-class mode for autonomous agent work. Uses the same severity matrix as `ask` (low continues; medium/high may prompt; not refuse-all). The agent continues under sandbox (Seatbelt/Landlock when session-attached) plus the hard fence. Prefer `yolo` over treating “ask on everything” as the hero path. Built-in preset: `ryk policy check --preset yolo` / `mode: yolo` in YAML.
-- `strict`: deny unknown or risky actions unless allowed. When a shell **permit-list is configured** for Strict evaluation (`commands.allow` / host permit), commands **off** that list are **refused** (deny, never ask-spam); reason includes `strict: not on allowlist`. On-list does **not** auto-allow high/medium pack hits — the severity matrix still applies after the refuse gate. With an **empty / unconfigured** permit list, Strict keeps the existing severity matrix only (not refuse-all-off-list).
-  - **Agents default permit:** quick-install / agent presets ship a curated `commands.allow` (git inspect + local write, tests/builds, narrow `gh pr`, `ryk explain` / `allow-once`, workspace inspect). Unquoted `&&` chains are on-list only when **every** segment matches; pipelines (``|``), sequencing (`;`), redirects (`>`/`<`), newlines, background (`&`), and `$()` / backticks stay off-list. Installers and `git push*` stay under `commands.ask`. Not a free pass — packs and the hard fence still apply. On-list `curl*`/`find*` still hit pack severity and hard fence; they are not auto-allow for high/medium.
+- `strict`: deny unknown or risky actions unless allowed. When a shell **permit-list is configured** for Strict evaluation (`commands.allow` / host permit), commands **off** that list are **refused** (deny, never ask-spam); reason includes `strict: not on allowlist`. On-list does **not** auto-allow high/medium pack hits — the severity matrix still applies after the refuse gate. With an **empty / unconfigured** permit list, Strict keeps the severity matrix only (not refuse-all-off-list).
+  - **Coding create-path (DCG):** `generic-agent` and coding host presets ship **empty** `commands.allow` + `commands.default: allow` under `mode: strict`. Unmatched shell is not approval-gated; high/medium pack hits **block** (never ask); critical stays hard-fenced. Catastrophe `commands.deny` patterns remain. This is intentional — not the sample permit list used by `strict-local` / `yolo` / `ask` built-ins.
+  - **Sample permit lists:** built-in `strict` / `yolo` / `ask` / `strict-local` still carry a curated `commands.allow` sample. Unquoted `&&` chains are on-list only when **every** segment matches; pipelines, sequencing, redirects, newlines, background, and `$()` / backticks stay off-list.
 - `ci`: non-interactive strict behavior; ask becomes deny.
 - `redteam`: strict fixture mode for deterministic tests (strict-like permit refuse when a list is configured).
 - `trusted`: observe-like mode for local trusted workflows.
@@ -450,10 +451,10 @@ CI never prompts. `ask` decisions become `deny`.
 
 ## Common Workflows
 
-- Start broad: `ryk init --preset generic-agent` (ask-matrix baseline; edit allowlists as needed).
-- YOLO + seatbelt local autonomy: set `mode: yolo` (or `ryk policy check --preset yolo`) so the agent continues under sandbox + hard fence without treating every action as an ask prompt.
-- Strict local work: `--preset strict-local` (`mode: strict` with a sample `commands.allow` permit list — off-list refuse when the host wires that list into shell evaluation).
-- MCP development: `--preset mcp-dev`.
+- Start coding: `ryk init --preset generic-agent` (DCG-style: matrix-only strict + allow default; packs/hard fence block danger; not ask-on-risk).
+- YOLO + seatbelt local autonomy: set `mode: yolo` (or `ryk policy check --preset yolo`) so the agent continues under sandbox + hard fence with the ask severity matrix + sample permit body.
+- Strict local work with off-list refuse: `--preset strict-local` (`mode: strict` with a sample `commands.allow` permit list — off-list refuse when the host wires that list into shell evaluation).
+- MCP development: `--preset mcp-dev` (same coding DCG body as generic-agent).
 - CI: `--preset github-actions` and `ryk redteam --ci`.
 
 ## Secretless Runtime

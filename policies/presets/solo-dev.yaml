@@ -1,5 +1,5 @@
-# ryk preset: claude-code
-# Generic/experimental coding DCG defaults (not private Claude Code internals).
+# ryk policy pack: solo-dev
+# Coding DCG local development pack for one developer.
 # Authoritative embedded source: src/policy/presets.zig (coding_dcg_policy).
 
 version: 1

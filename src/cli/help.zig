@@ -115,7 +115,7 @@ pub const commands =
             },
             .details = &.{
                 "Primary first-run onboarding — the only Safe Launch door.",
-                "Creates a policy if missing (Ask on risk by default via generic-agent preset).",
+                "Creates a policy if missing (coding DCG defaults via generic-agent: matrix-only strict, no ask main loop).",
                 "Wires detected host integrations and verifies daemon/hook paths when available.",
                 "Auto-selects the best available Ask posture — no protection-grade menu.",
                 "On interactive terminals, prompts only for host selection when hosts are detected.",
