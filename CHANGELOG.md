@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.2.14] - 2026-08-11
+
+## What's Changed
+* feat(cli): day-one install reliability + coding-agent DCG defaults by @christopherkarani in https://github.com/christopherkarani/ryk/pull/116
+
+
+**Full Changelog**: https://github.com/christopherkarani/ryk/compare/v1.2.13...v1.2.14
+
 ## [1.2.13] - 2026-08-10
 
 ## What's Changed
