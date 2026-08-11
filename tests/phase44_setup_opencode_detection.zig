@@ -79,7 +79,8 @@ test "phase 44 doctor state only accepts complete Hermes install after child fai
         \\    "user_manifest_exists": true,
         \\    "user_source_exists": true,
         \\    "user_mapping_exists": true,
-        \\    "config_references_plugin": true
+        \\    "config_references_plugin": true,
+        \\    "user_manifest_name_is_ryk": true
         \\  }
         \\}
     ;
