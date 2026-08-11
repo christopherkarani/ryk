@@ -1607,9 +1607,7 @@ fn buildAgentVisibleDaemonDeny(
     // Recourse/Next for operators live on stderr (writeHumanShellExplain) and in
     // structured remediation_commands — never stuffed into agent-facing `message`.
     if (decision == .block and shell_command != null) {
-        if (tryIssuePendingShortCode(allocator, shell_command.?, fm_opts.cwd, fm_opts.workspace_root, safe_reason)) |code| {
-            allocator.free(code);
-        }
+        tryIssuePendingShortCode(allocator, shell_command.?, fm_opts.cwd, fm_opts.workspace_root, safe_reason);
     }
 
     // Agent-facing message: short plain reason only (prefer one line). Multi-line
@@ -1620,6 +1618,7 @@ fn buildAgentVisibleDaemonDeny(
             const safe = try core_api.redactAlloc(allocator, explanation);
             defer allocator.free(safe);
             const line = firstLineOnly(safe);
+            if (line.len == 0) break :blk try buildMessage(allocator, decision, "command");
             break :blk try std.fmt.allocPrint(allocator, "command blocked by ryk policy: {s}", .{line});
         }
         break :blk try buildMessage(allocator, decision, "command");
@@ -1772,29 +1771,31 @@ fn resolvePendingIssueCwd(
 /// On pack deny, issue a pending short code when the data dir is resolvable.
 /// Returns an owned short_code slice, or null when store is unavailable / issue fails.
 /// Failures are silent (deny still proceeds with placeholder remediation).
+/// Best-effort issue of an allow-once pending short code for the operator path.
+/// Side-effect only: does not return the redeemable code (M-1 — never agent-visible).
 fn tryIssuePendingShortCode(
     allocator: std.mem.Allocator,
     command_text: []const u8,
     cwd: ?[]const u8,
     workspace_root: ?[]const u8,
     reason: []const u8,
-) ?[]const u8 {
-    const data_dir = resolveRykDataDirForPending(allocator) catch return null;
-    const data_dir_owned = data_dir orelse return null;
+) void {
+    const data_dir = resolveRykDataDirForPending(allocator) catch return;
+    const data_dir_owned = data_dir orelse return;
     defer allocator.free(data_dir_owned);
 
     var threaded: std.Io.Threaded = .init_single_threaded;
     const io = threaded.io();
 
-    std.Io.Dir.cwd().createDirPath(io, data_dir_owned) catch return null;
+    std.Io.Dir.cwd().createDirPath(io, data_dir_owned) catch return;
 
-    const pending_path = std.fs.path.join(allocator, &.{ data_dir_owned, shell_engine.allow_once.pending_file_name }) catch return null;
+    const pending_path = std.fs.path.join(allocator, &.{ data_dir_owned, shell_engine.allow_once.pending_file_name }) catch return;
     defer allocator.free(pending_path);
 
     var now_buf: [32]u8 = undefined;
-    const now_iso = core.time.Timestamp.now(io).formatIso(&now_buf) catch return null;
+    const now_iso = core.time.Timestamp.now(io).formatIso(&now_buf) catch return;
 
-    const cwd_path = resolvePendingIssueCwd(io, allocator, cwd, workspace_root) orelse return null;
+    const cwd_path = resolvePendingIssueCwd(io, allocator, cwd, workspace_root) orelse return;
     defer allocator.free(cwd_path);
 
     var issued = shell_engine.allow_once.issuePending(
@@ -1806,10 +1807,8 @@ fn tryIssuePendingShortCode(
         reason,
         now_iso,
         true,
-    ) catch return null;
-    defer issued.deinit(allocator);
-
-    return allocator.dupe(u8, issued.record.short_code) catch null;
+    ) catch return;
+    issued.deinit(allocator);
 }
 
 fn hookResponseFromDaemonEvaluate(
@@ -5478,6 +5477,35 @@ test "hook firstLineOnly strips multi-line operator walls" {
     try std.testing.expectEqualStrings("line one", firstLineOnly("line one\nRecourse: tip"));
     try std.testing.expectEqualStrings("line one", firstLineOnly("line one\r\nNext: tip"));
     try std.testing.expectEqualStrings("", firstLineOnly("\nonly second"));
+}
+
+// Empty first line of explanation falls back to buildMessage (no trailing bare colon).
+test "hook agent-facing message falls back when explanation first line is empty" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"status":"Deny","reason":"blocked","pack_id":"core.filesystem","pattern_name":"destructive_rm","severity":"critical","explanation":"\nRecourse: operator can run ryk allow-once <code>\nNext: ryk explain \"<command>\""}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+    var redactions: std.ArrayList(RedactionEntry) = .empty;
+    defer {
+        for (redactions.items) |r| r.deinit(allocator);
+        redactions.deinit(allocator);
+    }
+    var limitations: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (limitations.items) |l| allocator.free(l);
+        limitations.deinit(allocator);
+    }
+    var result = try hookResponseFromDaemonEvaluate(allocator, parsed.value, .strict, &redactions, &limitations, null, .{}, .{});
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqual(PluginDecision.block, result.decision);
+    try std.testing.expect(std.mem.indexOfScalar(u8, result.message, '\n') == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.message, "Recourse") == null);
+    // buildMessage fallback — not the empty-detail "command blocked by ryk policy: " form.
+    try std.testing.expect(std.mem.eql(u8, result.message, "command blocked by ryk policy.") or
+        (std.mem.indexOf(u8, result.message, "blocked") != null and !std.mem.endsWith(u8, result.message, ": ")));
 }
 
 test "s-once-cli: hook deny → pending code → redeem → evaluate allows once → second denies" {
