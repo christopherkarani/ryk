@@ -179,7 +179,7 @@ print_activation() {
 # ── Version resolution ───────────────────────────────────────────────────────
 # cut-release rewrites INSTALL_FALLBACK_VERSION when shipping; do not hand-edit
 # without also updating VERSION / the release cutter.
-INSTALL_FALLBACK_VERSION="1.2.15"
+INSTALL_FALLBACK_VERSION="1.2.16"
 
 is_semver() {
   # Strict X.Y.Z only (installer artifact names depend on this shape).

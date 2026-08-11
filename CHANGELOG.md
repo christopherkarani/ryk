@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.2.16] - 2026-08-11
+
+## What's Changed
+* fix(plugin): upgrade managed OpenCode plugins on update/install by @christopherkarani in https://github.com/christopherkarani/ryk/pull/123
+
+
+**Full Changelog**: https://github.com/christopherkarani/ryk/compare/v1.2.15...v1.2.16
+
 ## [1.2.15] - 2026-08-11
 
 ## What's Changed
