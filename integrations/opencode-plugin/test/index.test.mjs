@@ -127,6 +127,201 @@ printf '%s\n' '{"decision":"unexpected","message":"bad decision"}'
   );
 });
 
+// --- permission.ask hard-deny toast (best-effort; never softens deny) ---
+
+test('permission.ask block toasts error with short message', async () => {
+  const toasts = [];
+  await withFakeRyk(
+    async (plugin) => {
+      const permissionAsk = plugin['permission.ask'];
+      assert.ok(permissionAsk);
+      const output = { status: 'ask' };
+      await permissionAsk({ sessionID: 'session-1', command: 'rm -rf build' }, output);
+      assert.equal(output.status, 'deny');
+      assert.equal(toasts.length, 1, 'exactly one error toast on permission deny');
+      const body = toasts[0]?.body;
+      assert.ok(body, 'toast body present');
+      assert.equal(body.variant, 'error');
+      assert.match(body.title, /ryk/i);
+      assert.ok(typeof body.message === 'string' && body.message.length > 0);
+      assert.ok(body.message.length <= 280, 'toast message ≤280');
+      assert.ok(!body.message.includes('\n'), 'toast message single-line');
+      assert.ok(!body.message.includes('Recourse:'), 'no Recourse wall in toast');
+      assert.ok(!body.message.includes('Next:'), 'no Next wall in toast');
+      assert.match(body.message, /ryk blocked/i);
+    },
+    `#!/bin/sh
+printf '%s\\n' '{"decision":"block","rule":"core.filesystem:rm-rf","message":"command blocked by ryk policy\\nRecourse: operator can run ryk allow-once ABC\\nNext: ryk explain rm","remediation_commands":["ryk allow-once ABC","ryk explain rm"]}'
+`,
+    {
+      client: {
+        tui: {
+          showToast: async (input) => {
+            toasts.push(input);
+          },
+        },
+      },
+    }
+  );
+});
+
+test('permission.ask error decision toasts error and denies', async () => {
+  const toasts = [];
+  await withFakeRyk(
+    async (plugin) => {
+      const permissionAsk = plugin['permission.ask'];
+      assert.ok(permissionAsk);
+      const output = { status: 'ask' };
+      await permissionAsk({ sessionID: 'session-1', command: 'echo hi' }, output);
+      assert.equal(output.status, 'deny');
+      assert.equal(toasts.length, 1);
+      assert.equal(toasts[0]?.body?.variant, 'error');
+    },
+    `#!/bin/sh
+printf '%s\\n' '{"decision":"error","message":"evaluator failed"}'
+`,
+    {
+      client: {
+        tui: {
+          showToast: async (input) => {
+            toasts.push(input);
+          },
+        },
+      },
+    }
+  );
+});
+
+test('permission.ask deny with throwing toast still denies', async () => {
+  await withFakeRyk(
+    async (plugin) => {
+      const permissionAsk = plugin['permission.ask'];
+      assert.ok(permissionAsk);
+      const output = { status: 'ask' };
+      await permissionAsk({ sessionID: 'session-1', command: 'rm -rf build' }, output);
+      assert.equal(output.status, 'deny', 'toast failure must not soften deny');
+    },
+    `#!/bin/sh
+printf '%s\\n' '{"decision":"block","message":"command blocked"}'
+`,
+    {
+      client: {
+        tui: {
+          showToast: async () => {
+            throw new Error('toast transport failed');
+          },
+        },
+      },
+    }
+  );
+});
+
+test('permission.ask deny without showToast still denies', async () => {
+  await withFakeRyk(
+    async (plugin) => {
+      const permissionAsk = plugin['permission.ask'];
+      assert.ok(permissionAsk);
+      const output = { status: 'ask' };
+      await permissionAsk({ sessionID: 'session-1', command: 'rm -rf build' }, output);
+      assert.equal(output.status, 'deny');
+    },
+    `#!/bin/sh
+printf '%s\\n' '{"decision":"block","message":"command blocked"}'
+`
+    // no client — toast optional
+  );
+});
+
+test('permission.ask warn maps to host ask and may toast warning', async () => {
+  const toasts = [];
+  await withFakeRyk(
+    async (plugin) => {
+      const permissionAsk = plugin['permission.ask'];
+      assert.ok(permissionAsk);
+      const output = { status: 'ask' };
+      await permissionAsk({ sessionID: 'session-1', command: 'echo warn-me' }, output);
+      assert.equal(output.status, 'ask', 'warn must not silent-allow or hard-deny');
+      assert.equal(toasts.length, 1);
+      assert.equal(toasts[0]?.body?.variant, 'warning');
+    },
+    `#!/bin/sh
+printf '%s\\n' '{"decision":"warn","message":"soft policy note"}'
+`,
+    {
+      client: {
+        tui: {
+          showToast: async (input) => {
+            toasts.push(input);
+          },
+        },
+      },
+    }
+  );
+});
+
+test('permission.ask ryk ask toasts warning not error', async () => {
+  const toasts = [];
+  await withFakeRyk(
+    async (plugin) => {
+      const permissionAsk = plugin['permission.ask'];
+      assert.ok(permissionAsk);
+      const output = { status: 'ask' };
+      await permissionAsk({ sessionID: 'session-1', command: 'rm file.txt' }, output);
+      assert.equal(output.status, 'ask');
+      assert.equal(toasts.length, 1);
+      assert.equal(toasts[0]?.body?.variant, 'warning');
+    },
+    undefined,
+    {
+      client: {
+        tui: {
+          showToast: async (input) => {
+            toasts.push(input);
+          },
+        },
+      },
+    }
+  );
+});
+
+test('missing binary permission.ask toasts error and denies', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'ryk-opencode-plugin-'));
+  const originalPath = process.env.PATH;
+  const originalAllow = process.env.RYK_ALLOW_WORKSPACE_BIN;
+  const originalRykBin = process.env.RYK_BIN;
+  process.env.PATH = directory;
+  delete process.env.RYK_ALLOW_WORKSPACE_BIN;
+  delete process.env.RYK_BIN;
+  const toasts = [];
+  try {
+    const plugin = await rykPlugin({
+      directory,
+      worktree: directory,
+      client: {
+        tui: {
+          showToast: async (input) => {
+            toasts.push(input);
+          },
+        },
+      },
+    });
+    const permissionAsk = plugin['permission.ask'];
+    assert.ok(permissionAsk);
+    const output = { status: 'ask' };
+    await permissionAsk({ sessionID: 'session-1', command: 'echo hi' }, output);
+    assert.equal(output.status, 'deny');
+    assert.equal(toasts.length, 1);
+    assert.equal(toasts[0]?.body?.variant, 'error');
+  } finally {
+    process.env.PATH = originalPath;
+    if (originalAllow === undefined) delete process.env.RYK_ALLOW_WORKSPACE_BIN;
+    else process.env.RYK_ALLOW_WORKSPACE_BIN = originalAllow;
+    if (originalRykBin === undefined) delete process.env.RYK_BIN;
+    else process.env.RYK_BIN = originalRykBin;
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test('tool.execute.before still hard-blocks ryk ask (no resume on that path)', async () => {
   await withFakeRyk(async (plugin) => {
     const before = plugin['tool.execute.before'];
