@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.2.15] - 2026-08-11
+
+## What's Changed
+* fix(opencode-plugin): toast + short tool line on hard block by @christopherkarani in https://github.com/christopherkarani/ryk/pull/117
+* fix(hook): short agent-facing message without Recourse wall by @christopherkarani in https://github.com/christopherkarani/ryk/pull/118
+* feat(hook): Claude host-shaped deny via permissionDecision by @christopherkarani in https://github.com/christopherkarani/ryk/pull/119
+* fix(hermes): one-line host block/approve message without remediation walls by @christopherkarani in https://github.com/christopherkarani/ryk/pull/120
+* fix(hosts): OpenCode permission deny toast + Pi notify on hard deny by @christopherkarani in https://github.com/christopherkarani/ryk/pull/121
+* fix(pi): short agent block reason with one structured Next by @christopherkarani in https://github.com/christopherkarani/ryk/pull/122
+
+
+**Full Changelog**: https://github.com/christopherkarani/ryk/compare/v1.2.14...v1.2.15
+
 ## [1.2.14] - 2026-08-11
 
 ## What's Changed
