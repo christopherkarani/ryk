@@ -570,6 +570,13 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_cli_contract_tests.step);
     test_step.dependOn(&run_phase25_hardening_tests.step);
     test_step.dependOn(&run_daemon_ipc_hardening_tests.step);
+    // Named subset for hook host-matrix work (phase2d/2e/2f + phase38).
+    const test_phase_hooks_step = b.step("test-phase-hooks", "Run phase2d/2e/2f/38 hook integration tests");
+    test_phase_hooks_step.dependOn(&run_phase2d_daemon_hook_matrix_tests.step);
+    test_phase_hooks_step.dependOn(&run_phase2e_hook_dispatch_tests.step);
+    test_phase_hooks_step.dependOn(&run_phase2f_hook_validation_tests.step);
+    test_phase_hooks_step.dependOn(&run_phase38_plugin_security_tests.step);
+
     test_step.dependOn(&run_phase2d_daemon_hook_matrix_tests.step);
     test_step.dependOn(&run_phase2e_hook_dispatch_tests.step);
     test_step.dependOn(&run_phase2f_hook_validation_tests.step);

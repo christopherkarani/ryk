@@ -35,7 +35,7 @@ Where a host already hardens interactive outcomes:
 | **OpenCode** | `tool.execute.before` | proceed | throw/block | **block** (no resume) | log + allow | No on tool path | Prefer routing high-risk tools through OpenCode permission UX. |
 | **OpenCode** | `command.execute.before` | proceed | throw/block | **block** (no resume) | log + allow | No | Slash/custom commands; payload uses command name as tool. |
 | **OpenCode** | `permission.ask` | allow | deny | **host ask** (resume) | log | **Yes** | Leave OpenCode permission UI for ryk `ask`; only hard-deny on `block`. |
-| **Claude Code** | `PreToolUse` / `PermissionRequest` | allow | deny | host permission / ask shape | warn | Partial | Map to Claude permission request where the host supports it. |
+| **Claude Code** | `PreToolUse` / `PermissionRequest` | `permissionDecision: allow` | `permissionDecision: deny` | `permissionDecision: ask` (CI→deny) | proceed as allow | Partial | Host-shaped stdout JSON via `hookSpecificOutput` (hook grade; exit 0). See `host-output-mapping.md`. |
 | **Codex** | `PreToolUse` / `PermissionRequest` | allow | deny | host permission / ask shape | warn | Partial | Same pattern as Claude adapter. |
 | **Pi** | tool hooks | allow | deny | host-dependent | warn | Host-dependent | See `ryk-pi` extension docs. |
 

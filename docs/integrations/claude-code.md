@@ -200,9 +200,31 @@ The plugin uses synthetic test secrets (e.g., `fake_p05_secret_value`) in fixtur
 
 The marketplace catalog uses a relative path (`../claude-code-plugin`). If your Claude Code version requires absolute paths, adjust the `source` field in `integrations/claude-marketplace/.claude-plugin/marketplace.json`.
 
+## Hook stdout contract (tool gates)
+
+For `PreToolUse` and `PermissionRequest`, `ryk hook claude` emits Claude-native JSON so the host can hard-stop the tool:
+
+```json
+{
+  "hookSpecificOutput": {
+    "hookEventName": "PreToolUse",
+    "permissionDecision": "deny",
+    "permissionDecisionReason": "command blocked by ryk policy: …"
+  }
+}
+```
+
+- `permissionDecision`: `allow` | `deny` | `ask` (CI / `--ci` hardens ryk `ask` to `deny`)
+- `permissionDecisionReason`: short one-line reason (no Recourse/Next walls)
+- Process exit is `0` with structured JSON (Claude plugin-compatible)
+- Operator Recourse/Next remain on **stderr**, not in the reason string
+- Informational events (`SessionStart`, `UserPromptSubmit`, …) still use ryk-generic hook JSON
+
+Grade: **hook**. Host-shaped deny works when Claude Code honors `permissionDecision`. It does not replace process wrapping.
+
 ## Limitations
 
-- Hooks are advisory; enforcement depends on Claude Code host support.
+- Tool-gate deny/ask is host-shaped hook output; enforcement still depends on Claude Code honoring `permissionDecision` (hook grade, not OS sandbox).
 - The strongest protection is the process-level wrapper `ryk run -- <claude-code-command>` (the `ryk claude` launcher uses the same protected path).
 - Plugin installation is a preview/dry-run by default.
 - The plugin does not collect telemetry itself. Hook and machine-readable calls are excluded from release CLI telemetry; user-invoked CLI wrappers may record only the fixed pseudonymous metadata described in [`../telemetry.md`](../telemetry.md).
