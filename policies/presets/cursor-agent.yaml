@@ -1,7 +1,9 @@
 # ryk preset: cursor-agent
-# Generic/experimental: this is a conservative local editor-agent policy, not a claim about Cursor internals.
+# Generic/experimental coding DCG defaults for local editor-agent work.
+# Authoritative embedded source: src/policy/presets.zig (coding_dcg_policy).
+
 version: 1
-mode: ask
+mode: strict
 
 workspace:
   root: "."
@@ -14,6 +16,8 @@ env:
     - HOME
     - LANG
     - TERM
+    - RYK_UNATTENDED
+    - RYK_OPENCLAW_UNATTENDED
   deny_patterns:
     - "*TOKEN*"
     - "*SECRET*"
@@ -22,10 +26,13 @@ env:
     - "*PRIVATE*"
     - "*KEY*"
     - "AWS_*"
+    - "AZURE_*"
     - "GITHUB_TOKEN"
     - "GH_TOKEN"
     - "OPENAI_API_KEY"
     - "ANTHROPIC_API_KEY"
+    - "GOOGLE_API_KEY"
+    - "GOOGLE_APPLICATION_CREDENTIALS"
     - "NPM_TOKEN"
     - "PYPI_TOKEN"
     - "SSH_AUTH_SOCK"
@@ -35,55 +42,84 @@ files:
     allow:
       - "./**"
     deny:
+      # Expanded secret protections (kept in sync with embedded coding_dcg_rules).
       - "./.env"
       - "./.env.*"
       - "~/.ssh/**"
       - "~/.aws/**"
+      - "~/.gcloud/**"
+      - "~/.azure/**"
       - "~/.config/gh/**"
+      - "~/Library/Keychains/**"
+      - "./Library/Keychains/**"
+      - "~/Library/Application Support/**/Cookies*"
+      - "./Library/Application Support/**/Cookies*"
+      - "~/Library/Application Support/**/Login Data*"
+      - "./Library/Application Support/**/Login Data*"
+      - "~/Library/Application Support/Google/Chrome/**"
+      - "./Library/Application Support/Google/Chrome/**"
+      - "~/Library/Application Support/BraveSoftware/**"
+      - "./Library/Application Support/BraveSoftware/**"
+      - "~/Library/Application Support/Firefox/**"
+      - "./Library/Application Support/Firefox/**"
+      - "~/Library/Mobile Documents/**"
+      - "./Library/Mobile Documents/**"
+      - "~/.zsh_history"
+      - "~/.bash_history"
+      - "~/.zshrc"
+      - "~/.bashrc"
+      - "~/.profile"
+      - "**/id_rsa"
+      - "**/id_ed25519"
       - "**/*credentials*"
+      - "**/*credential*"
       - "**/*secret*"
       - "**/*token*"
   write:
     allow:
       - "./**"
     deny:
+      # Dual patterns for robustness across hook/plugin callers.
       - "./.git/**"
+      - ".git/**"
       - "./.ryk/**"
+      - ".ryk/**"
     mode: staged
 
 commands:
-  default: ask
-  allow:
-    - "git status"
-    - "git diff *"
-    - "ls *"
-    - "pwd"
-    - "npm test*"
+  default: allow
+  # Matrix-only Strict: empty commands.allow disables off-list refuse.
+  # Packs + hard fence block high/critical; deny patterns for catastrophes.
+  # Unmatched shell allows — normal coding work is not approval-gated.
   deny:
     - "rm -rf *"
+    - "find * -delete"
+    - "shred *"
     - "curl * | sh"
     - "wget * | bash"
     - "sudo *"
+    - "su *"
+    - "doas *"
+    - "powershell *EncodedCommand*"
+    - "powershell *-enc*"
     - "cat .env"
     - "cat ~/.ssh/*"
-  ask:
-    - "git push*"
-    - "npm install*"
-    - "pnpm install*"
-    - "yarn install*"
-    - "pip install*"
 
 network:
   mode: allowlist
-  default: ask
+  # Authoritative runtime preset: src/policy/presets.zig (coding_dcg_rules).
+  default: deny
   allow:
     - "api.github.com"
     - "*.github.com"
     - "registry.npmjs.org"
     - "pypi.org"
+  ask:
+    - "*.githubusercontent.com"
   deny:
     - "pastebin.com"
     - "*.ngrok.io"
+    - "*.requestbin.net"
   detect_exfiltration:
     dns: true
     long_query_strings: true
@@ -95,6 +131,16 @@ mcp:
     - "*.search_*"
     - "*.list_*"
     - "*.get_*"
+    - "glob"
+    - "grep"
+    - "list"
+    - "read"
+    - "todowrite"
+    - "todoread"
+    - "skill"
+    - "task"
+    - "question"
+    - "lsp"
   deny:
     - "*.delete_*"
     - "*.shell"

@@ -3,6 +3,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const resource_root = @import("../resource_root.zig");
+const env_util = @import("../env_util.zig");
 
 pub const ownership_marker = "// Managed by ryk. Updates may replace this file; do not edit it directly.\n";
 pub const relative_install_dir = ".pi/agent/extensions/ryk";
@@ -24,6 +25,9 @@ pub const InstallOptions = struct {
     /// Test/package injection. Production callers normally use resource lookup.
     asset_dir: ?[]const u8 = null,
     resource_root_override: ?[]const u8 = null,
+    /// Workspace root for resource resolution (default `.`). Tests may pin an
+    /// empty/missing tree so resource_root_override / packaged paths are exercised.
+    workspace_root: []const u8 = ".",
 };
 
 const Asset = struct {
@@ -168,18 +172,56 @@ fn hasExpectedInstalledShape(destination_name: []const u8, content: []const u8) 
             std.mem.indexOf(u8, content, "export async function handleSecretCaptureInput") != null;
     }
     if (std.mem.eql(u8, destination_name, "parent_ask.ts")) {
+        // Real packaged source uses `export async function waitForAskResponse`.
         return std.mem.indexOf(u8, content, "export function resolvePiAskRoot") != null and
-            std.mem.indexOf(u8, content, "export function waitForAskResponse") != null;
+            (std.mem.indexOf(u8, content, "export function waitForAskResponse") != null or
+                std.mem.indexOf(u8, content, "export async function waitForAskResponse") != null);
     }
     return false;
 }
 
 fn resolveAssetDir(io: std.Io, allocator: std.mem.Allocator, options: InstallOptions) ![]u8 {
     if (options.asset_dir) |path| return allocator.dupe(u8, path);
-    return resource_root.resolveResourcePath(io, allocator, .{
-        .workspace_root = ".",
+    // Primary: ryk-pi/extensions via resource_root (workspace, RYK_RESOURCE_ROOT,
+    // exe-relative, $PREFIX/share/ryk/current). Does not fall back to orca-pi —
+    // those assets lack installRykExtension and would leave incomplete installs.
+    if (resource_root.resolveResourcePath(io, allocator, .{
+        .workspace_root = options.workspace_root,
         .resource_root_override = options.resource_root_override,
-    }, "ryk-pi/extensions");
+    }, "ryk-pi/extensions")) |resolved| {
+        return resolved;
+    } else |_| {}
+
+    // When env RYK_RESOURCE_ROOT points at a stale orca tree, resolveResourcePath
+    // still falls through to share/ryk/current — but a bare HOME package without
+    // a product binary nearby can miss that. Probe the standard data home layout.
+    return resolvePackagedRykPiExtensions(io, allocator) orelse error.ResourceNotFound;
+}
+
+/// `$XDG_DATA_HOME/ryk/current/ryk-pi/extensions` then `~/.local/share/ryk/current/…`.
+fn resolvePackagedRykPiExtensions(io: std.Io, allocator: std.mem.Allocator) ?[]u8 {
+    var env_map = env_util.createProcessMap(allocator) catch return null;
+    defer env_map.deinit();
+
+    if (env_util.getOwned(&env_map, allocator, "XDG_DATA_HOME") catch null) |xdg| {
+        defer allocator.free(xdg);
+        if (joinIfExists(io, allocator, &.{ xdg, "ryk", "current", "ryk-pi", "extensions" })) |path| return path;
+    }
+    if (env_util.getOwnedHome(&env_map, allocator) catch null) |home| {
+        defer allocator.free(home);
+        if (joinIfExists(io, allocator, &.{ home, ".local", "share", "ryk", "current", "ryk-pi", "extensions" })) |path|
+            return path;
+    }
+    return null;
+}
+
+fn joinIfExists(io: std.Io, allocator: std.mem.Allocator, parts: []const []const u8) ?[]u8 {
+    const path = std.fs.path.join(allocator, parts) catch return null;
+    std.Io.Dir.cwd().access(io, path, .{}) catch {
+        allocator.free(path);
+        return null;
+    };
+    return path;
 }
 
 fn ensureDestinationDirectory(io: std.Io, allocator: std.mem.Allocator, home: []const u8) !void {
@@ -290,10 +332,54 @@ fn writeFixtureAssets(io: std.Io, dir: std.Io.Dir) !void {
         .sub_path = "assets/parent_ask.ts",
         .data =
         \\export function resolvePiAskRoot() {}
-        \\export function waitForAskResponse() {}
+        \\export async function waitForAskResponse() {}
         \\
         ,
     });
+}
+
+test "Pi completeness accepts async waitForAskResponse from packaged parent_ask" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, relative_install_dir);
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = relative_install_dir ++ "/index.ts",
+        .data = ownership_marker ++
+            \\import { installRykExtension } from "./runtime.ts";
+            \\export default function rykPiExtension(pi: Parameters<typeof installRykExtension>[0]): void {
+            \\  installRykExtension(pi, { rykBin: "/opt/ryk/bin/ryk" });
+            \\}
+            \\
+        ,
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = relative_install_dir ++ "/runtime.ts",
+        .data = ownership_marker ++
+            \\import { handleSecretCaptureInput } from "./secret_capture.ts";
+            \\import { resolvePiAskRoot } from "./parent_ask.ts";
+            \\export function installRykExtension() {}
+            \\
+        ,
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = relative_install_dir ++ "/secret_capture.ts",
+        .data = ownership_marker ++
+            \\export function storeSecretToEnvFile() {}
+            \\export async function handleSecretCaptureInput() {}
+            \\
+        ,
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = relative_install_dir ++ "/parent_ask.ts",
+        .data = ownership_marker ++
+            \\export function resolvePiAskRoot() {}
+            \\export async function waitForAskResponse() {}
+            \\
+        ,
+    });
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(home);
+    try std.testing.expect(isCompleteAtHome(std.testing.io, std.testing.allocator, home));
 }
 
 test "Pi install creates a complete extension and is idempotent" {
@@ -456,4 +542,102 @@ test "Pi completeness rejects ownership-marker-only spoof files" {
     const home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(home);
     try std.testing.expect(!isCompleteAtHome(std.testing.io, std.testing.allocator, home));
+}
+
+test "Pi install upgrades ownership-marked orca-shaped index to installRykExtension" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeFixtureAssets(std.testing.io, tmp.dir);
+    try tmp.dir.createDirPath(std.testing.io, relative_install_dir);
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = relative_install_dir ++ "/index.ts",
+        .data = ownership_marker ++
+            \\import { installOrcaExtension } from "./runtime.ts";
+            \\export default function (pi: any) {
+            \\  installOrcaExtension(pi, { orcaBin: "/opt/orca/bin/orca" });
+            \\}
+            \\
+        ,
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = relative_install_dir ++ "/runtime.ts",
+        .data = ownership_marker ++ "export function installOrcaExtension() {}\n",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = relative_install_dir ++ "/secret_capture.ts",
+        .data = ownership_marker ++ "old\n",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = relative_install_dir ++ "/parent_ask.ts",
+        .data = ownership_marker ++ "old\n",
+    });
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(home);
+    const asset_dir = try std.fs.path.join(std.testing.allocator, &.{ home, "assets" });
+    defer std.testing.allocator.free(asset_dir);
+
+    try std.testing.expect(!isCompleteAtHome(std.testing.io, std.testing.allocator, home));
+    try std.testing.expectEqual(InstallResult.upgraded, try install(std.testing.io, std.testing.allocator, .{
+        .home = home,
+        .ryk_binary = "/opt/ryk/bin/ryk",
+        .asset_dir = asset_dir,
+    }));
+    try std.testing.expect(isCompleteAtHome(std.testing.io, std.testing.allocator, home));
+    const wrapper = try tmp.dir.readFileAlloc(std.testing.io, relative_install_dir ++ "/index.ts", std.testing.allocator, .limited(4096));
+    defer std.testing.allocator.free(wrapper);
+    try std.testing.expect(std.mem.indexOf(u8, wrapper, "installRykExtension") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wrapper, "rykBin") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wrapper, "installOrcaExtension") == null);
+}
+
+test "Pi resolveAssetDir finds ryk-pi under resource_root_override packaged layout" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "share/ryk/current/ryk-pi/extensions");
+    try tmp.dir.createDirPath(std.testing.io, "home-root");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "share/ryk/current/ryk-pi/extensions/ryk.ts",
+        .data =
+        \\import { handleSecretCaptureInput } from "./secret_capture.ts";
+        \\import { resolvePiAskRoot } from "./parent_ask.ts";
+        \\export function installRykExtension() {}
+        \\
+        ,
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "share/ryk/current/ryk-pi/extensions/secret_capture.ts",
+        .data =
+        \\export function storeSecretToEnvFile() {}
+        \\export async function handleSecretCaptureInput() {}
+        \\
+        ,
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "share/ryk/current/ryk-pi/extensions/parent_ask.ts",
+        .data =
+        \\export function resolvePiAskRoot() {}
+        \\export function waitForAskResponse() {}
+        \\
+        ,
+    });
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const packaged = try std.fs.path.join(std.testing.allocator, &.{ root, "share", "ryk", "current" });
+    defer std.testing.allocator.free(packaged);
+    const home = try std.fs.path.join(std.testing.allocator, &.{ root, "home-root" });
+    defer std.testing.allocator.free(home);
+
+    // Pin workspace away from the repo tree so override/packaged layout is the
+    // only resolution path (otherwise cwd `./ryk-pi/extensions` wins first).
+    const empty_ws = try std.fs.path.join(std.testing.allocator, &.{ root, "empty-ws" });
+    defer std.testing.allocator.free(empty_ws);
+    try tmp.dir.createDirPath(std.testing.io, "empty-ws");
+
+    try std.testing.expectEqual(InstallResult.installed, try install(std.testing.io, std.testing.allocator, .{
+        .home = home,
+        .ryk_binary = "/opt/ryk/bin/ryk",
+        .resource_root_override = packaged,
+        .workspace_root = empty_ws,
+    }));
+    try std.testing.expect(isCompleteAtHome(std.testing.io, std.testing.allocator, home));
 }

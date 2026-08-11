@@ -1,8 +1,10 @@
 # ryk preset: generic-agent
-# Conservative starting point for local coding agents with no proprietary assumptions.
-# Edit allowlists for your repository before switching broad actions from ask to allow.
+# Coding DCG defaults: normal work allows; packs/hard fence block danger; no ask main loop.
+# mode strict + empty commands.allow (matrix-only) + commands.default allow.
+# Authoritative embedded source: src/policy/presets.zig (coding_dcg_policy).
+
 version: 1
-mode: ask
+mode: strict
 
 workspace:
   root: "."
@@ -15,6 +17,8 @@ env:
     - HOME
     - LANG
     - TERM
+    - RYK_UNATTENDED
+    - RYK_OPENCLAW_UNATTENDED
   deny_patterns:
     - "*TOKEN*"
     - "*SECRET*"
@@ -39,8 +43,7 @@ files:
     allow:
       - "./**"
     deny:
-      # Expanded secret protections (kept in sync with the authoritative
-      # embedded common_strict_rules used by quick-install presets).
+      # Expanded secret protections (kept in sync with embedded coding_dcg_rules).
       - "./.env"
       - "./.env.*"
       - "~/.ssh/**"
@@ -77,9 +80,7 @@ files:
     allow:
       - "./**"
     deny:
-      # Dual patterns for robustness across hook/plugin callers (Hermes,
-      # OpenClaw, raw CLI) that may normalize paths without leading "./".
-      # See matchesPath + stripLeadingDotSlash in src/policy/matchers.zig.
+      # Dual patterns for robustness across hook/plugin callers.
       - "./.git/**"
       - ".git/**"
       - "./.ryk/**"
@@ -87,131 +88,10 @@ files:
     mode: staged
 
 commands:
-  default: ask
-  # Agents default permit (strict list; packs + hard fence still apply).
-  # Unquoted && chains are on-list only when every segment matches.
-  # Generated init policy comes from embedded common_strict_rules (authoritative).
-  allow:
-    # Workspace / inspect
-    - "cd *"
-    - "mkdir *"
-    - "touch *"
-    - "cp *"
-    - "mv *"
-    - "rmdir *"
-    - "cat *"
-    - "head *"
-    - "tail *"
-    - "file *"
-    - "stat *"
-    - "which *"
-    - "whoami"
-    - "id"
-    - "uname *"
-    - "date"
-    - "umask"
-    - "umask *"
-    - "ls"
-    - "ls *"
-    - "pwd"
-    - "echo *"
-    - "/usr/bin/env"
-    - "true"
-    - "false"
-    - "rg *"
-    - "grep *"
-    - "find *"
-    - "wc *"
-    - "sort *"
-    - "uniq *"
-    - "sed -n *"
-    - "curl *"
-    - "wget *"
-    # Git (local read/write; no bare git *; push stays ask)
-    - "git status"
-    - "git status*"
-    - "git diff"
-    - "git diff *"
-    - "git log"
-    - "git log *"
-    - "git branch"
-    - "git branch *"
-    - "git ls-files"
-    - "git ls-files *"
-    - "git add *"
-    - "git commit *"
-    - "git show *"
-    - "git stash *"
-    - "git fetch *"
-    - "git pull *"
-    - "git merge *"
-    - "git remote *"
-    - "git tag *"
-    - "git cherry-pick *"
-    - "git init"
-    - "git clone *"
-    - "git rev-parse *"
-    - "git merge-base *"
-    - "git checkout *"
-    - "git switch *"
-    - "git restore *"
-    # GitHub CLI (narrow; no blanket gh api *)
-    - "gh auth status"
-    - "gh pr *"
-    - "gh issue *"
-    # Language / test / build
-    - "zig version"
-    - "zig build"
-    - "zig build *"
-    - "zig fmt"
-    - "zig fmt *"
-    - "npm test*"
-    - "npm run *"
-    - "pnpm test*"
-    - "pnpm run *"
-    - "yarn test*"
-    - "yarn run *"
-    - "go test"
-    - "go test *"
-    - "go build"
-    - "go build *"
-    - "go run"
-    - "go run *"
-    - "go fmt"
-    - "go fmt *"
-    - "cargo test"
-    - "cargo test *"
-    - "cargo build"
-    - "cargo build *"
-    - "cargo run"
-    - "cargo run *"
-    - "cargo fmt"
-    - "cargo check"
-    - "cargo clippy"
-    - "swift test*"
-    - "swift build"
-    - "swift build *"
-    - "tsc"
-    - "tsc *"
-    - "python --version"
-    - "python3 --version"
-    - "python -m pytest*"
-    - "python3 -m pytest*"
-    - "pytest"
-    - "pytest *"
-    - "node --version"
-    - "make test*"
-    - "make build*"
-    - "make check*"
-    - "./scripts/zig *"
-    # Ryk recovery / inspect (never deadlock allow-once / explain)
-    - "ryk version"
-    - "ryk help *"
-    - "ryk doctor *"
-    - "ryk explain *"
-    - "ryk allow-once *"
-    - "ryk allowlist *"
-    - "ryk packs *"
+  default: allow
+  # Matrix-only Strict: empty commands.allow disables off-list refuse.
+  # Packs + hard fence block high/critical; deny patterns for catastrophes.
+  # Unmatched shell allows — normal coding work is not approval-gated.
   deny:
     - "rm -rf *"
     - "find * -delete"
@@ -225,28 +105,11 @@ commands:
     - "powershell *-enc*"
     - "cat .env"
     - "cat ~/.ssh/*"
-  ask:
-    - "npm install*"
-    - "pnpm install*"
-    - "yarn install*"
-    - "pip install*"
-    - "git push*"
-    - "rm *"
-    - "go mod *"
-    - "make install*"
-    - "git checkout *"
-    - "git reset *"
-    - "git rebase *"
-    - "git push*"
-    - "npm install*"
-    - "pnpm install*"
-    - "yarn install*"
-    - "pip install*"
 
 network:
   mode: allowlist
-  # Authoritative runtime preset: src/policy/presets.zig (common_strict_rules).
-  default: ask
+  # Authoritative runtime preset: src/policy/presets.zig (coding_dcg_rules).
+  default: deny
   allow:
     - "api.github.com"
     - "*.github.com"
@@ -254,11 +117,6 @@ network:
     - "pypi.org"
   ask:
     - "*.githubusercontent.com"
-    - "objects.githubusercontent.com"
-    - "codeload.github.com"
-    - "api.openai.com"
-    - "api.anthropic.com"
-    - "generativelanguage.googleapis.com"
   deny:
     - "pastebin.com"
     - "*.ngrok.io"
@@ -274,10 +132,16 @@ mcp:
     - "*.search_*"
     - "*.list_*"
     - "*.get_*"
-    # Pi orchestrator bare names (exact; see policies/presets/pi-orchestrator.yaml)
-    # - "subagent"
-    # - "skill"
-    # - "task"
+    - "glob"
+    - "grep"
+    - "list"
+    - "read"
+    - "todowrite"
+    - "todoread"
+    - "skill"
+    - "task"
+    - "question"
+    - "lsp"
   deny:
     - "*.delete_*"
     - "*.shell"

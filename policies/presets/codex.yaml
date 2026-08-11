@@ -1,8 +1,9 @@
 # ryk preset: codex
-# Generic/experimental: designed for local Codex-style coding tasks without assuming model-provider secrets.
-# Network and writes stay reviewable by default.
+# Generic/experimental coding DCG defaults for local Codex-style work.
+# Authoritative embedded source: src/policy/presets.zig (coding_dcg_policy).
+
 version: 1
-mode: ask
+mode: strict
 
 workspace:
   root: "."
@@ -15,6 +16,8 @@ env:
     - HOME
     - LANG
     - TERM
+    - RYK_UNATTENDED
+    - RYK_OPENCLAW_UNATTENDED
   deny_patterns:
     - "*TOKEN*"
     - "*SECRET*"
@@ -29,6 +32,7 @@ env:
     - "OPENAI_API_KEY"
     - "ANTHROPIC_API_KEY"
     - "GOOGLE_API_KEY"
+    - "GOOGLE_APPLICATION_CREDENTIALS"
     - "NPM_TOKEN"
     - "PYPI_TOKEN"
     - "SSH_AUTH_SOCK"
@@ -38,19 +42,44 @@ files:
     allow:
       - "./**"
     deny:
+      # Expanded secret protections (kept in sync with embedded coding_dcg_rules).
       - "./.env"
       - "./.env.*"
       - "~/.ssh/**"
       - "~/.aws/**"
+      - "~/.gcloud/**"
+      - "~/.azure/**"
       - "~/.config/gh/**"
+      - "~/Library/Keychains/**"
+      - "./Library/Keychains/**"
+      - "~/Library/Application Support/**/Cookies*"
+      - "./Library/Application Support/**/Cookies*"
+      - "~/Library/Application Support/**/Login Data*"
+      - "./Library/Application Support/**/Login Data*"
+      - "~/Library/Application Support/Google/Chrome/**"
+      - "./Library/Application Support/Google/Chrome/**"
+      - "~/Library/Application Support/BraveSoftware/**"
+      - "./Library/Application Support/BraveSoftware/**"
+      - "~/Library/Application Support/Firefox/**"
+      - "./Library/Application Support/Firefox/**"
+      - "~/Library/Mobile Documents/**"
+      - "./Library/Mobile Documents/**"
+      - "~/.zsh_history"
+      - "~/.bash_history"
+      - "~/.zshrc"
+      - "~/.bashrc"
+      - "~/.profile"
+      - "**/id_rsa"
+      - "**/id_ed25519"
       - "**/*credentials*"
+      - "**/*credential*"
       - "**/*secret*"
       - "**/*token*"
   write:
     allow:
       - "./**"
     deny:
-      # Dual patterns (see generic-agent.yaml for rationale).
+      # Dual patterns for robustness across hook/plugin callers.
       - "./.git/**"
       - ".git/**"
       - "./.ryk/**"
@@ -58,118 +87,10 @@ files:
     mode: staged
 
 commands:
-  default: ask
-  allow:
-    - "mkdir *"
-    - "touch *"
-    - "cp *"
-    - "mv *"
-    - "rmdir *"
-    - "cat *"
-    - "grep *"
-    - "find *"
-    - "head *"
-    - "tail *"
-    - "file *"
-    - "stat *"
-    - "which *"
-    - "whoami"
-    - "id"
-    - "uname *"
-    - "git status*"
-    - "git diff"
-    - "git diff *"
-    - "git log"
-    - "git log *"
-    - "git branch"
-    - "git branch *"
-    - "git ls-files"
-    - "git ls-files *"
-    - "git add *"
-    - "git commit *"
-    - "git show *"
-    - "git stash *"
-    - "git fetch *"
-    - "git pull *"
-    - "git merge *"
-    - "git remote *"
-    - "git tag *"
-    - "git cherry-pick *"
-    - "git init"
-    - "git clone *"
-    - "ls"
-    - "ls *"
-    - "pwd"
-    - "echo *"
-    - "/usr/bin/env"
-    - "true"
-    - "false"
-    - "rg *"
-    - "wc *"
-    - "sort *"
-    - "uniq *"
-    - "sed -n *"
-    - "curl *"
-    - "wget *"
-    - "tar *"
-    - "zip *"
-    - "unzip *"
-    - "gzip *"
-    - "gunzip *"
-    - "xargs *"
-    - "zig version"
-    - "zig build"
-    - "zig build *"
-    - "zig fmt"
-    - "npm test*"
-    - "npm run *"
-    - "pnpm test*"
-    - "pnpm run *"
-    - "yarn test*"
-    - "yarn run *"
-    - "go test"
-    - "go test *"
-    - "go build"
-    - "go build *"
-    - "go run"
-    - "go run *"
-    - "go fmt"
-    - "go fmt *"
-    - "cargo test"
-    - "cargo test *"
-    - "cargo build"
-    - "cargo build *"
-    - "cargo run"
-    - "cargo run *"
-    - "cargo fmt"
-    - "cargo check"
-    - "cargo clippy"
-    - "swift test*"
-    - "swift build"
-    - "swift build *"
-    - "tsc"
-    - "tsc *"
-    - "cmake *"
-    - "ninja *"
-    - "make"
-    - "make all"
-    - "make clean"
-    - "make test*"
-    - "make build*"
-    - "make check*"
-    - "prettier *"
-    - "eslint *"
-    - "black *"
-    - "isort *"
-    - "gofmt *"
-    - "rustfmt *"
-    - "clang-format *"
-    - "python -m pytest*"
-    - "python -m venv *"
-    - "python -m pip list*"
-    - "python -m pip show*"
-    - "pytest"
-    - "pytest *"
+  default: allow
+  # Matrix-only Strict: empty commands.allow disables off-list refuse.
+  # Packs + hard fence block high/critical; deny patterns for catastrophes.
+  # Unmatched shell allows — normal coding work is not approval-gated.
   deny:
     - "rm -rf *"
     - "find * -delete"
@@ -183,23 +104,11 @@ commands:
     - "powershell *-enc*"
     - "cat .env"
     - "cat ~/.ssh/*"
-  ask:
-    - "rm *"
-    - "go mod *"
-    - "make install*"
-    - "git checkout *"
-    - "git reset *"
-    - "git rebase *"
-    - "git push*"
-    - "npm install*"
-    - "pnpm install*"
-    - "yarn install*"
-    - "pip install*"
 
 network:
   mode: allowlist
-  # Keep in sync with generic-agent.yaml and src/policy/presets.zig.
-  default: ask
+  # Authoritative runtime preset: src/policy/presets.zig (coding_dcg_rules).
+  default: deny
   allow:
     - "api.github.com"
     - "*.github.com"
@@ -207,11 +116,6 @@ network:
     - "pypi.org"
   ask:
     - "*.githubusercontent.com"
-    - "objects.githubusercontent.com"
-    - "codeload.github.com"
-    - "api.openai.com"
-    - "api.anthropic.com"
-    - "generativelanguage.googleapis.com"
   deny:
     - "pastebin.com"
     - "*.ngrok.io"
@@ -227,6 +131,16 @@ mcp:
     - "*.search_*"
     - "*.list_*"
     - "*.get_*"
+    - "glob"
+    - "grep"
+    - "list"
+    - "read"
+    - "todowrite"
+    - "todoread"
+    - "skill"
+    - "task"
+    - "question"
+    - "lsp"
   deny:
     - "*.delete_*"
     - "*.shell"

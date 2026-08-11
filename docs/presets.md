@@ -11,19 +11,13 @@ ryk policy check .ryk/policy.yaml
 
 Available presets:
 
-- `generic-agent`: conservative local coding-agent baseline (the default for `ryk init --preset` and `ryk start` / `start --auto`). The on-disk YAML documents the structure; the generated policy uses the stricter embedded variant (network default deny + expanded secret protections + **agents default command permit** — see the file header and `src/policy/presets.zig`). The permit is usable for agent shell work under strict refuse without blanket `python3 *` / `bash *` / `git *`; recovery commands (`ryk explain`, `ryk allow-once`) are included so agents cannot deadlock on the escape hatch.
-- `claude-code`: generic/experimental local coding-agent assumptions for Claude Code-style use.
-- `codex`: generic/experimental local coding-agent assumptions for Codex-style use.
-- `cursor-agent`: generic/experimental local editor-agent assumptions.
-- `opencode`: generic/experimental local coding-agent assumptions.
-- `cline-roo`: generic/experimental local editor/MCP-agent assumptions.
-- `mcp-dev`: stdio MCP development baseline with conservative tool defaults.
+- `generic-agent`: coding-agent day-to-day baseline (the default for `ryk init --preset` and `ryk start` / `start --auto`). **DCG-style:** `mode: strict` with an **empty** `commands.allow` (matrix-only — no `strict: not on allowlist` refuse) and `commands.default: allow` so normal shell work is not approval-gated. Packs + hard fence **block** high/critical danger; catastrophe deny patterns stay on. Network defaults to deny with a narrow allowlist; secret read denys remain expanded. Not ask-on-risk.
+- `claude-code`, `codex`, `cursor-agent`, `opencode`, `cline-roo`, `solo-dev`, `mcp-dev`: same coding DCG body as `generic-agent` (host/product labels differ; mcp-dev notes stdio MCP manifest binding still required).
 - `no-external-comms`: strict-local baseline plus effect-class denials for messaging, social publish, and payments (`comms.message`, `comms.publish`, `money.transfer`).
 - `github-actions`: non-interactive CI baseline.
-- `solo-dev`: product policy pack for local solo development with ask-mode defaults.
-- `strict-local`: strict local baseline with denied unknown commands/network.
+- `strict-local`: strict local baseline with a **sample** `commands.allow` permit list (off-list refuse when the host wires that list).
 - `team-ci`: product policy pack for team CI baselines.
-- `openclaw-hermes`: product policy pack for OpenClaw and Hermes hook workflows.
+- `openclaw-hermes`: product policy pack for OpenClaw and Hermes hook workflows (**ask-mode** body — approval-capable; not the coding DCG path).
 - `unattended`: strict permit-list fail-closed baseline for agents running without an operator. Commands outside the reviewed local-safe set are denied rather than waiting for approval.
 - `trusted-local`: more permissive local baseline for trusted repositories; secret redaction and deny rules remain active.
 

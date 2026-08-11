@@ -317,8 +317,9 @@ fn evaluateDecision(
 
             // Shell pack fence: medium/high/critical pack denials take the more
             // restrictive of policy vs shell-derived plugin decision. Critical/high
-            // → block (closer to hook hard fence for critical); medium → ask
-            // (CI hardens ask→block). Not a full mode×severity matrix.
+            // → block (closer to hook hard fence for critical); medium → ask only
+            // under ask/yolo (CI and strict/redteam/ci policy modes harden to block).
+            // Coding DCG create-path uses mode: strict so medium pack hits never ask.
             //
             // evaluateCommand error set is allocator-only (OOM). Registry init and
             // other evaluator failures already return a fail-closed deny Evaluation
@@ -330,7 +331,7 @@ fn evaluateDecision(
             if (shell.decision == .deny and packSeverityBlocksPolicyAllow(shell.severity)) {
                 const shell_derived: PluginDecision = switch (shell.severity) {
                     .critical, .high => .block,
-                    .medium => if (ci_mode) .block else .ask,
+                    .medium => if (ci_mode or packMediumFenceBlocks(policy_value.mode)) .block else .ask,
                     .low => unreachable, // excluded by packSeverityBlocksPolicyAllow
                 };
                 const policy_decision = PluginDecision.fromDecisionResult(evaluation.decision.result, ci_mode);
@@ -489,6 +490,15 @@ fn evaluateDecision(
             };
         },
     }
+}
+
+/// Strict-like policy modes (and CI flag) harden medium pack fence to block so
+/// coding DCG / unattended create-paths never emit ask for medium pack denials.
+fn packMediumFenceBlocks(mode: policy.schema.Mode) bool {
+    return switch (mode) {
+        .strict, .redteam, .ci => true,
+        .ask, .yolo, .observe, .trusted => false,
+    };
 }
 
 /// Pack deny at medium+ participates in the decide pack fence.
@@ -1597,4 +1607,169 @@ test "decide rejects inline json payloads over limit" {
     // Oversize is rejected before evaluation; no typed decision JSON (usage/size guard).
     try std.testing.expectEqualStrings("", stdout_writer.buffered());
     try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "JSON payload exceeds maximum size") != null);
+}
+
+// ---------------------------------------------------------------------------
+// U2: user-shaped coding DCG create-path proof (product agentPresetText)
+// ---------------------------------------------------------------------------
+
+/// Run `ryk decide command` against an explicit policy path; return exit code + stdout.
+fn decideCommandUnderPolicy(
+    policy_path: []const u8,
+    command_json: []const u8,
+    stdout_buf: []u8,
+    stderr_buf: []u8,
+) !struct { u8, []const u8 } {
+    var stdout_writer: std.Io.Writer = .fixed(stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(stderr_buf);
+    const code = try decideCommandWithPolicy(
+        std.testing.io,
+        .command,
+        &.{ "--json", command_json },
+        &stdout_writer,
+        &stderr_writer,
+        policy_path,
+    );
+    return .{ code, stdout_writer.buffered() };
+}
+
+test "coding DCG create-path decide: normal allow, danger block, unmatched never ask" {
+    // Product create-path body — same text `ryk init --preset generic-agent` writes
+    // via agentPresetText (coding_dcg_policy). Not a hand-rolled stub.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "policy.yaml",
+        .data = policy.presets.agentPresetText(.generic_agent),
+    });
+    const policy_path = try tmp.dir.realPathFileAlloc(std.testing.io, "policy.yaml", std.testing.allocator);
+    defer std.testing.allocator.free(policy_path);
+
+    var stdout_buf: [8192]u8 = undefined;
+    var stderr_buf: [1024]u8 = undefined;
+
+    // 1) Normal day-to-day work → allow (exit 0), never ask.
+    {
+        const code, const output = try decideCommandUnderPolicy(
+            policy_path,
+            "{\"command\":\"true\"}",
+            &stdout_buf,
+            &stderr_buf,
+        );
+        try std.testing.expectEqual(exit_codes.success, code);
+        try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"allow\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"ask\"") == null);
+    }
+    {
+        const code, const output = try decideCommandUnderPolicy(
+            policy_path,
+            "{\"command\":\"git status\"}",
+            &stdout_buf,
+            &stderr_buf,
+        );
+        try std.testing.expectEqual(exit_codes.success, code);
+        try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"allow\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"ask\"") == null);
+    }
+
+    // 2) Catastrophe / destructive → block (deny), not ask.
+    {
+        const code, const output = try decideCommandUnderPolicy(
+            policy_path,
+            "{\"command\":\"rm -rf /\"}",
+            &stdout_buf,
+            &stderr_buf,
+        );
+        try std.testing.expectEqual(exit_codes.denial, code);
+        try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"block\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"ask\"") == null);
+    }
+    {
+        const code, const output = try decideCommandUnderPolicy(
+            policy_path,
+            "{\"command\":\"git reset --hard\"}",
+            &stdout_buf,
+            &stderr_buf,
+        );
+        try std.testing.expectEqual(exit_codes.denial, code);
+        try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"block\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"ask\"") == null);
+    }
+
+    // 3) Representative unmatched command that previously asked under old
+    // generic-agent (commands.default: ask) must NOT return ask.
+    {
+        const code, const output = try decideCommandUnderPolicy(
+            policy_path,
+            "{\"command\":\"chmod -R 777 .\"}",
+            &stdout_buf,
+            &stderr_buf,
+        );
+        try std.testing.expect(code != exit_codes.ask);
+        try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"ask\"") == null);
+        // DCG matrix-only + default allow → allow (packs do not fence chmod).
+        try std.testing.expectEqual(exit_codes.success, code);
+        try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"allow\"") != null);
+    }
+
+    // 4) Medium pack hit under coding DCG (mode: strict) → block, never ask.
+    {
+        const code, const output = try decideCommandUnderPolicy(
+            policy_path,
+            "{\"command\":\"git branch -D feature\"}",
+            &stdout_buf,
+            &stderr_buf,
+        );
+        try std.testing.expectEqual(exit_codes.denial, code);
+        try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"block\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"ask\"") == null);
+        try std.testing.expect(std.mem.indexOf(u8, output, "core.git:branch-force-delete") != null);
+    }
+}
+
+test "coding DCG on-disk generic-agent YAML: decide path matches create-path" {
+    // Same user-shaped checks against shipped policies/presets/generic-agent.yaml.
+    const policy_path = try std.Io.Dir.cwd().realPathFileAlloc(
+        std.testing.io,
+        "policies/presets/generic-agent.yaml",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(policy_path);
+
+    var stdout_buf: [8192]u8 = undefined;
+    var stderr_buf: [1024]u8 = undefined;
+
+    {
+        const code, const output = try decideCommandUnderPolicy(
+            policy_path,
+            "{\"command\":\"git status\"}",
+            &stdout_buf,
+            &stderr_buf,
+        );
+        try std.testing.expectEqual(exit_codes.success, code);
+        try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"allow\"") != null);
+    }
+    {
+        const code, const output = try decideCommandUnderPolicy(
+            policy_path,
+            "{\"command\":\"rm -rf /\"}",
+            &stdout_buf,
+            &stderr_buf,
+        );
+        try std.testing.expectEqual(exit_codes.denial, code);
+        try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"block\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"ask\"") == null);
+    }
+    {
+        const code, const output = try decideCommandUnderPolicy(
+            policy_path,
+            "{\"command\":\"chmod -R 777 .\"}",
+            &stdout_buf,
+            &stderr_buf,
+        );
+        try std.testing.expect(code != exit_codes.ask);
+        try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"ask\"") == null);
+        try std.testing.expectEqual(exit_codes.success, code);
+        try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"allow\"") != null);
+    }
 }

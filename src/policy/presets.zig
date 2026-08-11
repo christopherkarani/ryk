@@ -174,47 +174,47 @@ pub fn defaultPreset() Preset {
 
 const generic_agent_policy =
     \\# ryk preset: generic-agent
-    \\# Conservative starting point for local coding agents with no proprietary assumptions.
-    \\# Edit allowlists for your repository before switching broad actions from ask to allow.
+    \\# Coding DCG defaults: normal work allows; packs/hard fence block danger; no ask main loop.
+    \\# mode strict + empty commands.allow (matrix-only) + commands.default allow.
     \\
-++ ask_policy;
+++ coding_dcg_policy;
 
 const claude_code_policy =
     \\# ryk preset: claude-code
-    \\# Generic/experimental: assumes a normal local coding-agent workflow, not private Claude Code internals.
+    \\# Generic/experimental coding DCG defaults (not private Claude Code internals).
     \\
-++ ask_policy;
+++ coding_dcg_policy;
 
 const codex_policy =
     \\# ryk preset: codex
-    \\# Generic/experimental: designed for local Codex-style coding tasks without model-provider secrets.
+    \\# Generic/experimental coding DCG defaults for local Codex-style work.
     \\
-++ ask_policy;
+++ coding_dcg_policy;
 
 const cursor_agent_policy =
     \\# ryk preset: cursor-agent
-    \\# Generic/experimental: conservative local editor-agent policy, not a claim about Cursor internals.
+    \\# Generic/experimental coding DCG defaults for local editor-agent work.
     \\
-++ ask_policy;
+++ coding_dcg_policy;
 
 const opencode_policy =
     \\# ryk preset: opencode
-    \\# Generic/experimental: tuned for local coding-agent workflows and editable allowlists.
+    \\# Generic/experimental coding DCG defaults for local coding-agent work.
     \\
-++ ask_policy;
+++ coding_dcg_policy;
 
 const cline_roo_policy =
     \\# ryk preset: cline-roo
-    \\# Generic/experimental: conservative policy for local editor agents with MCP-style extensions.
+    \\# Generic/experimental coding DCG defaults for local editor agents with MCP-style extensions.
     \\
-++ ask_policy;
+++ coding_dcg_policy;
 
 const mcp_dev_policy =
     \\# ryk preset: mcp-dev
-    \\# Conservative preset for developing stdio MCP servers through ryk.
+    \\# Coding DCG defaults for developing stdio MCP servers through ryk.
     \\# Manifests still need explicit command/hash binding; this policy does not trust servers by name alone.
     \\
-++ ask_policy;
+++ coding_dcg_policy;
 
 const github_actions_policy =
     \\# ryk preset: github-actions
@@ -225,9 +225,9 @@ const github_actions_policy =
 
 const solo_dev_policy =
     \\# ryk policy pack: solo-dev
-    \\# Ask-mode local development pack for one developer. Keeps secret and destructive-action denies active.
+    \\# Coding DCG local development pack for one developer. Secret and destructive-action denies stay active.
     \\
-++ ask_policy;
+++ coding_dcg_policy;
 
 const strict_local_policy =
     \\# ryk preset: strict-local
@@ -711,6 +711,165 @@ const common_strict_rules =
     \\
 ;
 
+/// Coding-agent DCG body (fork of common_strict_rules, not a shared empty-allow edit).
+/// mode strict + empty commands.allow → matrix-only (no strict off-list refuse).
+/// commands.default allow → unmatched shell is not approval-gated.
+/// Packs + hard fence block high/critical; deny patterns keep catastrophes out.
+/// yolo/strict-local/ask keep common_strict_rules (sample allow lists intact).
+const coding_dcg_rules =
+    \\workspace:
+    \\  root: "."
+    \\  write_mode: staged
+    \\
+    \\env:
+    \\  inherit: false
+    \\  allow:
+    \\    - PATH
+    \\    - HOME
+    \\    - LANG
+    \\    - TERM
+    \\    - RYK_UNATTENDED
+    \\    - RYK_OPENCLAW_UNATTENDED
+    \\  deny_patterns:
+    \\    - "*TOKEN*"
+    \\    - "*SECRET*"
+    \\    - "*PASSWORD*"
+    \\    - "*PASSWD*"
+    \\    - "*PRIVATE*"
+    \\    - "*KEY*"
+    \\    - "AWS_*"
+    \\    - "AZURE_*"
+    \\    - "GITHUB_TOKEN"
+    \\    - "GH_TOKEN"
+    \\    - "OPENAI_API_KEY"
+    \\    - "ANTHROPIC_API_KEY"
+    \\    - "GOOGLE_API_KEY"
+    \\    - "GOOGLE_APPLICATION_CREDENTIALS"
+    \\    - "NPM_TOKEN"
+    \\    - "PYPI_TOKEN"
+    \\    - "SSH_AUTH_SOCK"
+    \\
+    \\files:
+    \\  read:
+    \\    allow:
+    \\      - "./**"
+    \\    deny:
+    \\      - "./.env"
+    \\      - "./.env.*"
+    \\      - "~/.ssh/**"
+    \\      - "~/.aws/**"
+    \\      - "~/.gcloud/**"
+    \\      - "~/.azure/**"
+    \\      - "~/.config/gh/**"
+    \\      - "~/Library/Keychains/**"
+    \\      - "./Library/Keychains/**"
+    \\      - "~/Library/Application Support/**/Cookies*"
+    \\      - "./Library/Application Support/**/Cookies*"
+    \\      - "~/Library/Application Support/**/Login Data*"
+    \\      - "./Library/Application Support/**/Login Data*"
+    \\      - "~/Library/Application Support/Google/Chrome/**"
+    \\      - "./Library/Application Support/Google/Chrome/**"
+    \\      - "~/Library/Application Support/BraveSoftware/**"
+    \\      - "./Library/Application Support/BraveSoftware/**"
+    \\      - "~/Library/Application Support/Firefox/**"
+    \\      - "./Library/Application Support/Firefox/**"
+    \\      - "~/Library/Mobile Documents/**"
+    \\      - "./Library/Mobile Documents/**"
+    \\      - "~/.zsh_history"
+    \\      - "~/.bash_history"
+    \\      - "~/.zshrc"
+    \\      - "~/.bashrc"
+    \\      - "~/.profile"
+    \\      - "**/id_rsa"
+    \\      - "**/id_ed25519"
+    \\      - "**/*credentials*"
+    \\      - "**/*credential*"
+    \\      - "**/*secret*"
+    \\      - "**/*token*"
+    \\  write:
+    \\    allow:
+    \\      - "./**"
+    \\    deny:
+    \\      # Dual patterns for robustness across hook/plugin path normalizations.
+    \\      - "./.git/**"
+    \\      - ".git/**"
+    \\      - "./.ryk/**"
+    \\      - ".ryk/**"
+    \\    mode: staged
+    \\
+    \\commands:
+    \\  default: allow
+    \\  # Matrix-only Strict: empty commands.allow disables off-list refuse.
+    \\  # Packs + hard fence block high/critical; deny patterns for catastrophes.
+    \\  # Unmatched shell allows — normal coding work is not approval-gated.
+    \\  deny:
+    \\    - "rm -rf *"
+    \\    - "find * -delete"
+    \\    - "shred *"
+    \\    - "curl * | sh"
+    \\    - "wget * | bash"
+    \\    - "sudo *"
+    \\    - "su *"
+    \\    - "doas *"
+    \\    - "powershell *EncodedCommand*"
+    \\    - "powershell *-enc*"
+    \\    - "cat .env"
+    \\    - "cat ~/.ssh/*"
+    \\
+    \\network:
+    \\  mode: allowlist
+    \\  default: deny
+    \\  allow:
+    \\    - "api.github.com"
+    \\    - "*.github.com"
+    \\    - "registry.npmjs.org"
+    \\    - "pypi.org"
+    \\  ask:
+    \\    - "*.githubusercontent.com"
+    \\  deny:
+    \\    - "pastebin.com"
+    \\    - "*.ngrok.io"
+    \\    - "*.requestbin.net"
+    \\  detect_exfiltration:
+    \\    dns: true
+    \\    long_query_strings: true
+    \\    secret_patterns: true
+    \\
+    \\mcp:
+    \\  default: ask
+    \\  allow:
+    \\    - "*.search_*"
+    \\    - "*.list_*"
+    \\    - "*.get_*"
+    \\    - "glob"
+    \\    - "grep"
+    \\    - "list"
+    \\    - "read"
+    \\    - "todowrite"
+    \\    - "todoread"
+    \\    - "skill"
+    \\    - "task"
+    \\    - "question"
+    \\    - "lsp"
+    \\  deny:
+    \\    - "*.delete_*"
+    \\    - "*.shell"
+    \\    - "*.run_command"
+    \\
+    \\audit:
+    \\  level: full
+    \\  redact_secrets: true
+    \\  tamper_evident: true
+    \\
+;
+
+/// Coding create-path product body: strict matrix-only + allow default (DCG-like).
+pub const coding_dcg_policy =
+    \\version: 1
+    \\mode: strict
+    \\
+++ coding_dcg_rules;
+
 pub const strict_policy =
     \\version: 1
     \\mode: strict
@@ -1044,10 +1203,9 @@ test "no-external-comms on-disk YAML matches embedded effect rules" {
     }
 }
 
-// Quick-install DX invariants: the presets used by `ryk init --preset` and `setup --auto`
-// (generic-agent and friends via common_strict_rules) must remain conservative.
-// These properties are the "source of truth" for the generated .ryk/policy.yaml.
-// A future semantic sync test will also load the on-disk YAMLs in policies/presets/ and assert parity.
+// Quick-install DX invariants: coding create-path presets (generic-agent via coding_dcg_rules)
+// stay conservative on network + secrets while using DCG matrix-only command defaults.
+// openclaw_hermes still inherits common_strict_rules (ask body).
 test "quick install agent presets have conservative defaults (network deny + broad secret protection)" {
     const generic = agentPresetText(.generic_agent);
     const codex = agentPresetText(.codex);
@@ -1071,28 +1229,97 @@ test "quick install agent presets have conservative defaults (network deny + bro
     try std.testing.expect(std.mem.indexOf(u8, openclaw, "default: deny") != null);
     try std.testing.expect(std.mem.indexOf(u8, openclaw, "~/.zsh_history") != null);
 
-    // Phase 2 DX guards (explicit regression protection for the surgical changes in PR #18).
-    // These assert the narrow command allows and dual bare paths are present in the
-    // authoritative embedded common_strict_rules (used by quick-install flows).
-    // NOTE: Full on-disk YAML parity is still manual (see comment above); a future
-    // generator or stricter embed-based test can enforce it when package path rules allow.
+    // Dual bare paths for control dirs (hook/plugin path normalizations).
     try std.testing.expect(std.mem.indexOf(u8, generic, ".git/**") != null);
     try std.testing.expect(std.mem.indexOf(u8, generic, ".ryk/**") != null);
-    try std.testing.expect(std.mem.indexOf(u8, generic, "    - \"zig build\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, generic, "    - \"make test*\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, generic, "    - \"make build*\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, generic, "    - \"make check*\"") != null);
-
-    // Agents default permit markers (usable strict list without broad * shells).
-    try std.testing.expect(std.mem.indexOf(u8, generic, "Agents default permit") != null);
-    try std.testing.expect(std.mem.indexOf(u8, generic, "    - \"git add *\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, generic, "    - \"gh pr *\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, generic, "    - \"ryk explain *\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, generic, "    - \"ryk allow-once *\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, generic, "    - \"mkdir *\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, generic, "    - \"cd *\"") != null);
-    // Must not ship unrestricted interpreter / force-push permits.
+    // Coding DCG: catastrophe deny patterns retained; no fat commands.allow sample.
+    try std.testing.expect(std.mem.indexOf(u8, generic, "rm -rf *") != null);
+    try std.testing.expect(std.mem.indexOf(u8, generic, "mode: strict") != null);
+    // Must not ship unrestricted interpreter / blanket git shells.
     try std.testing.expect(std.mem.indexOf(u8, generic, "    - \"python3 *\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, generic, "    - \"bash *\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, generic, "    - \"git *\"") == null);
+}
+
+/// Coding create-path DCG contract: mode strict, empty commands.allow (matrix-only),
+/// commands.default = allow (never ask). High/critical → block/deny, not ask.
+const coding_dcg_agent_presets = [_]AgentPreset{
+    .generic_agent,
+    .claude_code,
+    .codex,
+    .cursor_agent,
+    .opencode,
+    .cline_roo,
+    .solo_dev,
+    .mcp_dev,
+};
+
+test "coding agent presets are DCG matrix-only strict (no ask default, empty allow)" {
+    const load = @import("load.zig");
+    const evaluate = @import("evaluate.zig");
+    const core = @import("../core/public.zig");
+
+    for (coding_dcg_agent_presets) |preset| {
+        const source = agentPresetText(preset);
+        try std.testing.expect(std.mem.indexOf(u8, source, "mode: strict") != null);
+
+        var policy = try load.parseFromSlice(std.testing.allocator, source, "coding-dcg-test");
+        defer policy.deinit();
+
+        try std.testing.expectEqual(schema.Mode.strict, policy.mode);
+        try std.testing.expectEqual(@as(usize, 0), policy.commands.allow.len);
+        try std.testing.expectEqual(schema.DecisionValue.allow, policy.commands.default.?);
+        // No ask spam lists required for default experience.
+        try std.testing.expectEqual(@as(usize, 0), policy.commands.ask.len);
+
+        // Unmatched / normal shell is not approval-gated.
+        var normal = try evaluate.command(&policy, "chmod -R 777 .", std.testing.allocator);
+        defer normal.deinit(std.testing.allocator);
+        try std.testing.expectEqual(core.decision.DecisionResult.allow, normal.decision.result);
+        try std.testing.expect(!normal.decision.requires_user);
+
+        // Catastrophe / high-risk → block (deny), never ask.
+        var wiped = try evaluate.command(&policy, "rm -rf /", std.testing.allocator);
+        defer wiped.deinit(std.testing.allocator);
+        try std.testing.expectEqual(core.decision.DecisionResult.deny, wiped.decision.result);
+        try std.testing.expect(!wiped.decision.requires_user);
+
+        var hard_reset = try evaluate.command(&policy, "git reset --hard", std.testing.allocator);
+        defer hard_reset.deinit(std.testing.allocator);
+        // Pack/matrix path may differ; rule-surface must not ask.
+        try std.testing.expect(hard_reset.decision.result != .ask);
+        try std.testing.expect(!hard_reset.decision.requires_user);
+    }
+}
+
+test "openclaw_hermes remains ask_policy (not coding DCG)" {
+    const load = @import("load.zig");
+    const source = agentPresetText(.openclaw_hermes);
+    try std.testing.expect(std.mem.indexOf(u8, source, "mode: ask") != null);
+
+    var policy = try load.parseFromSlice(std.testing.allocator, source, "openclaw-hermes-ask");
+    defer policy.deinit();
+    try std.testing.expectEqual(schema.Mode.ask, policy.mode);
+    // Still has sample allow list / ask-oriented defaults (not empty matrix-only).
+    try std.testing.expect(policy.commands.allow.len > 0);
+    try std.testing.expectEqual(schema.DecisionValue.ask, policy.commands.default.?);
+}
+
+test "generic-agent on-disk YAML matches coding DCG embedded contract" {
+    const load = @import("load.zig");
+    var embedded = try load.loadAgentPreset(std.testing.allocator, .generic_agent);
+    defer embedded.deinit();
+    var disk = try load.loadFile(
+        std.testing.io,
+        std.testing.allocator,
+        "policies/presets/generic-agent.yaml",
+    );
+    defer disk.deinit();
+
+    try std.testing.expectEqual(schema.Mode.strict, embedded.mode);
+    try std.testing.expectEqual(schema.Mode.strict, disk.mode);
+    try std.testing.expectEqual(@as(usize, 0), embedded.commands.allow.len);
+    try std.testing.expectEqual(@as(usize, 0), disk.commands.allow.len);
+    try std.testing.expectEqual(schema.DecisionValue.allow, embedded.commands.default.?);
+    try std.testing.expectEqual(schema.DecisionValue.allow, disk.commands.default.?);
 }

@@ -236,6 +236,9 @@ pub const HermesPaths = struct {
     user_source_exists: bool,
     user_mapping_exists: bool,
     config_references_plugin: bool,
+    /// True when user plugin.yaml declares `name: ryk` (not stale `name: orca`).
+    /// Populated at report collection so doctor JSON and hostPluginInstalledFromReport agree.
+    user_manifest_name_is_ryk: bool,
 };
 
 pub const MarketplaceStatus = struct {
@@ -495,6 +498,7 @@ fn collectPluginDoctorReportWithOptions(
         .user_source_exists = fileExistsAbsolute(io, hermes_user_source_path),
         .user_mapping_exists = fileExistsAbsolute(io, hermes_user_mapping_path),
         .config_references_plugin = fileContains(allocator, hermes_config_path, "ryk"),
+        .user_manifest_name_is_ryk = hermesManifestDeclaresNameRyk(allocator, hermes_user_manifest_path),
     };
 
     const codex_marketplace_path = try std.fs.path.join(allocator, &.{ workspace_root, ".agents", "plugins", "marketplace.json" });
@@ -756,6 +760,8 @@ fn writeDoctorPlain(io: std.Io, allocator: std.mem.Allocator, stdout: anytype, r
             if (!report.hermes_paths.user_mapping_exists) try stdout.writeAll("    → Fix: ryk doctor --fix or ryk plugin install hermes\n");
             try stdout.print("  config references plugin: {s}\n", .{if (report.hermes_paths.config_references_plugin) "yes" else "unknown/no"});
             if (!report.hermes_paths.config_references_plugin) try stdout.writeAll("    → Fix: ryk doctor --fix or ryk plugin install hermes\n");
+            try stdout.print("  user manifest name: ryk: {s}\n", .{if (report.hermes_paths.user_manifest_name_is_ryk) "yes" else "no"});
+            if (!report.hermes_paths.user_manifest_name_is_ryk) try stdout.writeAll("    → Fix: ryk doctor --fix or ryk plugin install hermes (rewrites stale name: orca)\n");
             const hermes_fail_open = host_status.hermesFailOpenFromEnv();
             const hermes_wired: []const u8 = if (hostPluginInstalledFromReport("hermes", report)) "yes" else if (report.host_binaries.hermes) "no" else "—";
             try stdout.print("  fail stance: {s}\n", .{host_status.failStance("hermes", hermes_fail_open, hermes_wired)});
@@ -983,7 +989,8 @@ fn writeDoctorJson(stdout: anytype, report: PluginDoctorReport, target: DoctorTa
     try stdout.print("    \"user_manifest_exists\": {s},\n", .{if (report.hermes_paths.user_manifest_exists) "true" else "false"});
     try stdout.print("    \"user_source_exists\": {s},\n", .{if (report.hermes_paths.user_source_exists) "true" else "false"});
     try stdout.print("    \"user_mapping_exists\": {s},\n", .{if (report.hermes_paths.user_mapping_exists) "true" else "false"});
-    try stdout.print("    \"config_references_plugin\": {s}\n", .{if (report.hermes_paths.config_references_plugin) "true" else "false"});
+    try stdout.print("    \"config_references_plugin\": {s},\n", .{if (report.hermes_paths.config_references_plugin) "true" else "false"});
+    try stdout.print("    \"user_manifest_name_is_ryk\": {s}\n", .{if (report.hermes_paths.user_manifest_name_is_ryk) "true" else "false"});
     try stdout.writeAll("  },\n");
 
     try stdout.writeAll("  \"hermes_hook_smoke_passed\": ");
@@ -2043,10 +2050,14 @@ pub fn captureChildOutputTimedInCurrentProcessGroup(
 
 pub fn hostPluginInstalledFromReport(host_name: []const u8, report: PluginDoctorReport) bool {
     if (std.mem.eql(u8, host_name, "hermes")) {
+        // Config substring "ryk" alone is insufficient: stale name: orca manifests
+        // still match config while hermes plugins enable ryk fails. Identity is
+        // recorded on the report so doctor JSON and this predicate stay in sync.
         return report.hermes_paths.user_manifest_exists and
             report.hermes_paths.user_source_exists and
             report.hermes_paths.user_mapping_exists and
-            report.hermes_paths.config_references_plugin;
+            report.hermes_paths.config_references_plugin and
+            report.hermes_paths.user_manifest_name_is_ryk;
     }
     if (std.mem.eql(u8, host_name, "openclaw")) return report.openclaw_paths.host_plugin_installed;
     if (std.mem.eql(u8, host_name, "opencode")) {
@@ -2089,7 +2100,8 @@ pub fn hostPluginInstalledFromDoctorJson(host_name: []const u8, root: std.json.V
         return jsonBoolField(paths.object, "user_manifest_exists") and
             jsonBoolField(paths.object, "user_source_exists") and
             jsonBoolField(paths.object, "user_mapping_exists") and
-            jsonBoolField(paths.object, "config_references_plugin");
+            jsonBoolField(paths.object, "config_references_plugin") and
+            jsonBoolField(paths.object, "user_manifest_name_is_ryk");
     }
     if (std.mem.eql(u8, host_name, "openclaw")) {
         const paths = root.object.get("openclaw_paths") orelse return false;
@@ -2363,6 +2375,17 @@ fn installHermesBundleAtomically(
         defer allocator.free(source_path);
         source_bytes[index] = try std.Io.Dir.cwd().readFileAlloc(io, source_path, allocator, .limited(8 * 1024 * 1024));
         loaded += 1;
+    }
+    // Stale packaged trees may still ship `name: orca` while enable targets `ryk`.
+    // Normalize identity before staging so enable + doctor installed evidence agree.
+    {
+        const normalized = try normalizeHermesManifestNameToRyk(allocator, source_bytes[0]);
+        if (!std.mem.eql(u8, normalized, source_bytes[0])) {
+            allocator.free(source_bytes[0]);
+            source_bytes[0] = normalized;
+        } else {
+            allocator.free(normalized);
+        }
     }
 
     const existing = dirExists(destination_dir);
@@ -2758,6 +2781,43 @@ pub fn runHermesEnable(allocator: std.mem.Allocator, host_binary: []const u8) !u
     const result = try child_process.runHostCommandTimed(allocator, &argv, 10_000, null, null);
     defer child_process.deinitHostCommandResult(result, allocator);
     return if (result.timed_out) 255 else result.exit_code;
+}
+
+/// True when `~/.hermes/plugins/ryk/plugin.yaml` declares `name: ryk` (not stale `name: orca`).
+pub fn hermesUserManifestNameIsRyk() bool {
+    const allocator = std.heap.page_allocator;
+    const root = hermesUserPluginRoot(allocator) catch return false;
+    defer allocator.free(root);
+    const manifest = std.fs.path.join(allocator, &.{ root, "plugin.yaml" }) catch return false;
+    defer allocator.free(manifest);
+    return hermesManifestDeclaresNameRyk(allocator, manifest);
+}
+
+/// Manifest identity check: requires `name: ryk` and rejects `name: orca`.
+pub fn hermesManifestDeclaresNameRyk(allocator: std.mem.Allocator, manifest_path: []const u8) bool {
+    if (!fileContains(allocator, manifest_path, "name: ryk")) return false;
+    // Stale dual-name or pure orca packages are not installed-as-ryk.
+    if (fileContains(allocator, manifest_path, "name: orca")) return false;
+    return true;
+}
+
+/// Rewrite stale packaged/user `name: orca` manifest bytes to `name: ryk` before install.
+/// Returns owned slice (may equal input when already ryk); caller frees when different from input.
+pub fn normalizeHermesManifestNameToRyk(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
+    if (std.mem.indexOf(u8, source, "name: ryk") != null and std.mem.indexOf(u8, source, "name: orca") == null) {
+        return try allocator.dupe(u8, source);
+    }
+    // Replace the YAML name field only (first occurrence of name: orca / missing name).
+    if (std.mem.indexOf(u8, source, "name: orca")) |idx| {
+        const before = source[0..idx];
+        const after = source[idx + "name: orca".len ..];
+        return try std.mem.concat(allocator, u8, &.{ before, "name: ryk", after });
+    }
+    // No name field: prefix with name: ryk for fail-closed identity.
+    if (std.mem.indexOf(u8, source, "name:") == null) {
+        return try std.mem.concat(allocator, u8, &.{ "name: ryk\n", source });
+    }
+    return try allocator.dupe(u8, source);
 }
 
 fn hermesManagedDestination(io: std.Io, allocator: std.mem.Allocator, plugin_dir: []const u8) bool {
@@ -3204,6 +3264,143 @@ test "plugin command help and invalid subcommands are stable" {
     try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "unknown subcommand") != null);
 }
 
+test "Hermes manifest name: orca normalizes to name: ryk" {
+    const allocator = std.testing.allocator;
+    const orca = "name: orca\nversion: 1.2.9\ndescription: ryk runtime guardrails for Hermes Agent.\n";
+    const normalized = try normalizeHermesManifestNameToRyk(allocator, orca);
+    defer allocator.free(normalized);
+    try std.testing.expect(std.mem.indexOf(u8, normalized, "name: ryk") != null);
+    try std.testing.expect(std.mem.indexOf(u8, normalized, "name: orca") == null);
+
+    const already = try normalizeHermesManifestNameToRyk(allocator, "name: ryk\nversion: 1\n");
+    defer allocator.free(already);
+    try std.testing.expectEqualStrings("name: ryk\nversion: 1\n", already);
+}
+
+test "Hermes manifest declares name ryk rejects orca identity" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "orca.yaml", .data = "name: orca\nversion: 1\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "ryk.yaml", .data = "name: ryk\nversion: 1\n" });
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const orca_path = try std.fs.path.join(std.testing.allocator, &.{ root, "orca.yaml" });
+    defer std.testing.allocator.free(orca_path);
+    const ryk_path = try std.fs.path.join(std.testing.allocator, &.{ root, "ryk.yaml" });
+    defer std.testing.allocator.free(ryk_path);
+    try std.testing.expect(!hermesManifestDeclaresNameRyk(std.testing.allocator, orca_path));
+    try std.testing.expect(hermesManifestDeclaresNameRyk(std.testing.allocator, ryk_path));
+}
+
+test "Hermes bundle install rewrites stale name: orca source to name: ryk" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "source");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "source/plugin.yaml",
+        .data = "name: orca\nversion: 1\ndescription: ryk runtime guardrails for Hermes Agent.\n",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "source/__init__.py", .data = "source-v1\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "source/mapping.py", .data = "mapping-v1\n" });
+
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const source = try std.fs.path.join(std.testing.allocator, &.{ root, "source" });
+    defer std.testing.allocator.free(source);
+    const destination = try std.fs.path.join(std.testing.allocator, &.{ root, "installed" });
+    defer std.testing.allocator.free(destination);
+
+    try std.testing.expect(try installHermesBundleAtomically(std.testing.io, std.testing.allocator, source, destination));
+    const installed = try tmp.dir.readFileAlloc(std.testing.io, "installed/plugin.yaml", std.testing.allocator, .limited(1024));
+    defer std.testing.allocator.free(installed);
+    try std.testing.expect(std.mem.indexOf(u8, installed, "name: ryk") != null);
+    try std.testing.expect(std.mem.indexOf(u8, installed, "name: orca") == null);
+    const installed_manifest = try std.fs.path.join(std.testing.allocator, &.{ destination, "plugin.yaml" });
+    defer std.testing.allocator.free(installed_manifest);
+    try std.testing.expect(hermesManifestDeclaresNameRyk(std.testing.allocator, installed_manifest));
+}
+
+test "hostPluginInstalledFromReport hermes requires name: ryk not config substring alone" {
+    // Files + config alone with orca identity must not count as installed.
+    try std.testing.expect(!hermesManifestDeclaresNameRyk(std.testing.allocator, "/nonexistent/plugin.yaml"));
+
+    // Report predicate uses only report fields (no live re-read) so JSON consumers match.
+    var paths_stale = HermesPaths{
+        .repo_manifest_exists = true,
+        .repo_source_exists = true,
+        .repo_mapping_exists = true,
+        .user_manifest_exists = true,
+        .user_source_exists = true,
+        .user_mapping_exists = true,
+        .config_references_plugin = true,
+        .user_manifest_name_is_ryk = false,
+    };
+    const report_stale = PluginDoctorReport{
+        .ryk_version = "test",
+        .ryk_binary_path = null,
+        .cwd = try std.testing.allocator.dupeZ(u8, "."),
+        .workspace_root = try std.testing.allocator.dupe(u8, "."),
+        .policy_present = false,
+        .policy_valid = false,
+        .policy_error = null,
+        .audit_replay_available = false,
+        .mcp_support_status = "test",
+        .plugin_directories = .{ .codex = false, .claude = false, .opencode = false, .openclaw = false, .hermes = true, .common = false },
+        .host_binaries = .{ .codex = false, .claude = false, .opencode = false, .openclaw = false, .hermes = true },
+        .opencode_paths = .{ .project_plugin_exists = false, .global_plugin_exists = false, .config_references_plugin = false },
+        .openclaw_paths = .{
+            .host_plugin_installed = false,
+            .plugin_manifest_exists = false,
+            .package_json_exists = false,
+            .source_exists = false,
+            .detection_note = "test",
+        },
+        .hermes_paths = paths_stale,
+        .hermes_hook_smoke_passed = false,
+        .marketplace = .{
+            .codex_marketplace = false,
+            .claude_marketplace = false,
+            .codex_plugin_manifest = false,
+            .claude_plugin_manifest = false,
+            .codex_user_plugin = false,
+            .claude_user_plugin = false,
+        },
+        .platform_summary = "test",
+        .warnings = &.{},
+    };
+    defer {
+        std.testing.allocator.free(report_stale.cwd);
+        std.testing.allocator.free(report_stale.workspace_root);
+    }
+    try std.testing.expect(!hostPluginInstalledFromReport("hermes", report_stale));
+
+    paths_stale.user_manifest_name_is_ryk = true;
+    var report_ok = report_stale;
+    report_ok.hermes_paths = paths_stale;
+    try std.testing.expect(hostPluginInstalledFromReport("hermes", report_ok));
+
+    // JSON path must require the same identity flag.
+    const json_stale =
+        \\{"hermes_paths":{"user_manifest_exists":true,"user_source_exists":true,"user_mapping_exists":true,"config_references_plugin":true,"user_manifest_name_is_ryk":false}}
+    ;
+    var parsed_stale = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json_stale, .{});
+    defer parsed_stale.deinit();
+    try std.testing.expect(!hostPluginInstalledFromDoctorJson("hermes", parsed_stale.value));
+
+    const json_ok =
+        \\{"hermes_paths":{"user_manifest_exists":true,"user_source_exists":true,"user_mapping_exists":true,"config_references_plugin":true,"user_manifest_name_is_ryk":true}}
+    ;
+    var parsed_ok = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json_ok, .{});
+    defer parsed_ok.deinit();
+    try std.testing.expect(hostPluginInstalledFromDoctorJson("hermes", parsed_ok.value));
+}
+
+test "classifyHostInstallOutcome enable failure stays failed when installed_after false" {
+    try std.testing.expectEqual(HostInstallOutcome.failed, classifyHostInstallOutcome(1, false));
+    try std.testing.expectEqual(HostInstallOutcome.installed_after_child_failure, classifyHostInstallOutcome(1, true));
+    try std.testing.expectEqual(HostInstallOutcome.installed, classifyHostInstallOutcome(0, true));
+}
+
 test "plugin commands reject the retired hermess target spelling" {
     var stdout_buf: [4096]u8 = undefined;
     var stderr_buf: [1024]u8 = undefined;
@@ -3315,6 +3512,7 @@ fn pluginDoctorReportOwnedFieldsHarness(allocator: std.mem.Allocator) !void {
             .user_source_exists = false,
             .user_mapping_exists = false,
             .config_references_plugin = false,
+            .user_manifest_name_is_ryk = false,
         },
         .hermes_hook_smoke_passed = true,
         .marketplace = .{
@@ -4304,7 +4502,7 @@ fn pluginListTestReport() PluginDoctorReport {
         .host_binaries = .{ .codex = false, .claude = false, .opencode = false, .openclaw = false, .hermes = false },
         .opencode_paths = .{ .project_plugin_exists = false, .global_plugin_exists = false, .config_references_plugin = false },
         .openclaw_paths = .{ .host_plugin_installed = false, .plugin_manifest_exists = false, .package_json_exists = false, .source_exists = false, .detection_note = "" },
-        .hermes_paths = .{ .repo_manifest_exists = false, .repo_source_exists = false, .repo_mapping_exists = false, .user_manifest_exists = false, .user_source_exists = false, .user_mapping_exists = false, .config_references_plugin = false },
+        .hermes_paths = .{ .repo_manifest_exists = false, .repo_source_exists = false, .repo_mapping_exists = false, .user_manifest_exists = false, .user_source_exists = false, .user_mapping_exists = false, .config_references_plugin = false, .user_manifest_name_is_ryk = false },
         .hermes_hook_smoke_passed = false,
         .marketplace = .{ .codex_marketplace = false, .claude_marketplace = false, .codex_plugin_manifest = true, .claude_plugin_manifest = true, .codex_user_plugin = false, .claude_user_plugin = false },
         .platform_summary = "",

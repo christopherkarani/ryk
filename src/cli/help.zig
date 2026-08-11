@@ -115,7 +115,7 @@ pub const commands =
             },
             .details = &.{
                 "Primary first-run onboarding — the only Safe Launch door.",
-                "Creates a policy if missing (Ask on risk by default via generic-agent preset).",
+                "Creates a policy if missing (coding DCG defaults via generic-agent: matrix-only strict, no ask main loop).",
                 "Wires detected host integrations and verifies daemon/hook paths when available.",
                 "Auto-selects the best available Ask posture — no protection-grade menu.",
                 "On interactive terminals, prompts only for host selection when hosts are detected.",
@@ -570,11 +570,12 @@ pub const commands =
             "ryk stop cursor",
         }, .details = &.{
             "Removes ryk plugin registrations from host agents without removing the ryk binary or policy files.",
-            "Hosts: codex, claude, cursor, opencode, openclaw, hermes. Defaults to all if no host is specified.",
+            "Hosts: codex, claude, cursor, opencode, openclaw, hermes, grok. Defaults to all if no host is specified.",
             "Cursor: removes the ryk shell hook wrapper and disables simple ryk-only hooks.json files.",
             "OpenCode: removes .opencode/plugins/ryk.ts and ~/.config/opencode/plugins/ryk.ts",
             "OpenClaw: runs 'openclaw plugins uninstall ryk'",
             "Hermes: runs 'hermes plugins disable ryk' and removes ~/.hermes/plugins/ryk/",
+            "Grok: removes ~/.grok/hooks/ryk.json and strips ryk PreToolUse from ~/.grok/user-settings.json (restart Grok to reload).",
             "Codex / Claude: removes known plugin paths (host-managed install locations).",
             "Restart protection later with: ryk start",
         } },

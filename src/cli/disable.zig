@@ -253,8 +253,9 @@ pub fn disableClaude(io: std.Io, allocator: std.mem.Allocator, stdout: anytype) 
     });
 }
 
-/// Remove the managed Grok Build Command Guard hook (`~/.grok/hooks/ryk.json`).
-/// Does not delete unrelated hooks under `~/.grok/hooks/`.
+/// Remove the managed Grok Build Command Guard hook (`~/.grok/hooks/ryk.json`)
+/// and strip ryk PreToolUse entries from legacy `~/.grok/user-settings.json`.
+/// Does not delete unrelated hooks under `~/.grok/hooks/` or non-ryk settings.
 pub fn disableGrok(io: std.Io, allocator: std.mem.Allocator, stdout: anytype) !bool {
     const home_z = std.c.getenv("HOME") orelse {
         try stdout.writeAll("  grok: HOME not set; skipped\n");
@@ -262,13 +263,14 @@ pub fn disableGrok(io: std.Io, allocator: std.mem.Allocator, stdout: anytype) !b
     };
     const home = std.mem.span(home_z);
     const removed = @import("grok_install.zig").uninstallAtHome(io, allocator, home) catch |err| {
-        try stdout.print("  grok hooks: failed to remove managed ryk hook ({s})\n", .{@errorName(err)});
+        try stdout.print("  grok hooks: failed to remove ryk hooks ({s})\n", .{@errorName(err)});
         return false;
     };
     if (removed) {
-        try stdout.writeAll("  grok hooks: removed ~/.grok/hooks/ryk.json\n");
+        try stdout.writeAll("  grok hooks: removed managed ryk hook and stripped legacy user-settings PreToolUse\n");
+        try stdout.writeAll("    → Restart Grok Build so hooks reload (new session).\n");
     } else {
-        try stdout.writeAll("  grok hooks: managed ryk hook not present\n");
+        try stdout.writeAll("  grok hooks: managed ryk hook / legacy user-settings ryk entries not present\n");
     }
     return removed;
 }
