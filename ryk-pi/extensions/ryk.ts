@@ -1070,31 +1070,43 @@ const AGENT_NEXT_CLAUSE_MAX = 120;
  * Agent-facing tool block `reason`: one line, operator walls stripped, optional
  * structured Next from card.nextStep (never invented). Prefer this for policy /
  * protocol agent block text (hardcoded audit-fail strings may stay as-is).
+ *
+ * Truncation is suffix-first: reserve Next then meta (rule/pack/severity), then
+ * clip only the Why atom so a long reason does not drop the rule.
  */
 export function formatAgentBlockReason(
 	card: RykDecisionCard,
 	toolLabel = "bash",
 ): string {
-	const why = agentWhyText(card.summary);
-	const base = formatRykDecisionSummary(
-		{ ...card, summary: why },
-		toolLabel,
-	);
+	const why = stripOperatorWalls(card.summary);
+	const action = toolLabel === "bash" ? "bash command" : `${toolLabel} action`;
+	const verb =
+		card.variant === "ask" || card.variant === "wait"
+			? "needs your decision"
+			: `blocked this ${action}`;
+	const prefix = `${PRODUCT_NAME} ${verb}: `;
+
+	const metaParts: string[] = [];
+	if (card.rule) metaParts.push(`rule ${card.rule}`);
+	if (card.pack && card.pack !== card.rule?.split(":")[0])
+		metaParts.push(`pack ${card.pack}`);
+	if (card.severity) metaParts.push(`severity ${card.severity}`);
+	const metaSuffix = metaParts.length ? ` • ${metaParts.join(" • ")}` : "";
+
 	const nextRaw = card.nextStep?.trim();
-	let reason = base;
-	if (nextRaw) {
-		const nextClause = truncate(
-			sanitizeVisibleText(nextRaw),
-			AGENT_NEXT_CLAUSE_MAX,
-		);
-		if (nextClause) {
-			// Reserve room for Next so the overall 320 cap does not clip recovery.
-			const suffix = ` • Next: ${nextClause}`;
-			const budget = Math.max(48, AGENT_BLOCK_REASON_MAX - suffix.length);
-			reason = `${truncate(base, budget)}${suffix}`;
-		}
-	}
-	reason = sanitizeVisibleText(reason);
+	const nextClause = nextRaw
+		? truncate(sanitizeVisibleText(nextRaw), AGENT_NEXT_CLAUSE_MAX)
+		: "";
+	const nextSuffix = nextClause ? ` • Next: ${nextClause}` : "";
+
+	const fixedTail = `${metaSuffix}${nextSuffix}`;
+	const whyBudget = Math.max(
+		24,
+		AGENT_BLOCK_REASON_MAX - prefix.length - fixedTail.length,
+	);
+	let reason = sanitizeVisibleText(
+		`${prefix}${truncate(why, whyBudget)}${fixedTail}`,
+	);
 	// Defense in depth: strip residual Recourse walls without eating rule/Next bullets.
 	if (/Recourse:/i.test(reason)) {
 		reason = sanitizeVisibleText(
@@ -1102,11 +1114,6 @@ export function formatAgentBlockReason(
 		);
 	}
 	return truncate(reason, AGENT_BLOCK_REASON_MAX);
-}
-
-/** Why atom for agent text: drop Recourse/Next walls; never reintroduce them. */
-function agentWhyText(summary: string): string {
-	return stripOperatorWalls(summary);
 }
 
 export function installRykExtension(
@@ -1916,12 +1923,13 @@ async function handlePolicyAskAutoDeny(
 	// Prefer recording audit before returning the block; still block if audit fails.
 	recordAskAutoDeny(pi, toolLabel, sessionClass, policyReason);
 	showRykDecision(pi, ctx, card);
-	// Agent reason uses auto-denied token + structured Next (card stays rich Why/Next).
+	// Agent Why atom keeps "auto-denied" for search, without a second product brand
+	// (formatAgentBlockReason already prefixes PRODUCT_NAME + blocked verb).
 	return block(
 		formatAgentBlockReason(
 			{
 				...card,
-				summary: copy.reason,
+				summary: `auto-denied (${sessionClass}): ${policyReason || `${toolLabel} requires approval`}`,
 			},
 			toolLabel,
 		),

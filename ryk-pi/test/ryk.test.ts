@@ -2193,7 +2193,7 @@ test("formatAgentBlockReason truncates long Next and never reintroduces Recourse
 		nextPart.length <= 120 + 3,
 		`Next clause should be truncated (~120), got ${nextPart.length}`,
 	);
-	// Long Why must not erase reserved Next recovery clause.
+	// Long Why must not erase reserved Next recovery clause or the rule atom.
 	const longWhy = `unsafe-${"y".repeat(400)} path`;
 	const preserved = formatAgentBlockReason(
 		{
@@ -2206,8 +2206,38 @@ test("formatAgentBlockReason truncates long Next and never reintroduces Recourse
 		"write",
 	);
 	assert.match(preserved, /Next:\s*Use a project-scoped path/i);
+	assert.match(
+		preserved,
+		/rule files\.write:deny/,
+		`long Why must not drop rule, got: ${preserved}`,
+	);
 	assert.ok(preserved.length <= 320);
 	assert.ok(!/Recourse:/i.test(preserved));
+});
+
+test("formatAgentBlockReason auto-deny why is single-branded", () => {
+	const reason = formatAgentBlockReason(
+		{
+			variant: "block",
+			title: DISPLAY_BRAND,
+			summary: "auto-denied (non-interactive): needs approval for write",
+			rule: "rykanv:ask-no-ui",
+			nextStep: "Re-run in interactive Pi, or pre-allow the tool in policy.",
+		},
+		"write",
+	);
+	assert.match(reason, /auto-denied \(non-interactive\)/i);
+	assert.match(reason, /Next:/i);
+	assert.match(reason, /rule rykanv:ask-no-ui/);
+	// Only one product brand prefix (blocked verb), not "PRODUCT blocked: PRODUCT auto-denied".
+	const productHits = (reason.match(new RegExp(PRODUCT_NAME, "gi")) ?? [])
+		.length;
+	assert.equal(
+		productHits,
+		1,
+		`expected single ${PRODUCT_NAME} brand, got ${productHits}: ${reason}`,
+	);
+	assert.ok(reason.length <= 320);
 });
 
 test("ryk inline decision keeps long reasons inside the compact frame", async () => {
