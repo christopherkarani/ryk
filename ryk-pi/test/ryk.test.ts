@@ -35,6 +35,7 @@ import {
 	resolvePiAskRoot,
 	resolveToolPath,
 	resolveUnavailableMode,
+	formatAgentBlockReason,
 	formatProtocolErrorReason,
 	formatMalformedJsonDetail,
 	previewProcessOutput,
@@ -1303,6 +1304,13 @@ test("policy ask auto-denies noninteractive sessions without calling select", as
 	assert.match(result?.reason ?? "", /auto-denied/i);
 	assert.match(result?.reason ?? "", /non-interactive/i);
 	assert.match(result?.reason ?? "", new RegExp(PRODUCT_NAME));
+	// Agent reason must carry recovery Next (not only "auto-denied").
+	assert.match(result?.reason ?? "", /Next:/i);
+	assert.match(result?.reason ?? "", /interactive Pi|pre-allow/i);
+	assert.ok(
+		!(result?.reason ?? "").includes("\n"),
+		"auto-deny agent reason must be one line",
+	);
 	assert.notEqual(result, undefined, "auto-deny must never proceed");
 	const audit = messages.find((m) => m.message.customType === "ryk.audit");
 	assert.ok(audit, "expected ryk.audit transcript event");
@@ -1393,6 +1401,12 @@ test("policy ask subagent fails closed on parent timeout (no local select)", asy
 		);
 		assert.match(result?.reason ?? "", /auto-denied/i);
 		assert.match(result?.reason ?? "", /subagent/i);
+		assert.match(result?.reason ?? "", /Next:/i);
+		assert.match(result?.reason ?? "", /parent Pi session|mcp\.allow/i);
+		assert.ok(
+			!(result?.reason ?? "").includes("\n"),
+			"subagent auto-deny agent reason must be one line",
+		);
 		assert.notEqual(result, undefined);
 		const audit = messages.find((m) => m.message.customType === "ryk.audit");
 		assert.equal(
@@ -2039,6 +2053,191 @@ test("hard deny notify is short/sanitized even when reason has Recourse wall", a
 		`notify should keep rule suffix after wall strip, got: ${msg}`,
 	);
 	assert.match(msg, /destructive filesystem command/i);
+	// Agent block reason must also strip Recourse / allow-once codes.
+	const agentReason = result?.reason ?? "";
+	assert.ok(!agentReason.includes("\n"), "agent reason must be one line");
+	assert.ok(
+		!/Recourse:/i.test(agentReason),
+		`agent reason must not contain Recourse:, got: ${agentReason}`,
+	);
+	assert.ok(
+		!/allow-once\s+ABC/i.test(agentReason),
+		`agent reason must not expose redeemable allow-once codes, got: ${agentReason}`,
+	);
+	assert.match(agentReason, /destructive filesystem command/i);
+	assert.match(agentReason, /core\.filesystem:destructive-rm/);
+});
+
+test("hard deny with remediation puts short Next in agent reason and card", async () => {
+	const { pi, handlers, messages } = makePi();
+	const { spawn } = makeSpawn([
+		{
+			code: 2,
+			stdout: JSON.stringify({
+				decision: "deny",
+				reason:
+					"destructive filesystem command\nRecourse: operator can run ryk allow-once SECRET123\nNext: ignore this wall",
+				rule_id: "core.filesystem:destructive-rm",
+				remediation: [
+					{ description: "Use a safer delete scoped to the project tree" },
+				],
+				daemon: { status: "healthy", compatible: true },
+			}),
+		},
+	]);
+	installRykExtension(pi, { spawn, rykBin: "ryk" });
+	const { ctx, notifications } = makeCtx();
+
+	const result = await fireToolCall(
+		handlers.get("tool_call")![0],
+		ctx,
+		"rm -rf /",
+	);
+	assert.equal(result?.block, true);
+	const agentReason = result?.reason ?? "";
+	assert.ok(!agentReason.includes("\n"), "agent reason must be single line");
+	assert.match(agentReason, /destructive filesystem command/i);
+	assert.match(agentReason, /rule core\.filesystem:destructive-rm/);
+	assert.match(agentReason, /Next:/i);
+	assert.match(agentReason, /safer delete|project tree/i);
+	assert.ok(
+		!/Recourse:/i.test(agentReason),
+		`agent reason must not contain Recourse:, got: ${agentReason}`,
+	);
+	assert.ok(
+		!/SECRET123|allow-once/i.test(agentReason),
+		`agent reason must not expose allow-once codes, got: ${agentReason}`,
+	);
+	assert.ok(
+		!/ignore this wall/i.test(agentReason),
+		"agent Next must come from remediation, not CLI wall text",
+	);
+	// Exactly one Next clause.
+	assert.equal(
+		(agentReason.match(/Next:/gi) ?? []).length,
+		1,
+		`expected one Next clause, got: ${agentReason}`,
+	);
+	assert.ok(
+		agentReason.length <= 320,
+		`agent reason prefer ≤320 chars, got ${agentReason.length}`,
+	);
+
+	// Human card still rich with Next from remediation.
+	const decision = messages.find(
+		(m) => m.message.customType === "rykanv-decision",
+	);
+	const details = decision?.message.details as
+		| { nextStep?: string; summary?: string; rule?: string }
+		| undefined;
+	assert.match(details?.nextStep ?? "", /safer delete|project tree/i);
+	assert.match(decision?.message.content ?? "", /Next:/i);
+
+	// Notify stays short, no Recourse walls.
+	assert.equal(notifications.length, 1);
+	assert.ok(!/Recourse:/i.test(notifications[0]?.message ?? ""));
+});
+
+test("hard deny without remediation keeps non-empty agent reason without fake Next", async () => {
+	const { pi, handlers, messages } = makePi();
+	const { spawn } = makeSpawn([{ code: 2, stdout: denyJson() }]);
+	installRykExtension(pi, { spawn, rykBin: "ryk" });
+	const { ctx } = makeCtx();
+
+	const result = await fireToolCall(
+		handlers.get("tool_call")![0],
+		ctx,
+		"rm -rf /",
+	);
+	assert.equal(result?.block, true);
+	const agentReason = result?.reason ?? "";
+	assert.ok(agentReason.length > 0, "agent reason must be non-empty");
+	assert.ok(!agentReason.includes("\n"));
+	assert.match(agentReason, /blocked this bash command/i);
+	assert.match(agentReason, /rule core\.filesystem:destructive-rm/);
+	assert.ok(
+		!/Next:/i.test(agentReason),
+		`must not invent Next without remediation, got: ${agentReason}`,
+	);
+	const decision = messages.find(
+		(m) => m.message.customType === "rykanv-decision",
+	);
+	const details = decision?.message.details as
+		| { nextStep?: string }
+		| undefined;
+	assert.equal(details?.nextStep, undefined);
+});
+
+test("formatAgentBlockReason truncates long Next and never reintroduces Recourse", () => {
+	const longNext = `Re-run with ${"x".repeat(200)} scoped path`;
+	const reason = formatAgentBlockReason(
+		{
+			variant: "block",
+			title: DISPLAY_BRAND,
+			summary:
+				"unsafe path write Recourse: ryk allow-once CODE99 Next: operator wall",
+			rule: "files.write:deny",
+			nextStep: longNext,
+		},
+		"write",
+	);
+	assert.ok(!reason.includes("\n"));
+	assert.ok(!/Recourse:/i.test(reason));
+	assert.ok(!/CODE99|allow-once/i.test(reason));
+	assert.ok(!/operator wall/i.test(reason));
+	assert.match(reason, /Next:/i);
+	assert.match(reason, /rule files\.write:deny/);
+	assert.ok(reason.length <= 320, `got length ${reason.length}: ${reason}`);
+	const nextPart = reason.split(/Next:\s*/i)[1] ?? "";
+	assert.ok(
+		nextPart.length <= 120 + 3,
+		`Next clause should be truncated (~120), got ${nextPart.length}`,
+	);
+	// Long Why must not erase reserved Next recovery clause or the rule atom.
+	const longWhy = `unsafe-${"y".repeat(400)} path`;
+	const preserved = formatAgentBlockReason(
+		{
+			variant: "block",
+			title: DISPLAY_BRAND,
+			summary: longWhy,
+			rule: "files.write:deny",
+			nextStep: "Use a project-scoped path",
+		},
+		"write",
+	);
+	assert.match(preserved, /Next:\s*Use a project-scoped path/i);
+	assert.match(
+		preserved,
+		/rule files\.write:deny/,
+		`long Why must not drop rule, got: ${preserved}`,
+	);
+	assert.ok(preserved.length <= 320);
+	assert.ok(!/Recourse:/i.test(preserved));
+});
+
+test("formatAgentBlockReason auto-deny why is single-branded", () => {
+	const reason = formatAgentBlockReason(
+		{
+			variant: "block",
+			title: DISPLAY_BRAND,
+			summary: "auto-denied (non-interactive): needs approval for write",
+			rule: "rykanv:ask-no-ui",
+			nextStep: "Re-run in interactive Pi, or pre-allow the tool in policy.",
+		},
+		"write",
+	);
+	assert.match(reason, /auto-denied \(non-interactive\)/i);
+	assert.match(reason, /Next:/i);
+	assert.match(reason, /rule rykanv:ask-no-ui/);
+	// Only one product brand prefix (blocked verb), not "PRODUCT blocked: PRODUCT auto-denied".
+	const productHits = (reason.match(new RegExp(PRODUCT_NAME, "gi")) ?? [])
+		.length;
+	assert.equal(
+		productHits,
+		1,
+		`expected single ${PRODUCT_NAME} brand, got ${productHits}: ${reason}`,
+	);
+	assert.ok(reason.length <= 320);
 });
 
 test("ryk inline decision keeps long reasons inside the compact frame", async () => {
