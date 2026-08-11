@@ -118,6 +118,17 @@ fn runRyk(allocator: std.mem.Allocator, args: []const []const u8, stdin_data: ?[
 fn parseDecision(allocator: std.mem.Allocator, stdout: []const u8) ![]const u8 {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, stdout, .{});
     defer parsed.deinit();
+    // Claude PreToolUse/PermissionRequest emit host-shaped permissionDecision.
+    if (parsed.value.object.get("hookSpecificOutput")) |hso_val| {
+        if (hso_val == .object) {
+            if (hso_val.object.get("permissionDecision")) |pd| {
+                if (pd == .string) {
+                    if (std.mem.eql(u8, pd.string, "deny")) return try allocator.dupe(u8, "block");
+                    return try allocator.dupe(u8, pd.string);
+                }
+            }
+        }
+    }
     const decision = parsed.value.object.get("decision").?.string;
     return try allocator.dupe(u8, decision);
 }

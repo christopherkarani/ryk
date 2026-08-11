@@ -31,7 +31,7 @@
       "hooks": [
         {
           "type": "command",
-          "command": "sh -c 'ryk_bin=\"$RYK_BIN\"; case \"$ryk_bin\" in /*) [ -x \"$ryk_bin\" ] || ryk_bin=\"\";; *) ryk_bin=\"\";; esac; if [ -z \"$ryk_bin\" ]; then for candidate in \"$HOME/.local/bin/ryk\" \"$HOME/.ryk/bin/ryk\" \"/usr/local/bin/ryk\" \"/opt/homebrew/bin/ryk\"; do if [ -x \"$candidate\" ]; then ryk_bin=\"$candidate\"; break; fi; done; fi; if [ -n \"$ryk_bin\" ]; then exec \"$ryk_bin\" hook claude PreToolUse; fi; printf \"%s\\n\" \"{\\\"version\\\":1,\\\"decision\\\":\\\"block\\\",\\\"risk\\\":\\\"unknown\\\",\\\"category\\\":\\\"tool\\\",\\\"reason\\\":\\\"ryk_unavailable\\\",\\\"message\\\":\\\"ryk binary unavailable; blocked fail-closed\\\"}\"'",
+          "command": "sh -c 'ryk_bin=\"$RYK_BIN\"; case \"$ryk_bin\" in /*) [ -x \"$ryk_bin\" ] || ryk_bin=\"\";; *) ryk_bin=\"\";; esac; if [ -z \"$ryk_bin\" ]; then for candidate in \"$HOME/.local/bin/ryk\" \"$HOME/.ryk/bin/ryk\" \"/usr/local/bin/ryk\" \"/opt/homebrew/bin/ryk\"; do if [ -x \"$candidate\" ]; then ryk_bin=\"$candidate\"; break; fi; done; fi; if [ -n \"$ryk_bin\" ]; then exec \"$ryk_bin\" hook claude PreToolUse; fi; printf \"%s\\n\" \"{\\\"hookSpecificOutput\\\":{\\\"hookEventName\\\":\\\"PreToolUse\\\",\\\"permissionDecision\\\":\\\"deny\\\",\\\"permissionDecisionReason\\\":\\\"ryk binary unavailable; blocked fail-closed\\\"},\\\"systemMessage\\\":\\\"ryk binary unavailable; blocked fail-closed\\\"}\"'",
           "timeout": 15,
           "statusMessage": "Checking tool use with ryk"
         }
@@ -44,7 +44,7 @@
       "hooks": [
         {
           "type": "command",
-          "command": "sh -c 'ryk_bin=\"$RYK_BIN\"; case \"$ryk_bin\" in /*) [ -x \"$ryk_bin\" ] || ryk_bin=\"\";; *) ryk_bin=\"\";; esac; if [ -z \"$ryk_bin\" ]; then for candidate in \"$HOME/.local/bin/ryk\" \"$HOME/.ryk/bin/ryk\" \"/usr/local/bin/ryk\" \"/opt/homebrew/bin/ryk\"; do if [ -x \"$candidate\" ]; then ryk_bin=\"$candidate\"; break; fi; done; fi; if [ -n \"$ryk_bin\" ]; then exec \"$ryk_bin\" hook claude PermissionRequest; fi; printf \"%s\\n\" \"{\\\"version\\\":1,\\\"decision\\\":\\\"block\\\",\\\"risk\\\":\\\"unknown\\\",\\\"category\\\":\\\"tool\\\",\\\"reason\\\":\\\"ryk_unavailable\\\",\\\"message\\\":\\\"ryk binary unavailable; blocked fail-closed\\\"}\"'",
+          "command": "sh -c 'ryk_bin=\"$RYK_BIN\"; case \"$ryk_bin\" in /*) [ -x \"$ryk_bin\" ] || ryk_bin=\"\";; *) ryk_bin=\"\";; esac; if [ -z \"$ryk_bin\" ]; then for candidate in \"$HOME/.local/bin/ryk\" \"$HOME/.ryk/bin/ryk\" \"/usr/local/bin/ryk\" \"/opt/homebrew/bin/ryk\"; do if [ -x \"$candidate\" ]; then ryk_bin=\"$candidate\"; break; fi; done; fi; if [ -n \"$ryk_bin\" ]; then exec \"$ryk_bin\" hook claude PermissionRequest; fi; printf \"%s\\n\" \"{\\\"hookSpecificOutput\\\":{\\\"hookEventName\\\":\\\"PermissionRequest\\\",\\\"permissionDecision\\\":\\\"deny\\\",\\\"permissionDecisionReason\\\":\\\"ryk binary unavailable; blocked fail-closed\\\"},\\\"systemMessage\\\":\\\"ryk binary unavailable; blocked fail-closed\\\"}\"'",
           "timeout": 15,
           "statusMessage": "Checking permission request with ryk"
         }

@@ -1,13 +1,13 @@
 # Host Output Mapping
 
 > Host hook responses for Codex and Claude Code
-> Version: 1.2.9
+> Version: 1.3.0
 
 ## Overview
 
 `ryk hook` receives host lifecycle events from Codex and Claude Code plugins, normalizes the payload, evaluates the event against existing ryk policy and redaction logic, then returns a host-valid decision object.
 
-The hook is additive only. It does not replace `ryk run`, and it does not claim full enforcement when the host treats hook output as advisory.
+The hook is additive only. It does not replace `ryk run`. Claude tool-gating events emit native `permissionDecision` JSON so the host can veto tools when it honors that contract; grade remains **hook**, not OS-enforced sandbox.
 
 ## Supported Hosts
 
@@ -105,7 +105,9 @@ Claude only. Informational allow.
 
 ## Response Fields
 
-Every hook response uses the same top-level shape.
+### Canonical ryk hook response (most hosts / non-tool Claude events)
+
+Most hosts and Claude informational events (`SessionStart`, `UserPromptSubmit`, `PostToolUse`, `SessionEnd`) use the same top-level shape.
 
 | Field | Required | Notes |
 |---|---|---|
@@ -118,6 +120,41 @@ Every hook response uses the same top-level shape.
 | `message` | yes | Short agent-facing reason (prefer one line). Operator Recourse/Next live on stderr and in `remediation_commands` / `suggestions` — not stuffed into `message`. |
 | `redactions` | yes | Array of `{field, reason}` |
 | `host_limitations` | yes | Always includes `Hook enforcement is additive; does not replace ryk run supervision.` |
+
+### Claude Code tool-gating events (`PreToolUse`, `PermissionRequest`)
+
+Claude Code expects native host JSON so blocks surface as real permission denials. For these events `ryk hook claude` emits:
+
+```json
+{
+  "hookSpecificOutput": {
+    "hookEventName": "PreToolUse",
+    "permissionDecision": "deny",
+    "permissionDecisionReason": "command blocked by ryk policy: …"
+  },
+  "systemMessage": "command blocked by ryk policy: …"
+}
+```
+
+| Field | Notes |
+|---|---|
+| `hookSpecificOutput.hookEventName` | Matches the event (`PreToolUse` or `PermissionRequest`) |
+| `hookSpecificOutput.permissionDecision` | `allow` \| `deny` \| `ask` |
+| `hookSpecificOutput.permissionDecisionReason` | Short one-line reason; no Recourse/Next walls; no redeemable allow-once codes |
+| `systemMessage` | Optional short notice on deny/ask (UX only; not a substitute for `permissionDecision`) |
+
+#### ryk decision → Claude `permissionDecision`
+
+| ryk hook decision | Claude `permissionDecision` | Notes |
+|---|---|---|
+| `block` / `error` | `deny` | Hard veto |
+| `ask` | `ask` | Interactive; under `--ci` ryk hardens `ask`→`block` before emit → `deny` |
+| `allow` / `context_only` | `allow` | Proceed |
+| `warn` | `allow` | Warn is not a hard veto on this surface (documented proceed; not a silent silent-allow of blocked tools) |
+
+Process exit remains `0` for structured Claude JSON (plugin-compatible). Operator-rich explain still goes to **stderr** on block.
+
+This is still **hook-grade** enforcement: strongest boundary remains `ryk claude` / `ryk run` (wrapper). Do not treat host-shaped deny as OS-enforced sandbox.
 
 ## Example Responses
 

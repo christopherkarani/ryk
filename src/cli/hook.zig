@@ -612,6 +612,15 @@ fn hookCommand(io: std.Io, host: Host, event: Event, original_event_name: []cons
         } else {
             try writeExitTwoGuardBlock(allocator, stderr, result.message, result.reason);
         }
+    } else if (usesClaudeHostShapedPermission(host, event)) {
+        // Claude PreToolUse / PermissionRequest: native permissionDecision JSON (exit 0).
+        // Operator Recourse/Next stay on stderr; reason is short (no Recourse walls).
+        try writeClaudePermissionDecision(stdout, event, result);
+        if (result.decision == .block) {
+            try writeHumanShellExplain(io, allocator, stderr, result);
+        } else if (result.rule) |rule| {
+            try stderr.print("[hook] matched rule: {s}\n", .{rule});
+        }
     } else {
         try writeHookResponse(stdout, result);
         // Human-facing hosts: rich explain on stderr; agent protocol stays on stdout JSON.
@@ -758,6 +767,7 @@ fn shouldFailClosedOnPreEval(host: Host, event: Event) bool {
 
 /// Emit a structured fail-closed hook response for pre-eval failures.
 /// Codex: sentinel stderr + exit 2. Grok: native deny JSON + sentinel + exit 2.
+/// Claude PreToolUse/PermissionRequest: host-shaped `permissionDecision: deny`.
 /// Other hosts: JSON `decision: block` on stdout.
 fn emitPreEvalFailClosed(
     allocator: std.mem.Allocator,
@@ -787,8 +797,72 @@ fn emitPreEvalFailClosed(
         }
         return codex_deny_exit_code;
     }
+    if (usesClaudeHostShapedPermission(host, event)) {
+        try writeClaudePermissionDecision(stdout, event, result);
+        return hookExitCode(host, result.decision, false);
+    }
     try writeHookResponse(stdout, result);
     return hookExitCode(host, result.decision, false);
+}
+
+/// Claude Code PreToolUse / PermissionRequest expect native host JSON, not ryk-generic
+/// `decision: block`. Plugin path is `ryk hook claude <Event>` (not bare agent_hook).
+fn usesClaudeHostShapedPermission(host: Host, event: Event) bool {
+    return host == .claude and (event == .PreToolUse or event == .PermissionRequest);
+}
+
+/// Map ryk plugin decisions to Claude `permissionDecision` values.
+/// - block/err → deny
+/// - ask → ask (CI already hardens ask→block before emit)
+/// - allow/context_only/warn → allow (warn is not a hard veto; documented proceed)
+/// ask never maps to allow.
+fn claudePermissionDecisionString(decision: PluginDecision) []const u8 {
+    return switch (decision) {
+        .block, .err => "deny",
+        .ask => "ask",
+        .allow, .context_only, .warn => "allow",
+    };
+}
+
+/// Max length for Claude `permissionDecisionReason` (short host UI surface).
+const claude_permission_reason_max: usize = 280;
+
+/// Short one-line reason for Claude permission UI. Prefer agent-facing `message`
+/// (already first-line / no Recourse walls after PR #1); fall back to `reason`.
+/// Truncates on a UTF-8 codepoint boundary so JSON strings stay well-formed.
+fn claudePermissionReason(result: HookResponse) []const u8 {
+    const raw: []const u8 = if (result.message.len > 0)
+        firstLineOnly(result.message)
+    else if (result.reason.len > 0)
+        firstLineOnly(result.reason)
+    else
+        "blocked by ryk policy";
+    if (raw.len == 0) return "blocked by ryk policy";
+    if (raw.len <= claude_permission_reason_max) return raw;
+    var end = claude_permission_reason_max;
+    while (end > 0 and (raw[end] & 0xC0) == 0x80) end -= 1;
+    if (end == 0) return raw[0..claude_permission_reason_max];
+    return raw[0..end];
+}
+
+/// Emit Claude-native PreToolUse/PermissionRequest stdout JSON (mirrors agent_hook shape).
+/// Process exit stays success (0); enforcement is the structured permissionDecision.
+fn writeClaudePermissionDecision(stdout: anytype, event: Event, result: HookResponse) !void {
+    const decision = claudePermissionDecisionString(result.decision);
+    const reason = claudePermissionReason(result);
+    try stdout.writeAll("{\"hookSpecificOutput\":{\"hookEventName\":\"");
+    try stdout.writeAll(@tagName(event));
+    try stdout.writeAll("\",\"permissionDecision\":\"");
+    try stdout.writeAll(decision);
+    try stdout.writeAll("\",\"permissionDecisionReason\":");
+    try writeJsonString(stdout, reason);
+    try stdout.writeAll("}");
+    // Best-effort user-visible notice on veto/ask — does not replace permissionDecision.
+    if (result.decision == .block or result.decision == .err or result.decision == .ask) {
+        try stdout.writeAll(",\"systemMessage\":");
+        try writeJsonString(stdout, reason);
+    }
+    try stdout.writeAll("}\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -4068,7 +4142,7 @@ test "hook Grok deny reason redacts secrets in stdout JSON" {
     try std.testing.expect(std.mem.indexOf(u8, reason_out, "[REDACTED") != null);
 }
 
-test "hook pre-eval fail-closed Claude emits block JSON on stdout" {
+test "hook pre-eval fail-closed Claude emits host-shaped deny on stdout" {
     const allocator = std.testing.allocator;
     var stdout_buf: [2048]u8 = undefined;
     var stderr_buf: [512]u8 = undefined;
@@ -4090,8 +4164,15 @@ test "hook pre-eval fail-closed Claude emits block JSON on stdout" {
 
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, stdout_writer.buffered(), .{});
     defer parsed.deinit();
-    try std.testing.expectEqualStrings("block", parsed.value.object.get("decision").?.string);
-    try std.testing.expectEqualStrings("policy load failed", parsed.value.object.get("reason").?.string);
+    const hso = parsed.value.object.get("hookSpecificOutput").?.object;
+    try std.testing.expectEqualStrings("PermissionRequest", hso.get("hookEventName").?.string);
+    try std.testing.expectEqualStrings("deny", hso.get("permissionDecision").?.string);
+    const reason = hso.get("permissionDecisionReason").?.string;
+    try std.testing.expect(std.mem.indexOf(u8, reason, "failed to load policy") != null or
+        std.mem.indexOf(u8, reason, "policy") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reason, "Recourse:") == null);
+    // Not generic-only ryk block JSON as the sole contract.
+    try std.testing.expect(parsed.value.object.get("decision") == null);
 }
 
 test "hook classifies non-shell tool with incidental command as zig native route" {
@@ -5477,6 +5558,205 @@ test "hook firstLineOnly strips multi-line operator walls" {
     try std.testing.expectEqualStrings("line one", firstLineOnly("line one\nRecourse: tip"));
     try std.testing.expectEqualStrings("line one", firstLineOnly("line one\r\nNext: tip"));
     try std.testing.expectEqualStrings("", firstLineOnly("\nonly second"));
+}
+
+// ---------------------------------------------------------------------------
+// Claude host-shaped permissionDecision (PreToolUse / PermissionRequest)
+// ---------------------------------------------------------------------------
+
+fn testClaudeHookResponse(
+    allocator: std.mem.Allocator,
+    decision: PluginDecision,
+    reason: []const u8,
+    message: []const u8,
+) !HookResponse {
+    return .{
+        .version = 1,
+        .decision = decision,
+        .risk = .critical,
+        .category = try allocator.dupe(u8, "command"),
+        .reason = try allocator.dupe(u8, reason),
+        .rule = null,
+        .message = try allocator.dupe(u8, message),
+        .redactions = &.{},
+        .host_limitations = &.{},
+        .suggestions = &.{},
+        .remediation_commands = &.{},
+    };
+}
+
+test "hook Claude maps block to permissionDecision deny with short reason" {
+    const allocator = std.testing.allocator;
+    var result = try testClaudeHookResponse(
+        allocator,
+        .block,
+        "command.dangerous",
+        "command blocked by ryk policy: Matched destructive pattern: recursive delete\nRecourse: operator tip\nNext: ryk explain",
+    );
+    defer result.deinit(allocator);
+
+    var stdout_buf: [2048]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    try writeClaudePermissionDecision(&stdout_writer, .PreToolUse, result);
+    const out = stdout_writer.buffered();
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"hookSpecificOutput\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"permissionDecision\":\"deny\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"hookEventName\":\"PreToolUse\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Recourse:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Next:") == null);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, out, .{});
+    defer parsed.deinit();
+    const reason = parsed.value.object.get("hookSpecificOutput").?.object.get("permissionDecisionReason").?.string;
+    try std.testing.expect(std.mem.indexOfScalar(u8, reason, '\n') == null);
+    try std.testing.expect(std.mem.indexOf(u8, reason, "Recourse") == null);
+    try std.testing.expect(reason.len > 0);
+    try std.testing.expect(reason.len <= claude_permission_reason_max);
+    try std.testing.expectEqual(exit_codes.success, hookExitCode(.claude, .block, false));
+}
+
+test "hook Claude maps ask to permissionDecision ask never allow" {
+    const allocator = std.testing.allocator;
+    var result = try testClaudeHookResponse(
+        allocator,
+        .ask,
+        "needs approval",
+        "command requires user approval per ryk policy.",
+    );
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqualStrings("ask", claudePermissionDecisionString(.ask));
+    try std.testing.expect(!std.mem.eql(u8, claudePermissionDecisionString(.ask), "allow"));
+
+    var stdout_buf: [1024]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    try writeClaudePermissionDecision(&stdout_writer, .PreToolUse, result);
+    const out = stdout_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"permissionDecision\":\"ask\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"permissionDecision\":\"allow\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"permissionDecision\":\"deny\"") == null);
+}
+
+test "hook Claude CI-hardened ask is block which maps to deny" {
+    // PluginDecision.fromDecisionResult already converts ask→block under ci_mode.
+    // Emit path must never re-surface ask when decision is already block.
+    try std.testing.expectEqual(PluginDecision.block, PluginDecision.fromDecisionResult(.ask, true));
+    try std.testing.expectEqualStrings("deny", claudePermissionDecisionString(.block));
+    try std.testing.expectEqualStrings("deny", claudePermissionDecisionString(PluginDecision.fromDecisionResult(.ask, true)));
+}
+
+test "hook Claude allow path does not emit deny" {
+    const allocator = std.testing.allocator;
+    var result = try testClaudeHookResponse(
+        allocator,
+        .allow,
+        "allowed",
+        "command allowed by ryk policy.",
+    );
+    defer result.deinit(allocator);
+
+    var stdout_buf: [1024]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    try writeClaudePermissionDecision(&stdout_writer, .PreToolUse, result);
+    const out = stdout_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"permissionDecision\":\"allow\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"permissionDecision\":\"deny\"") == null);
+    try std.testing.expectEqualStrings("allow", claudePermissionDecisionString(.allow));
+    try std.testing.expectEqualStrings("allow", claudePermissionDecisionString(.context_only));
+    try std.testing.expectEqualStrings("allow", claudePermissionDecisionString(.warn));
+    try std.testing.expectEqualStrings("deny", claudePermissionDecisionString(.err));
+}
+
+test "hook Claude PermissionRequest deny uses PermissionRequest event name" {
+    const allocator = std.testing.allocator;
+    var result = try testClaudeHookResponse(
+        allocator,
+        .block,
+        "blocked",
+        "command blocked by ryk policy.",
+    );
+    defer result.deinit(allocator);
+
+    var stdout_buf: [1024]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    try writeClaudePermissionDecision(&stdout_writer, .PermissionRequest, result);
+    const out = stdout_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"hookEventName\":\"PermissionRequest\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"permissionDecision\":\"deny\"") != null);
+    try std.testing.expect(usesClaudeHostShapedPermission(.claude, .PermissionRequest));
+    try std.testing.expect(usesClaudeHostShapedPermission(.claude, .PreToolUse));
+    try std.testing.expect(!usesClaudeHostShapedPermission(.claude, .SessionStart));
+    try std.testing.expect(!usesClaudeHostShapedPermission(.claude, .UserPromptSubmit));
+    try std.testing.expect(!usesClaudeHostShapedPermission(.opencode, .PreToolUse));
+    try std.testing.expect(!usesClaudeHostShapedPermission(.codex, .PreToolUse));
+    try std.testing.expect(!usesClaudeHostShapedPermission(.hermes, .PreToolUse));
+    try std.testing.expect(!usesClaudeHostShapedPermission(.grok, .PreToolUse));
+}
+
+test "hook Claude multi-line message source becomes short permissionDecisionReason" {
+    const allocator = std.testing.allocator;
+    var result = try testClaudeHookResponse(
+        allocator,
+        .block,
+        "x",
+        "first useful line only\nRecourse: operator can run ryk allow-once <code>\nNext: tip",
+    );
+    defer result.deinit(allocator);
+    const reason = claudePermissionReason(result);
+    try std.testing.expectEqualStrings("first useful line only", reason);
+    try std.testing.expect(std.mem.indexOf(u8, reason, "Recourse") == null);
+}
+
+test "hook Claude pre-eval fail-closed PreToolUse is host-shaped deny" {
+    const allocator = std.testing.allocator;
+    var stdout_buf: [2048]u8 = undefined;
+    var stderr_buf: [512]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+
+    const code = try emitPreEvalFailClosed(
+        allocator,
+        .claude,
+        .PreToolUse,
+        &stdout_writer,
+        &stderr_writer,
+        "hook",
+        "invalid JSON",
+        "ryk hook: invalid JSON; ryk blocked it before evaluation.",
+    );
+    try std.testing.expectEqual(exit_codes.success, code);
+    const out = stdout_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"hookSpecificOutput\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"permissionDecision\":\"deny\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"hookEventName\":\"PreToolUse\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Recourse:") == null);
+}
+
+test "hook OpenCode PreToolUse pre-eval still emits generic ryk block JSON" {
+    // Non-Claude hosts must not switch to Claude permissionDecision shape.
+    const allocator = std.testing.allocator;
+    var stdout_buf: [2048]u8 = undefined;
+    var stderr_buf: [512]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+
+    const code = try emitPreEvalFailClosed(
+        allocator,
+        .opencode,
+        .PreToolUse,
+        &stdout_writer,
+        &stderr_writer,
+        "hook",
+        "invalid JSON",
+        "ryk hook: invalid JSON; ryk blocked it before evaluation.",
+    );
+    try std.testing.expectEqual(exit_codes.success, code);
+    const out = stdout_writer.buffered();
+    // Generic ryk JSON uses pretty spacing: "decision": "block"
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"decision\": \"block\"") != null or
+        std.mem.indexOf(u8, out, "\"decision\":\"block\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "hookSpecificOutput") == null);
 }
 
 // Empty first line of explanation falls back to buildMessage (no trailing bare colon).

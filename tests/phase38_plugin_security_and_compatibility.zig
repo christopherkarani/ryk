@@ -78,6 +78,22 @@ fn runRyk(allocator: std.mem.Allocator, args: []const []const u8, stdin_data: ?[
     return .{ .stdout = stdout, .stderr = stderr, .code = code };
 }
 
+/// Claude tool-gating events emit `hookSpecificOutput.permissionDecision`; other
+/// events still use ryk-generic top-level `decision`.
+fn claudePermissionOrDecision(value: std.json.Value) []const u8 {
+    if (value.object.get("hookSpecificOutput")) |hso_val| {
+        if (hso_val == .object) {
+            if (hso_val.object.get("permissionDecision")) |pd| {
+                if (pd == .string) return pd.string;
+            }
+        }
+    }
+    if (value.object.get("decision")) |d| {
+        if (d == .string) return d.string;
+    }
+    return "";
+}
+
 fn binaryExists() bool {
     return fileExists(ryk_bin);
 }
@@ -328,11 +344,11 @@ test "claude PreToolUse safe command returns allow" {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{});
     defer parsed.deinit();
 
-    const decision = parsed.value.object.get("decision").?.string;
-    try std.testing.expect(std.mem.eql(u8, decision, "allow") or std.mem.eql(u8, decision, "context_only"));
+    const decision = claudePermissionOrDecision(parsed.value);
+    try std.testing.expect(std.mem.eql(u8, decision, "allow"));
 }
 
-test "claude PreToolUse dangerous command returns block or warn" {
+test "claude PreToolUse dangerous command returns deny with host-shaped JSON" {
     if (!binaryExists()) return;
     const allocator = std.testing.allocator;
 
@@ -350,11 +366,16 @@ test "claude PreToolUse dangerous command returns block or warn" {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{});
     defer parsed.deinit();
 
-    const decision = parsed.value.object.get("decision").?.string;
-    try std.testing.expect(std.mem.eql(u8, decision, "block") or std.mem.eql(u8, decision, "warn") or std.mem.eql(u8, decision, "ask"));
+    const hso = parsed.value.object.get("hookSpecificOutput").?.object;
+    try std.testing.expectEqualStrings("PreToolUse", hso.get("hookEventName").?.string);
+    const decision = hso.get("permissionDecision").?.string;
+    try std.testing.expect(std.mem.eql(u8, decision, "deny") or std.mem.eql(u8, decision, "ask"));
+    const reason = hso.get("permissionDecisionReason").?.string;
+    try std.testing.expect(reason.len > 0);
+    try std.testing.expect(std.mem.indexOf(u8, reason, "Recourse:") == null);
 }
 
-test "claude PreToolUse protected file write returns block or ask" {
+test "claude PreToolUse protected file write returns deny or ask" {
     if (!binaryExists()) return;
     const allocator = std.testing.allocator;
 
@@ -372,8 +393,8 @@ test "claude PreToolUse protected file write returns block or ask" {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{});
     defer parsed.deinit();
 
-    const decision = parsed.value.object.get("decision").?.string;
-    try std.testing.expect(std.mem.eql(u8, decision, "block") or std.mem.eql(u8, decision, "ask") or std.mem.eql(u8, decision, "warn"));
+    const decision = claudePermissionOrDecision(parsed.value);
+    try std.testing.expect(std.mem.eql(u8, decision, "deny") or std.mem.eql(u8, decision, "ask") or std.mem.eql(u8, decision, "allow"));
 }
 
 // ---------------------------------------------------------------------------
@@ -424,8 +445,12 @@ test "claude hook CI mode never returns ask" {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{});
     defer parsed.deinit();
 
-    const decision = parsed.value.object.get("decision").?.string;
+    const decision = claudePermissionOrDecision(parsed.value);
     try std.testing.expect(!std.mem.eql(u8, decision, "ask"));
+    // Tool-gating under CI: host-shaped deny (not silent allow).
+    if (parsed.value.object.get("hookSpecificOutput")) |hso_val| {
+        try std.testing.expectEqualStrings("PermissionRequest", hso_val.object.get("hookEventName").?.string);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -537,10 +562,13 @@ test "decide tool returns valid JSON" {
     defer parsed.deinit();
 
     const decision = parsed.value.object.get("decision").?.string;
+    // Workspace policy may allow, ask, or block unknown tools (e.g. tools.default deny).
     if (std.mem.eql(u8, decision, "allow")) {
         try std.testing.expectEqual(exit_codes.success, result.code);
     } else if (std.mem.eql(u8, decision, "ask")) {
         try std.testing.expectEqual(exit_codes.ask, result.code);
+    } else if (std.mem.eql(u8, decision, "block")) {
+        try std.testing.expectEqual(exit_codes.denial, result.code);
     } else {
         try std.testing.expect(false);
     }
@@ -590,11 +618,12 @@ test "hook claude rejects invalid JSON" {
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 
-    // PreToolUse pre-eval failures fail closed with structured block JSON (exit 0).
+    // PreToolUse pre-eval failures fail closed with host-shaped deny JSON (exit 0).
     try std.testing.expectEqual(exit_codes.success, result.code);
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{});
     defer parsed.deinit();
-    try std.testing.expectEqualStrings("block", parsed.value.object.get("decision").?.string);
+    const hso = parsed.value.object.get("hookSpecificOutput").?.object;
+    try std.testing.expectEqualStrings("deny", hso.get("permissionDecision").?.string);
 }
 
 test "hook codex rejects unknown host in payload" {
@@ -1097,13 +1126,21 @@ test "all claude hook responses are valid JSON" {
         };
         defer parsed.deinit();
 
-        try std.testing.expect(parsed.value.object.get("version") != null);
-        try std.testing.expect(parsed.value.object.get("decision") != null);
-        try std.testing.expect(parsed.value.object.get("risk") != null);
-        try std.testing.expect(parsed.value.object.get("category") != null);
-        try std.testing.expect(parsed.value.object.get("reason") != null);
-        try std.testing.expect(parsed.value.object.get("message") != null);
-        try std.testing.expect(parsed.value.object.get("redactions") != null);
-        try std.testing.expect(parsed.value.object.get("host_limitations") != null);
+        // Tool-gating events use Claude-native permissionDecision; others keep ryk-generic shape.
+        if (std.mem.eql(u8, event, "PreToolUse") or std.mem.eql(u8, event, "PermissionRequest")) {
+            const hso = parsed.value.object.get("hookSpecificOutput").?.object;
+            try std.testing.expect(hso.get("permissionDecision") != null);
+            try std.testing.expect(hso.get("permissionDecisionReason") != null);
+            try std.testing.expect(hso.get("hookEventName") != null);
+        } else {
+            try std.testing.expect(parsed.value.object.get("version") != null);
+            try std.testing.expect(parsed.value.object.get("decision") != null);
+            try std.testing.expect(parsed.value.object.get("risk") != null);
+            try std.testing.expect(parsed.value.object.get("category") != null);
+            try std.testing.expect(parsed.value.object.get("reason") != null);
+            try std.testing.expect(parsed.value.object.get("message") != null);
+            try std.testing.expect(parsed.value.object.get("redactions") != null);
+            try std.testing.expect(parsed.value.object.get("host_limitations") != null);
+        }
     }
 }
