@@ -135,7 +135,7 @@ Example response:
 }
 ```
 
-If the decision is `block`, the plugin throws an error that prevents the tool from executing.
+If the decision is `block`, the plugin shows a short TUI error toast (when available), logs full operator detail to stderr, and throws a **single-line** `Error` so OpenCode’s tool row stays short (no multi-line Recourse/Next wall in the chat card). The throw still prevents the tool from executing.
 
 ## Run redteam
 

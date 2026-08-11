@@ -450,7 +450,45 @@ function buildToolBeforePayload(
   };
 }
 
-function formatBlockMessage(response: RykResponse, context: string): string {
+/** First non-empty line of text (strips multi-line Recourse/Next walls). */
+function firstLine(text: string): string {
+  for (const line of text.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (trimmed) return trimmed;
+  }
+  return '';
+}
+
+/**
+ * Short one-line tool/toast copy for hard blocks.
+ * Prefer rule → reason → first line of message. Never embed Recourse/Next walls.
+ */
+function formatShortBlock(response: RykResponse, context: string): string {
+  let detail = '';
+  if (typeof response.rule === 'string' && response.rule.trim()) {
+    detail = firstLine(response.rule);
+  } else if (typeof response.reason === 'string' && response.reason.trim()) {
+    detail = firstLine(response.reason);
+  } else if (typeof response.message === 'string' && response.message.trim()) {
+    detail = firstLine(response.message);
+  }
+  if (!detail) {
+    detail = 'blocked by policy';
+  }
+  // Belt-and-suspenders: strip same-line Recourse/Next if CLI ever packs them.
+  detail = detail.replace(/\s*Recourse:\s*.*$/i, '').replace(/\s*Next:\s*.*$/i, '').trim() || detail;
+  // Prefer ~120-char tool lines; keep room for the "ryk blocked …: " prefix.
+  const maxDetail = 90;
+  if (detail.length > maxDetail) {
+    detail = `${detail.slice(0, maxDetail - 3)}...`;
+  }
+  return `ryk blocked ${context}: ${detail}`;
+}
+
+/**
+ * Full operator detail for stderr only (not Error.message / chat tool card).
+ */
+function formatOperatorDetail(response: RykResponse, context: string): string {
   const base = response.message || response.reason || 'ryk blocked this command.';
   const parts = [`ryk blocked ${context}: ${base}`];
   if (response.remediation_commands && response.remediation_commands.length > 0) {
@@ -463,6 +501,9 @@ function formatBlockMessage(response: RykResponse, context: string): string {
   return parts.join('\n');
 }
 
+/** Cap toast RPC wait so a stuck TUI client cannot freeze the hard-block path. */
+const TOAST_TIMEOUT_MS = 1500;
+
 async function maybeToast(
   ctx: PluginContext,
   variant: 'info' | 'success' | 'warning' | 'error',
@@ -472,20 +513,33 @@ async function maybeToast(
   const showToast = ctx.client?.tui?.showToast;
   if (!showToast) return;
   try {
-    await showToast({
-      body: {
-        title,
-        message: message.slice(0, 280),
-        variant,
-        duration: variant === 'error' ? 8000 : 5000,
-      },
-    });
+    await Promise.race([
+      showToast({
+        body: {
+          title,
+          message: message.slice(0, 280),
+          variant,
+          duration: variant === 'error' ? 8000 : 5000,
+        },
+      }),
+      new Promise<void>((resolve) => {
+        setTimeout(resolve, TOAST_TIMEOUT_MS);
+      }),
+    ]);
   } catch {
-    // Host toast is best-effort; never fail closed on UI.
+    // Host toast is best-effort; never fail open on UI (block path still throws).
   }
 }
 
-function applyBlockingDecision(response: RykResponse, context: string): void {
+/**
+ * Apply a blocking-path decision: warn/pass-through return; hard blocks toast
+ * then throw a short Error. Full operator detail goes to stderr only.
+ */
+async function applyBlockingDecision(
+  response: RykResponse,
+  context: string,
+  ctx: PluginContext
+): Promise<void> {
   if (response.decision === 'warn') {
     console.warn(`[ryk] Warning: ${response.message || response.reason}`);
     return;
@@ -496,9 +550,22 @@ function applyBlockingDecision(response: RykResponse, context: string): void {
   }
 
   // block, ask, error, unrecognized → veto tool execution
-  const msg = formatBlockMessage(response, context);
-  console.error(`[ryk] ${msg}`);
-  throw new Error(msg);
+  const shortMsg = formatShortBlock(response, context);
+  const detail = formatOperatorDetail(response, context);
+  console.error(`[ryk] ${detail}`);
+  await maybeToast(ctx, 'error', 'ryk blocked', shortMsg);
+  throw new Error(shortMsg);
+}
+
+/** Best-effort error toast then throw a short single-line Error. */
+async function hardBlockWithToast(
+  ctx: PluginContext,
+  shortMsg: string,
+  operatorDetail?: string
+): Promise<never> {
+  console.error(`[ryk] ${operatorDetail ?? shortMsg}`);
+  await maybeToast(ctx, 'error', 'ryk blocked', shortMsg);
+  throw new Error(shortMsg);
 }
 
 /** ryk decision → OpenCode permission.ask status. Unknown decisions fail closed to deny. */
@@ -577,14 +644,19 @@ const READ_LIKE_TOOLS = new Set([
   'cat',
 ]);
 
-function localDotenvGuard(tool: string, args: Record<string, unknown>): void {
+async function localDotenvGuard(
+  tool: string,
+  args: Record<string, unknown>,
+  ctx: PluginContext
+): Promise<void> {
   if (!READ_LIKE_TOOLS.has(tool.toLowerCase())) return;
   const pathValue = pathFromArgs(args);
   if (!pathValue) return;
   if (!isBlockedDotenvPath(pathValue)) return;
-  const msg = `ryk blocked tool execution: reading ${pathValue} is blocked (.env protection).`;
-  console.error(`[ryk] ${msg}`);
-  throw new Error(msg);
+  // Keep path on one line (no embedded newlines from untrusted args).
+  const safePath = firstLine(pathValue) || pathValue.replace(/\s+/g, ' ').slice(0, 80);
+  const msg = `ryk blocked tool execution: reading ${safePath} is blocked (.env protection).`;
+  await hardBlockWithToast(ctx, msg);
 }
 
 const MISSING_BINARY_MSG = 'ryk binary not found; blocking as a precaution.';
@@ -609,12 +681,18 @@ export default async function rykPlugin(ctx: PluginContext): Promise<PluginHooks
     );
     return {
       'tool.execute.before': async () => {
-        console.error(`[ryk] Blocked tool execution: ${MISSING_BINARY_MSG}`);
-        throw new Error(MISSING_BINARY_MSG);
+        await hardBlockWithToast(
+          ctx,
+          `ryk blocked tool execution: ${MISSING_BINARY_MSG}`,
+          `Blocked tool execution: ${MISSING_BINARY_MSG}`
+        );
       },
       'command.execute.before': async () => {
-        console.error(`[ryk] Blocked command: ${MISSING_BINARY_MSG}`);
-        throw new Error(MISSING_BINARY_MSG);
+        await hardBlockWithToast(
+          ctx,
+          `ryk blocked command: ${MISSING_BINARY_MSG}`,
+          `Blocked command: ${MISSING_BINARY_MSG}`
+        );
       },
       'permission.ask': async (_input, output) => {
         console.error(`[ryk] Blocked permission: ${MISSING_BINARY_MSG}`);
@@ -649,7 +727,7 @@ export default async function rykPlugin(ctx: PluginContext): Promise<PluginHooks
 
     'tool.execute.before': async (input, output) => {
       // Local defense-in-depth (.env protection) before ryk round-trip.
-      localDotenvGuard(input.tool, output.args ?? {});
+      await localDotenvGuard(input.tool, output.args ?? {}, ctx);
 
       const response = callRyk(
         rykBin,
@@ -666,7 +744,7 @@ export default async function rykPlugin(ctx: PluginContext): Promise<PluginHooks
           response.message || response.reason || 'policy warning'
         );
       }
-      applyBlockingDecision(response, 'tool execution');
+      await applyBlockingDecision(response, 'tool execution', ctx);
     },
 
     'tool.execute.after': async (input, output) => {
@@ -716,7 +794,15 @@ export default async function rykPlugin(ctx: PluginContext): Promise<PluginHooks
         input.sessionID,
         true
       );
-      applyBlockingDecision(response, 'command');
+      if (response.decision === 'warn') {
+        await maybeToast(
+          ctx,
+          'warning',
+          'ryk',
+          response.message || response.reason || 'policy warning'
+        );
+      }
+      await applyBlockingDecision(response, 'command', ctx);
     },
 
     'shell.env': async (input, output) => {

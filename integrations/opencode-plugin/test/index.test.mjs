@@ -10,7 +10,7 @@ import rykPlugin, { findRyk, parseHookResponse } from '../dist/index.js';
 
 const pluginRoot = join(dirname(fileURLToPath(import.meta.url)), '..');
 
-async function withFakeRyk(run, scriptBody) {
+async function withFakeRyk(run, scriptBody, pluginExtras = {}) {
   const directory = await mkdtemp(join(tmpdir(), 'ryk-opencode-plugin-'));
   const body =
     scriptBody ??
@@ -40,7 +40,7 @@ fi
   process.env.RYK_ALLOW_WORKSPACE_BIN = '1';
 
   try {
-    await run(await rykPlugin({ directory, worktree: directory }));
+    await run(await rykPlugin({ directory, worktree: directory, ...pluginExtras }));
   } finally {
     process.env.PATH = originalPath;
     if (originalAllow === undefined) delete process.env.RYK_ALLOW_WORKSPACE_BIN;
@@ -49,6 +49,18 @@ fi
     else process.env.RYK_BIN = originalRykBin;
     await rm(directory, { recursive: true, force: true });
   }
+}
+
+/** Assert thrown Error.message is a single short tool line (no remediation wall). */
+function assertShortBlockThrow(err, contextRe) {
+  assert.ok(err instanceof Error, 'must throw Error');
+  const msg = err.message;
+  assert.ok(!msg.includes('\n'), `throw must be single-line, got: ${JSON.stringify(msg)}`);
+  assert.ok(!msg.includes('Recourse:'), `throw must not contain Recourse:, got: ${JSON.stringify(msg)}`);
+  assert.ok(!msg.includes('Next:'), `throw must not contain Next:, got: ${JSON.stringify(msg)}`);
+  assert.match(msg, /ryk blocked/);
+  if (contextRe) assert.match(msg, contextRe);
+  assert.ok(msg.length <= 200, `throw should stay short (≤200), got ${msg.length}: ${msg}`);
 }
 
 for (const [command, message] of [
@@ -66,7 +78,10 @@ for (const [command, message] of [
           { tool: 'bash', sessionID: 'session-1', callID: 'call-1' },
           { args: { command } }
         ),
-        new RegExp(`ryk blocked tool execution: ${message}`)
+        (err) => {
+          assertShortBlockThrow(err, new RegExp(`ryk blocked tool execution: ${message}`));
+          return true;
+        }
       );
     });
   });
@@ -121,9 +136,385 @@ test('tool.execute.before still hard-blocks ryk ask (no resume on that path)', a
         { tool: 'bash', sessionID: 'session-1', callID: 'call-1' },
         { args: { command: 'rm file.txt' } }
       ),
-      /ryk blocked tool execution: approval required/
+      (err) => {
+        assertShortBlockThrow(err, /ryk blocked tool execution: approval required/);
+        return true;
+      }
     );
   });
+});
+
+// --- Hard-block presentation: short throw + toast (no Recourse wall) ---
+
+test('hard block throws single-line Error without Recourse/Next wall', async () => {
+  // Multi-line CLI message + remediation_commands must not leak into throw.
+  // Prefer rule in short line; full wall stays on stderr only.
+  await withFakeRyk(
+    async (plugin) => {
+      const before = plugin['tool.execute.before'];
+      assert.ok(before);
+      await assert.rejects(
+        before(
+          { tool: 'bash', sessionID: 'session-1', callID: 'call-1' },
+          { args: { command: 'rm -rf /' } }
+        ),
+        (err) => {
+          assertShortBlockThrow(err, /ryk blocked tool execution: core\.filesystem:rm-rf-root-home/);
+          assert.ok(
+            !err.message.includes('allow-once'),
+            'remediation must not appear in throw'
+          );
+          assert.ok(
+            !err.message.includes('destructive'),
+            'long policy message must not appear in throw when rule is present'
+          );
+          return true;
+        }
+      );
+    },
+    // Heredoc keeps valid JSON with embedded \\n escapes (real multi-line after parse).
+    `#!/bin/sh
+cat <<'EOF'
+{"decision":"block","rule":"core.filesystem:rm-rf-root-home","message":"command blocked by ryk policy: destructive rm\\nRecourse: operator can run ryk allow-once ABC\\nNext: ryk explain rm","remediation_commands":["ryk allow-once ABC","ryk explain rm"]}
+EOF
+`
+  );
+});
+
+test('hard block multi-line message without rule uses first line only', async () => {
+  await withFakeRyk(
+    async (plugin) => {
+      const before = plugin['tool.execute.before'];
+      assert.ok(before);
+      await assert.rejects(
+        before(
+          { tool: 'bash', sessionID: 'session-1', callID: 'call-1' },
+          { args: { command: 'rm -rf /' } }
+        ),
+        (err) => {
+          assertShortBlockThrow(err, /ryk blocked tool execution: command blocked by ryk policy/);
+          assert.ok(!err.message.includes('Recourse:'));
+          assert.ok(!err.message.includes('Next:'));
+          assert.ok(!err.message.includes('allow-once'));
+          return true;
+        }
+      );
+    },
+    `#!/bin/sh
+cat <<'EOF'
+{"decision":"block","message":"command blocked by ryk policy: rm refused\\nRecourse: operator can run ryk allow-once ABC\\nNext: ryk explain rm","remediation_commands":["ryk allow-once ABC"]}
+EOF
+`
+  );
+});
+
+test('hard block prefers rule in short throw when present', async () => {
+  await withFakeRyk(
+    async (plugin) => {
+      const before = plugin['tool.execute.before'];
+      assert.ok(before);
+      await assert.rejects(
+        before(
+          { tool: 'bash', sessionID: 'session-1', callID: 'call-1' },
+          { args: { command: 'rm -rf build' } }
+        ),
+        (err) => {
+          assertShortBlockThrow(err, /core\.filesystem:rm-rf-root-home/);
+          return true;
+        }
+      );
+    },
+    `#!/bin/sh
+printf '%s\\n' '{"decision":"block","rule":"core.filesystem:rm-rf-root-home","message":"long wall\\nRecourse: hide me","reason":"also hide if rule wins"}'
+`
+  );
+});
+
+test('hard block with empty rule/message still identifies ryk block', async () => {
+  await withFakeRyk(
+    async (plugin) => {
+      const before = plugin['tool.execute.before'];
+      assert.ok(before);
+      await assert.rejects(
+        before(
+          { tool: 'bash', sessionID: 'session-1', callID: 'call-1' },
+          { args: { command: 'echo hi' } }
+        ),
+        (err) => {
+          assertShortBlockThrow(err, /ryk blocked tool execution/);
+          return true;
+        }
+      );
+    },
+    `#!/bin/sh
+printf '%s\\n' '{"decision":"block"}'
+`
+  );
+});
+
+test('hard block shows toast error before throw when client present', async () => {
+  const toasts = [];
+  await withFakeRyk(
+    async (plugin) => {
+      const before = plugin['tool.execute.before'];
+      assert.ok(before);
+      await assert.rejects(
+        before(
+          { tool: 'bash', sessionID: 'session-1', callID: 'call-1' },
+          { args: { command: 'rm -rf build' } }
+        ),
+        (err) => {
+          assertShortBlockThrow(err, /ryk blocked/);
+          return true;
+        }
+      );
+      assert.equal(toasts.length, 1, 'exactly one error toast on block');
+      const body = toasts[0]?.body;
+      assert.ok(body, 'toast body present');
+      assert.equal(body.variant, 'error');
+      assert.ok(body.title && body.title.length <= 40, 'toast title short');
+      assert.match(body.title, /ryk/i);
+      assert.ok(typeof body.message === 'string' && body.message.length > 0);
+      assert.ok(body.message.length <= 280, 'toast message ≤280');
+      assert.ok(!body.message.includes('\n'), 'toast message single-line');
+      assert.ok(!body.message.includes('Recourse:'));
+      assert.ok(!body.message.includes('Next:'));
+    },
+    `#!/bin/sh
+printf '%s\\n' '{"decision":"block","message":"command blocked\\nRecourse: no","remediation_commands":["ryk allow-once x"]}'
+`,
+    {
+      client: {
+        tui: {
+          showToast: async (input) => {
+            toasts.push(input);
+          },
+        },
+      },
+    }
+  );
+});
+
+test('toast failure does not allow tool (still throws short Error)', async () => {
+  await withFakeRyk(
+    async (plugin) => {
+      const before = plugin['tool.execute.before'];
+      assert.ok(before);
+      await assert.rejects(
+        before(
+          { tool: 'bash', sessionID: 'session-1', callID: 'call-1' },
+          { args: { command: 'rm -rf build' } }
+        ),
+        (err) => {
+          assertShortBlockThrow(err, /ryk blocked/);
+          return true;
+        }
+      );
+    },
+    `#!/bin/sh
+printf '%s\\n' '{"decision":"block","message":"command blocked"}'
+`,
+    {
+      client: {
+        tui: {
+          showToast: async () => {
+            throw new Error('toast transport failed');
+          },
+        },
+      },
+    }
+  );
+});
+
+test('missing toast client still hard-blocks with short throw', async () => {
+  await withFakeRyk(
+    async (plugin) => {
+      const before = plugin['tool.execute.before'];
+      assert.ok(before);
+      await assert.rejects(
+        before(
+          { tool: 'bash', sessionID: 'session-1', callID: 'call-1' },
+          { args: { command: 'rm -rf build' } }
+        ),
+        (err) => {
+          assertShortBlockThrow(err, /ryk blocked/);
+          return true;
+        }
+      );
+    },
+    `#!/bin/sh
+printf '%s\\n' '{"decision":"block","message":"command blocked"}'
+`
+    // no client — toast optional
+  );
+});
+
+test('hard block logs full operator detail to console.error', async () => {
+  const errors = [];
+  const originalError = console.error;
+  console.error = (...args) => {
+    errors.push(args.map(String).join(' '));
+  };
+  try {
+    await withFakeRyk(
+      async (plugin) => {
+        const before = plugin['tool.execute.before'];
+        assert.ok(before);
+        await assert.rejects(
+          before(
+            { tool: 'bash', sessionID: 'session-1', callID: 'call-1' },
+            { args: { command: 'rm -rf build' } }
+          )
+        );
+        const joined = errors.join('\n');
+        assert.match(joined, /Recourse:|Next:|allow-once|command blocked by ryk/);
+      },
+      `#!/bin/sh
+printf '%s\\n' '{"decision":"block","message":"command blocked by ryk policy\\nRecourse: operator can run ryk allow-once ABC","remediation_commands":["ryk allow-once ABC"]}'
+`
+    );
+  } finally {
+    console.error = originalError;
+  }
+});
+
+test('warn path does not throw and may toast warning', async () => {
+  const toasts = [];
+  await withFakeRyk(
+    async (plugin) => {
+      const before = plugin['tool.execute.before'];
+      assert.ok(before);
+      await before(
+        { tool: 'bash', sessionID: 'session-1', callID: 'call-1' },
+        { args: { command: 'echo warn-me' } }
+      );
+      assert.equal(toasts.length, 1);
+      assert.equal(toasts[0]?.body?.variant, 'warning');
+    },
+    `#!/bin/sh
+printf '%s\\n' '{"decision":"warn","message":"soft policy note"}'
+`,
+    {
+      client: {
+        tui: {
+          showToast: async (input) => {
+            toasts.push(input);
+          },
+        },
+      },
+    }
+  );
+});
+
+test('command.execute.before block uses short throw + error toast', async () => {
+  const toasts = [];
+  await withFakeRyk(
+    async (plugin) => {
+      const hook = plugin['command.execute.before'];
+      assert.ok(hook);
+      await assert.rejects(
+        hook(
+          { command: 'danger', sessionID: 'session-1', arguments: '' },
+          { parts: [] }
+        ),
+        (err) => {
+          assertShortBlockThrow(err, /ryk blocked command/);
+          return true;
+        }
+      );
+      assert.equal(toasts.length, 1);
+      assert.equal(toasts[0]?.body?.variant, 'error');
+    },
+    `#!/bin/sh
+printf '%s\\n' '{"decision":"block","message":"command blocked\\nRecourse: hide","remediation_commands":["ryk explain x"]}'
+`,
+    {
+      client: {
+        tui: {
+          showToast: async (input) => {
+            toasts.push(input);
+          },
+        },
+      },
+    }
+  );
+});
+
+test('.env local block uses short throw and error toast', async () => {
+  const toasts = [];
+  await withFakeRyk(
+    async (plugin) => {
+      const before = plugin['tool.execute.before'];
+      assert.ok(before);
+      await assert.rejects(
+        before(
+          { tool: 'read', sessionID: 'session-1', callID: 'call-1' },
+          { args: { path: '.env' } }
+        ),
+        (err) => {
+          assertShortBlockThrow(err, /\.env protection/);
+          return true;
+        }
+      );
+      assert.equal(toasts.length, 1);
+      assert.equal(toasts[0]?.body?.variant, 'error');
+    },
+    undefined,
+    {
+      client: {
+        tui: {
+          showToast: async (input) => {
+            toasts.push(input);
+          },
+        },
+      },
+    }
+  );
+});
+
+test('missing binary hard-block toasts error and throws short message', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'ryk-opencode-plugin-'));
+  const originalPath = process.env.PATH;
+  const originalAllow = process.env.RYK_ALLOW_WORKSPACE_BIN;
+  const originalRykBin = process.env.RYK_BIN;
+  process.env.PATH = directory;
+  delete process.env.RYK_ALLOW_WORKSPACE_BIN;
+  delete process.env.RYK_BIN;
+  const toasts = [];
+  try {
+    const plugin = await rykPlugin({
+      directory,
+      worktree: directory,
+      client: {
+        tui: {
+          showToast: async (input) => {
+            toasts.push(input);
+          },
+        },
+      },
+    });
+    const before = plugin['tool.execute.before'];
+    assert.ok(before);
+    await assert.rejects(
+      before(
+        { tool: 'bash', sessionID: 'session-1', callID: 'call-1' },
+        { args: { command: 'echo hi' } }
+      ),
+      (err) => {
+        assertShortBlockThrow(err, /ryk binary not found/);
+        return true;
+      }
+    );
+    assert.equal(toasts.length, 1);
+    assert.equal(toasts[0]?.body?.variant, 'error');
+  } finally {
+    process.env.PATH = originalPath;
+    if (originalAllow === undefined) delete process.env.RYK_ALLOW_WORKSPACE_BIN;
+    else process.env.RYK_ALLOW_WORKSPACE_BIN = originalAllow;
+    if (originalRykBin === undefined) delete process.env.RYK_BIN;
+    else process.env.RYK_BIN = originalRykBin;
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test('ryk.ts is a single-source sync of src/index.ts', async () => {
@@ -188,7 +579,10 @@ test('tool.execute.before blocks empty stdout', async () => {
           { tool: 'bash', sessionID: 'session-1', callID: 'call-1' },
           { args: { command: 'echo hi' } }
         ),
-        /ryk blocked tool execution/
+        (err) => {
+          assertShortBlockThrow(err, /ryk blocked tool execution/);
+          return true;
+        }
       );
     },
     `#!/bin/sh
@@ -207,7 +601,10 @@ test('tool.execute.before blocks decision error', async () => {
           { tool: 'bash', sessionID: 'session-1', callID: 'call-1' },
           { args: { command: 'echo hi' } }
         ),
-        /ryk blocked tool execution/
+        (err) => {
+          assertShortBlockThrow(err, /ryk blocked tool execution: evaluator failed/);
+          return true;
+        }
       );
     },
     `#!/bin/sh
@@ -226,12 +623,47 @@ test('tool.execute.before blocks unknown decision', async () => {
           { tool: 'bash', sessionID: 'session-1', callID: 'call-1' },
           { args: { command: 'echo hi' } }
         ),
-        /ryk blocked tool execution/
+        (err) => {
+          assertShortBlockThrow(err, /ryk blocked tool execution/);
+          return true;
+        }
       );
     },
     `#!/bin/sh
 printf '%s\\n' '{"decision":"unexpected","message":"bad decision"}'
 `
+  );
+});
+
+test('toast timeout does not prevent hard block throw', async () => {
+  await withFakeRyk(
+    async (plugin) => {
+      const before = plugin['tool.execute.before'];
+      assert.ok(before);
+      const start = Date.now();
+      await assert.rejects(
+        before(
+          { tool: 'bash', sessionID: 'session-1', callID: 'call-1' },
+          { args: { command: 'rm -rf build' } }
+        ),
+        (err) => {
+          assertShortBlockThrow(err, /ryk blocked/);
+          return true;
+        }
+      );
+      // Toast hangs for 10s; plugin must not wait that long (TOAST_TIMEOUT_MS=1500).
+      assert.ok(Date.now() - start < 4000, 'stuck toast must not freeze hard-block path');
+    },
+    `#!/bin/sh
+printf '%s\\n' '{"decision":"block","message":"command blocked"}'
+`,
+    {
+      client: {
+        tui: {
+          showToast: () => new Promise(() => {}), // never resolves
+        },
+      },
+    }
   );
 });
 
@@ -422,7 +854,10 @@ test('tool.execute.before blocks .env reads locally', async () => {
         { tool: 'read', sessionID: 'session-1', callID: 'call-1' },
         { args: { path: '.env' } }
       ),
-      /\.env protection/
+      (err) => {
+        assertShortBlockThrow(err, /\.env protection/);
+        return true;
+      }
     );
   });
 });
@@ -437,7 +872,10 @@ test('command.execute.before blocks when ryk returns block', async () => {
           { command: 'danger', sessionID: 'session-1', arguments: '' },
           { parts: [] }
         ),
-        /ryk blocked command/
+        (err) => {
+          assertShortBlockThrow(err, /ryk blocked command/);
+          return true;
+        }
       );
     },
     `#!/bin/sh
