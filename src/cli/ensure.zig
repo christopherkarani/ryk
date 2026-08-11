@@ -766,7 +766,8 @@ fn installOneHostInner(
     }
     // Plugin install resolves marketplace roots from process cwd — pin to ensure workspace
     // so from_install (HOME) cannot write plugins under a nested caller `.git` tree.
-    // OpenCode day-one: always global ~/.config/opencode/plugins (not HOME/.opencode project scope).
+    // OpenCode day-one: install/upgrade global ~/.config/opencode/plugins/ryk.ts.
+    // plugin install also upgrades an existing project .opencode/plugins/ryk.ts when present.
     const timeout_ms = hostPluginInstallTimeoutMs(host_id);
     const child = if (std.mem.eql(u8, host_id, "opencode")) blk: {
         const install_argv = [_][]const u8{ self_exe, "plugin", "install", "opencode", "--yes", "--scope", "global" };
