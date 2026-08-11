@@ -697,6 +697,15 @@ export default async function rykPlugin(ctx: PluginContext): Promise<PluginHooks
       'permission.ask': async (_input, output) => {
         console.error(`[ryk] Blocked permission: ${MISSING_BINARY_MSG}`);
         output.status = 'deny';
+        await maybeToast(
+          ctx,
+          'error',
+          'ryk blocked',
+          formatShortBlock(
+            { decision: 'error', message: MISSING_BINARY_MSG },
+            'permission'
+          )
+        );
       },
       'shell.env': async (_input, output) => {
         const scrubbed = scrubEnv(output.env);
@@ -770,7 +779,16 @@ export default async function rykPlugin(ctx: PluginContext): Promise<PluginHooks
       const response = callRyk(rykBin, 'permission.asked', input, sessionId, true);
       // Host already presents permission UI: map via table (ask stays ask for resume).
       applyPermissionDecision(response, output);
-      if (response.decision === 'warn' || response.decision === 'ask') {
+      if (output.status === 'deny') {
+        // Best-effort error toast; full operator detail already on console.error.
+        // Toast failure must never change deny outcome.
+        await maybeToast(
+          ctx,
+          'error',
+          'ryk blocked',
+          formatShortBlock(response, 'permission')
+        );
+      } else if (response.decision === 'warn' || response.decision === 'ask') {
         await maybeToast(
           ctx,
           'warning',

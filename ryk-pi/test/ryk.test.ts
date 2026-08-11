@@ -1898,7 +1898,7 @@ test("bash dangerous command with ryk deny returns block", async () => {
 	const { pi, handlers, messages } = makePi();
 	const { spawn } = makeSpawn([{ code: 2, stdout: denyJson() }]);
 	installRykExtension(pi, { spawn, rykBin: "ryk" });
-	const { ctx, widgets } = makeCtx();
+	const { ctx, widgets, notifications } = makeCtx();
 
 	const result = await fireToolCall(
 		handlers.get("tool_call")![0],
@@ -1919,6 +1919,18 @@ test("bash dangerous command with ryk deny returns block", async () => {
 		false,
 		"expected deny output to avoid the docked widget surface",
 	);
+	// Hard deny also flashes a best-effort error notify (card remains primary).
+	assert.equal(notifications.length, 1, "hard deny should notify once");
+	assert.equal(notifications[0]?.type, "error");
+	assert.match(notifications[0]?.message ?? "", /blocked this bash command/i);
+	assert.ok(
+		!notifications[0]?.message.includes("\n"),
+		"notify text should be single-line",
+	);
+	assert.ok(
+		!/Recourse:/i.test(notifications[0]?.message ?? ""),
+		"notify must not embed Recourse walls",
+	);
 	const inlineDecision = messages[0].message.content;
 	assert.match(inlineDecision, /┏━+/);
 	assert.match(inlineDecision, /RYKAN V/);
@@ -1936,6 +1948,97 @@ test("bash dangerous command with ryk deny returns block", async () => {
 		inlineDecision.split("\n").every((line) => line.length >= 40 && line.length <= 80),
 		"expected a compact, aligned decision card",
 	);
+});
+
+test("hard deny still blocks when ui.notify is missing", async () => {
+	const { pi, handlers, messages } = makePi();
+	const { spawn } = makeSpawn([{ code: 2, stdout: denyJson() }]);
+	installRykExtension(pi, { spawn, rykBin: "ryk" });
+	const { ctx } = makeCtx({
+		ui: {
+			// no notify — best-effort flash optional
+			setStatus: () => {},
+			setWidget: () => {},
+			select: async () => undefined,
+		},
+	});
+
+	const result = await fireToolCall(
+		handlers.get("tool_call")![0],
+		ctx,
+		"rm -rf /",
+	);
+	assert.equal(result?.block, true);
+	assert.match(result?.reason ?? "", /blocked this bash command/i);
+	assert.equal(messages.length, 1, "decision card path still runs without notify");
+	assert.equal(messages[0].message.customType, "rykanv-decision");
+});
+
+test("hard deny still blocks when ui.notify throws", async () => {
+	const { pi, handlers, messages } = makePi();
+	const { spawn } = makeSpawn([{ code: 2, stdout: denyJson() }]);
+	installRykExtension(pi, { spawn, rykBin: "ryk" });
+	const { ctx } = makeCtx({
+		ui: {
+			notify: () => {
+				throw new Error("notify transport failed");
+			},
+			setStatus: () => {},
+			setWidget: () => {},
+			select: async () => undefined,
+		},
+	});
+
+	const result = await fireToolCall(
+		handlers.get("tool_call")![0],
+		ctx,
+		"rm -rf /",
+	);
+	assert.equal(result?.block, true, "notify throw must not fail open");
+	assert.match(result?.reason ?? "", /blocked this bash command/i);
+	assert.equal(messages.length, 1);
+});
+
+test("hard deny notify is short/sanitized even when reason has Recourse wall", async () => {
+	const { pi, handlers } = makePi();
+	const { spawn } = makeSpawn([
+		{
+			code: 2,
+			stdout: JSON.stringify({
+				decision: "deny",
+				reason:
+					"destructive filesystem command\nRecourse: operator can run ryk allow-once ABC\nNext: ryk explain rm",
+				rule_id: "core.filesystem:destructive-rm",
+				daemon: { status: "healthy", compatible: true },
+			}),
+		},
+	]);
+	installRykExtension(pi, { spawn, rykBin: "ryk" });
+	const { ctx, notifications } = makeCtx();
+
+	const result = await fireToolCall(
+		handlers.get("tool_call")![0],
+		ctx,
+		"rm -rf /",
+	);
+	assert.equal(result?.block, true);
+	assert.equal(notifications.length, 1);
+	assert.equal(notifications[0]?.type, "error");
+	const msg = notifications[0]?.message ?? "";
+	assert.ok(!msg.includes("\n"), "notify collapsed to single line");
+	// Prefer no Recourse wall in the flash; card remains the detail surface.
+	assert.ok(
+		!/Recourse:/i.test(msg),
+		`notify should not re-surface Recourse wall, got: ${msg}`,
+	);
+	// Wall strip must run on the reason atom, not the composed sentence —
+	// otherwise greedy Recourse:.*$ also drops rule/pack/severity suffix.
+	assert.match(
+		msg,
+		/core\.filesystem:destructive-rm/,
+		`notify should keep rule suffix after wall strip, got: ${msg}`,
+	);
+	assert.match(msg, /destructive filesystem command/i);
 });
 
 test("ryk inline decision keeps long reasons inside the compact frame", async () => {
