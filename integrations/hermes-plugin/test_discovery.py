@@ -641,7 +641,8 @@ class HermesPluginDiscoveryTests(unittest.TestCase):
         self.assertEqual(approved["action"], "approve")
         self.assertTrue(approved["rule_key"].startswith("ryk|"))
 
-    def test_pre_tool_call_surfaces_remediation_commands(self) -> None:
+    def test_pre_tool_call_block_message_is_short_without_remediation(self) -> None:
+        """Host block message is one short line: no Next/remediation wall, rule once."""
         ctx = mock.Mock()
         _PLUGIN._register(ctx, "pre_tool_call")
         handler = ctx.register_hook.call_args.args[1]
@@ -658,8 +659,218 @@ class HermesPluginDiscoveryTests(unittest.TestCase):
             result = handler(tool_name="terminal", args={"command": "rm -rf /"})
         self.assertEqual(result.get("action"), "block")
         message = result.get("message", "")
-        self.assertIn("ryk explain", message)
-        self.assertIn("rule: core.filesystem:destructive_rm", message)
+        self.assertTrue(message.strip())
+        self.assertNotIn("Next:", message)
+        self.assertNotIn("ryk explain", message)
+        self.assertNotIn("allowlist", message)
+        self.assertNotIn("\n", message)
+        self.assertIn("core.filesystem:destructive_rm", message)
+        self.assertLessEqual(len(message), 200)
+
+    def test_format_tool_message_collapses_recourse_and_skips_remediation(self) -> None:
+        """Multi-line CLI Recourse walls never reach Hermes host message."""
+        mapping = _PLUGIN._mapping
+        resp = {
+            "message": (
+                "command blocked by ryk policy: destructive\n"
+                "Recourse: operator can run ryk allow-once <code>\n"
+                "Next: ryk explain \"rm -rf /\""
+            ),
+            "reason": "blocked by ryk policy",
+            "rule": "core.filesystem:rm-rf-root-home",
+            "remediation_commands": [
+                "ryk explain \"rm -rf /\"",
+                "ryk allow-once <code>",
+            ],
+        }
+        message = mapping.format_tool_message(resp, default="blocked by ryk")
+        self.assertNotIn("Recourse", message)
+        self.assertNotIn("Next:", message)
+        self.assertNotIn("allow-once", message)
+        self.assertNotIn("\n", message)
+        self.assertTrue(message.strip())
+        self.assertIn("core.filesystem:rm-rf-root-home", message)
+        # Prefer short reason when present.
+        self.assertIn("blocked by ryk policy", message)
+        self.assertLessEqual(len(message), 200)
+
+        out = mapping.map_pre_tool_call(
+            {**resp, "decision": "block"},
+            "terminal",
+            {"command": "rm -rf /"},
+        )
+        assert out is not None
+        self.assertEqual(out["action"], "block")
+        host_msg = out["message"]
+        self.assertNotIn("Recourse", host_msg)
+        self.assertNotIn("Next:", host_msg)
+        self.assertNotIn("\n", host_msg)
+        self.assertLessEqual(len(host_msg), 200)
+
+    def test_format_tool_message_empty_inputs_default_and_rule_only(self) -> None:
+        mapping = _PLUGIN._mapping
+        empty = mapping.format_tool_message({}, default="blocked by ryk")
+        self.assertEqual(empty, "blocked by ryk")
+
+        rule_only = mapping.format_tool_message(
+            {"rule_id": "core.shell:network", "message": "", "reason": "   "},
+            default="blocked by ryk",
+        )
+        self.assertIn("blocked by ryk", rule_only)
+        self.assertIn("core.shell:network", rule_only)
+        self.assertNotIn("\n", rule_only)
+
+    def test_ask_approve_message_is_short_with_stable_rule_key(self) -> None:
+        mapping = _PLUGIN._mapping
+        out = mapping.map_pre_tool_call(
+            {
+                "decision": "ask",
+                "message": (
+                    "approval required by ryk\n"
+                    "Recourse: run ryk allow-once <code>"
+                ),
+                "rule_id": "core.filesystem:destructive_rm",
+                "remediation_commands": ["ryk allow-once <code>"],
+            },
+            "terminal",
+            {"command": "rm -rf /tmp/x"},
+            environ={},
+        )
+        assert out is not None
+        self.assertEqual(out["action"], "approve")
+        self.assertTrue(out["rule_key"].startswith("ryk|core.filesystem:destructive_rm|terminal|"))
+        message = out["message"]
+        self.assertIn("approval required", message.lower())
+        self.assertNotIn("Recourse", message)
+        self.assertNotIn("Next:", message)
+        self.assertNotIn("\n", message)
+        self.assertLessEqual(len(message), 200)
+
+    def test_ci_ask_block_message_is_short_single_line(self) -> None:
+        mapping = _PLUGIN._mapping
+        out = mapping.map_pre_tool_call(
+            {
+                "decision": "ask",
+                "message": "approval required by ryk\nRecourse: tip",
+                "rule": "core.shell:push",
+                "remediation_commands": ["ryk explain push"],
+            },
+            "terminal",
+            {"command": "git push"},
+            environ={"CI": "true"},
+        )
+        assert out is not None
+        self.assertEqual(out["action"], "block")
+        message = out["message"]
+        self.assertIn("approval required", message.lower())
+        self.assertIn("noninteractive", message.lower())
+        self.assertNotIn("Recourse", message)
+        self.assertNotIn("Next:", message)
+        self.assertNotIn("\n", message)
+        self.assertNotIn("ryk explain", message)
+
+    def test_warn_stays_advisory_with_short_log_text(self) -> None:
+        mapping = _PLUGIN._mapping
+        logs: list[str] = []
+        out = mapping.map_pre_tool_call(
+            {
+                "decision": "warn",
+                "message": "warn by ryk\nRecourse: ignore me",
+                "remediation_commands": ["ryk explain x"],
+            },
+            "terminal",
+            {"command": "curl example.com"},
+            log_warn=logs.append,
+        )
+        self.assertIsNone(out)
+        self.assertEqual(len(logs), 1)
+        self.assertIn("WARN (advisory, not blocked)", logs[0])
+        self.assertIn("warn by ryk", logs[0])
+        self.assertNotIn("Recourse", logs[0])
+        self.assertNotIn("Next:", logs[0])
+
+    def test_invalid_decision_fail_closed_meaningful_message(self) -> None:
+        mapping = _PLUGIN._mapping
+        out = mapping.map_pre_tool_call(
+            {"decision": "future-decision", "message": "should not surface"},
+            "terminal",
+            {},
+        )
+        assert out is not None
+        self.assertEqual(out["action"], "block")
+        self.assertIn("fail-closed", out["message"].lower())
+        self.assertTrue(out["message"].strip())
+
+    def test_format_tool_message_redacts_secret_like_patterns(self) -> None:
+        mapping = _PLUGIN._mapping
+        message = mapping.format_tool_message(
+            {
+                "message": "token=super-secret-value blocked",
+                "rule_id": "core.shell:env",
+            },
+            default="blocked by ryk",
+        )
+        self.assertNotIn("super-secret-value", message)
+        self.assertIn("[REDACTED]", message)
+        self.assertNotIn("\n", message)
+
+    def test_format_tool_message_strips_inline_recourse_next(self) -> None:
+        """Same-line operator tails must not re-inflate the host string."""
+        mapping = _PLUGIN._mapping
+        message = mapping.format_tool_message(
+            {
+                "message": (
+                    "blocked by ryk policy. Recourse: run ryk allow-once <code> "
+                    "Next: ryk explain \"rm -rf /\""
+                ),
+                "remediation_commands": ["ryk explain \"rm -rf /\""],
+            },
+            default="blocked by ryk",
+        )
+        self.assertEqual(message, "blocked by ryk policy.")
+        self.assertNotIn("Recourse", message)
+        self.assertNotIn("Next:", message)
+        self.assertNotIn("allow-once", message)
+
+    def test_format_tool_message_long_rule_stays_within_host_cap(self) -> None:
+        """Long rule_id must not defeat host 200-cap mid-suffix truncation."""
+        mapping = _PLUGIN._mapping
+        long_rule = "core.filesystem:" + ("very-long-rule-segment-" * 20)
+        message = mapping.format_tool_message(
+            {"reason": "blocked by ryk policy", "rule_id": long_rule},
+            default="blocked by ryk",
+        )
+        self.assertLessEqual(len(message), 200)
+        self.assertNotIn("\n", message)
+        self.assertIn("blocked by ryk policy", message)
+        self.assertIn("(rule:", message)
+        self.assertIn("core.filesystem:", message)
+        # Final string must not end with the full-message truncation marker
+        # after "reserving" room for the rule (rule itself may be truncated).
+        self.assertFalse(message.endswith("...[truncated]"))
+
+    def test_ci_ask_block_message_respects_host_char_cap(self) -> None:
+        """CI harden clause must still fit Hermes host message budget."""
+        mapping = _PLUGIN._mapping
+        out = mapping.map_pre_tool_call(
+            {
+                "decision": "ask",
+                "reason": "x" * 180,
+                "message": "approval required by ryk\nRecourse: tip",
+                "rule": "core.shell:push",
+                "remediation_commands": ["ryk explain push"],
+            },
+            "terminal",
+            {"command": "git push"},
+            environ={"CI": "true"},
+        )
+        assert out is not None
+        self.assertEqual(out["action"], "block")
+        message = out["message"]
+        self.assertLessEqual(len(message), 200)
+        self.assertNotIn("\n", message)
+        self.assertIn("noninteractive", message.lower())
+        self.assertNotIn("Recourse", message)
 
     def test_pre_tool_call_allows_only_explicit_allow(self) -> None:
         ctx = mock.Mock()

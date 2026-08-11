@@ -16,6 +16,8 @@ On `pre_tool_call`, ryk decisions map to Hermes native directives:
 | `warn` | log + `None` | Advisory warning only; tool proceeds (not collapsed to block) |
 | other / malformed | `{"action":"block",...}` | Fail-closed |
 
+Host-facing `message` on block/approve is a **short single line** (reason and/or rule id). Operator tips (`Recourse` / `Next` / `remediation_commands`) are **not** stuffed into the Hermes UI string — use `ryk explain` / stderr from the CLI for those.
+
 ### Approve-and-resume (`ask`)
 
 Hermes ≥ the version that shipped `pre_tool_call` `action: approve` (escalation to the same gate Tier-2 dangerous commands use) is required for the native path. When ryk returns `ask`:
