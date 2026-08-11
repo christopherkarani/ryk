@@ -463,6 +463,27 @@ phase_bump() {
 
   printf '%s\n' "$VERSION" >"${REPO_ROOT}/VERSION"
 
+  # Keep install.sh piped fallback current when discovery is unavailable.
+  if [[ -f scripts/install.sh ]] && grep -q '^INSTALL_FALLBACK_VERSION=' scripts/install.sh; then
+    PREVIOUS_RELEASE_VERSION="$PREV_VERSION" NEXT_RELEASE_VERSION="$VERSION" node <<'NODE'
+const fs = require('fs');
+const previous = process.env.PREVIOUS_RELEASE_VERSION;
+const next = process.env.NEXT_RELEASE_VERSION;
+const path = 'scripts/install.sh';
+let source = fs.readFileSync(path, 'utf8');
+const re = /^INSTALL_FALLBACK_VERSION="[0-9]+\.[0-9]+\.[0-9]+"/m;
+if (!re.test(source)) {
+  throw new Error(`${path} missing INSTALL_FALLBACK_VERSION="X.Y.Z" line`);
+}
+source = source.replace(re, `INSTALL_FALLBACK_VERSION="${next}"`);
+// Also rewrite stale documented fallback mentions of the previous version.
+if (previous) {
+  source = source.replaceAll(`fallback ${previous}`, `fallback ${next}`);
+}
+fs.writeFileSync(path, source);
+NODE
+  fi
+
   set_package_json_version integrations/openclaw-plugin/package.json "$VERSION"
   set_package_json_version integrations/opencode-plugin/package.json "$VERSION"
   set_package_json_version ryk-pi/package.json "$VERSION"
@@ -522,6 +543,7 @@ NODE
   fi
 
   git add VERSION CHANGELOG.md \
+    scripts/install.sh \
     integrations/openclaw-plugin/package.json \
     integrations/opencode-plugin/package.json \
     ryk-pi/package.json

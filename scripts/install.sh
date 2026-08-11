@@ -9,7 +9,7 @@ set -eu
 #   curl -fsSL https://raw.githubusercontent.com/christopherkarani/ryk/main/scripts/install.sh | sh
 #
 # Environment (RYK_* only (hard-cut)):
-#   RYK_VERSION         Pin release version (default: latest / local VERSION / 1.2.9)
+#   RYK_VERSION         Pin release version (default: discover latest; else INSTALL_FALLBACK_VERSION)
 #   RYK_INSTALL_DIR Binary install dir (default: ~/.local/bin)
 #   RYK_SHARE_DIR     Runtime share root (default: ~/.local/share/ryk — kept in 5a)
 #   RYK_BASE_URL       Override release base URL
@@ -24,11 +24,12 @@ set -eu
 # - An artifact whose CLI does not advertise that door is rejected instead of
 #   being silently onboarded through a removed or weaker command.
 #
-# Robust VERSION resolution (piped-safe):
-# - File execution (dev, local checkout): read ../VERSION when present.
-# - Piped public install (curl | sh): $0 is not a regular file, so we skip the
-#   local read and fall through to the GitHub API (or RYK_VERSION / 1.2.9).
-# - RYK_VERSION always wins. Hardcoded value is only the final safety net.
+# VERSION resolution (piped-safe; plain `curl | sh` must not need RYK_VERSION):
+# 1. RYK_VERSION always wins.
+# 2. Local checkout: ../VERSION next to this script.
+# 3. Piped public install: discover without GitHub REST API rate limits —
+#    raw main VERSION, then releases/latest redirect, then API as last resort.
+# 4. INSTALL_FALLBACK_VERSION (kept in sync by cut-release) only if discovery fails.
 
 SCRIPT_DIR=""
 if [ -f "$0" ] 2>/dev/null; then
@@ -176,37 +177,103 @@ print_activation() {
 }
 
 # ── Version resolution ───────────────────────────────────────────────────────
+# cut-release rewrites INSTALL_FALLBACK_VERSION when shipping; do not hand-edit
+# without also updating VERSION / the release cutter.
+INSTALL_FALLBACK_VERSION="1.2.14"
 
-DEFAULT_VERSION=""
-if [ -n "$SCRIPT_DIR" ] && [ -r "${SCRIPT_DIR}/../VERSION" ]; then
-  DEFAULT_VERSION="$(tr -d '[:space:]' < "${SCRIPT_DIR}/../VERSION" 2>/dev/null || true)"
-fi
+is_semver() {
+  # Strict X.Y.Z only (installer artifact names depend on this shape).
+  case "$1" in
+    '' | *[!0-9.]* | *.*.*.*) return 1 ;;
+    [0-9]*.[0-9]*.[0-9]*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
 
-RESOLVED_FROM="fallback 1.2.9"
-if [ -n "${RYK_VERSION:-}" ]; then
-  RESOLVED_FROM="version environment override"
-elif [ -n "${DEFAULT_VERSION}" ]; then
-  RESOLVED_FROM="local VERSION"
-else
-  # Piped / non-filesystem path: best-effort latest release.
-  _url="https://api.github.com/repos/christopherkarani/ryk/releases/latest"
-  _resp=""
+install_http_get() {
+  # Body on stdout; non-zero exit on failure. Quiet network errors.
+  _url="$1"
   if command -v curl >/dev/null 2>&1; then
-    _resp="$(curl -fsSL --max-time 8 -H "User-Agent: ryk-install-script/1.0 (github.com/christopherkarani/ryk)" "$_url" 2>/dev/null || true)"
+    curl -fsSL --max-time 8 \
+      -H "User-Agent: ryk-install-script/1.0 (github.com/christopherkarani/ryk)" \
+      "$_url" 2>/dev/null
   elif command -v wget >/dev/null 2>&1; then
-    _resp="$(wget -qO- --timeout=8 --user-agent="ryk-install-script/1.0 (github.com/christopherkarani/ryk)" "$_url" 2>/dev/null || true)"
+    wget -qO- --timeout=8 \
+      --user-agent="ryk-install-script/1.0 (github.com/christopherkarani/ryk)" \
+      "$_url" 2>/dev/null
+  else
+    return 1
   fi
+}
+
+install_http_final_url() {
+  # Final URL after redirects (curl only; used for releases/latest).
+  _url="$1"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL --max-time 8 -o /dev/null -w '%{url_effective}' \
+      -H "User-Agent: ryk-install-script/1.0 (github.com/christopherkarani/ryk)" \
+      "$_url" 2>/dev/null
+  else
+    return 1
+  fi
+}
+
+discover_latest_version() {
+  # Prefer sources that do not burn unauthenticated GitHub REST quota.
+  # 1) main VERSION (updated on every cut-release bump commit).
+  _raw="$(install_http_get "https://raw.githubusercontent.com/christopherkarani/ryk/main/VERSION" 2>/dev/null || true)"
+  _v="$(printf '%s' "${_raw:-}" | tr -d '[:space:]')"
+  if is_semver "$_v"; then
+    printf '%s\n' "$_v"
+    return 0
+  fi
+
+  # 2) releases/latest redirect → …/tag/vX.Y.Z (HTML, not API).
+  _final="$(install_http_final_url "https://github.com/christopherkarani/ryk/releases/latest" 2>/dev/null || true)"
+  _v="$(printf '%s' "${_final:-}" | sed -n 's#.*/tag/v\([0-9][0-9.]*\)$#\1#p' | head -n1)"
+  if is_semver "$_v"; then
+    printf '%s\n' "$_v"
+    return 0
+  fi
+
+  # 3) REST API last (often rate-limited for anonymous curl | sh).
+  _resp="$(install_http_get "https://api.github.com/repos/christopherkarani/ryk/releases/latest" 2>/dev/null || true)"
   if [ -n "${_resp:-}" ]; then
-    _tag="$(printf '%s' "$_resp" | grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[vV]*[^"]*"' | head -n1 | \
+    _v="$(printf '%s' "$_resp" | grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[vV]*[^"]*"' | head -n1 | \
       sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"[vV]?([^"]*)".*/\1/' || true)"
-    if [ -n "${_tag:-}" ]; then
-      DEFAULT_VERSION="$_tag"
-      RESOLVED_FROM="GitHub latest"
+    if is_semver "$_v"; then
+      printf '%s\n' "$_v"
+      return 0
     fi
   fi
+  return 1
+}
+
+DEFAULT_VERSION=""
+RESOLVED_FROM="fallback ${INSTALL_FALLBACK_VERSION}"
+if [ -n "${RYK_VERSION:-}" ]; then
+  DEFAULT_VERSION=""
+  RESOLVED_FROM="version environment override"
+elif [ -n "$SCRIPT_DIR" ] && [ -r "${SCRIPT_DIR}/../VERSION" ]; then
+  DEFAULT_VERSION="$(tr -d '[:space:]' < "${SCRIPT_DIR}/../VERSION" 2>/dev/null || true)"
+  if is_semver "${DEFAULT_VERSION:-}"; then
+    RESOLVED_FROM="local VERSION"
+  else
+    DEFAULT_VERSION=""
+  fi
 fi
 
-VERSION="${RYK_VERSION:-${DEFAULT_VERSION:-1.2.9}}"
+if [ -z "${RYK_VERSION:-}" ] && [ -z "${DEFAULT_VERSION}" ]; then
+  # Piped / non-checkout path: discover latest for plain curl | sh users.
+  if DEFAULT_VERSION="$(discover_latest_version 2>/dev/null)"; then
+    RESOLVED_FROM="discovered latest"
+  else
+    DEFAULT_VERSION=""
+    RESOLVED_FROM="fallback ${INSTALL_FALLBACK_VERSION}"
+  fi
+fi
+
+VERSION="${RYK_VERSION:-${DEFAULT_VERSION:-$INSTALL_FALLBACK_VERSION}}"
 BASE_URL="${RYK_BASE_URL:-https://github.com/christopherkarani/ryk/releases/download/v${VERSION}}"
 INSTALL_DIR="${RYK_INSTALL_DIR:-${HOME}/.local/bin}"
 SHARE_DIR="${RYK_SHARE_DIR:-${HOME}/.local/share/ryk}"
