@@ -1517,14 +1517,38 @@ test "decide tool applies effect-class denials" {
 }
 
 test "decide non-ci mode returns ask exit code for unknown command" {
+    // Coding DCG defaults allow unmatched shell; use an explicit ask-default
+    // policy so this still exercises PluginDecision ask → exit 7.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "policy.yaml",
+        .data =
+            \\version: 1
+            \\mode: ask
+            \\commands:
+            \\  default: ask
+            \\  allow:
+            \\    - "git status"
+            \\
+        ,
+    });
+    const policy_path = try tmp.dir.realPathFileAlloc(std.testing.io, "policy.yaml", std.testing.allocator);
+    defer std.testing.allocator.free(policy_path);
+
     var stdout_buf: [2048]u8 = undefined;
     var stderr_buf: [256]u8 = undefined;
     var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
     var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
 
-    const code = try decideCommand(std.testing.io, .command, &.{
-        "--json", "{\"command\":\"unknown-tool --help\"}",
-    }, &stdout_writer, &stderr_writer);
+    const code = try decideCommandWithPolicy(
+        std.testing.io,
+        .command,
+        &.{ "--json", "{\"command\":\"unknown-tool --help\"}" },
+        &stdout_writer,
+        &stderr_writer,
+        policy_path,
+    );
     try std.testing.expectEqual(exit_codes.ask, code);
 
     const output = stdout_writer.buffered();
@@ -1532,22 +1556,41 @@ test "decide non-ci mode returns ask exit code for unknown command" {
 }
 
 test "decide ci mode turns ask into block" {
+    // Same ask-default policy as non-ci; --ci must map ask → block (exit denial).
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "policy.yaml",
+        .data =
+            \\version: 1
+            \\mode: ask
+            \\commands:
+            \\  default: ask
+            \\  allow:
+            \\    - "git status"
+            \\
+        ,
+    });
+    const policy_path = try tmp.dir.realPathFileAlloc(std.testing.io, "policy.yaml", std.testing.allocator);
+    defer std.testing.allocator.free(policy_path);
+
     var stdout_buf: [2048]u8 = undefined;
     var stderr_buf: [256]u8 = undefined;
     var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
     var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
 
-    // Use a command that typically asks; in CI it should block
-    const code = try decideCommand(std.testing.io, .command, &.{
-        "--json", "{\"command\":\"unknown-tool --help\"}",
-        "--ci",
-    }, &stdout_writer, &stderr_writer);
+    const code = try decideCommandWithPolicy(
+        std.testing.io,
+        .command,
+        &.{ "--json", "{\"command\":\"unknown-tool --help\"}", "--ci" },
+        &stdout_writer,
+        &stderr_writer,
+        policy_path,
+    );
     try std.testing.expectEqual(exit_codes.denial, code);
 
     const output = stdout_writer.buffered();
-    // In CI mode, ask should become block
-    // Note: the exact decision depends on policy; we just verify JSON validity
-    try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"block\"") != null);
 }
 
 test "decide rejects invalid JSON" {

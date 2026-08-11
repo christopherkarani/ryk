@@ -1,12 +1,12 @@
 Decision  [ALLOW]
 
-+--------------------------------------------------+
-| Decision details                                 |
-+--------------------------------------------------+
-| Reason    matched commands.allow rule "echo *"   |
-| Rule      commands.allow[21]                     |
-| Mode      ask                                    |
-| Category  command                                |
-| Message   command allowed by ryk policy.         |
-+--------------------------------------------------+
++--------------------------------------------+
+| Decision details                           |
++--------------------------------------------+
+| Reason    commands.default: allow          |
+| Rule      none                             |
+| Mode      strict                           |
+| Category  command                          |
+| Message   command allowed by ryk policy.   |
++--------------------------------------------+
   Risk  .................... unknown

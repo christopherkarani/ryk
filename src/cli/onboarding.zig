@@ -883,7 +883,7 @@ fn dayOneHostEmptyPluginReport() plugin.PluginDoctorReport {
         .host_binaries = .{ .codex = false, .claude = false, .opencode = false, .openclaw = false, .hermes = false },
         .opencode_paths = .{ .project_plugin_exists = false, .global_plugin_exists = false, .config_references_plugin = false },
         .openclaw_paths = .{ .host_plugin_installed = false, .plugin_manifest_exists = false, .package_json_exists = false, .source_exists = false, .detection_note = "" },
-        .hermes_paths = .{ .repo_manifest_exists = false, .repo_source_exists = false, .repo_mapping_exists = false, .user_manifest_exists = false, .user_source_exists = false, .user_mapping_exists = false, .config_references_plugin = false },
+        .hermes_paths = .{ .repo_manifest_exists = false, .repo_source_exists = false, .repo_mapping_exists = false, .user_manifest_exists = false, .user_source_exists = false, .user_mapping_exists = false, .config_references_plugin = false, .user_manifest_name_is_ryk = false },
         .hermes_hook_smoke_passed = false,
         .marketplace = .{ .codex_marketplace = false, .claude_marketplace = false, .codex_plugin_manifest = false, .claude_plugin_manifest = false, .codex_user_plugin = false, .claude_user_plugin = false },
         .platform_summary = "",

@@ -3,8 +3,8 @@
   "decision": "allow",
   "risk": "unknown",
   "category": "command",
-  "reason": "matched commands.allow rule \"echo *\"",
-  "rule": "commands.allow[21]",
+  "reason": "commands.default: allow",
+  "rule": null,
   "message": "command allowed by ryk policy.",
   "redactions": [
   ]
