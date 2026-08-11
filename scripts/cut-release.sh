@@ -550,7 +550,9 @@ NODE
   git add build.zig.zon integrations/hermes-plugin/plugin.yaml \
     integrations/codex-plugin/.codex-plugin/plugin.json \
     integrations/claude-code-plugin/.claude-plugin/plugin.json \
-    integrations/openclaw-plugin/openclaw.plugin.json
+    integrations/openclaw-plugin/openclaw.plugin.json \
+    packaging/scoop/ryk.json packaging/winget/ryk.yaml \
+    packaging/homebrew/Formula/ryk.rb packaging/npm/package.json
 
   if git diff --cached --quiet; then
     warn "nothing to commit for version bump (already at ${VERSION}?)"
