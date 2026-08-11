@@ -312,6 +312,11 @@ test('missing binary permission.ask toasts error and denies', async () => {
     assert.equal(output.status, 'deny');
     assert.equal(toasts.length, 1);
     assert.equal(toasts[0]?.body?.variant, 'error');
+    assert.match(
+      toasts[0]?.body?.message ?? '',
+      /^ryk blocked permission:/,
+      'missing-binary toast should use formatShortBlock shape'
+    );
   } finally {
     process.env.PATH = originalPath;
     if (originalAllow === undefined) delete process.env.RYK_ALLOW_WORKSPACE_BIN;

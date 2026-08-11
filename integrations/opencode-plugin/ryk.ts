@@ -701,7 +701,10 @@ export default async function rykPlugin(ctx: PluginContext): Promise<PluginHooks
           ctx,
           'error',
           'ryk blocked',
-          `ryk blocked permission: ${MISSING_BINARY_MSG}`
+          formatShortBlock(
+            { decision: 'error', message: MISSING_BINARY_MSG },
+            'permission'
+          )
         );
       },
       'shell.env': async (_input, output) => {

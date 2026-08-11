@@ -2031,6 +2031,14 @@ test("hard deny notify is short/sanitized even when reason has Recourse wall", a
 		!/Recourse:/i.test(msg),
 		`notify should not re-surface Recourse wall, got: ${msg}`,
 	);
+	// Wall strip must run on the reason atom, not the composed sentence —
+	// otherwise greedy Recourse:.*$ also drops rule/pack/severity suffix.
+	assert.match(
+		msg,
+		/core\.filesystem:destructive-rm/,
+		`notify should keep rule suffix after wall strip, got: ${msg}`,
+	);
+	assert.match(msg, /destructive filesystem command/i);
 });
 
 test("ryk inline decision keeps long reasons inside the compact frame", async () => {

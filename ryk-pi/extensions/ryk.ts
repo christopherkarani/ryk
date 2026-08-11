@@ -1663,12 +1663,12 @@ async function applyToolDecision(
 		showRykDecision(pi, ctx, card);
 		const summary = formatRykDecisionSummary(card, toolLabel);
 		// Best-effort error flash; card remains primary. Never softens deny.
-		// Strip operator Recourse/Next walls from the toast-like notify body only.
-		try {
-			notify(ctx, stripOperatorWalls(summary), "error");
-		} catch {
-			// Host notify is optional; missing/throwing UI must not fail open.
-		}
+		// Strip Recourse/Next on the reason atom so rule/pack/severity suffix survives.
+		const flash = formatRykDecisionSummary(
+			{ ...card, summary: stripOperatorWalls(card.summary) },
+			toolLabel,
+		);
+		notify(ctx, flash, "error");
 		return block(summary);
 	}
 	if (decision.kind === "warn") {
@@ -2904,10 +2904,15 @@ function notify(
 	message: string,
 	type: "info" | "warning" | "error",
 ): void {
-	ctx.ui?.notify?.(truncate(sanitizeVisibleText(message), 2_000), type);
+	// Host UI is best-effort; never alter allow/deny control flow.
+	try {
+		ctx.ui?.notify?.(truncate(sanitizeVisibleText(message), 2_000), type);
+	} catch {
+		// Swallow notify transport failures.
+	}
 }
 
-/** Drop same-line Recourse/Next operator walls from short flash UI. */
+/** Drop same-line Recourse/Next operator walls from short flash UI reason atoms. */
 function stripOperatorWalls(text: string): string {
 	const cleaned = text
 		.replace(/\s*Recourse:\s*.*$/i, "")
