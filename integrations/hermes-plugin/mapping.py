@@ -27,6 +27,8 @@ _RULE_KEY_SEP = "|"
 _MAX_MESSAGE_CHARS = 2048
 # Host UI line for block/approve/warn — short, scannable (not operator walls).
 _MAX_HOST_MESSAGE_CHARS = 200
+# Host-facing rule display only (leaves room for body inside the 200-char cap).
+_MAX_HOST_RULE_DISPLAY_CHARS = 72
 _MAX_RULE_COMPONENT_CHARS = 256
 _MAX_RULE_INPUT_CHARS = 65536
 _SECRET_TEXT_RE = re.compile(
@@ -127,21 +129,23 @@ def format_tool_message(response: dict[str, Any], *, default: str = "blocked by 
     body = _first_host_line(response.get("reason")) or _first_host_line(response.get("message"))
     if not body:
         body = default_s
+    body = " ".join(body.split())
 
     rule_s = ""
     rule_id = response.get("rule_id") or response.get("rule")
     if isinstance(rule_id, str) and rule_id.strip():
-        rule_s = _bounded_text(rule_id.strip(), "policy", _MAX_RULE_COMPONENT_CHARS).strip()
+        # Cap host rule display so body+suffix always fit in the host budget.
+        rule_s = _bounded_text(
+            rule_id.strip(), "policy", _MAX_HOST_RULE_DISPLAY_CHARS
+        ).strip()
 
     # Reserve room for " (rule: …)" so truncation keeps policy identity.
     rule_suffix = f" (rule: {rule_s})" if rule_s and rule_s not in body else ""
-    body_limit = max(32, _MAX_HOST_MESSAGE_CHARS - len(rule_suffix))
+    body_limit = max(1, _MAX_HOST_MESSAGE_CHARS - len(rule_suffix))
     body = _bounded_text(body, default_s, body_limit)
     if rule_suffix and rule_s not in body:
-        body = f"{body}{rule_suffix}"
-    # Single line + tight UI cap (never multi-line walls).
-    body = " ".join(body.split())
-    return _bounded_text(body, default_s, _MAX_HOST_MESSAGE_CHARS)
+        return f"{body}{rule_suffix}"
+    return body
 
 
 def _base_message(response: dict[str, Any], default: str) -> str:
@@ -210,18 +214,16 @@ def map_pre_tool_call(
     if decision == "ask":
         message = format_tool_message(response, default="approval required by ryk")
         if ci_mode(environ, unattended_marker=unattended_marker):
-            # Keep one line; brief CI clause is OK for unattended harden.
-            ci_message = (
-                f"{message} "
-                "(CI/noninteractive: ryk ask hardened to block; no approval prompt available)"
+            # Keep one host line: reserve room for the CI clause inside the 200 budget.
+            ci_suffix = (
+                " (CI/noninteractive: ryk ask hardened to block; "
+                "no approval prompt available)"
             )
+            base_limit = max(1, _MAX_HOST_MESSAGE_CHARS - len(ci_suffix))
+            base = _bounded_text(message, "blocked by ryk", base_limit)
             return {
                 "action": "block",
-                "message": _bounded_text(
-                    " ".join(ci_message.split()),
-                    "blocked by ryk",
-                    _MAX_MESSAGE_CHARS,
-                ),
+                "message": f"{base}{ci_suffix}",
             }
         return {
             "action": "approve",

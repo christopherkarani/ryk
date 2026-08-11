@@ -832,6 +832,46 @@ class HermesPluginDiscoveryTests(unittest.TestCase):
         self.assertNotIn("Next:", message)
         self.assertNotIn("allow-once", message)
 
+    def test_format_tool_message_long_rule_stays_within_host_cap(self) -> None:
+        """Long rule_id must not defeat host 200-cap mid-suffix truncation."""
+        mapping = _PLUGIN._mapping
+        long_rule = "core.filesystem:" + ("very-long-rule-segment-" * 20)
+        message = mapping.format_tool_message(
+            {"reason": "blocked by ryk policy", "rule_id": long_rule},
+            default="blocked by ryk",
+        )
+        self.assertLessEqual(len(message), 200)
+        self.assertNotIn("\n", message)
+        self.assertIn("blocked by ryk policy", message)
+        self.assertIn("(rule:", message)
+        self.assertIn("core.filesystem:", message)
+        # Final string must not end with the full-message truncation marker
+        # after "reserving" room for the rule (rule itself may be truncated).
+        self.assertFalse(message.endswith("...[truncated]"))
+
+    def test_ci_ask_block_message_respects_host_char_cap(self) -> None:
+        """CI harden clause must still fit Hermes host message budget."""
+        mapping = _PLUGIN._mapping
+        out = mapping.map_pre_tool_call(
+            {
+                "decision": "ask",
+                "reason": "x" * 180,
+                "message": "approval required by ryk\nRecourse: tip",
+                "rule": "core.shell:push",
+                "remediation_commands": ["ryk explain push"],
+            },
+            "terminal",
+            {"command": "git push"},
+            environ={"CI": "true"},
+        )
+        assert out is not None
+        self.assertEqual(out["action"], "block")
+        message = out["message"]
+        self.assertLessEqual(len(message), 200)
+        self.assertNotIn("\n", message)
+        self.assertIn("noninteractive", message.lower())
+        self.assertNotIn("Recourse", message)
+
     def test_pre_tool_call_allows_only_explicit_allow(self) -> None:
         ctx = mock.Mock()
         _PLUGIN._register(ctx, "pre_tool_call")
