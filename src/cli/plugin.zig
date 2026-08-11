@@ -4489,6 +4489,18 @@ test "plugin install opencode --scope project upgrades stale project plugin" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 
     const io = std.testing.io;
+    // Isolate HOME so dual-scope reconcile cannot touch the developer's real
+    // ~/.config/opencode/{plugins/ryk.ts,opencode.json}.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(home);
+    const home_z = try std.testing.allocator.dupeZ(u8, home);
+    defer std.testing.allocator.free(home_z);
+    const prev_home = try testDupEnvZ("HOME");
+    defer testRestoreEnv("HOME", prev_home);
+    try std.testing.expectEqual(@as(c_int, 0), setenv("HOME", home_z.ptr, 1));
+
     // Project destination is workspace-relative and gitignored under .opencode/.
     const project_rel = ".opencode/plugins/ryk.ts";
     try std.Io.Dir.cwd().createDirPath(io, ".opencode/plugins");
@@ -4529,6 +4541,11 @@ test "plugin install opencode --scope project upgrades stale project plugin" {
     const source = try std.Io.Dir.cwd().readFileAlloc(io, source_path, std.testing.allocator, .limited(8 * 1024 * 1024));
     defer std.testing.allocator.free(source);
     try std.testing.expectEqualStrings(source, installed);
+
+    // Dual-scope must not create a global plugin under the isolated HOME unless it already existed.
+    const global_path = try std.fs.path.join(std.testing.allocator, &.{ home, ".config", "opencode", "plugins", "ryk.ts" });
+    defer std.testing.allocator.free(global_path);
+    try std.testing.expect(!fileExistsAbsolute(io, global_path));
 }
 
 test "plugin install opencode global scope upgrades existing stale project plugin too" {
