@@ -5,6 +5,7 @@
 //! API surface is frozen after w1-ensure-core (D20); later W1 units fill behavior only.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 const onboarding = @import("onboarding.zig");
 const init = @import("init.zig");
@@ -556,11 +557,13 @@ pub fn writeEnsureReceipt(writer: anytype, outcome: EnsureOutcome) !void {
                 if (h.wired and h.smoke_ok and h.error_class == .none) continue;
                 any_fail_line = true;
                 const hint = if (h.fix_hint.len > 0) h.fix_hint else doctor_fix_hint;
-                try writer.print("  host {s}: incomplete — repair: {s}\n", .{ h.host_id, hint });
+                // Lead with concrete fix_hint (reason + next step). Avoid the old
+                // circular-only form: "incomplete — repair: ryk doctor --fix".
+                try writer.print("  host {s}: incomplete — {s}\n", .{ h.host_id, hint });
             }
             if (!any_fail_line) {
                 // Zero hosts or only non-detected: still teach repair door.
-                try writer.print("  no hosts fully wired — repair: {s}\n", .{doctor_fix_hint});
+                try writer.print("  no hosts fully wired — next: {s}\n", .{doctor_fix_hint});
             }
         },
         .core_failed => {
@@ -618,9 +621,85 @@ pub const DayOneInstallResult = enum {
     upgraded,
     already_installed,
     assets_unavailable,
+    timed_out,
+    enable_failed,
+    trusted_binary_missing,
+    workspace_bind_failed,
     failed,
     deferred,
 };
+
+/// Day-one plugin install wall budget (ms). OpenClaw host install routinely
+/// exceeds the historical 15s parent kill (CLI install + receipt + workspace bind).
+pub const host_plugin_install_timeout_ms: u64 = 60_000;
+
+/// Per-host install budget. OpenClaw needs the full floor; others stay shorter.
+pub fn hostPluginInstallTimeoutMs(host_id: []const u8) u64 {
+    if (std.mem.eql(u8, host_id, "openclaw")) return host_plugin_install_timeout_ms;
+    if (std.mem.eql(u8, host_id, "hermes")) return 45_000;
+    return 30_000; // codex, claude, opencode
+}
+
+/// Last concrete install failure detail (static/copied; never secrets).
+/// Cleared on success paths; start/ensure print this under host lines.
+var last_install_detail_buf: [240]u8 = undefined;
+var last_install_detail_len: usize = 0;
+
+pub fn lastInstallDetail() []const u8 {
+    return last_install_detail_buf[0..last_install_detail_len];
+}
+
+fn clearInstallDetail() void {
+    last_install_detail_len = 0;
+}
+
+fn setInstallDetail(text: []const u8) void {
+    // extractInstallFailureDetail returns slices into last_install_detail_buf;
+    // callers may re-set that same slice. Zig @memcpy forbids overlap.
+    if (text.len == 0) {
+        last_install_detail_len = 0;
+        return;
+    }
+    if (@intFromPtr(text.ptr) == @intFromPtr(&last_install_detail_buf)) {
+        last_install_detail_len = @min(text.len, last_install_detail_buf.len);
+        return;
+    }
+    const n = @min(text.len, last_install_detail_buf.len);
+    @memcpy(last_install_detail_buf[0..n], text[0..n]);
+    last_install_detail_len = n;
+}
+
+/// User-facing reason for a failed day-one install line (never empty on failure classes).
+pub fn dayOneInstallFailureReason(result: DayOneInstallResult) []const u8 {
+    const detail = lastInstallDetail();
+    if (detail.len > 0) return detail;
+    return switch (result) {
+        .assets_unavailable => "bundled extension assets unavailable",
+        .timed_out => "install timed out",
+        .enable_failed => "host enable failed",
+        .trusted_binary_missing => "trusted host binary not found",
+        .workspace_bind_failed => "workspace policy bind failed",
+        .failed => "install failed",
+        .deferred => "deferred",
+        .installed, .upgraded, .already_installed => "",
+    };
+}
+
+/// Static repair hint for ensure/doctor receipts (borrowed; multi-host safe).
+/// Always keeps `doctor --fix` as a door, but leads with a concrete class so
+/// incomplete hosts do not only loop "repair: ryk doctor --fix".
+pub fn dayOneWireFixHint(result: DayOneInstallResult) []const u8 {
+    return switch (result) {
+        .installed, .upgraded, .already_installed => "",
+        .timed_out => "install timed out — next: ryk plugin install <host> --yes (or ryk doctor --fix)",
+        .assets_unavailable => "bundled assets missing (ryk-pi/extensions) — reinstall ryk or fix RYK_RESOURCE_ROOT (or ryk doctor --fix)",
+        .enable_failed => "host enable failed — hermes: hermes plugins enable ryk (or ryk doctor --fix)",
+        .trusted_binary_missing => "trusted host binary missing/outdated — install OpenClaw 2026.8.1+ (or ryk doctor --fix)",
+        .workspace_bind_failed => "workspace policy bind failed — check cwd and .ryk/policy.yaml (or ryk doctor --fix)",
+        .failed => "install failed — ryk plugin doctor <host> for detail (or ryk doctor --fix)",
+        .deferred => "Cursor auto-wire deferred to W3 — ryk doctor --fix",
+    };
+}
 
 /// Single host install path shared by ensure auto-wire and start multi-select (no dual drift).
 /// `workspace_root` is the install cwd for plugin marketplace wires (from_install → HOME).
@@ -632,10 +711,11 @@ pub fn installOneHost(
     self_exe: []const u8,
     workspace_root: []const u8,
 ) DayOneInstallResult {
+    clearInstallDetail();
     const result = installOneHostInner(io, allocator, host_id, home, self_exe, workspace_root);
     telemetry.recordIntegration(host_id, "install", switch (result) {
         .installed, .upgraded, .already_installed => "success",
-        .assets_unavailable, .failed => "failure",
+        .assets_unavailable, .timed_out, .enable_failed, .trusted_binary_missing, .workspace_bind_failed, .failed => "failure",
         .deferred => "deferred",
     });
     return result;
@@ -654,12 +734,23 @@ fn installOneHostInner(
         const result = pi_install.install(io, allocator, .{
             .home = home,
             .ryk_binary = self_exe,
-        }) catch return .failed;
+        }) catch |err| {
+            setInstallDetail(switch (err) {
+                error.RefusingToOverwriteUnownedFile => "refusing to overwrite unowned Pi extension",
+                error.UnsafeDestination => "unsafe Pi extension destination",
+                error.IncompleteInstall => "Pi extension install incomplete",
+                else => "Pi extension install failed",
+            });
+            return .failed;
+        };
         return switch (result) {
             .installed => .installed,
             .upgraded => .upgraded,
             .already_installed => .already_installed,
-            .assets_unavailable => .assets_unavailable,
+            .assets_unavailable => blk: {
+                setInstallDetail("bundled extension assets unavailable (ryk-pi/extensions)");
+                break :blk .assets_unavailable;
+            },
         };
     }
     if (std.mem.eql(u8, host_id, "grok")) {
@@ -672,21 +763,42 @@ fn installOneHostInner(
     // Plugin install resolves marketplace roots from process cwd — pin to ensure workspace
     // so from_install (HOME) cannot write plugins under a nested caller `.git` tree.
     // OpenCode day-one: always global ~/.config/opencode/plugins (not HOME/.opencode project scope).
-    const code = if (std.mem.eql(u8, host_id, "opencode")) blk: {
+    const timeout_ms = hostPluginInstallTimeoutMs(host_id);
+    const child = if (std.mem.eql(u8, host_id, "opencode")) blk: {
         const install_argv = [_][]const u8{ self_exe, "plugin", "install", "opencode", "--yes", "--scope", "global" };
-        break :blk ensureRunChildAt(allocator, &install_argv, workspace_root) catch return .failed;
+        break :blk ensureRunPluginInstall(allocator, &install_argv, workspace_root, timeout_ms) catch {
+            setInstallDetail("failed to spawn plugin install");
+            return .failed;
+        };
     } else blk: {
         const install_argv = [_][]const u8{ self_exe, "plugin", "install", host_id, "--yes" };
-        break :blk ensureRunChildAt(allocator, &install_argv, workspace_root) catch return .failed;
+        break :blk ensureRunPluginInstall(allocator, &install_argv, workspace_root, timeout_ms) catch {
+            setInstallDetail("failed to spawn plugin install");
+            return .failed;
+        };
     };
-    return switch (plugin.verifyHostInstallAfterChild(io, allocator, host_id, code)) {
-        .failed => .failed,
+    if (child.timed_out) {
+        var buf: [96]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "install timed out after {d}s", .{timeout_ms / 1000}) catch "install timed out";
+        setInstallDetail(msg);
+        return .timed_out;
+    }
+    // child.detail already points at last_install_detail_buf when capture populated it.
+    const classified = classifyPluginInstallFailure(child.detail, child.exit_code);
+    return switch (plugin.verifyHostInstallAfterChild(io, allocator, host_id, child.exit_code)) {
         .installed => .installed,
         // Stale files are not proof that a failed host command activated the
         // bundled adapter. Always surface the child failure to setup.
-        .installed_after_child_failure => .failed,
+        .failed, .installed_after_child_failure => classified,
     };
 }
+
+const PluginChildRun = struct {
+    exit_code: u8,
+    timed_out: bool,
+    /// Borrowed static or last_install_detail_buf slice set by capture helper.
+    detail: []const u8,
+};
 
 fn ensureProcessHome(allocator: std.mem.Allocator) ![]u8 {
     var env_map = try env_util.createProcessMap(allocator);
@@ -700,22 +812,171 @@ fn ensureIsProductRykBinary(path: []const u8) bool {
 }
 
 fn ensureRunChild(allocator: std.mem.Allocator, argv: []const []const u8) !u8 {
-    return ensureRunChildAt(allocator, argv, null);
+    return ensureRunChildAt(allocator, argv, null, 15_000);
 }
 
-fn ensureRunChildAt(allocator: std.mem.Allocator, argv: []const []const u8, cwd_path: ?[]const u8) !u8 {
+fn ensureRunChildAt(
+    allocator: std.mem.Allocator,
+    argv: []const []const u8,
+    cwd_path: ?[]const u8,
+    timeout_ms: u64,
+) !u8 {
     const result = try child_process.runHostCommandTimedCwd(
         allocator,
         argv,
-        15_000,
+        timeout_ms,
         cwd_path,
     );
     defer child_process.deinitHostCommandResult(result, allocator);
     return if (result.timed_out) 255 else result.exit_code;
 }
 
+/// Run day-one `ryk plugin install …` with host budget and captured diagnostics.
+fn ensureRunPluginInstall(
+    allocator: std.mem.Allocator,
+    argv: []const []const u8,
+    cwd_path: ?[]const u8,
+    timeout_ms: u64,
+) !PluginChildRun {
+    const result = child_process.runHostCommandCaptureTimedCwd(
+        allocator,
+        argv,
+        timeout_ms,
+        cwd_path,
+    ) catch {
+        // Fall back to non-capturing timed path if capture spawn fails.
+        const code = try ensureRunChildAt(allocator, argv, cwd_path, timeout_ms);
+        return .{
+            .exit_code = code,
+            .timed_out = code == 255,
+            .detail = if (code == 255) "install timed out" else "",
+        };
+    };
+    defer result.deinit(allocator);
+
+    // extractInstallFailureDetail already writes last_install_detail_buf when non-empty.
+    _ = extractInstallFailureDetail(result.stdout, result.stderr, result.timed_out, result.exit_code);
+
+    return .{
+        .exit_code = if (result.timed_out) 255 else result.exit_code,
+        .timed_out = result.timed_out,
+        .detail = lastInstallDetail(),
+    };
+}
+
+/// Prefer actionable plugin-install lines; copies into last_install_detail_buf.
+/// Never retains gateway tokens or secrets.
+fn extractInstallFailureDetail(stdout: []const u8, stderr: []const u8, timed_out: bool, exit_code: u8) []const u8 {
+    if (timed_out) {
+        setInstallDetail("install timed out");
+        return lastInstallDetail();
+    }
+    if (exit_code == 0) return "";
+
+    // Prefer last non-empty diagnostic line from plugin install stdout/stderr.
+    const needles = [_][]const u8{
+        "trusted OpenClaw",
+        "trusted host binary",
+        "workspace policy bind",
+        "bind OpenClaw policy workspace",
+        "enable: failed",
+        "enable: hermes binary not found",
+        "Plugin files missing",
+        "not Ryk-owned",
+        "action: failed",
+    };
+    const sources = [_][]const u8{ stdout, stderr };
+    for (sources) |src| {
+        for (needles) |needle| {
+            if (lastNonEmptyLineContaining(src, needle)) |line| {
+                setInstallDetail(sanitizeInstallDetailLine(line));
+                return lastInstallDetail();
+            }
+        }
+    }
+    if (lastNonEmptyLine(stderr)) |line| {
+        setInstallDetail(sanitizeInstallDetailLine(line));
+        return lastInstallDetail();
+    }
+    if (lastNonEmptyLine(stdout)) |line| {
+        setInstallDetail(sanitizeInstallDetailLine(line));
+        return lastInstallDetail();
+    }
+    var buf: [48]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, "plugin install exit {d}", .{exit_code}) catch "plugin install failed";
+    setInstallDetail(msg);
+    return lastInstallDetail();
+}
+
+fn sanitizeInstallDetailLine(line: []const u8) []const u8 {
+    // Drop lines that look like secrets (token-ish / bearer / password / api keys).
+    // Case-fold scan without allocating: ASCII-only check for common secret markers.
+    if (containsAsciiIgnoreCase(line, "token") or
+        containsAsciiIgnoreCase(line, "bearer") or
+        containsAsciiIgnoreCase(line, "password") or
+        containsAsciiIgnoreCase(line, "apikey") or
+        containsAsciiIgnoreCase(line, "api_key") or
+        containsAsciiIgnoreCase(line, "secret"))
+    {
+        return "plugin install failed (details redacted)";
+    }
+    return line;
+}
+
+fn containsAsciiIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0 or haystack.len < needle.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        var ok = true;
+        for (needle, 0..) |nb, j| {
+            const hb = haystack[i + j];
+            if (std.ascii.toLower(hb) != std.ascii.toLower(nb)) {
+                ok = false;
+                break;
+            }
+        }
+        if (ok) return true;
+    }
+    return false;
+}
+
+fn lastNonEmptyLine(text: []const u8) ?[]const u8 {
+    var end = text.len;
+    while (end > 0 and (text[end - 1] == '\n' or text[end - 1] == '\r')) end -= 1;
+    if (end == 0) return null;
+    var start = end;
+    while (start > 0 and text[start - 1] != '\n') start -= 1;
+    const line = std.mem.trim(u8, text[start..end], " \t\r");
+    if (line.len == 0) return null;
+    return line;
+}
+
+fn lastNonEmptyLineContaining(text: []const u8, needle: []const u8) ?[]const u8 {
+    var best: ?[]const u8 = null;
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0) continue;
+        if (std.mem.indexOf(u8, line, needle) != null) best = line;
+    }
+    return best;
+}
+
+fn classifyPluginInstallFailure(detail: []const u8, exit_code: u8) DayOneInstallResult {
+    _ = exit_code;
+    if (std.mem.indexOf(u8, detail, "timed out") != null) return .timed_out;
+    if (std.mem.indexOf(u8, detail, "enable:") != null or std.mem.indexOf(u8, detail, "enable failed") != null)
+        return .enable_failed;
+    if (std.mem.indexOf(u8, detail, "trusted") != null and std.mem.indexOf(u8, detail, "not found") != null)
+        return .trusted_binary_missing;
+    if (std.mem.indexOf(u8, detail, "workspace") != null and std.mem.indexOf(u8, detail, "bind") != null)
+        return .workspace_bind_failed;
+    if (detail.len == 0) setInstallDetail("plugin install failed");
+    return .failed;
+}
+
 /// Attempt install for one host via HostWireTable installer (no multi-select).
-/// Returns true when install succeeds / already present after attempt.
+/// Returns the day-one result so callers can surface concrete fix hints.
 fn attemptHostInstall(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -723,13 +984,17 @@ fn attemptHostInstall(
     home: []const u8,
     self_exe: []const u8,
     workspace_root: []const u8,
-) bool {
+) DayOneInstallResult {
     return switch (entry.installer) {
-        .deferred_w3 => false,
-        .pi_extension, .grok_hooks, .plugin_yes => switch (installOneHost(io, allocator, entry.host_id, home, self_exe, workspace_root)) {
-            .installed, .upgraded, .already_installed => true,
-            .assets_unavailable, .failed, .deferred => false,
-        },
+        .deferred_w3 => .deferred,
+        .pi_extension, .grok_hooks, .plugin_yes => installOneHost(io, allocator, entry.host_id, home, self_exe, workspace_root),
+    };
+}
+
+fn dayOneResultIsWired(result: DayOneInstallResult) bool {
+    return switch (result) {
+        .installed, .upgraded, .already_installed => true,
+        .assets_unavailable, .timed_out, .enable_failed, .trusted_binary_missing, .workspace_bind_failed, .failed, .deferred => false,
     };
 }
 
@@ -845,17 +1110,24 @@ pub fn wireDetectedHosts(
         // Grok: always re-run install when we can mutate. Managed `~/.grok/hooks/ryk.json`
         // is the only live path; legacy user-settings must not skip repair.
         var wired = st.installed;
+        var last_install: DayOneInstallResult = .already_installed;
         if (can_mutate and (entry.installer == .grok_hooks or !wired)) {
-            wired = attemptHostInstall(io, allocator, entry, home_opt.?, self_exe_opt.?, workspace_root);
+            last_install = attemptHostInstall(io, allocator, entry, home_opt.?, self_exe_opt.?, workspace_root);
+            wired = dayOneResultIsWired(last_install);
         }
 
         if (!wired) {
+            // Prefer class-specific next step over circular "repair: ryk doctor --fix".
+            const hint = if (can_mutate and (entry.installer == .grok_hooks or !st.installed))
+                dayOneWireFixHint(last_install)
+            else
+                doctor_fix_hint;
             try list.append(allocator, .{
                 .host_id = st.name,
                 .detected = true,
                 .wired = false,
                 .smoke_ok = false,
-                .fix_hint = doctor_fix_hint,
+                .fix_hint = if (hint.len > 0) hint else doctor_fix_hint,
                 .error_class = .wire,
             });
             continue;
@@ -867,7 +1139,7 @@ pub fn wireDetectedHosts(
             .detected = true,
             .wired = true,
             .smoke_ok = smoke.smoke_ok,
-            .fix_hint = if (smoke.smoke_ok) "" else doctor_fix_hint,
+            .fix_hint = if (smoke.smoke_ok) "" else "host smoke failed — ryk plugin doctor <host> (or ryk doctor --fix)",
             .error_class = smoke.error_class,
         });
     }
@@ -2403,4 +2675,123 @@ test "Ensure invalid preset fails with ensure branding not init" {
     if (tmp.dir.access(io, ".ryk/policy.yaml", .{})) |_| {
         try std.testing.expect(false);
     } else |_| {}
+}
+
+// ---------------------------------------------------------------------------
+// Day-one host install timeout + diagnostics (openclaw 15s kill regression)
+// ---------------------------------------------------------------------------
+
+test "day-one host plugin install budget exceeds historical 15s kill" {
+    // RED-before-GREEN contract: openclaw must be allowed ≥60s so a ~16–30s
+    // host install is not killed by the ensure parent.
+    try std.testing.expect(host_plugin_install_timeout_ms >= 60_000);
+    try std.testing.expect(hostPluginInstallTimeoutMs("openclaw") >= 60_000);
+    try std.testing.expect(hostPluginInstallTimeoutMs("openclaw") > 15_000);
+    try std.testing.expect(hostPluginInstallTimeoutMs("hermes") > 15_000);
+    try std.testing.expect(hostPluginInstallTimeoutMs("codex") > 15_000);
+    try std.testing.expect(hostPluginInstallTimeoutMs("opencode") >= 30_000);
+}
+
+test "day-one install failure reasons surface timeout assets and enable classes" {
+    clearInstallDetail();
+    setInstallDetail("install timed out after 60s");
+    try std.testing.expectEqualStrings(
+        "install timed out after 60s",
+        dayOneInstallFailureReason(.timed_out),
+    );
+    clearInstallDetail();
+    try std.testing.expectEqualStrings(
+        "bundled extension assets unavailable",
+        dayOneInstallFailureReason(.assets_unavailable),
+    );
+    clearInstallDetail();
+    try std.testing.expectEqualStrings(
+        "host enable failed",
+        dayOneInstallFailureReason(.enable_failed),
+    );
+    clearInstallDetail();
+    setInstallDetail("enable: failed (hermes exit code: 1)");
+    try std.testing.expectEqualStrings(
+        "enable: failed (hermes exit code: 1)",
+        dayOneInstallFailureReason(.enable_failed),
+    );
+}
+
+test "day-one wire fix hints are non-circular and keep doctor --fix door" {
+    // UX: incomplete hosts must not only say "repair: ryk doctor --fix" when that
+    // path is the same broken install monopath — lead with class + concrete next.
+    const timeout_hint = dayOneWireFixHint(.timed_out);
+    try std.testing.expect(std.mem.indexOf(u8, timeout_hint, "timed out") != null);
+    try std.testing.expect(std.mem.indexOf(u8, timeout_hint, "plugin install") != null);
+    try std.testing.expect(ensureSoftHasDoctorRepair(timeout_hint));
+
+    const assets_hint = dayOneWireFixHint(.assets_unavailable);
+    try std.testing.expect(std.mem.indexOf(u8, assets_hint, "ryk-pi") != null);
+    try std.testing.expect(ensureSoftHasDoctorRepair(assets_hint));
+
+    const enable_hint = dayOneWireFixHint(.enable_failed);
+    try std.testing.expect(std.mem.indexOf(u8, enable_hint, "enable") != null);
+    try std.testing.expect(ensureSoftHasDoctorRepair(enable_hint));
+
+    // Receipt must print concrete hint, not only circular repair token.
+    var hosts = [_]HostResult{
+        .{
+            .host_id = "openclaw",
+            .detected = true,
+            .wired = false,
+            .smoke_ok = false,
+            .fix_hint = dayOneWireFixHint(.timed_out),
+            .error_class = .wire,
+        },
+    };
+    var outcome = EnsureOutcome{
+        .core_ok = true,
+        .hosts = hosts[0..],
+        .policy_created = false,
+        .policy_left_alone = true,
+        .protection_label = .partial,
+        .hosts_owned = false,
+    };
+    defer outcome.deinit(std.testing.allocator);
+    var buf: [1024]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try writeEnsureReceipt(&writer, outcome);
+    const text = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, text, "openclaw") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "timed out") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "incomplete — repair: ryk doctor --fix") == null);
+    try std.testing.expect(ensureSoftHasDoctorRepair(text));
+}
+
+test "extractInstallFailureDetail classifies trusted binary and redacts tokens" {
+    clearInstallDetail();
+    const d1 = extractInstallFailureDetail(
+        "  action: failed (trusted OpenClaw 2026.8.1+ binary not found)\n",
+        "",
+        false,
+        1,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, d1, "trusted OpenClaw") != null);
+
+    clearInstallDetail();
+    const d2 = extractInstallFailureDetail(
+        "",
+        "gateway token=sekrit-value-here\n",
+        false,
+        1,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, d2, "sekrit") == null);
+    try std.testing.expect(std.mem.indexOf(u8, d2, "redacted") != null);
+
+    clearInstallDetail();
+    const d3 = extractInstallFailureDetail("", "", true, 255);
+    try std.testing.expect(std.mem.indexOf(u8, d3, "timed out") != null);
+}
+
+test "ensureRunChildAt respects caller timeout budget for slow children" {
+    // A 20s sleep must complete under the openclaw 60s budget (not the old 15s).
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const argv = [_][]const u8{ "sleep", "2" };
+    const code = try ensureRunChildAt(std.testing.allocator, &argv, null, hostPluginInstallTimeoutMs("openclaw"));
+    try std.testing.expectEqual(@as(u8, 0), code);
 }

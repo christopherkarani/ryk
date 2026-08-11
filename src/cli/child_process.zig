@@ -282,7 +282,17 @@ pub fn runHostCommandCaptureTimed(
     argv: []const []const u8,
     timeout_ms: u32,
 ) !HostCommandCaptureResult {
-    return runHostCommandInputCaptureTimedInternal(allocator, argv, "", timeout_ms, false, true);
+    return runHostCommandInputCaptureTimedInternal(allocator, argv, "", timeout_ms, false, true, null);
+}
+
+/// Capture stdout/stderr with timeout and optional cwd pin (day-one plugin install).
+pub fn runHostCommandCaptureTimedCwd(
+    allocator: std.mem.Allocator,
+    argv: []const []const u8,
+    timeout_ms: u64,
+    cwd_path: ?[]const u8,
+) !HostCommandCaptureResult {
+    return runHostCommandInputCaptureTimedInternal(allocator, argv, "", timeout_ms, false, true, cwd_path);
 }
 
 /// Capture a host command in the caller's existing POSIX process group. This
@@ -295,7 +305,7 @@ pub fn runHostCommandCaptureTimedInCurrentProcessGroup(
     timeout_ms: u32,
 ) !HostCommandCaptureResult {
     if (comptime builtin.os.tag == .windows) return error.UnsupportedPlatform;
-    return runHostCommandInputCaptureTimedInternal(allocator, argv, "", timeout_ms, true, false);
+    return runHostCommandInputCaptureTimedInternal(allocator, argv, "", timeout_ms, true, false, null);
 }
 
 /// Hook-style stdin capture that joins the caller's POSIX process group.
@@ -308,7 +318,7 @@ pub fn runHostCommandInputCaptureTimedInCurrentProcessGroup(
     timeout_ms: u64,
 ) !HostCommandCaptureResult {
     if (comptime builtin.os.tag == .windows) return error.UnsupportedPlatform;
-    return runHostCommandInputCaptureTimedInternal(allocator, argv, stdin_bytes, timeout_ms, true, false);
+    return runHostCommandInputCaptureTimedInternal(allocator, argv, stdin_bytes, timeout_ms, true, false, null);
 }
 
 const DrainContext = struct {
@@ -442,7 +452,7 @@ pub fn runHostCommandInputCaptureTimed(
     stdin_bytes: []const u8,
     timeout_ms: u64,
 ) !HostCommandCaptureResult {
-    return runHostCommandInputCaptureTimedInternal(allocator, argv, stdin_bytes, timeout_ms, false, true);
+    return runHostCommandInputCaptureTimedInternal(allocator, argv, stdin_bytes, timeout_ms, false, true, null);
 }
 
 fn runHostCommandInputCaptureTimedInternal(
@@ -452,6 +462,7 @@ fn runHostCommandInputCaptureTimedInternal(
     timeout_ms: u64,
     join_parent_process_group: bool,
     kill_process_group_after_wait: bool,
+    cwd_path: ?[]const u8,
 ) !HostCommandCaptureResult {
     if (argv.len == 0) return error.InvalidArgv;
     if (stdin_bytes.len > 256 * 1024) return error.InputTooLong;
@@ -491,6 +502,7 @@ fn runHostCommandInputCaptureTimedInternal(
 
     var child = std.process.spawn(io, .{
         .argv = argv,
+        .cwd = if (cwd_path) |p| .{ .path = p } else .inherit,
         .stdin = stdin_option,
         .stdout = .pipe,
         .stderr = .pipe,

@@ -411,7 +411,23 @@ fn installSelectedHosts(
                 try configured_out.append(allocator, try allocator.dupe(u8, host_name));
             },
             .assets_unavailable => {
-                try stdout.writeAll("failed (bundled extension assets unavailable)\n");
+                try stdout.print("failed ({s})\n", .{ensure.dayOneInstallFailureReason(.assets_unavailable)});
+                failures += 1;
+            },
+            .timed_out => {
+                try stdout.print("failed ({s})\n", .{ensure.dayOneInstallFailureReason(.timed_out)});
+                failures += 1;
+            },
+            .enable_failed => {
+                try stdout.print("failed ({s})\n", .{ensure.dayOneInstallFailureReason(.enable_failed)});
+                failures += 1;
+            },
+            .trusted_binary_missing => {
+                try stdout.print("failed ({s})\n", .{ensure.dayOneInstallFailureReason(.trusted_binary_missing)});
+                failures += 1;
+            },
+            .workspace_bind_failed => {
+                try stdout.print("failed ({s})\n", .{ensure.dayOneInstallFailureReason(.workspace_bind_failed)});
                 failures += 1;
             },
             .deferred => {
@@ -419,7 +435,12 @@ fn installSelectedHosts(
                 failures += 1;
             },
             .failed => {
-                try stdout.writeAll("failed\n");
+                const reason = ensure.dayOneInstallFailureReason(.failed);
+                if (reason.len > 0) {
+                    try stdout.print("failed ({s})\n", .{reason});
+                } else {
+                    try stdout.writeAll("failed\n");
+                }
                 failures += 1;
             },
         }

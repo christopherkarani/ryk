@@ -2043,10 +2043,13 @@ pub fn captureChildOutputTimedInCurrentProcessGroup(
 
 pub fn hostPluginInstalledFromReport(host_name: []const u8, report: PluginDoctorReport) bool {
     if (std.mem.eql(u8, host_name, "hermes")) {
+        // Config substring "ryk" alone is insufficient: stale name: orca manifests
+        // still match config while hermes plugins enable ryk fails.
         return report.hermes_paths.user_manifest_exists and
             report.hermes_paths.user_source_exists and
             report.hermes_paths.user_mapping_exists and
-            report.hermes_paths.config_references_plugin;
+            report.hermes_paths.config_references_plugin and
+            hermesUserManifestNameIsRyk();
     }
     if (std.mem.eql(u8, host_name, "openclaw")) return report.openclaw_paths.host_plugin_installed;
     if (std.mem.eql(u8, host_name, "opencode")) {
@@ -2363,6 +2366,17 @@ fn installHermesBundleAtomically(
         defer allocator.free(source_path);
         source_bytes[index] = try std.Io.Dir.cwd().readFileAlloc(io, source_path, allocator, .limited(8 * 1024 * 1024));
         loaded += 1;
+    }
+    // Stale packaged trees may still ship `name: orca` while enable targets `ryk`.
+    // Normalize identity before staging so enable + doctor installed evidence agree.
+    {
+        const normalized = try normalizeHermesManifestNameToRyk(allocator, source_bytes[0]);
+        if (!std.mem.eql(u8, normalized, source_bytes[0])) {
+            allocator.free(source_bytes[0]);
+            source_bytes[0] = normalized;
+        } else {
+            allocator.free(normalized);
+        }
     }
 
     const existing = dirExists(destination_dir);
@@ -2758,6 +2772,43 @@ pub fn runHermesEnable(allocator: std.mem.Allocator, host_binary: []const u8) !u
     const result = try child_process.runHostCommandTimed(allocator, &argv, 10_000, null, null);
     defer child_process.deinitHostCommandResult(result, allocator);
     return if (result.timed_out) 255 else result.exit_code;
+}
+
+/// True when `~/.hermes/plugins/ryk/plugin.yaml` declares `name: ryk` (not stale `name: orca`).
+pub fn hermesUserManifestNameIsRyk() bool {
+    const allocator = std.heap.page_allocator;
+    const root = hermesUserPluginRoot(allocator) catch return false;
+    defer allocator.free(root);
+    const manifest = std.fs.path.join(allocator, &.{ root, "plugin.yaml" }) catch return false;
+    defer allocator.free(manifest);
+    return hermesManifestDeclaresNameRyk(allocator, manifest);
+}
+
+/// Manifest identity check: requires `name: ryk` and rejects `name: orca`.
+pub fn hermesManifestDeclaresNameRyk(allocator: std.mem.Allocator, manifest_path: []const u8) bool {
+    if (!fileContains(allocator, manifest_path, "name: ryk")) return false;
+    // Stale dual-name or pure orca packages are not installed-as-ryk.
+    if (fileContains(allocator, manifest_path, "name: orca")) return false;
+    return true;
+}
+
+/// Rewrite stale packaged/user `name: orca` manifest bytes to `name: ryk` before install.
+/// Returns owned slice (may equal input when already ryk); caller frees when different from input.
+pub fn normalizeHermesManifestNameToRyk(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
+    if (std.mem.indexOf(u8, source, "name: ryk") != null and std.mem.indexOf(u8, source, "name: orca") == null) {
+        return try allocator.dupe(u8, source);
+    }
+    // Replace the YAML name field only (first occurrence of name: orca / missing name).
+    if (std.mem.indexOf(u8, source, "name: orca")) |idx| {
+        const before = source[0..idx];
+        const after = source[idx + "name: orca".len ..];
+        return try std.mem.concat(allocator, u8, &.{ before, "name: ryk", after });
+    }
+    // No name field: prefix with name: ryk for fail-closed identity.
+    if (std.mem.indexOf(u8, source, "name:") == null) {
+        return try std.mem.concat(allocator, u8, &.{ "name: ryk\n", source });
+    }
+    return try allocator.dupe(u8, source);
 }
 
 fn hermesManagedDestination(io: std.Io, allocator: std.mem.Allocator, plugin_dir: []const u8) bool {
@@ -3202,6 +3253,74 @@ test "plugin command help and invalid subcommands are stable" {
     const bad_code = try command(std.testing.io, &.{"unknown"}, &stdout_writer, &stderr_writer);
     try std.testing.expectEqual(exit_codes.usage, bad_code);
     try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "unknown subcommand") != null);
+}
+
+test "Hermes manifest name: orca normalizes to name: ryk" {
+    const allocator = std.testing.allocator;
+    const orca = "name: orca\nversion: 1.2.9\ndescription: ryk runtime guardrails for Hermes Agent.\n";
+    const normalized = try normalizeHermesManifestNameToRyk(allocator, orca);
+    defer allocator.free(normalized);
+    try std.testing.expect(std.mem.indexOf(u8, normalized, "name: ryk") != null);
+    try std.testing.expect(std.mem.indexOf(u8, normalized, "name: orca") == null);
+
+    const already = try normalizeHermesManifestNameToRyk(allocator, "name: ryk\nversion: 1\n");
+    defer allocator.free(already);
+    try std.testing.expectEqualStrings("name: ryk\nversion: 1\n", already);
+}
+
+test "Hermes manifest declares name ryk rejects orca identity" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "orca.yaml", .data = "name: orca\nversion: 1\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "ryk.yaml", .data = "name: ryk\nversion: 1\n" });
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const orca_path = try std.fs.path.join(std.testing.allocator, &.{ root, "orca.yaml" });
+    defer std.testing.allocator.free(orca_path);
+    const ryk_path = try std.fs.path.join(std.testing.allocator, &.{ root, "ryk.yaml" });
+    defer std.testing.allocator.free(ryk_path);
+    try std.testing.expect(!hermesManifestDeclaresNameRyk(std.testing.allocator, orca_path));
+    try std.testing.expect(hermesManifestDeclaresNameRyk(std.testing.allocator, ryk_path));
+}
+
+test "Hermes bundle install rewrites stale name: orca source to name: ryk" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "source");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "source/plugin.yaml",
+        .data = "name: orca\nversion: 1\ndescription: ryk runtime guardrails for Hermes Agent.\n",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "source/__init__.py", .data = "source-v1\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "source/mapping.py", .data = "mapping-v1\n" });
+
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const source = try std.fs.path.join(std.testing.allocator, &.{ root, "source" });
+    defer std.testing.allocator.free(source);
+    const destination = try std.fs.path.join(std.testing.allocator, &.{ root, "installed" });
+    defer std.testing.allocator.free(destination);
+
+    try std.testing.expect(try installHermesBundleAtomically(std.testing.io, std.testing.allocator, source, destination));
+    const installed = try tmp.dir.readFileAlloc(std.testing.io, "installed/plugin.yaml", std.testing.allocator, .limited(1024));
+    defer std.testing.allocator.free(installed);
+    try std.testing.expect(std.mem.indexOf(u8, installed, "name: ryk") != null);
+    try std.testing.expect(std.mem.indexOf(u8, installed, "name: orca") == null);
+    const installed_manifest = try std.fs.path.join(std.testing.allocator, &.{ destination, "plugin.yaml" });
+    defer std.testing.allocator.free(installed_manifest);
+    try std.testing.expect(hermesManifestDeclaresNameRyk(std.testing.allocator, installed_manifest));
+}
+
+test "hostPluginInstalledFromReport hermes requires name: ryk not config substring alone" {
+    // Files + config alone with orca identity must not count as installed.
+    // We only unit-test the manifest predicate here; full report path is integration.
+    try std.testing.expect(!hermesManifestDeclaresNameRyk(std.testing.allocator, "/nonexistent/plugin.yaml"));
+}
+
+test "classifyHostInstallOutcome enable failure stays failed when installed_after false" {
+    try std.testing.expectEqual(HostInstallOutcome.failed, classifyHostInstallOutcome(1, false));
+    try std.testing.expectEqual(HostInstallOutcome.installed_after_child_failure, classifyHostInstallOutcome(1, true));
+    try std.testing.expectEqual(HostInstallOutcome.installed, classifyHostInstallOutcome(0, true));
 }
 
 test "plugin commands reject the retired hermess target spelling" {

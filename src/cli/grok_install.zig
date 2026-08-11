@@ -297,17 +297,118 @@ pub fn installAtHome(
     return .{ .changed = any_changed, .settings_path = managed_path };
 }
 
-/// Remove the managed ryk Grok hook file when present. Does not touch unrelated
-/// hooks under `~/.grok/hooks/` or non-ryk entries in user-settings.
+/// Remove managed `~/.grok/hooks/ryk.json` and strip ryk PreToolUse entries from
+/// legacy `~/.grok/user-settings.json`. Unrelated hooks and settings are preserved.
 pub fn uninstallAtHome(io: std.Io, allocator: std.mem.Allocator, home: []const u8) !bool {
     if (!std.fs.path.isAbsolute(home)) return error.InvalidHomePath;
+    var removed = false;
+
     const managed_path = try std.fs.path.join(allocator, &.{ home, managed_hook_relative_path });
     defer allocator.free(managed_path);
-    std.Io.Dir.cwd().deleteFile(io, managed_path) catch |err| switch (err) {
+    if (std.Io.Dir.cwd().deleteFile(io, managed_path)) {
+        removed = true;
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    }
+
+    if (try stripRykHooksFromUserSettings(io, allocator, home)) removed = true;
+    return removed;
+}
+
+/// Remove ryk-owned PreToolUse matcher groups from legacy user-settings.json.
+/// Returns true when the file was modified. Non-ryk hooks are left intact.
+pub fn stripRykHooksFromUserSettings(io: std.Io, allocator: std.mem.Allocator, home: []const u8) !bool {
+    const settings_path = try std.fs.path.join(allocator, &.{ home, settings_relative_path });
+    defer allocator.free(settings_path);
+
+    const existing = std.Io.Dir.cwd().readFileAlloc(io, settings_path, allocator, .limited(max_settings_size)) catch |err| switch (err) {
         error.FileNotFound => return false,
         else => return err,
     };
+    defer allocator.free(existing);
+
+    const stripped = try stripRykPreToolUseFromSettingsAlloc(allocator, existing);
+    defer allocator.free(stripped.bytes);
+    if (!stripped.changed) return false;
+
+    try writeBytesAtomicallyChecked(io, allocator, settings_path, stripped.bytes, existing, true);
     return true;
+}
+
+/// Pure settings rewrite used by uninstall + tests.
+/// Drops ryk hook commands; preserves unrelated matchers and mixed-group non-ryk hooks.
+pub fn stripRykPreToolUseFromSettingsAlloc(allocator: std.mem.Allocator, existing: []const u8) !MergeResult {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, existing, .{}) catch
+        return error.InvalidSettings;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidSettings;
+    const tree = parsed.arena.allocator();
+
+    const hooks = parsed.value.object.getPtr("hooks") orelse {
+        return .{ .bytes = try allocator.dupe(u8, existing), .changed = false };
+    };
+    if (hooks.* != .object) return error.InvalidHooks;
+    const pre_tool = hooks.object.getPtr("PreToolUse") orelse {
+        return .{ .bytes = try allocator.dupe(u8, existing), .changed = false };
+    };
+    if (pre_tool.* != .array) return error.InvalidPreToolUseHooks;
+
+    var kept_groups = std.json.Array.init(tree);
+    var removed_any = false;
+    for (pre_tool.array.items) |entry| {
+        if (entry != .object) {
+            try kept_groups.append(entry);
+            continue;
+        }
+        const hooks_val = entry.object.get("hooks") orelse {
+            try kept_groups.append(entry);
+            continue;
+        };
+        if (hooks_val != .array) {
+            try kept_groups.append(entry);
+            continue;
+        }
+
+        var kept_hooks = std.json.Array.init(tree);
+        for (hooks_val.array.items) |hook| {
+            if (hook == .object) {
+                if (hook.object.get("command")) |command| {
+                    if (command == .string and isRykGrokHookCommand(command.string)) {
+                        removed_any = true;
+                        continue;
+                    }
+                }
+            }
+            try kept_hooks.append(hook);
+        }
+        if (kept_hooks.items.len == 0) {
+            // Entire matcher group was ryk-only.
+            removed_any = true;
+            continue;
+        }
+        if (kept_hooks.items.len != hooks_val.array.items.len) {
+            removed_any = true;
+            var new_entry: std.json.ObjectMap = .empty;
+            var it = entry.object.iterator();
+            while (it.next()) |kv| {
+                if (std.mem.eql(u8, kv.key_ptr.*, "hooks")) {
+                    try new_entry.put(tree, "hooks", .{ .array = kept_hooks });
+                } else {
+                    try new_entry.put(tree, kv.key_ptr.*, kv.value_ptr.*);
+                }
+            }
+            try kept_groups.append(.{ .object = new_entry });
+        } else {
+            try kept_groups.append(entry);
+        }
+    }
+    if (!removed_any) {
+        return .{ .bytes = try allocator.dupe(u8, existing), .changed = false };
+    }
+    pre_tool.* = .{ .array = kept_groups };
+    const bytes = try std.json.Stringify.valueAlloc(allocator, parsed.value, .{ .whitespace = .indent_2 });
+    return .{ .bytes = bytes, .changed = true };
 }
 
 fn writeTextFileAtomically(io: std.Io, allocator: std.mem.Allocator, path: []const u8, bytes: []const u8) !bool {
@@ -482,12 +583,20 @@ fn entryContainsAnyRykHook(entry: std.json.Value) bool {
 
 /// Recognize existing ryk Grok hook commands without matching arbitrary shell
 /// command text that merely mentions ryk.
+///
+/// Matches product `…/ryk hook grok PreToolUse` and staged test harness binaries
+/// that use the same argv suffix (zig-cache `test hook grok PreToolUse`).
 pub fn isRykGrokHookCommand(command: []const u8) bool {
     const trimmed = std.mem.trim(u8, command, " \t\r\n");
     const suffix = " hook grok PreToolUse";
     if (!std.mem.endsWith(u8, trimmed, suffix)) return false;
     const executable = std.mem.trim(u8, trimmed[0 .. trimmed.len - suffix.len], " \t\r\n'");
-    return std.mem.eql(u8, std.fs.path.basename(executable), "ryk");
+    if (executable.len == 0) return false;
+    const base = std.fs.path.basename(executable);
+    if (std.mem.eql(u8, base, "ryk")) return true;
+    // Zig unit-test binaries that embed the same PreToolUse entrypoint.
+    if (std.mem.eql(u8, base, "test") and std.mem.indexOf(u8, executable, "ryk") != null) return true;
+    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -733,4 +842,71 @@ test "Grok installer rejects a symlinked configuration directory" {
         error.UnsafeGrokDirectory,
         installAtHome(std.testing.io, std.testing.allocator, home, "/opt/ryk/bin/ryk"),
     );
+}
+
+test "Grok stripRykPreToolUse removes product and test harness hooks preserves others" {
+    const allocator = std.testing.allocator;
+    const existing =
+        \\{
+        \\  "apiKey": "synthetic-key",
+        \\  "hooks": {
+        \\    "PreToolUse": [
+        \\      {
+        \\        "matcher": "bash",
+        \\        "hooks": [
+        \\          {"type": "command", "command": "/opt/ryk/bin/ryk hook grok PreToolUse", "timeout": 30}
+        \\        ]
+        \\      },
+        \\      {
+        \\        "matcher": "Bash",
+        \\        "hooks": [
+        \\          {"type": "command", "command": "/repo/ryk/.zig-cache/o/abc/test hook grok PreToolUse", "timeout": 30}
+        \\        ]
+        \\      },
+        \\      {
+        \\        "matcher": "edit",
+        \\        "hooks": [
+        \\          {"type": "command", "command": "./existing-hook.sh", "timeout": 7}
+        \\        ]
+        \\      }
+        \\    ]
+        \\  }
+        \\}
+    ;
+    const stripped = try stripRykPreToolUseFromSettingsAlloc(allocator, existing);
+    defer allocator.free(stripped.bytes);
+    try std.testing.expect(stripped.changed);
+    try std.testing.expect(std.mem.indexOf(u8, stripped.bytes, "hook grok PreToolUse") == null);
+    try std.testing.expect(std.mem.indexOf(u8, stripped.bytes, "existing-hook.sh") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stripped.bytes, "synthetic-key") != null);
+}
+
+test "Grok uninstallAtHome removes managed hook and strips user-settings" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(home);
+
+    const install_result = try installAtHome(std.testing.io, std.testing.allocator, home, "/opt/ryk/bin/ryk");
+    defer install_result.deinit(std.testing.allocator);
+    try std.testing.expect(install_result.changed);
+    try std.testing.expect(installedAtHome(std.testing.io, std.testing.allocator, home));
+
+    try std.testing.expect(try uninstallAtHome(std.testing.io, std.testing.allocator, home));
+    try std.testing.expect(!installedAtHome(std.testing.io, std.testing.allocator, home));
+
+    const settings_path = try std.fs.path.join(std.testing.allocator, &.{ home, settings_relative_path });
+    defer std.testing.allocator.free(settings_path);
+    const written = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, settings_path, std.testing.allocator, .limited(max_settings_size));
+    defer std.testing.allocator.free(written);
+    try std.testing.expect(std.mem.indexOf(u8, written, "hook grok PreToolUse") == null);
+}
+
+test "isRykGrokHookCommand accepts product ryk and zig-cache test harness" {
+    try std.testing.expect(isRykGrokHookCommand("/opt/ryk/bin/ryk hook grok PreToolUse"));
+    try std.testing.expect(isRykGrokHookCommand(
+        "/Users/me/CodingProjects/ryk/.zig-cache/o/abc/test hook grok PreToolUse",
+    ));
+    try std.testing.expect(!isRykGrokHookCommand("/usr/bin/dcg"));
+    try std.testing.expect(!isRykGrokHookCommand("echo ryk"));
 }
