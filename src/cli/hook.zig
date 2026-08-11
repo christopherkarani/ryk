@@ -1163,6 +1163,17 @@ fn buildMessage(allocator: std.mem.Allocator, decision: PluginDecision, category
     };
 }
 
+/// First line of text only (strips trailing `\r` before `\n`). Used so agent-facing
+/// hook `message` never carries multi-line operator Recourse/Next walls.
+fn firstLineOnly(text: []const u8) []const u8 {
+    if (std.mem.indexOfScalar(u8, text, '\n')) |idx| {
+        var end = idx;
+        if (end > 0 and text[end - 1] == '\r') end -= 1;
+        return text[0..end];
+    }
+    return text;
+}
+
 fn evaluatePreToolUse(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -1590,34 +1601,29 @@ fn buildAgentVisibleDaemonDeny(
 
     // Issue allow-once pending short code on hard block (best-effort; store optional).
     // Pass workspace_root so null/empty host cwd never seeds bare "." (inert grants).
-    var short_code_owned: ?[]const u8 = if (decision == .block and shell_command != null)
-        tryIssuePendingShortCode(allocator, shell_command.?, fm_opts.cwd, fm_opts.workspace_root, safe_reason)
-    else
-        null;
-    errdefer if (short_code_owned) |c| allocator.free(c);
+    // Pending is for the human/operator path only. Redeemable short codes must never
+    // appear in agent-visible message or remediation_commands (M-1) — agents scrape
+    // deny panels; embedding digits would enable self-service bypass.
+    // Recourse/Next for operators live on stderr (writeHumanShellExplain) and in
+    // structured remediation_commands — never stuffed into agent-facing `message`.
+    if (decision == .block and shell_command != null) {
+        tryIssuePendingShortCode(allocator, shell_command.?, fm_opts.cwd, fm_opts.workspace_root, safe_reason);
+    }
 
-    var message = if (decision == .block) blk: {
+    // Agent-facing message: short plain reason only (prefer one line). Multi-line
+    // daemon explanations are truncated to the first line so Recourse/Next walls
+    // never leak into host agent UIs that surface `message`.
+    const message = if (decision == .block) blk: {
         if (daemon.responseStringField(result, "explanation")) |explanation| {
             const safe = try core_api.redactAlloc(allocator, explanation);
             defer allocator.free(safe);
-            break :blk try std.fmt.allocPrint(allocator, "command blocked by ryk policy: {s}", .{safe});
+            const line = firstLineOnly(safe);
+            if (line.len == 0) break :blk try buildMessage(allocator, decision, "command");
+            break :blk try std.fmt.allocPrint(allocator, "command blocked by ryk policy: {s}", .{line});
         }
         break :blk try buildMessage(allocator, decision, "command");
     } else try buildMessage(allocator, decision, "command");
     errdefer allocator.free(message);
-
-    // Pending is issued for the human/operator path, but the redeemable short code
-    // must never appear in agent-visible message or remediation_commands (M-1).
-    // Agents scrape deny panels; embedding digits would enable self-service bypass.
-    if (short_code_owned != null) {
-        const with_recourse = try std.fmt.allocPrint(
-            allocator,
-            "{s}\nRecourse: operator can run ryk allow-once <code> from local host UI",
-            .{message},
-        );
-        allocator.free(message);
-        message = with_recourse;
-    }
 
     const suggestions = try collectDaemonSuggestionTexts(allocator, result);
     errdefer {
@@ -1629,11 +1635,6 @@ fn buildAgentVisibleDaemonDeny(
     errdefer {
         for (remediation_commands) |c| allocator.free(c);
         allocator.free(remediation_commands);
-    }
-    // Code was only needed to know pending was issued; free (not agent-visible).
-    if (short_code_owned) |c| {
-        allocator.free(c);
-        short_code_owned = null;
     }
 
     return .{
@@ -1770,29 +1771,31 @@ fn resolvePendingIssueCwd(
 /// On pack deny, issue a pending short code when the data dir is resolvable.
 /// Returns an owned short_code slice, or null when store is unavailable / issue fails.
 /// Failures are silent (deny still proceeds with placeholder remediation).
+/// Best-effort issue of an allow-once pending short code for the operator path.
+/// Side-effect only: does not return the redeemable code (M-1 — never agent-visible).
 fn tryIssuePendingShortCode(
     allocator: std.mem.Allocator,
     command_text: []const u8,
     cwd: ?[]const u8,
     workspace_root: ?[]const u8,
     reason: []const u8,
-) ?[]const u8 {
-    const data_dir = resolveRykDataDirForPending(allocator) catch return null;
-    const data_dir_owned = data_dir orelse return null;
+) void {
+    const data_dir = resolveRykDataDirForPending(allocator) catch return;
+    const data_dir_owned = data_dir orelse return;
     defer allocator.free(data_dir_owned);
 
     var threaded: std.Io.Threaded = .init_single_threaded;
     const io = threaded.io();
 
-    std.Io.Dir.cwd().createDirPath(io, data_dir_owned) catch return null;
+    std.Io.Dir.cwd().createDirPath(io, data_dir_owned) catch return;
 
-    const pending_path = std.fs.path.join(allocator, &.{ data_dir_owned, shell_engine.allow_once.pending_file_name }) catch return null;
+    const pending_path = std.fs.path.join(allocator, &.{ data_dir_owned, shell_engine.allow_once.pending_file_name }) catch return;
     defer allocator.free(pending_path);
 
     var now_buf: [32]u8 = undefined;
-    const now_iso = core.time.Timestamp.now(io).formatIso(&now_buf) catch return null;
+    const now_iso = core.time.Timestamp.now(io).formatIso(&now_buf) catch return;
 
-    const cwd_path = resolvePendingIssueCwd(io, allocator, cwd, workspace_root) orelse return null;
+    const cwd_path = resolvePendingIssueCwd(io, allocator, cwd, workspace_root) orelse return;
     defer allocator.free(cwd_path);
 
     var issued = shell_engine.allow_once.issuePending(
@@ -1804,10 +1807,8 @@ fn tryIssuePendingShortCode(
         reason,
         now_iso,
         true,
-    ) catch return null;
-    defer issued.deinit(allocator);
-
-    return allocator.dupe(u8, issued.record.short_code) catch null;
+    ) catch return;
+    issued.deinit(allocator);
 }
 
 fn hookResponseFromDaemonEvaluate(
@@ -5228,8 +5229,9 @@ test "s-once-cli: hook pack deny issues pending short code when store enabled" {
     // M-1: agent-visible message/remediation must not embed redeemable digits.
     try std.testing.expect(sOnceCliHookExtractShortCode(blob) == null);
     try std.testing.expect(std.mem.indexOf(u8, blob, "allow-once") != null);
-    try std.testing.expect(std.mem.indexOf(u8, blob, "operator") != null or
-        std.mem.indexOf(u8, blob, "<code>") != null);
+    // Recourse wall is no longer stuffed into message; placeholders live in remediation_commands.
+    try std.testing.expect(std.mem.indexOf(u8, result.message, "Recourse") == null);
+    try std.testing.expect(std.mem.indexOf(u8, blob, "<code>") != null);
 
     // Pending store must still hold a real 6-digit code for this command (operator path).
     const pending_path = try sOnceCliHookPendingPath(xdg.data_root);
@@ -5358,6 +5360,152 @@ test "s-once-cli: hook deny without resolvable store still blocks without crash"
     defer result.deinit(allocator);
     try std.testing.expectEqual(PluginDecision.block, result.decision);
     // Must not panic; placeholder `<code>` residual is acceptable when store is off.
+}
+
+// Agent-facing JSON `message` is a short plain reason — no operator Recourse/Next walls.
+// Recourse stays on stderr (writeHumanShellExplain) and structured remediation_commands.
+test "hook agent-facing message is short: no Recourse or Next when pending short code issued" {
+    var xdg = try sOnceCliHookIsolateXdg();
+    defer xdg.deinit();
+
+    var ws_tmp = std.testing.tmpDir(.{});
+    defer ws_tmp.cleanup();
+    try ws_tmp.dir.createDirPath(std.testing.io, ".git");
+    const ws_z = try ws_tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(ws_z);
+    const ws_root = try std.testing.allocator.dupe(u8, ws_z);
+    defer std.testing.allocator.free(ws_root);
+
+    const allocator = std.testing.allocator;
+    const cmd_text = "git reset --hard";
+    var result = try sOnceCliHookRealZigDeny(allocator, cmd_text, ws_root, ws_root);
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqual(PluginDecision.block, result.decision);
+
+    // message: short, single-line agent surface — no operator walls.
+    try std.testing.expect(std.mem.indexOf(u8, result.message, "Recourse:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.message, "Recourse") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.message, "Next:") == null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, result.message, '\n') == null);
+    try std.testing.expect(result.message.len > 0);
+    // Still identifies a ryk policy block (not empty / not generic silence).
+    try std.testing.expect(std.mem.indexOf(u8, result.message, "blocked") != null or
+        std.mem.indexOf(u8, result.message, "ryk") != null);
+
+    // M-1: no redeemable allow-once digits in message or remediation_commands.
+    try std.testing.expect(sOnceCliHookExtractShortCode(result.message) == null);
+    for (result.remediation_commands) |c| {
+        try std.testing.expect(sOnceCliHookExtractShortCode(c) == null);
+    }
+
+    // Structured next steps still present (placeholders OK).
+    try std.testing.expect(result.remediation_commands.len >= 2);
+    try std.testing.expect(std.mem.indexOf(u8, result.remediation_commands[0], "ryk explain") != null);
+    var has_allow_once_placeholder = false;
+    for (result.remediation_commands) |c| {
+        if (std.mem.indexOf(u8, c, "allow-once") != null and std.mem.indexOf(u8, c, "<code>") != null) {
+            has_allow_once_placeholder = true;
+            break;
+        }
+    }
+    try std.testing.expect(has_allow_once_placeholder);
+
+    // Operator stderr still carries Recourse / BLOCKED explain.
+    var stderr_alloc: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_alloc.deinit();
+    try writeHumanShellExplain(std.testing.io, allocator, &stderr_alloc.writer, result);
+    const human = stderr_alloc.written();
+    try std.testing.expect(std.mem.indexOf(u8, human, "BLOCKED") != null);
+    try std.testing.expect(std.mem.indexOf(u8, human, "Recourse") != null);
+    try std.testing.expect(std.mem.indexOf(u8, human, "Next:") != null);
+    try std.testing.expect(sOnceCliHookExtractShortCode(human) == null);
+
+    // Pending short code still issued for operator redeem (out of agent channel).
+    const code = try sOnceCliHookPendingCodeForCommand(allocator, xdg.data_root, cmd_text, "2026-07-25T12:00:00Z");
+    defer allocator.free(code);
+    try std.testing.expectEqual(@as(usize, 6), code.len);
+    try std.testing.expect(std.mem.indexOf(u8, result.message, code) == null);
+    for (result.remediation_commands) |c| {
+        try std.testing.expect(std.mem.indexOf(u8, c, code) == null);
+    }
+
+    // Claude JSON hosts: exit-success-with-JSON (do not invent exit-2 for Claude).
+    try std.testing.expectEqual(exit_codes.success, hookExitCode(.claude, .block, false));
+}
+
+test "hook agent-facing message uses first line only from multi-line explanation" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"status":"Deny","reason":"blocked","pack_id":"core.filesystem","pattern_name":"destructive_rm","severity":"critical","explanation":"Matched destructive pattern: recursive delete\nRecourse: operator can run ryk allow-once <code>\nNext: ryk explain \"<command>\""}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+    var redactions: std.ArrayList(RedactionEntry) = .empty;
+    defer {
+        for (redactions.items) |r| r.deinit(allocator);
+        redactions.deinit(allocator);
+    }
+    var limitations: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (limitations.items) |l| allocator.free(l);
+        limitations.deinit(allocator);
+    }
+    // No shell_command → no pending short code path; exercises explanation → message only.
+    var result = try hookResponseFromDaemonEvaluate(allocator, parsed.value, .strict, &redactions, &limitations, null, .{}, .{});
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqual(PluginDecision.block, result.decision);
+    try std.testing.expect(std.mem.indexOf(u8, result.message, "Recourse") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.message, "Next:") == null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, result.message, '\n') == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.message, "Matched destructive pattern") != null);
+    try std.testing.expect(result.remediation_commands.len >= 2);
+}
+
+test "hook Claude block keeps exit success; Codex/Grok exit-two contracts unchanged" {
+    try std.testing.expectEqual(exit_codes.success, hookExitCode(.claude, .block, false));
+    try std.testing.expectEqual(exit_codes.success, hookExitCode(.opencode, .block, false));
+    try std.testing.expectEqual(exit_codes.success, hookExitCode(.hermes, .block, false));
+    try std.testing.expectEqual(@as(u8, 2), hookExitCode(.codex, .block, false));
+    try std.testing.expectEqual(@as(u8, 2), hookExitCode(.grok, .block, false));
+    try std.testing.expectEqual(@as(u8, 2), hookExitCode(.grok, .ask, false));
+}
+
+test "hook firstLineOnly strips multi-line operator walls" {
+    try std.testing.expectEqualStrings("line one", firstLineOnly("line one"));
+    try std.testing.expectEqualStrings("line one", firstLineOnly("line one\nRecourse: tip"));
+    try std.testing.expectEqualStrings("line one", firstLineOnly("line one\r\nNext: tip"));
+    try std.testing.expectEqualStrings("", firstLineOnly("\nonly second"));
+}
+
+// Empty first line of explanation falls back to buildMessage (no trailing bare colon).
+test "hook agent-facing message falls back when explanation first line is empty" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"status":"Deny","reason":"blocked","pack_id":"core.filesystem","pattern_name":"destructive_rm","severity":"critical","explanation":"\nRecourse: operator can run ryk allow-once <code>\nNext: ryk explain \"<command>\""}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+    var redactions: std.ArrayList(RedactionEntry) = .empty;
+    defer {
+        for (redactions.items) |r| r.deinit(allocator);
+        redactions.deinit(allocator);
+    }
+    var limitations: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (limitations.items) |l| allocator.free(l);
+        limitations.deinit(allocator);
+    }
+    var result = try hookResponseFromDaemonEvaluate(allocator, parsed.value, .strict, &redactions, &limitations, null, .{}, .{});
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqual(PluginDecision.block, result.decision);
+    try std.testing.expect(std.mem.indexOfScalar(u8, result.message, '\n') == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.message, "Recourse") == null);
+    // buildMessage fallback — not the empty-detail "command blocked by ryk policy: " form.
+    try std.testing.expect(std.mem.eql(u8, result.message, "command blocked by ryk policy.") or
+        (std.mem.indexOf(u8, result.message, "blocked") != null and !std.mem.endsWith(u8, result.message, ": ")));
 }
 
 test "s-once-cli: hook deny → pending code → redeem → evaluate allows once → second denies" {
