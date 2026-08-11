@@ -67,10 +67,12 @@ const non_shell_host_cases = [_]NonShellHostCase{
         .expected_decision = "block",
     },
     .{
+        // Workspace policy may allow or hard-block incidental path edits; either proves
+        // non-shell zig path (no daemon). Not a free pass for every Claude "allow" case.
         .host = "claude",
         .event = "PreToolUse",
         .fixture = "tests/plugin-fixtures/claude/pre_tool_use_file_write_incidental_command.json",
-        .expected_decision = "allow",
+        .expected_decision = "allow_or_block",
     },
     .{
         .host = "opencode",
@@ -233,11 +235,10 @@ fn expectHookDecision(
     try std.testing.expectEqual(exit_codes.success, result.code);
     const decision = try parseDecision(allocator, result.stdout);
     defer allocator.free(decision);
-    // Claude incidental file-edit fixture: allow or block both prove non-shell zig path.
-    if (std.mem.eql(u8, expected_decision, "allow") and
-        std.mem.eql(u8, host, "claude") and
-        (std.mem.eql(u8, decision, "allow") or std.mem.eql(u8, decision, "block")))
-    {
+    // Case-local only: incidental file-edit fixtures set expected_decision "allow_or_block".
+    // Shell-safe Claude PreToolUse must stay strict on "allow".
+    if (std.mem.eql(u8, expected_decision, "allow_or_block")) {
+        try std.testing.expect(std.mem.eql(u8, decision, "allow") or std.mem.eql(u8, decision, "block"));
         return;
     }
     try std.testing.expectEqualStrings(expected_decision, decision);

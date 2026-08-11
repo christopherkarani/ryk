@@ -615,7 +615,7 @@ fn hookCommand(io: std.Io, host: Host, event: Event, original_event_name: []cons
     } else if (usesClaudeHostShapedPermission(host, event)) {
         // Claude PreToolUse / PermissionRequest: native permissionDecision JSON (exit 0).
         // Operator Recourse/Next stay on stderr; reason is short (no Recourse walls).
-        try writeClaudePermissionDecision(stdout, event, result);
+        try writeClaudePermissionDecision(allocator, stdout, event, result);
         if (result.decision == .block) {
             try writeHumanShellExplain(io, allocator, stderr, result);
         } else if (result.rule) |rule| {
@@ -798,7 +798,7 @@ fn emitPreEvalFailClosed(
         return codex_deny_exit_code;
     }
     if (usesClaudeHostShapedPermission(host, event)) {
-        try writeClaudePermissionDecision(stdout, event, result);
+        try writeClaudePermissionDecision(allocator, stdout, event, result);
         return hookExitCode(host, result.decision, false);
     }
     try writeHookResponse(stdout, result);
@@ -847,9 +847,27 @@ fn claudePermissionReason(result: HookResponse) []const u8 {
 
 /// Emit Claude-native PreToolUse/PermissionRequest stdout JSON (mirrors agent_hook shape).
 /// Process exit stays success (0); enforcement is the structured permissionDecision.
-fn writeClaudePermissionDecision(stdout: anytype, event: Event, result: HookResponse) !void {
+/// Re-redact at emit (defense in depth with Grok / agent_hook) so agent-visible reason
+/// cannot leak secrets even if a future HookResponse path skips construction-time redaction.
+fn writeClaudePermissionDecision(
+    allocator: std.mem.Allocator,
+    stdout: anytype,
+    event: Event,
+    result: HookResponse,
+) !void {
     const decision = claudePermissionDecisionString(result.decision);
-    const reason = claudePermissionReason(result);
+    const raw_reason = claudePermissionReason(result);
+    const safe_reason = try core_api.redactAlloc(allocator, raw_reason);
+    defer allocator.free(safe_reason);
+    // Re-cap after redaction may lengthen tokens; keep Claude UI reason short + UTF-8 safe.
+    const reason: []const u8 = if (safe_reason.len <= claude_permission_reason_max)
+        safe_reason
+    else blk: {
+        var end = claude_permission_reason_max;
+        while (end > 0 and (safe_reason[end] & 0xC0) == 0x80) end -= 1;
+        if (end == 0) break :blk safe_reason[0..claude_permission_reason_max];
+        break :blk safe_reason[0..end];
+    };
     try stdout.writeAll("{\"hookSpecificOutput\":{\"hookEventName\":\"");
     try stdout.writeAll(@tagName(event));
     try stdout.writeAll("\",\"permissionDecision\":\"");
@@ -5597,7 +5615,7 @@ test "hook Claude maps block to permissionDecision deny with short reason" {
 
     var stdout_buf: [2048]u8 = undefined;
     var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
-    try writeClaudePermissionDecision(&stdout_writer, .PreToolUse, result);
+    try writeClaudePermissionDecision(allocator, &stdout_writer, .PreToolUse, result);
     const out = stdout_writer.buffered();
 
     try std.testing.expect(std.mem.indexOf(u8, out, "\"hookSpecificOutput\"") != null);
@@ -5631,7 +5649,7 @@ test "hook Claude maps ask to permissionDecision ask never allow" {
 
     var stdout_buf: [1024]u8 = undefined;
     var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
-    try writeClaudePermissionDecision(&stdout_writer, .PreToolUse, result);
+    try writeClaudePermissionDecision(allocator, &stdout_writer, .PreToolUse, result);
     const out = stdout_writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, out, "\"permissionDecision\":\"ask\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"permissionDecision\":\"allow\"") == null);
@@ -5658,7 +5676,7 @@ test "hook Claude allow path does not emit deny" {
 
     var stdout_buf: [1024]u8 = undefined;
     var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
-    try writeClaudePermissionDecision(&stdout_writer, .PreToolUse, result);
+    try writeClaudePermissionDecision(allocator, &stdout_writer, .PreToolUse, result);
     const out = stdout_writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, out, "\"permissionDecision\":\"allow\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"permissionDecision\":\"deny\"") == null);
@@ -5680,7 +5698,7 @@ test "hook Claude PermissionRequest deny uses PermissionRequest event name" {
 
     var stdout_buf: [1024]u8 = undefined;
     var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
-    try writeClaudePermissionDecision(&stdout_writer, .PermissionRequest, result);
+    try writeClaudePermissionDecision(allocator, &stdout_writer, .PermissionRequest, result);
     const out = stdout_writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, out, "\"hookEventName\":\"PermissionRequest\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"permissionDecision\":\"deny\"") != null);
@@ -5706,6 +5724,42 @@ test "hook Claude multi-line message source becomes short permissionDecisionReas
     const reason = claudePermissionReason(result);
     try std.testing.expectEqualStrings("first useful line only", reason);
     try std.testing.expect(std.mem.indexOf(u8, reason, "Recourse") == null);
+}
+
+test "hook Claude permissionDecisionReason redacts secrets in stdout JSON" {
+    const allocator = std.testing.allocator;
+    const secret = "sk-fakeSyntheticOpenAIKey1234567890";
+    var result = HookResponse{
+        .version = 1,
+        .decision = .block,
+        .risk = .critical,
+        .category = try allocator.dupe(u8, "command"),
+        .reason = try std.fmt.allocPrint(allocator, "matched deny pattern {s}", .{secret}),
+        .rule = try allocator.dupe(u8, "core.secrets:test-canary"),
+        .message = try std.fmt.allocPrint(allocator, "Blocked because path contains {s}", .{secret}),
+        .redactions = &.{},
+        .host_limitations = &.{},
+        .suggestions = &.{},
+        .remediation_commands = &.{},
+    };
+    defer result.deinit(allocator);
+
+    var stdout_buf: [4096]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    try writeClaudePermissionDecision(allocator, &stdout_writer, .PreToolUse, result);
+    const out = stdout_writer.buffered();
+
+    try std.testing.expect(std.mem.indexOf(u8, out, secret) == null);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, out, .{});
+    defer parsed.deinit();
+    const reason = parsed.value.object.get("hookSpecificOutput").?.object.get("permissionDecisionReason").?.string;
+    try std.testing.expect(std.mem.indexOf(u8, reason, secret) == null);
+    try std.testing.expect(std.mem.indexOf(u8, reason, "[REDACTED") != null);
+    try std.testing.expect(reason.len <= claude_permission_reason_max);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(reason));
+    if (parsed.value.object.get("systemMessage")) |sm| {
+        try std.testing.expect(std.mem.indexOf(u8, sm.string, secret) == null);
+    }
 }
 
 test "hook Claude pre-eval fail-closed PreToolUse is host-shaped deny" {

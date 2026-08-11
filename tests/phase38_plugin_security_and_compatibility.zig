@@ -393,8 +393,12 @@ test "claude PreToolUse protected file write returns deny or ask" {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{});
     defer parsed.deinit();
 
-    const decision = claudePermissionOrDecision(parsed.value);
-    try std.testing.expect(std.mem.eql(u8, decision, "deny") or std.mem.eql(u8, decision, "ask") or std.mem.eql(u8, decision, "allow"));
+    const hso = parsed.value.object.get("hookSpecificOutput").?.object;
+    try std.testing.expectEqualStrings("PreToolUse", hso.get("hookEventName").?.string);
+    const decision = hso.get("permissionDecision").?.string;
+    // Protected-path fixture must not silently allow; deny or ask only.
+    try std.testing.expect(std.mem.eql(u8, decision, "deny") or std.mem.eql(u8, decision, "ask"));
+    try std.testing.expect(hso.get("permissionDecisionReason").?.string.len > 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -445,12 +449,11 @@ test "claude hook CI mode never returns ask" {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{});
     defer parsed.deinit();
 
-    const decision = claudePermissionOrDecision(parsed.value);
-    try std.testing.expect(!std.mem.eql(u8, decision, "ask"));
-    // Tool-gating under CI: host-shaped deny (not silent allow).
-    if (parsed.value.object.get("hookSpecificOutput")) |hso_val| {
-        try std.testing.expectEqualStrings("PermissionRequest", hso_val.object.get("hookEventName").?.string);
-    }
+    // CI hardens ask→block→deny. Assert host-shaped deny, not merely "not ask".
+    const hso = parsed.value.object.get("hookSpecificOutput").?.object;
+    try std.testing.expectEqualStrings("PermissionRequest", hso.get("hookEventName").?.string);
+    try std.testing.expectEqualStrings("deny", hso.get("permissionDecision").?.string);
+    try std.testing.expect(hso.get("permissionDecisionReason").?.string.len > 0);
 }
 
 // ---------------------------------------------------------------------------
