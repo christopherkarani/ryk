@@ -980,7 +980,7 @@ function blockMalformedToolCall(
 		summary,
 	};
 	showRykDecision(pi, ctx, details);
-	return block(formatRykDecisionSummary(details, toolLabel));
+	return block(formatAgentBlockReason(details, toolLabel));
 }
 
 async function runRykCommand(
@@ -1060,6 +1060,53 @@ function policyAskAutoDenyClass(
 
 export function safeRykReason(response: unknown): string {
 	return formatRykDecisionSummary(buildRykDecisionCard(response, "block"));
+}
+
+/** Prefer one short agent-facing block line (Why + rule + one Next when known). */
+const AGENT_BLOCK_REASON_MAX = 320;
+const AGENT_NEXT_CLAUSE_MAX = 120;
+
+/**
+ * Agent-facing tool block `reason`: one line, operator walls stripped, optional
+ * structured Next from card.nextStep (never invented). Prefer this for policy /
+ * protocol agent block text (hardcoded audit-fail strings may stay as-is).
+ */
+export function formatAgentBlockReason(
+	card: RykDecisionCard,
+	toolLabel = "bash",
+): string {
+	const why = agentWhyText(card.summary);
+	const base = formatRykDecisionSummary(
+		{ ...card, summary: why },
+		toolLabel,
+	);
+	const nextRaw = card.nextStep?.trim();
+	let reason = base;
+	if (nextRaw) {
+		const nextClause = truncate(
+			sanitizeVisibleText(nextRaw),
+			AGENT_NEXT_CLAUSE_MAX,
+		);
+		if (nextClause) {
+			// Reserve room for Next so the overall 320 cap does not clip recovery.
+			const suffix = ` • Next: ${nextClause}`;
+			const budget = Math.max(48, AGENT_BLOCK_REASON_MAX - suffix.length);
+			reason = `${truncate(base, budget)}${suffix}`;
+		}
+	}
+	reason = sanitizeVisibleText(reason);
+	// Defense in depth: strip residual Recourse walls without eating rule/Next bullets.
+	if (/Recourse:/i.test(reason)) {
+		reason = sanitizeVisibleText(
+			reason.replace(/\s*Recourse:\s*[^•]*?(?=\s*•|$)/gi, ""),
+		);
+	}
+	return truncate(reason, AGENT_BLOCK_REASON_MAX);
+}
+
+/** Why atom for agent text: drop Recourse/Next walls; never reintroduce them. */
+function agentWhyText(summary: string): string {
+	return stripOperatorWalls(summary);
 }
 
 export function installRykExtension(
@@ -1661,15 +1708,17 @@ async function applyToolDecision(
 		if (session) session.protocolFailures = 0;
 		const card = buildRykDecisionCard(decision.response, "block");
 		showRykDecision(pi, ctx, card);
-		const summary = formatRykDecisionSummary(card, toolLabel);
+		// Agent reason: short + structured Next; walls stripped.
+		const agentReason = formatAgentBlockReason(card, toolLabel);
 		// Best-effort error flash; card remains primary. Never softens deny.
 		// Strip Recourse/Next on the reason atom so rule/pack/severity suffix survives.
+		// Flash stays shorter than agent reason (no Next clause required).
 		const flash = formatRykDecisionSummary(
 			{ ...card, summary: stripOperatorWalls(card.summary) },
 			toolLabel,
 		);
 		notify(ctx, flash, "error");
-		return block(summary);
+		return block(agentReason);
 	}
 	if (decision.kind === "warn") {
 		if (session) session.protocolFailures = 0;
@@ -1867,7 +1916,16 @@ async function handlePolicyAskAutoDeny(
 	// Prefer recording audit before returning the block; still block if audit fails.
 	recordAskAutoDeny(pi, toolLabel, sessionClass, policyReason);
 	showRykDecision(pi, ctx, card);
-	return block(copy.reason);
+	// Agent reason uses auto-denied token + structured Next (card stays rich Why/Next).
+	return block(
+		formatAgentBlockReason(
+			{
+				...card,
+				summary: copy.reason,
+			},
+			toolLabel,
+		),
+	);
 }
 
 /**
@@ -1986,7 +2044,7 @@ async function applyParentAskChoice(
 		case "run_once":
 			if (!allowOnce) {
 				return block(
-					formatRykDecisionSummary(
+					formatAgentBlockReason(
 						{ variant: "block", title: DISPLAY_BRAND, summary },
 						toolLabel,
 					),
@@ -2033,7 +2091,7 @@ async function applyParentAskChoice(
 		case "show_reason":
 			notify(ctx, summary, "error");
 			return block(
-				formatRykDecisionSummary(
+				formatAgentBlockReason(
 					{ variant: "block", title: DISPLAY_BRAND, summary },
 					toolLabel,
 				),
@@ -2041,7 +2099,7 @@ async function applyParentAskChoice(
 		case "block":
 		default:
 			return block(
-				formatRykDecisionSummary(
+				formatAgentBlockReason(
 					{ variant: "block", title: DISPLAY_BRAND, summary },
 					toolLabel,
 				),
@@ -2184,7 +2242,7 @@ async function handlePolicyAsk(
 		case "run_once":
 			if (!allowOnce) {
 				return block(
-					formatRykDecisionSummary(
+					formatAgentBlockReason(
 						{
 							variant: "block",
 							title: DISPLAY_BRAND,
@@ -2216,7 +2274,7 @@ async function handlePolicyAsk(
 		case "show_reason":
 			notify(ctx, summary, "error");
 			return block(
-				formatRykDecisionSummary(
+				formatAgentBlockReason(
 					{
 						variant: "block",
 						title: DISPLAY_BRAND,
@@ -2229,7 +2287,7 @@ async function handlePolicyAsk(
 		default:
 			// Timeout / undefined / unknown choice → block only (never allow).
 			return block(
-				formatRykDecisionSummary(
+				formatAgentBlockReason(
 					{
 						variant: "block",
 						title: DISPLAY_BRAND,
@@ -2264,7 +2322,7 @@ async function handleUnavailable(
 			summary: repair,
 		};
 		showRykDecision(pi, ctx, card);
-		return block(formatRykDecisionSummary(card, toolLabel));
+		return block(formatAgentBlockReason(card, toolLabel));
 	}
 
 	// allow-with-warning soft-allows only spawn_failed (binary missing).
@@ -2290,7 +2348,7 @@ async function handleUnavailable(
 			summary: repair,
 		};
 		showRykDecision(pi, ctx, card);
-		return block(formatRykDecisionSummary(card, toolLabel));
+		return block(formatAgentBlockReason(card, toolLabel));
 	}
 
 	// Subagent: parent-forward protocol recovery (child has no local recovery UI).
@@ -2322,7 +2380,7 @@ async function handleUnavailable(
 			summary: repair,
 		};
 		showRykDecision(pi, ctx, card);
-		return block(formatRykDecisionSummary(card, toolLabel));
+		return block(formatAgentBlockReason(card, toolLabel));
 	}
 
 	const card = buildRykAskCard(repair);
@@ -2352,7 +2410,7 @@ async function handleUnavailable(
 				clearRykWidget(ctx);
 				if (session) session.protocolRecovery = "block";
 				return block(
-					formatRykDecisionSummary(
+					formatAgentBlockReason(
 						{
 							variant: "block",
 							title: DISPLAY_BRAND,
@@ -2381,7 +2439,7 @@ async function handleUnavailable(
 			clearRykWidget(ctx);
 			if (session) session.protocolRecovery = "block";
 			return block(
-				formatRykDecisionSummary(
+				formatAgentBlockReason(
 					{
 						variant: "block",
 						title: DISPLAY_BRAND,
@@ -2912,13 +2970,15 @@ function notify(
 	}
 }
 
-/** Drop same-line Recourse/Next operator walls from short flash UI reason atoms. */
+/** Drop Recourse/Next operator walls from short flash / agent Why atoms. */
 function stripOperatorWalls(text: string): string {
-	const cleaned = text
+	// Collapse whitespace first so walls after newlines still match `.*$`.
+	const cleaned = sanitizeVisibleText(text)
 		.replace(/\s*Recourse:\s*.*$/i, "")
 		.replace(/\s*Next:\s*.*$/i, "")
 		.trim();
-	return cleaned || text;
+	// Never reintroduce walls when the entire atom was operator paste.
+	return cleaned || "ryk blocked this action.";
 }
 
 /**
