@@ -1908,16 +1908,24 @@ test "decide human mode gets a banner while default JSON remains machine output"
 }
 
 test "decide human mode honors no-rich without changing default machine JSON" {
+    var baseline_buf: [4096]u8 = undefined;
     var machine_buf: [4096]u8 = undefined;
     var human_buf: [4096]u8 = undefined;
     var stderr_buf: [512]u8 = undefined;
+    var baseline: std.Io.Writer = .fixed(&baseline_buf);
     var machine: std.Io.Writer = .fixed(&machine_buf);
     var human: std.Io.Writer = .fixed(&human_buf);
     var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
     const payload = "{\"command\":\"echo hello\"}";
 
+    // Compare --no-rich machine JSON to the default machine path. Do not pin a
+    // full decide fixture here: discovery depends on workspace/user policy, and
+    // this test is only about presentation flags not altering machine output.
+    try std.testing.expectEqual(exit_codes.success, try testRun(&.{ "decide", "command", "--json", payload }, &baseline, &stderr_writer));
+    stderr_writer = .fixed(&stderr_buf);
     try std.testing.expectEqual(exit_codes.success, try testRun(&.{ "--no-rich", "decide", "command", "--json", payload }, &machine, &stderr_writer));
-    try std.testing.expectEqualStrings(@embedFile("test-fixtures/decide-command-allow.json"), machine.buffered());
+    try std.testing.expectEqualStrings(baseline.buffered(), machine.buffered());
+    try std.testing.expect(std.mem.indexOf(u8, machine.buffered(), "\"decision\": \"allow\"") != null);
 
     stderr_writer = .fixed(&stderr_buf);
     try std.testing.expectEqual(exit_codes.success, try testRun(&.{ "--no-rich", "decide", "command", "--human", "--json", payload }, &human, &stderr_writer));

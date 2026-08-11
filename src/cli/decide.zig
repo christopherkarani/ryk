@@ -864,9 +864,23 @@ test "decide command machine output matches captured contract fixture" {
     var stderr_buf: [512]u8 = undefined;
     var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
     var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
-    const code = try decideCommand(std.testing.io, .command, &.{
-        "--json", "{\"command\":\"echo hello\"}",
-    }, &stdout_writer, &stderr_writer);
+    // Pin the coding DCG create-path policy so this contract is hermetic on a
+    // clean checkout (no workspace/user policy → builtin strict would match
+    // `echo *` instead of `commands.default: allow`).
+    const policy_path = try std.Io.Dir.cwd().realPathFileAlloc(
+        std.testing.io,
+        "policies/presets/generic-agent.yaml",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(policy_path);
+    const code = try decideCommandWithPolicy(
+        std.testing.io,
+        .command,
+        &.{ "--json", "{\"command\":\"echo hello\"}" },
+        &stdout_writer,
+        &stderr_writer,
+        policy_path,
+    );
     try std.testing.expectEqual(exit_codes.success, code);
     try std.testing.expectEqualStrings(
         @embedFile("test-fixtures/decide-command-allow.json"),
