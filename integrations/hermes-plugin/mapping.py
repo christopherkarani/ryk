@@ -25,14 +25,19 @@ _FALSY_ENV = frozenset({"0", "false", "no", "off", ""})
 # rule_key uses '|' so ryk rule_ids that contain ':' stay unambiguous.
 _RULE_KEY_SEP = "|"
 _MAX_MESSAGE_CHARS = 2048
+# Host UI line for block/approve/warn — short, scannable (not operator walls).
+_MAX_HOST_MESSAGE_CHARS = 200
 _MAX_RULE_COMPONENT_CHARS = 256
 _MAX_RULE_INPUT_CHARS = 65536
-_MAX_REMEDIATION_COMMANDS = 4
 _SECRET_TEXT_RE = re.compile(
     r"(?i)\b(password|passwd|pwd|token|api[_-]?key|apikey|api[_-]?secret|secret|"
     r"authorization|credential|access[_-]?token|refresh[_-]?token)\b"
     r"\s*[:=]\s*(?:bearer\s+)?[^\s,;]+|\bbearer\s+[^\s,;]+"
 )
+# Operator-only lines that must never re-inflate Hermes host message.
+_OPERATOR_LINE_PREFIXES = ("recourse:", "next:")
+# Same-line operator tails (e.g. "blocked. Recourse: … Next: …").
+_INLINE_OPERATOR_RE = re.compile(r"(?i)\b(?:recourse|next)\s*:")
 
 
 def _bounded_text(value: Any, default: str, limit: int = _MAX_MESSAGE_CHARS) -> str:
@@ -43,6 +48,27 @@ def _bounded_text(value: Any, default: str, limit: int = _MAX_MESSAGE_CHARS) -> 
         return redacted
     suffix = "...[truncated]"
     return redacted[: limit - len(suffix)] + suffix
+
+
+def _first_host_line(value: Any) -> str:
+    """First non-empty non-operator line; collapses internal whitespace."""
+    if not isinstance(value, str):
+        return ""
+    for raw in value.splitlines():
+        line = " ".join(raw.split())
+        if not line:
+            continue
+        lowered = line.lower()
+        if any(lowered.startswith(prefix) for prefix in _OPERATOR_LINE_PREFIXES):
+            continue
+        # Strip trailing operator walls glued onto the same line.
+        cut = _INLINE_OPERATOR_RE.search(line)
+        if cut is not None:
+            line = line[: cut.start()].rstrip(" -–—|;")
+        if not line:
+            continue
+        return line
+    return ""
 
 
 def ci_mode(
@@ -90,26 +116,38 @@ def stable_rule_key(response: dict[str, Any], tool_name: str, tool_input: Any) -
 
 
 def format_tool_message(response: dict[str, Any], *, default: str = "blocked by ryk") -> str:
-    message = response.get("message") or response.get("reason") or default
-    message = _bounded_text(message, default)
-    remediation = response.get("remediation_commands")
-    if isinstance(remediation, list) and remediation:
-        tips = "; ".join(
-            _bounded_text(item, "", _MAX_RULE_COMPONENT_CHARS)
-            for item in remediation[:_MAX_REMEDIATION_COMMANDS]
-            if isinstance(item, str) and item
-        )
-        if tips:
-            message = f"{message} Next: {tips}"
+    """Short one-line host message for block/approve/warn.
+
+    Prefer short reason, then first useful line of message, then default.
+    Include rule once when present. Never append remediation_commands or
+    Recourse/Next operator walls into the host string.
+    """
+    default_s = default if isinstance(default, str) and default.strip() else "blocked by ryk"
+    # Prefer reason → message first line → default (remediation list ignored).
+    body = _first_host_line(response.get("reason")) or _first_host_line(response.get("message"))
+    if not body:
+        body = default_s
+
+    rule_s = ""
     rule_id = response.get("rule_id") or response.get("rule")
-    if rule_id:
-        message = f"{message} (rule: {_bounded_text(rule_id, 'policy', _MAX_RULE_COMPONENT_CHARS)})"
-    return _bounded_text(message, default)
+    if isinstance(rule_id, str) and rule_id.strip():
+        rule_s = _bounded_text(rule_id.strip(), "policy", _MAX_RULE_COMPONENT_CHARS).strip()
+
+    # Reserve room for " (rule: …)" so truncation keeps policy identity.
+    rule_suffix = f" (rule: {rule_s})" if rule_s and rule_s not in body else ""
+    body_limit = max(32, _MAX_HOST_MESSAGE_CHARS - len(rule_suffix))
+    body = _bounded_text(body, default_s, body_limit)
+    if rule_suffix and rule_s not in body:
+        body = f"{body}{rule_suffix}"
+    # Single line + tight UI cap (never multi-line walls).
+    body = " ".join(body.split())
+    return _bounded_text(body, default_s, _MAX_HOST_MESSAGE_CHARS)
 
 
 def _base_message(response: dict[str, Any], default: str) -> str:
-    message = response.get("message") or response.get("reason") or default
-    return _bounded_text(message, default)
+    """Advisory context base: short first line only (no Recourse walls)."""
+    line = _first_host_line(response.get("message")) or _first_host_line(response.get("reason"))
+    return _bounded_text(line or default, default, _MAX_HOST_MESSAGE_CHARS)
 
 
 # Prompt templates: Hermes pre_llm_call is context-only — never an approval gate.
@@ -172,11 +210,17 @@ def map_pre_tool_call(
     if decision == "ask":
         message = format_tool_message(response, default="approval required by ryk")
         if ci_mode(environ, unattended_marker=unattended_marker):
+            # Keep one line; brief CI clause is OK for unattended harden.
+            ci_message = (
+                f"{message} "
+                "(CI/noninteractive: ryk ask hardened to block; no approval prompt available)"
+            )
             return {
                 "action": "block",
-                "message": (
-                    f"{message} "
-                    "(CI/noninteractive: ryk ask hardened to block; no approval prompt available)"
+                "message": _bounded_text(
+                    " ".join(ci_message.split()),
+                    "blocked by ryk",
+                    _MAX_MESSAGE_CHARS,
                 ),
             }
         return {
