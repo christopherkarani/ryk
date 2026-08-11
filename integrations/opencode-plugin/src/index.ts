@@ -531,6 +531,17 @@ async function maybeToast(
   }
 }
 
+/** Best-effort error toast then throw a short single-line Error. */
+async function hardBlockWithToast(
+  ctx: PluginContext,
+  shortMsg: string,
+  operatorDetail?: string
+): Promise<never> {
+  console.error(`[ryk] ${operatorDetail ?? shortMsg}`);
+  await maybeToast(ctx, 'error', 'ryk blocked', shortMsg);
+  throw new Error(shortMsg);
+}
+
 /**
  * Apply a blocking-path decision: warn/pass-through return; hard blocks toast
  * then throw a short Error. Full operator detail goes to stderr only.
@@ -550,22 +561,11 @@ async function applyBlockingDecision(
   }
 
   // block, ask, error, unrecognized → veto tool execution
-  const shortMsg = formatShortBlock(response, context);
-  const detail = formatOperatorDetail(response, context);
-  console.error(`[ryk] ${detail}`);
-  await maybeToast(ctx, 'error', 'ryk blocked', shortMsg);
-  throw new Error(shortMsg);
-}
-
-/** Best-effort error toast then throw a short single-line Error. */
-async function hardBlockWithToast(
-  ctx: PluginContext,
-  shortMsg: string,
-  operatorDetail?: string
-): Promise<never> {
-  console.error(`[ryk] ${operatorDetail ?? shortMsg}`);
-  await maybeToast(ctx, 'error', 'ryk blocked', shortMsg);
-  throw new Error(shortMsg);
+  await hardBlockWithToast(
+    ctx,
+    formatShortBlock(response, context),
+    formatOperatorDetail(response, context)
+  );
 }
 
 /** ryk decision → OpenCode permission.ask status. Unknown decisions fail closed to deny. */
