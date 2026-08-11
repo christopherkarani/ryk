@@ -41,7 +41,7 @@
     },
     "message": {
       "type": "string",
-      "description": "Human-readable message suitable for surfacing to the user."
+      "description": "Short agent-facing reason (prefer one line). Operator Recourse/Next live on stderr and in remediation_commands/suggestions, not in this field."
     },
     "redactions": {
       "type": "array",

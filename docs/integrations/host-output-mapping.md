@@ -115,7 +115,7 @@ Every hook response uses the same top-level shape.
 | `category` | yes | `command`, `file`, `prompt`, `tool`, `network`, `mcp`, `unknown` before normalization |
 | `reason` | yes | Machine-readable string |
 | `rule` | yes | Matched policy rule identifier or `null` |
-| `message` | yes | Human-readable message |
+| `message` | yes | Short agent-facing reason (prefer one line). Operator Recourse/Next live on stderr and in `remediation_commands` / `suggestions` — not stuffed into `message`. |
 | `redactions` | yes | Array of `{field, reason}` |
 | `host_limitations` | yes | Always includes `Hook enforcement is additive; does not replace ryk run supervision.` |
 
