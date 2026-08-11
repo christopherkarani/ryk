@@ -723,7 +723,7 @@ fn writeDoctorPlain(io: std.Io, allocator: std.mem.Allocator, stdout: anytype, r
             if (!report.opencode_paths.project_plugin_exists) try stdout.writeAll("    → Fix: ryk doctor --fix or ryk plugin install opencode\n");
             try stdout.print("  global plugin path (~/.config/opencode/plugins/ryk.ts): {s}\n", .{if (report.opencode_paths.global_plugin_exists) "exists" else "not found"});
             if (!report.opencode_paths.global_plugin_exists) try stdout.writeAll("    → Fix: ryk doctor --fix or ryk plugin install opencode\n");
-            try stdout.writeAll("  day-one path: global ~/.config/opencode/plugins/ryk.ts (project scope is opt-in)\n");
+            try stdout.writeAll("  day-one path: upgrades global ~/.config/opencode/plugins/ryk.ts and any existing project .opencode/plugins/ryk.ts\n");
             try stdout.writeAll("  install: use 'ryk plugin install opencode --dry-run' to preview\n");
             try stdout.writeAll("  note: OpenCode plugin uses TypeScript hooks, not a manifest file\n");
         },
@@ -1559,11 +1559,17 @@ fn installCommand(io: std.Io, argv: []const []const u8, stdout: anytype, stderr:
             try stdout.print("  plugin directory: found ({s})\n", .{plugin_dir});
 
             if (t == .opencode) {
-                // OpenCode-specific install guidance
+                // OpenCode managed plugin is release software: upgrade in place when
+                // bundled bytes differ. Also reconcile the other scope when that
+                // destination already exists so project plugins cannot stay stale
+                // after a global day-one/update install.
                 const source_path = try std.fs.path.join(allocator, &.{ plugin_dir, "ryk.ts" });
                 defer allocator.free(source_path);
                 const destination_path = try resolveOpenCodeDestination(allocator, workspace_root, scope);
                 defer allocator.free(destination_path);
+                const other_scope: InstallScope = if (scope == .global) .project else .global;
+                const other_destination_path = try resolveOpenCodeDestination(allocator, workspace_root, other_scope);
+                defer allocator.free(other_destination_path);
 
                 try stdout.writeAll("  install paths for OpenCode:\n");
                 try stdout.writeAll("    project: .opencode/plugins/ryk.ts\n");
@@ -1571,22 +1577,23 @@ fn installCommand(io: std.Io, argv: []const []const u8, stdout: anytype, stderr:
                 if (dry_run) {
                     try stdout.writeAll("  action: no changes made (dry-run)\n");
                     try stdout.print("  next step: copy {s} to {s}\n", .{ source_path, destination_path });
+                    if (fileExistsAbsolute(io, other_destination_path)) {
+                        try stdout.print("  next step: also upgrade existing {s} scope at {s}\n", .{ @tagName(other_scope), other_destination_path });
+                    }
                 } else {
                     if (!fileExistsAbsolute(io, source_path)) {
                         try stdout.print("  action: failed (source missing: {s})\n", .{source_path});
                         return exit_codes.general;
                     }
-                    const installed = installFileIfSafe(allocator, source_path, destination_path) catch |err| switch (err) {
-                        error.RefusingToOverwriteDifferentFile => {
-                            try stdout.print("  action: failed (destination exists and differs: {s})\n", .{destination_path});
-                            return exit_codes.general;
-                        },
+                    installOpenCodeManagedDestination(allocator, io, stdout, source_path, destination_path) catch |err| switch (err) {
+                        error.OpenCodeManagedInstallFailed => return exit_codes.general,
                         else => return err,
                     };
-                    if (installed) {
-                        try stdout.print("  action: installed to {s}\n", .{destination_path});
-                    } else {
-                        try stdout.print("  action: already up-to-date at {s}\n", .{destination_path});
+                    if (fileExistsAbsolute(io, other_destination_path)) {
+                        installOpenCodeManagedDestination(allocator, io, stdout, source_path, other_destination_path) catch |err| switch (err) {
+                            error.OpenCodeManagedInstallFailed => return exit_codes.general,
+                            else => return err,
+                        };
                     }
                     // Light config hygiene so local plugins auto-load.
                     if (ensureOpenCodeConfigSane(io, allocator)) |cfg_note| {
@@ -2256,6 +2263,44 @@ fn installManagedFile(allocator: std.mem.Allocator, source_path: []const u8, des
         destination_path,
         true,
     );
+}
+
+const OpenCodeManagedInstallError = error{
+    OpenCodeManagedInstallFailed,
+};
+
+fn installOpenCodeManagedDestination(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    stdout: anytype,
+    source_path: []const u8,
+    destination_path: []const u8,
+) !void {
+    const existed = fileExistsAbsolute(io, destination_path);
+    const changed = installManagedFile(allocator, source_path, destination_path) catch |err| switch (err) {
+        error.RefusingToOverwriteDifferentFile => {
+            try stdout.print("  action: failed (destination exists and differs: {s})\n", .{destination_path});
+            return error.OpenCodeManagedInstallFailed;
+        },
+        error.RefusingSymlinkPluginPath => {
+            try stdout.print("  action: failed (refusing symlink destination: {s})\n", .{destination_path});
+            return error.OpenCodeManagedInstallFailed;
+        },
+        error.NotDir => {
+            try stdout.print("  action: failed (unsafe destination path: {s})\n", .{destination_path});
+            return error.OpenCodeManagedInstallFailed;
+        },
+        else => return err,
+    };
+    if (changed) {
+        if (existed) {
+            try stdout.print("  action: upgraded {s}\n", .{destination_path});
+        } else {
+            try stdout.print("  action: installed to {s}\n", .{destination_path});
+        }
+    } else {
+        try stdout.print("  action: already up-to-date at {s}\n", .{destination_path});
+    }
 }
 
 fn sha256Hex(bytes: []const u8) [64]u8 {
@@ -4346,6 +4391,251 @@ test "plugin install opencode --yes writes global plugin under HOME" {
     const config_path = try std.fs.path.join(std.testing.allocator, &.{ home, ".config", "opencode", "opencode.json" });
     defer std.testing.allocator.free(config_path);
     try std.testing.expect(fileExistsAbsolute(std.testing.io, config_path));
+}
+
+test "plugin install opencode --yes upgrades stale global plugin under HOME" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(home);
+    const home_z = try std.testing.allocator.dupeZ(u8, home);
+    defer std.testing.allocator.free(home_z);
+
+    try tmp.dir.createDirPath(std.testing.io, ".config/opencode/plugins");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = ".config/opencode/plugins/ryk.ts",
+        .data = "// OLD STALE OPENCODE PLUGIN\n",
+    });
+
+    const prev_home = try testDupEnvZ("HOME");
+    defer testRestoreEnv("HOME", prev_home);
+    try std.testing.expectEqual(@as(c_int, 0), setenv("HOME", home_z.ptr, 1));
+
+    var stdout_buf: [65536]u8 = undefined;
+    var stderr_buf: [2048]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+
+    const code = try installCommand(std.testing.io, &.{ "opencode", "--yes", "--scope", "global" }, &stdout_writer, &stderr_writer);
+    try std.testing.expectEqual(exit_codes.success, code);
+    try std.testing.expectEqualStrings("", stderr_writer.buffered());
+
+    const output = stdout_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, output, "destination exists and differs") == null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, output, "upgraded") != null or
+            std.mem.indexOf(u8, output, "installed to") != null,
+    );
+
+    const plugin_path = try std.fs.path.join(std.testing.allocator, &.{ home, ".config", "opencode", "plugins", "ryk.ts" });
+    defer std.testing.allocator.free(plugin_path);
+    const installed = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, plugin_path, std.testing.allocator, .limited(8 * 1024 * 1024));
+    defer std.testing.allocator.free(installed);
+    try std.testing.expect(std.mem.indexOf(u8, installed, "OLD STALE OPENCODE PLUGIN") == null);
+
+    const source_path = try resolveBundledPath(std.testing.io, std.testing.allocator, "integrations/opencode-plugin/ryk.ts");
+    defer std.testing.allocator.free(source_path);
+    const source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, source_path, std.testing.allocator, .limited(8 * 1024 * 1024));
+    defer std.testing.allocator.free(source);
+    try std.testing.expectEqualStrings(source, installed);
+}
+
+test "plugin install opencode --yes is noop when global plugin already current" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(home);
+    const home_z = try std.testing.allocator.dupeZ(u8, home);
+    defer std.testing.allocator.free(home_z);
+
+    const source_path = try resolveBundledPath(std.testing.io, std.testing.allocator, "integrations/opencode-plugin/ryk.ts");
+    defer std.testing.allocator.free(source_path);
+    const source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, source_path, std.testing.allocator, .limited(8 * 1024 * 1024));
+    defer std.testing.allocator.free(source);
+
+    try tmp.dir.createDirPath(std.testing.io, ".config/opencode/plugins");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = ".config/opencode/plugins/ryk.ts",
+        .data = source,
+    });
+
+    const prev_home = try testDupEnvZ("HOME");
+    defer testRestoreEnv("HOME", prev_home);
+    try std.testing.expectEqual(@as(c_int, 0), setenv("HOME", home_z.ptr, 1));
+
+    var stdout_buf: [65536]u8 = undefined;
+    var stderr_buf: [2048]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+
+    const code = try installCommand(std.testing.io, &.{ "opencode", "--yes", "--scope", "global" }, &stdout_writer, &stderr_writer);
+    try std.testing.expectEqual(exit_codes.success, code);
+    try std.testing.expectEqualStrings("", stderr_writer.buffered());
+    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "already up-to-date") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "destination exists and differs") == null);
+
+    const plugin_path = try std.fs.path.join(std.testing.allocator, &.{ home, ".config", "opencode", "plugins", "ryk.ts" });
+    defer std.testing.allocator.free(plugin_path);
+    const installed = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, plugin_path, std.testing.allocator, .limited(8 * 1024 * 1024));
+    defer std.testing.allocator.free(installed);
+    try std.testing.expectEqualStrings(source, installed);
+}
+
+test "plugin install opencode --scope project upgrades stale project plugin" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const io = std.testing.io;
+    // Isolate HOME so dual-scope reconcile cannot touch the developer's real
+    // ~/.config/opencode/{plugins/ryk.ts,opencode.json}.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(home);
+    const home_z = try std.testing.allocator.dupeZ(u8, home);
+    defer std.testing.allocator.free(home_z);
+    const prev_home = try testDupEnvZ("HOME");
+    defer testRestoreEnv("HOME", prev_home);
+    try std.testing.expectEqual(@as(c_int, 0), setenv("HOME", home_z.ptr, 1));
+
+    // Project destination is workspace-relative and gitignored under .opencode/.
+    const project_rel = ".opencode/plugins/ryk.ts";
+    try std.Io.Dir.cwd().createDirPath(io, ".opencode/plugins");
+
+    const prev = std.Io.Dir.cwd().readFileAlloc(io, project_rel, std.testing.allocator, .limited(8 * 1024 * 1024)) catch null;
+    defer if (prev) |bytes| std.testing.allocator.free(bytes);
+    defer {
+        if (prev) |bytes| {
+            std.Io.Dir.cwd().writeFile(io, .{ .sub_path = project_rel, .data = bytes }) catch {};
+        } else {
+            std.Io.Dir.cwd().deleteFile(io, project_rel) catch {};
+        }
+    }
+
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = project_rel, .data = "// OLD STALE PROJECT OPENCODE PLUGIN\n" });
+
+    var stdout_buf: [65536]u8 = undefined;
+    var stderr_buf: [2048]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+
+    const code = try installCommand(io, &.{ "opencode", "--yes", "--scope", "project" }, &stdout_writer, &stderr_writer);
+    try std.testing.expectEqual(exit_codes.success, code);
+    try std.testing.expectEqualStrings("", stderr_writer.buffered());
+    const output = stdout_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, output, "destination exists and differs") == null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, output, "upgraded") != null or
+            std.mem.indexOf(u8, output, "installed to") != null,
+    );
+
+    const installed = try std.Io.Dir.cwd().readFileAlloc(io, project_rel, std.testing.allocator, .limited(8 * 1024 * 1024));
+    defer std.testing.allocator.free(installed);
+    try std.testing.expect(std.mem.indexOf(u8, installed, "OLD STALE PROJECT OPENCODE PLUGIN") == null);
+
+    const source_path = try resolveBundledPath(io, std.testing.allocator, "integrations/opencode-plugin/ryk.ts");
+    defer std.testing.allocator.free(source_path);
+    const source = try std.Io.Dir.cwd().readFileAlloc(io, source_path, std.testing.allocator, .limited(8 * 1024 * 1024));
+    defer std.testing.allocator.free(source);
+    try std.testing.expectEqualStrings(source, installed);
+
+    // Dual-scope must not create a global plugin under the isolated HOME unless it already existed.
+    const global_path = try std.fs.path.join(std.testing.allocator, &.{ home, ".config", "opencode", "plugins", "ryk.ts" });
+    defer std.testing.allocator.free(global_path);
+    try std.testing.expect(!fileExistsAbsolute(io, global_path));
+}
+
+test "plugin install opencode global scope upgrades existing stale project plugin too" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(home);
+    const home_z = try std.testing.allocator.dupeZ(u8, home);
+    defer std.testing.allocator.free(home_z);
+
+    try tmp.dir.createDirPath(io, ".config/opencode/plugins");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = ".config/opencode/plugins/ryk.ts",
+        .data = "// OLD STALE GLOBAL OPENCODE PLUGIN\n",
+    });
+
+    const project_rel = ".opencode/plugins/ryk.ts";
+    try std.Io.Dir.cwd().createDirPath(io, ".opencode/plugins");
+    const prev = std.Io.Dir.cwd().readFileAlloc(io, project_rel, std.testing.allocator, .limited(8 * 1024 * 1024)) catch null;
+    defer if (prev) |bytes| std.testing.allocator.free(bytes);
+    defer {
+        if (prev) |bytes| {
+            std.Io.Dir.cwd().writeFile(io, .{ .sub_path = project_rel, .data = bytes }) catch {};
+        } else {
+            std.Io.Dir.cwd().deleteFile(io, project_rel) catch {};
+        }
+    }
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = project_rel, .data = "// OLD STALE PROJECT OPENCODE PLUGIN\n" });
+
+    const prev_home = try testDupEnvZ("HOME");
+    defer testRestoreEnv("HOME", prev_home);
+    try std.testing.expectEqual(@as(c_int, 0), setenv("HOME", home_z.ptr, 1));
+
+    var stdout_buf: [65536]u8 = undefined;
+    var stderr_buf: [2048]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+
+    const code = try installCommand(io, &.{ "opencode", "--yes", "--scope", "global" }, &stdout_writer, &stderr_writer);
+    try std.testing.expectEqual(exit_codes.success, code);
+    try std.testing.expectEqualStrings("", stderr_writer.buffered());
+    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "destination exists and differs") == null);
+
+    const source_path = try resolveBundledPath(io, std.testing.allocator, "integrations/opencode-plugin/ryk.ts");
+    defer std.testing.allocator.free(source_path);
+    const source = try std.Io.Dir.cwd().readFileAlloc(io, source_path, std.testing.allocator, .limited(8 * 1024 * 1024));
+    defer std.testing.allocator.free(source);
+
+    const global_path = try std.fs.path.join(std.testing.allocator, &.{ home, ".config", "opencode", "plugins", "ryk.ts" });
+    defer std.testing.allocator.free(global_path);
+    const global_bytes = try std.Io.Dir.cwd().readFileAlloc(io, global_path, std.testing.allocator, .limited(8 * 1024 * 1024));
+    defer std.testing.allocator.free(global_bytes);
+    try std.testing.expectEqualStrings(source, global_bytes);
+
+    const project_bytes = try std.Io.Dir.cwd().readFileAlloc(io, project_rel, std.testing.allocator, .limited(8 * 1024 * 1024));
+    defer std.testing.allocator.free(project_bytes);
+    try std.testing.expectEqualStrings(source, project_bytes);
+}
+
+test "OpenCode managed file install refuses symlink destination" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "source.ts", .data = "managed" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "outside.ts", .data = "keep" });
+    try tmp.dir.symLink(std.testing.io, "outside.ts", "linked.ts", .{});
+
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const source = try std.fs.path.join(std.testing.allocator, &.{ root, "source.ts" });
+    defer std.testing.allocator.free(source);
+    const linked = try std.fs.path.join(std.testing.allocator, &.{ root, "linked.ts" });
+    defer std.testing.allocator.free(linked);
+
+    try std.testing.expectError(
+        error.RefusingSymlinkPluginPath,
+        installManagedFile(std.testing.allocator, source, linked),
+    );
+    const preserved = try tmp.dir.readFileAlloc(
+        std.testing.io,
+        "outside.ts",
+        std.testing.allocator,
+        .limited(64),
+    );
+    defer std.testing.allocator.free(preserved);
+    try std.testing.expectEqualStrings("keep", preserved);
 }
 
 test "ensureOpenCodeConfigSane repairs plugin list placeholder" {

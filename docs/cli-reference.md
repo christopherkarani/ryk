@@ -328,7 +328,7 @@ ryk plugin manifest all --json
 ryk plugin install
 ~~~
 
-Bare plugin install is a dry-run preview. An explicit host or all plus --yes is required for mutation. Plugin diagnostics do not print secrets.
+Bare plugin install is a dry-run preview. An explicit host or all plus --yes is required for mutation. Managed host plugins are part of the release: `ryk plugin install`, `ryk doctor --fix`, and post-install/`ryk update` setup upgrade ryk-owned plugin files in place when bundled content differs (unsafe destinations still refuse). Plugin diagnostics do not print secrets.
 
 MCP commands cover local stdio servers and manifests:
 
@@ -403,7 +403,7 @@ ryk uninstall --plugins-only --yes
 ryk update --check
 ~~~
 
-stop removes host protection registrations without removing the ryk binary or policy. shutdown is an advanced background-service command. uninstall can remove the installation and user configuration; use --dry-run first. update --check performs a read-only release check, while an update can contact the release service and replace the installed binary.
+stop removes host protection registrations without removing the ryk binary or policy. shutdown is an advanced background-service command. uninstall can remove the installation and user configuration; use --dry-run first. update --check performs a read-only release check, while an update can contact the release service and replace the installed binary; the official installer then refreshes managed host plugins via doctor --fix.
 
 disable dispatches to the same implementation as stop and is retained as an accepted compatibility route. New integrations should use stop, which is the documented command.
 

@@ -50,7 +50,7 @@ ryk update --check  # report only
 ryk update --yes    # non-interactive
 ```
 
-`ryk update` reuses the official curl installer (checksums + atomic replace). Use `ryk update --force` only when you intentionally want to override the normal release check.
+`ryk update` reuses the official curl installer (checksums + atomic replace). Use `ryk update --force` only when you intentionally want to override the normal release check. After the binary is replaced, the installer runs `ryk doctor --fix --from-install`, which refreshes managed host plugins (for example OpenCode `ryk.ts`, Codex/Claude marketplace plugins, and ryk-owned Hermes trees) so stale plugin files are upgraded in place without a manual delete.
 
 The installers print a step-based receipt (brand header, phases, activation hero). They honor `NO_COLOR` and `RYK_INSTALL_QUIET=1` (non-error silence; activation line still printed) and run the canonical `doctor --fix --from-install` setup door.
 

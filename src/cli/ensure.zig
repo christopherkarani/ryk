@@ -766,7 +766,8 @@ fn installOneHostInner(
     }
     // Plugin install resolves marketplace roots from process cwd — pin to ensure workspace
     // so from_install (HOME) cannot write plugins under a nested caller `.git` tree.
-    // OpenCode day-one: always global ~/.config/opencode/plugins (not HOME/.opencode project scope).
+    // OpenCode day-one: install/upgrade global ~/.config/opencode/plugins/ryk.ts.
+    // plugin install also upgrades an existing project .opencode/plugins/ryk.ts when present.
     const timeout_ms = hostPluginInstallTimeoutMs(host_id);
     const child = if (std.mem.eql(u8, host_id, "opencode")) blk: {
         const install_argv = [_][]const u8{ self_exe, "plugin", "install", "opencode", "--yes", "--scope", "global" };
@@ -1002,6 +1003,15 @@ fn dayOneResultIsWired(result: DayOneInstallResult) bool {
     };
 }
 
+/// Whether ensure should re-run install when the host already looks "installed"
+/// (file/presence based). Managed release glue upgrades in place; Cursor does not.
+fn hostInstallerReconcilesWhenPresent(installer: HostInstaller) bool {
+    return switch (installer) {
+        .plugin_yes, .pi_extension, .grok_hooks => true,
+        .deferred_w3 => false,
+    };
+}
+
 /// Per-host smoke (D26 / D14 doctor-class; no live host UI spawn).
 /// When `skip_verify`, install-evidence-only: smoke is not run; wire-ok is treated
 /// as smoke skip-pass (honest: protection_label still partial if any host unwired).
@@ -1045,8 +1055,10 @@ fn evaluateHostSmoke(
 /// Product path:
 /// 1. Detect via `onboarding.collectHostStatuses` (membership = `onboarding.supported_hosts`).
 /// 2. Dispatch HostWireTable installer for each detected host (existing Pi/plugin paths).
-/// 3. Already-installed → wired without re-mutation; not installed → attempt install;
-///    install fail → soft `.wire` + `doctor_fix_hint` (D24), never clears core_ok.
+/// 3. When mutation is allowed, re-reconcile managed installers even if a plugin file
+///    already exists (upgrade-in-place for OpenCode/Codex/Claude/Hermes/Pi/Grok).
+///    Install fail → soft `.wire` + concrete fix hint (D24), never clears core_ok.
+///    Cursor stays detect-only (`deferred_w3`).
 /// 4. Per-host smoke when `!skip_verify` (D26); skip_verify → install-evidence smoke skip-pass.
 ///
 /// HostResult.host_id / fix_hint are borrowed static strings; only the slice is owned.
@@ -1111,18 +1123,19 @@ pub fn wireDetectedHosts(
             continue;
         }
 
-        // Grok: always re-run install when we can mutate. Managed `~/.grok/hooks/ryk.json`
-        // is the only live path; legacy user-settings must not skip repair.
+        // Managed host glue is release software: when mutation is allowed, always
+        // re-run install/upgrade so doctor --fix / post-update setup refreshes
+        // stale plugin files (not only missing ones). Cursor stays deferred above.
         var wired = st.installed;
         var last_install: DayOneInstallResult = .already_installed;
-        if (can_mutate and (entry.installer == .grok_hooks or !wired)) {
+        if (can_mutate and hostInstallerReconcilesWhenPresent(entry.installer)) {
             last_install = attemptHostInstall(io, allocator, entry, home_opt.?, self_exe_opt.?, workspace_root);
             wired = dayOneResultIsWired(last_install);
         }
 
         if (!wired) {
             // Prefer class-specific next step over circular "repair: ryk doctor --fix".
-            const hint = if (can_mutate and (entry.installer == .grok_hooks or !st.installed))
+            const hint = if (can_mutate and hostInstallerReconcilesWhenPresent(entry.installer))
                 dayOneWireFixHint(last_install)
             else
                 doctor_fix_hint;
@@ -2688,6 +2701,23 @@ test "Ensure invalid preset fails with ensure branding not init" {
 // ---------------------------------------------------------------------------
 // Day-one host install timeout + diagnostics (openclaw 15s kill regression)
 // ---------------------------------------------------------------------------
+
+test "day-one ensure reconciles managed hosts even when already installed" {
+    // Product: doctor --fix / post-update must refresh stale managed plugins, not
+    // skip install solely because a plugin file already exists (presence ≠ freshness).
+    try std.testing.expect(hostInstallerReconcilesWhenPresent(.plugin_yes));
+    try std.testing.expect(hostInstallerReconcilesWhenPresent(.pi_extension));
+    try std.testing.expect(hostInstallerReconcilesWhenPresent(.grok_hooks));
+    try std.testing.expect(!hostInstallerReconcilesWhenPresent(.deferred_w3));
+
+    // Dispatch rows for managed plugin hosts must use plugin_yes (OpenCode path).
+    try std.testing.expectEqual(HostInstaller.plugin_yes, HostWireTable.entryFor("opencode").?.installer);
+    try std.testing.expectEqual(HostInstaller.plugin_yes, HostWireTable.entryFor("codex").?.installer);
+    try std.testing.expectEqual(HostInstaller.plugin_yes, HostWireTable.entryFor("claude").?.installer);
+    try std.testing.expectEqual(HostInstaller.plugin_yes, HostWireTable.entryFor("hermes").?.installer);
+    try std.testing.expectEqual(HostInstaller.grok_hooks, HostWireTable.entryFor("grok").?.installer);
+    try std.testing.expectEqual(HostInstaller.deferred_w3, HostWireTable.entryFor("cursor").?.installer);
+}
 
 test "day-one host plugin install budget exceeds historical 15s kill" {
     // RED-before-GREEN contract: openclaw must be allowed ≥60s so a ~16–30s
