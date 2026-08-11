@@ -735,6 +735,9 @@ fn installOneHostInner(
         const result = pi_install.install(io, allocator, .{
             .home = home,
             .ryk_binary = self_exe,
+            // Resolved ensure/start workspace (not process cwd ".") so nested-cwd
+            // and system-binary-vs-checkout installs still find ryk-pi assets.
+            .workspace_root = workspace_root,
         }) catch |err| {
             setInstallDetail(switch (err) {
                 error.RefusingToOverwriteUnownedFile => "refusing to overwrite unowned Pi extension",

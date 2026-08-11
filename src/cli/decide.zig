@@ -317,8 +317,9 @@ fn evaluateDecision(
 
             // Shell pack fence: medium/high/critical pack denials take the more
             // restrictive of policy vs shell-derived plugin decision. Critical/high
-            // → block (closer to hook hard fence for critical); medium → ask
-            // (CI hardens ask→block). Not a full mode×severity matrix.
+            // → block (closer to hook hard fence for critical); medium → ask only
+            // under ask/yolo (CI and strict/redteam/ci policy modes harden to block).
+            // Coding DCG create-path uses mode: strict so medium pack hits never ask.
             //
             // evaluateCommand error set is allocator-only (OOM). Registry init and
             // other evaluator failures already return a fail-closed deny Evaluation
@@ -330,7 +331,7 @@ fn evaluateDecision(
             if (shell.decision == .deny and packSeverityBlocksPolicyAllow(shell.severity)) {
                 const shell_derived: PluginDecision = switch (shell.severity) {
                     .critical, .high => .block,
-                    .medium => if (ci_mode) .block else .ask,
+                    .medium => if (ci_mode or packMediumFenceBlocks(policy_value.mode)) .block else .ask,
                     .low => unreachable, // excluded by packSeverityBlocksPolicyAllow
                 };
                 const policy_decision = PluginDecision.fromDecisionResult(evaluation.decision.result, ci_mode);
@@ -489,6 +490,15 @@ fn evaluateDecision(
             };
         },
     }
+}
+
+/// Strict-like policy modes (and CI flag) harden medium pack fence to block so
+/// coding DCG / unattended create-paths never emit ask for medium pack denials.
+fn packMediumFenceBlocks(mode: policy.schema.Mode) bool {
+    return switch (mode) {
+        .strict, .redteam, .ci => true,
+        .ask, .yolo, .observe, .trusted => false,
+    };
 }
 
 /// Pack deny at medium+ participates in the decide pack fence.
@@ -1700,6 +1710,20 @@ test "coding DCG create-path decide: normal allow, danger block, unmatched never
         // DCG matrix-only + default allow → allow (packs do not fence chmod).
         try std.testing.expectEqual(exit_codes.success, code);
         try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"allow\"") != null);
+    }
+
+    // 4) Medium pack hit under coding DCG (mode: strict) → block, never ask.
+    {
+        const code, const output = try decideCommandUnderPolicy(
+            policy_path,
+            "{\"command\":\"git branch -D feature\"}",
+            &stdout_buf,
+            &stderr_buf,
+        );
+        try std.testing.expectEqual(exit_codes.denial, code);
+        try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"block\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"ask\"") == null);
+        try std.testing.expect(std.mem.indexOf(u8, output, "core.git:branch-force-delete") != null);
     }
 }
 
