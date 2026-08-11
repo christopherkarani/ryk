@@ -92,7 +92,8 @@ pub const EnsureOutcome = struct {
 /// Policy is always written at the resolved workspace root (D29) — never naively under
 /// a nested process cwd when a parent workspace marker exists.
 ///
-/// D09/D10: missing → generic-agent (ask-on-risk) create; present → never overwrite;
+/// D09/D10: missing → generic-agent coding DCG create (mode strict, matrix-only,
+/// commands.default allow; no ask main loop); present → never overwrite;
 /// unreadable / non-mediating / no-mode → operator-visible residual or core_failed
 /// (never silent-green Ask-on-risk without mode evidence).
 ///
@@ -1566,8 +1567,8 @@ fn ensurePolicyHasOperatorResidual(text: []const u8) bool {
         containsIgnoreCase(text, "core_failed");
 }
 
-// Acceptance (1): Missing policy creates generic-agent / ask-on-risk path used by former start.
-test "EnsurePolicy missing creates generic-agent ask-on-risk path used by former start" {
+// Acceptance (1): Missing policy creates generic-agent coding DCG path used by former start.
+test "EnsurePolicy missing creates generic-agent coding DCG path used by former start" {
     const io = std.testing.io;
     const allocator = std.testing.allocator;
 
@@ -1599,17 +1600,19 @@ test "EnsurePolicy missing creates generic-agent ask-on-risk path used by former
     const policy = try ensureCoreReadPolicy(tmp.dir);
     defer allocator.free(policy);
     try std.testing.expect(policy.len > 0);
-    // Ask-on-risk = policy mode ask (generic-agent preset body).
-    try std.testing.expect(std.mem.indexOf(u8, policy, "mode: ask") != null);
+    // Coding DCG create-path body: mode strict + matrix-only allow default (U1).
+    try std.testing.expect(std.mem.indexOf(u8, policy, "mode: strict") != null);
+    try std.testing.expect(std.mem.indexOf(u8, policy, "mode: ask") == null);
     try std.testing.expect(std.mem.indexOf(u8, policy, "mode: observe") == null);
     try std.testing.expect(std.mem.indexOf(u8, policy, "mode: trusted") == null);
+    try std.testing.expect(std.mem.indexOf(u8, policy, "default: allow") != null);
     // generic-agent shape markers (preset file + init path).
     try std.testing.expect(std.mem.indexOf(u8, policy, "write_mode: staged") != null or
         std.mem.indexOf(u8, policy, "version:") != null);
 }
 
-// Acceptance (1) explicit preset pin — same ask-on-risk body as start --preset generic-agent.
-test "EnsurePolicy explicit generic-agent preset creates mode ask not observe" {
+// Acceptance (1) explicit preset pin — same coding DCG body as start --preset generic-agent.
+test "EnsurePolicy explicit generic-agent preset creates mode strict coding DCG not observe" {
     const io = std.testing.io;
     const allocator = std.testing.allocator;
 
@@ -1634,7 +1637,10 @@ test "EnsurePolicy explicit generic-agent preset creates mode ask not observe" {
 
     const policy = try ensureCoreReadPolicy(tmp.dir);
     defer allocator.free(policy);
-    try std.testing.expect(std.mem.indexOf(u8, policy, "mode: ask") != null);
+    try std.testing.expect(std.mem.indexOf(u8, policy, "mode: strict") != null);
+    try std.testing.expect(std.mem.indexOf(u8, policy, "mode: ask") == null);
+    try std.testing.expect(std.mem.indexOf(u8, policy, "mode: observe") == null);
+    try std.testing.expect(std.mem.indexOf(u8, policy, "default: allow") != null);
 }
 
 // Acceptance (2): Existing policy content unchanged after ensure (hash equal).
@@ -1684,8 +1690,7 @@ test "EnsurePolicy existing policy content hash unchanged after ensure" {
     try std.testing.expectEqualSlices(u8, &hash_before, &hash_after);
     try std.testing.expect(std.mem.indexOf(u8, after, "ensure-policy-hash-marker-c7e1") != null);
     try std.testing.expect(std.mem.indexOf(u8, after, "mode: strict") != null);
-    // Must not rewrite to default ask-on-risk body.
-    try std.testing.expect(std.mem.indexOf(u8, after, "mode: ask") == null);
+    // Must not rewrite existing policy to a different create-path body (hash/marker above).
 }
 
 // Composition: nested cwd re-run keeps root path + hash stable (no project-subdir steal).
@@ -1941,7 +1946,7 @@ test "EnsurePolicy corrupt no-mode policy never claims Ask-on-risk without mode 
     }, &stdout_writer, &stderr_writer);
     defer outcome.deinit(allocator);
 
-    // Never overwrite garbage with default ask-on-risk (D09 leave-alone).
+    // Never overwrite garbage with default coding DCG create body (D09 leave-alone).
     try std.testing.expect(!outcome.policy_created);
     const after = try ensureCoreReadPolicy(tmp.dir);
     defer allocator.free(after);
