@@ -1,15 +1,15 @@
 # Telemetry
 
-Rykan V release builds include lightweight pseudonymous product telemetry so the project can measure product usage and enforcement reliability. Telemetry is enabled by default. Users can opt out at any time. It does not use an account, email address, host identity, or machine identifier, but its random installation identifier is retained locally so repeat usage can be measured:
+Rykan V release builds include lightweight pseudonymous product telemetry so the project can measure product usage and enforcement reliability. Telemetry is **opt-in**: it is disabled until you explicitly enable it, and you can opt back out at any time. It does not use an account, email address, host identity, or machine identifier, but its random installation identifier is retained locally so repeat usage can be measured:
 
 ```sh
 ryk telemetry status
-ryk telemetry disable
 ryk telemetry enable
+ryk telemetry disable
 ryk feedback bug
 ```
 
-There is no first-run prompt. Missing consent state means enabled; malformed or inaccessible state fails closed. `RYK_NO_TELEMETRY=1` disables telemetry for the process and prevents queued events from being sent. Disabling telemetry also clears the local queue and installation identifier.
+There is no first-run prompt. Missing consent state means disabled; malformed or inaccessible state also fails closed to disabled. `RYK_NO_TELEMETRY=1` disables telemetry for the process and prevents queued events from being sent, overriding even an explicit opt-in. Disabling telemetry also clears the local queue and installation identifier.
 
 Disabling affects future collection and removes locally queued data. It cannot recall events already delivered to PostHog; retention or deletion of received events is governed by the PostHog project settings.
 
