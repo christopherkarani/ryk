@@ -22,14 +22,27 @@ type PluginContext = {
   worktree: string;
   client?: {
     tui?: {
-      showToast?: (input: {
-        body: {
-          title?: string;
-          message: string;
-          variant?: 'info' | 'success' | 'warning' | 'error';
-          duration?: number;
-        };
-      }) => Promise<unknown>;
+      /**
+       * OpenCode 1.18+ SDK: flat fields mapped into POST /tui/show-toast body.
+       * Older SDK Options shape: `{ body: { title, message, variant, duration } }`.
+       */
+      showToast?: (
+        input:
+          | {
+              title?: string;
+              message: string;
+              variant?: 'info' | 'success' | 'warning' | 'error';
+              duration?: number;
+            }
+          | {
+              body: {
+                title?: string;
+                message: string;
+                variant?: 'info' | 'success' | 'warning' | 'error';
+                duration?: number;
+              };
+            }
+      ) => Promise<unknown>;
     };
   };
 };
@@ -562,7 +575,7 @@ async function maybeToast(
     }
     return;
   }
-  const body = {
+  const payload = {
     title,
     message: message.slice(0, 280),
     variant,
@@ -570,7 +583,24 @@ async function maybeToast(
   };
   try {
     await Promise.race([
-      Promise.resolve(showToast({ body })).then(() => undefined),
+      (async () => {
+        // Prefer flat args (OpenCode 1.18+ / current SDK client).
+        // Fall back to nested `{ body }` for older plugin clients.
+        try {
+          await showToast(payload);
+        } catch (flatErr: unknown) {
+          try {
+            await showToast({ body: payload });
+          } catch (bodyErr: unknown) {
+            if (process.env.RYK_OPENCODE_TOAST_DEBUG === '1') {
+              const flatMsg = flatErr instanceof Error ? flatErr.message : String(flatErr);
+              const bodyMsg = bodyErr instanceof Error ? bodyErr.message : String(bodyErr);
+              console.error(`[ryk] toast failed (flat): ${flatMsg}`);
+              console.error(`[ryk] toast failed (body): ${bodyMsg}`);
+            }
+          }
+        }
+      })(),
       new Promise<void>((resolve) => {
         setTimeout(resolve, TOAST_TIMEOUT_MS);
       }),
