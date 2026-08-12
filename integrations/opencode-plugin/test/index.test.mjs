@@ -580,6 +580,46 @@ printf '%s\n' '{"decision":"block","message":"command blocked by ryk policy\nRec
   }
 });
 
+test('hard block with RYK_OPENCODE_VERBOSE logs operator Next detail', async () => {
+  const errors = [];
+  const originalError = console.error;
+  const originalVerbose = process.env.RYK_OPENCODE_VERBOSE;
+  console.error = (...args) => {
+    errors.push(args.map(String).join(' '));
+  };
+  process.env.RYK_OPENCODE_VERBOSE = '1';
+  try {
+    await withFakeRyk(
+      async (plugin) => {
+        const before = plugin['tool.execute.before'];
+        assert.ok(before);
+        await assert.rejects(
+          before(
+            { tool: 'bash', sessionID: 'session-1', callID: 'call-1' },
+            { args: { command: 'rm -rf build' } }
+          ),
+          (err) => {
+            assert.ok(err instanceof Error);
+            assert.ok(!err.message.includes('Next:'), 'throw stays short even with VERBOSE');
+            assert.ok(!err.message.includes('allow-once'), 'throw stays short even with VERBOSE');
+            return true;
+          }
+        );
+        const joined = errors.join('\n');
+        assert.match(joined, /\[ryk\] ryk blocked tool execution:/);
+        assert.match(joined, /Next:.*allow-once/, `VERBOSE stderr should include Next, got: ${JSON.stringify(joined)}`);
+      },
+      `#!/bin/sh
+printf '%s\n' '{"decision":"block","message":"command blocked by ryk policy","remediation_commands":["ryk allow-once ABC","ryk explain rm"]}'
+`
+    );
+  } finally {
+    console.error = originalError;
+    if (originalVerbose === undefined) delete process.env.RYK_OPENCODE_VERBOSE;
+    else process.env.RYK_OPENCODE_VERBOSE = originalVerbose;
+  }
+});
+
 test('warn path does not throw and may toast warning', async () => {
   const toasts = [];
   await withFakeRyk(
@@ -949,6 +989,106 @@ printf '%s\\n' '{"product":"ryk","version":"1.2.16"}'
   process.env.PATH = localBin;
   try {
     assert.equal(findRyk(directory), realpathSync(rykBin));
+  } finally {
+    process.env.PATH = originalPath;
+    process.env.HOME = originalHome;
+    if (originalAllow === undefined) delete process.env.RYK_ALLOW_WORKSPACE_BIN;
+    else process.env.RYK_ALLOW_WORKSPACE_BIN = originalAllow;
+    if (originalBin === undefined) delete process.env.RYK_BIN;
+    else process.env.RYK_BIN = originalBin;
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('findRyk accepts managed ~/.ryk/bin under HOME workspace', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'ryk-opencode-ryk-bin-'));
+  const managedBin = join(directory, '.ryk', 'bin');
+  await mkdir(managedBin, { recursive: true });
+  const rykBin = join(managedBin, 'ryk');
+  await writeFile(
+    rykBin,
+    `#!/bin/sh
+printf '%s\\n' '{"product":"ryk","version":"1.2.16"}'
+`,
+    { mode: 0o755 }
+  );
+  const originalPath = process.env.PATH;
+  const originalAllow = process.env.RYK_ALLOW_WORKSPACE_BIN;
+  const originalHome = process.env.HOME;
+  const originalBin = process.env.RYK_BIN;
+  delete process.env.RYK_BIN;
+  delete process.env.RYK_ALLOW_WORKSPACE_BIN;
+  process.env.HOME = directory;
+  process.env.PATH = managedBin;
+  try {
+    assert.equal(findRyk(directory), realpathSync(rykBin));
+  } finally {
+    process.env.PATH = originalPath;
+    process.env.HOME = originalHome;
+    if (originalAllow === undefined) delete process.env.RYK_ALLOW_WORKSPACE_BIN;
+    else process.env.RYK_ALLOW_WORKSPACE_BIN = originalAllow;
+    if (originalBin === undefined) delete process.env.RYK_BIN;
+    else process.env.RYK_BIN = originalBin;
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('findRyk rejects HOME root plant when cwd is HOME', async () => {
+  // Non-managed path under $HOME must stay fail-closed (not a denylist gap).
+  const directory = await mkdtemp(join(tmpdir(), 'ryk-opencode-home-plant-'));
+  const rykBin = join(directory, 'ryk');
+  await writeFile(
+    rykBin,
+    `#!/bin/sh
+printf '%s\\n' '{"product":"ryk","version":"1.2.16"}'
+`,
+    { mode: 0o755 }
+  );
+  const originalPath = process.env.PATH;
+  const originalAllow = process.env.RYK_ALLOW_WORKSPACE_BIN;
+  const originalHome = process.env.HOME;
+  const originalBin = process.env.RYK_BIN;
+  delete process.env.RYK_BIN;
+  delete process.env.RYK_ALLOW_WORKSPACE_BIN;
+  process.env.HOME = directory;
+  process.env.PATH = directory;
+  try {
+    assert.equal(findRyk(directory), null);
+  } finally {
+    process.env.PATH = originalPath;
+    process.env.HOME = originalHome;
+    if (originalAllow === undefined) delete process.env.RYK_ALLOW_WORKSPACE_BIN;
+    else process.env.RYK_ALLOW_WORKSPACE_BIN = originalAllow;
+    if (originalBin === undefined) delete process.env.RYK_BIN;
+    else process.env.RYK_BIN = originalBin;
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('findRyk rejects workspace bin/ryk plant without allow override', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'ryk-opencode-bin-plant-'));
+  const binDir = join(directory, 'bin');
+  await mkdir(binDir, { recursive: true });
+  const rykBin = join(binDir, 'ryk');
+  await writeFile(
+    rykBin,
+    `#!/bin/sh
+printf '%s\\n' '{"product":"ryk","version":"1.2.16"}'
+`,
+    { mode: 0o755 }
+  );
+  const originalPath = process.env.PATH;
+  const originalAllow = process.env.RYK_ALLOW_WORKSPACE_BIN;
+  const originalHome = process.env.HOME;
+  const originalBin = process.env.RYK_BIN;
+  delete process.env.RYK_BIN;
+  delete process.env.RYK_ALLOW_WORKSPACE_BIN;
+  process.env.HOME = join(directory, 'home-isolated');
+  process.env.PATH = binDir;
+  try {
+    assert.equal(findRyk(directory), null);
+    process.env.RYK_BIN = rykBin;
+    assert.equal(findRyk(directory), null, 'absolute workspace plant via RYK_BIN also rejected');
   } finally {
     process.env.PATH = originalPath;
     process.env.HOME = originalHome;

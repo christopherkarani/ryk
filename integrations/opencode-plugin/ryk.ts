@@ -365,31 +365,45 @@ function canonicalPath(path: string): string {
   }
 }
 
+function isWithin(candidate: string, root: string): boolean {
+  const normalizedCandidate = candidate.replaceAll('\\', '/').replace(/\/$/, '');
+  const normalizedRoot = root.replaceAll('\\', '/').replace(/\/$/, '');
+  return normalizedCandidate === normalizedRoot || normalizedCandidate.startsWith(`${normalizedRoot}/`);
+}
+
+/** Product install roots trusted even when OpenCode opens $HOME as the project. */
+function managedInstallRoots(): string[] {
+  const home = process.env.HOME?.trim() || process.env.USERPROFILE?.trim();
+  if (!home) return [];
+  return [
+    canonicalPath(join(home, '.local', 'bin')),
+    canonicalPath(join(home, '.ryk', 'bin')),
+  ];
+}
+
+function isManagedInstallPath(canonical: string): boolean {
+  return managedInstallRoots().some((root) => isWithin(canonical, root));
+}
+
+/**
+ * True when the path must not be attested without RYK_ALLOW_WORKSPACE_BIN=1.
+ * Managed install roots (`~/.local/bin`, `~/.ryk/bin`) stay trusted; everything
+ * else under cwd is treated as an agent-writable plant.
+ */
 function isWorkspaceCandidate(path: string, cwd?: string): boolean {
   if (process.env.RYK_ALLOW_WORKSPACE_BIN === '1') return false;
   const canonical = canonicalPath(path).replaceAll('\\', '/');
-  // Always reject package-manager shims.
   if (canonical.includes('/node_modules/.bin/')) return true;
+  if (isManagedInstallPath(canonical)) return false;
   if (!cwd) return false;
   const workspace = canonicalPath(cwd).replaceAll('\\', '/').replace(/\/$/, '');
-  if (!(canonical === workspace || canonical.startsWith(`${workspace}/`))) return false;
-  // Only reject agent-writable *build* outputs under the workspace.
-  // When OpenCode opens $HOME as the project, ~/.local/bin/ryk is under cwd
-  // but is a product install — must not be treated as a workspace bin.
-  return (
-    canonical.includes('/zig-out/bin/') ||
-    canonical.includes('/target/debug/') ||
-    canonical.includes('/target/release/') ||
-    /\/\.bin\/ryk(?:\.exe)?$/.test(canonical)
-  );
+  return isWithin(canonical, workspace);
 }
 
 /** Well-known product install locations when host PATH is stripped. */
 function wellKnownRykBins(platform: NodeJS.Platform): string[] {
   const exe = platform === 'win32' ? 'ryk.exe' : 'ryk';
-  const out: string[] = [];
-  const home = process.env.HOME?.trim() || process.env.USERPROFILE?.trim();
-  if (home) out.push(join(home, '.local', 'bin', exe));
+  const out: string[] = managedInstallRoots().map((root) => join(root, exe));
   if (platform === 'darwin') {
     out.push(join('/opt/homebrew/bin', exe));
     out.push(join('/usr/local/bin', exe));
@@ -541,7 +555,6 @@ async function maybeToast(
   title: string,
   message: string
 ): Promise<void> {
-  // OpenCode PluginInput.client is the SDK client: client.tui.showToast(...)
   const showToast = ctx.client?.tui?.showToast;
   if (typeof showToast !== 'function') {
     if (process.env.RYK_OPENCODE_TOAST_DEBUG === '1') {
@@ -556,12 +569,8 @@ async function maybeToast(
     duration: variant === 'error' ? 8000 : 5000,
   };
   try {
-    // Prefer body shape (SDK v1). Fall back to flat args if host rejects body.
-    const toastPromise = Promise.resolve(showToast({ body })).catch(() =>
-      Promise.resolve(showToast(body as never))
-    );
     await Promise.race([
-      toastPromise.then(() => undefined),
+      Promise.resolve(showToast({ body })).then(() => undefined),
       new Promise<void>((resolve) => {
         setTimeout(resolve, TOAST_TIMEOUT_MS);
       }),
@@ -575,20 +584,16 @@ async function maybeToast(
   }
 }
 
-/** Best-effort error toast then throw a short single-line Error.
- *
- * OpenCode surfaces console.error into the TUI status line, so default stderr
- * must stay short (same copy as toast / Error.message). Full operator detail
- * (Recourse/Next) is only logged when RYK_OPENCODE_VERBOSE=1.
+/**
+ * Best-effort error toast then throw a short single-line Error.
+ * Default stderr matches toast copy; set RYK_OPENCODE_VERBOSE=1 for operator Next/Recourse.
  */
 async function hardBlockWithToast(
   ctx: PluginContext,
   shortMsg: string,
   operatorDetail?: string
 ): Promise<never> {
-  // Toast first so TUI can paint before throw re-renders the tool row.
   await maybeToast(ctx, 'error', 'ryk blocked', shortMsg);
-  // Keep default stderr short: OpenCode often surfaces console.error in the status line.
   console.error(`[ryk] ${shortMsg}`);
   if (
     operatorDetail &&
@@ -600,11 +605,7 @@ async function hardBlockWithToast(
   throw new Error(shortMsg);
 }
 
-/**
- * Apply a blocking-path decision: warn/pass-through return; hard blocks toast
- * then throw a short Error. Operator Next/Recourse walls stay off the default
- * console path (OpenCode shows console.error to the user).
- */
+/** Apply a blocking-path decision: warn/pass-through return; hard blocks toast then throw. */
 async function applyBlockingDecision(
   response: RykResponse,
   context: string,
