@@ -330,6 +330,11 @@ export function findRyk(cwd?: string, platform: NodeJS.Platform = process.platfo
   const pathBin = resolveOnPath('ryk', platform);
   if (pathBin && attestRykCandidate(pathBin, cwd)) return canonicalPath(pathBin);
 
+  // Product installs (GUI/TUI hosts often strip login PATH).
+  for (const p of wellKnownRykBins(platform)) {
+    if (attestRykCandidate(p, cwd)) return canonicalPath(p);
+  }
+
   // Dev-only: never trust agent-writable workspace bins in production loads.
   if (process.env.RYK_ALLOW_WORKSPACE_BIN === '1') {
     const candidates: string[] = [];
@@ -363,10 +368,36 @@ function canonicalPath(path: string): string {
 function isWorkspaceCandidate(path: string, cwd?: string): boolean {
   if (process.env.RYK_ALLOW_WORKSPACE_BIN === '1') return false;
   const canonical = canonicalPath(path).replaceAll('\\', '/');
+  // Always reject package-manager shims.
   if (canonical.includes('/node_modules/.bin/')) return true;
   if (!cwd) return false;
   const workspace = canonicalPath(cwd).replaceAll('\\', '/').replace(/\/$/, '');
-  return canonical === workspace || canonical.startsWith(`${workspace}/`);
+  if (!(canonical === workspace || canonical.startsWith(`${workspace}/`))) return false;
+  // Only reject agent-writable *build* outputs under the workspace.
+  // When OpenCode opens $HOME as the project, ~/.local/bin/ryk is under cwd
+  // but is a product install — must not be treated as a workspace bin.
+  return (
+    canonical.includes('/zig-out/bin/') ||
+    canonical.includes('/target/debug/') ||
+    canonical.includes('/target/release/') ||
+    /\/\.bin\/ryk(?:\.exe)?$/.test(canonical)
+  );
+}
+
+/** Well-known product install locations when host PATH is stripped. */
+function wellKnownRykBins(platform: NodeJS.Platform): string[] {
+  const exe = platform === 'win32' ? 'ryk.exe' : 'ryk';
+  const out: string[] = [];
+  const home = process.env.HOME?.trim() || process.env.USERPROFILE?.trim();
+  if (home) out.push(join(home, '.local', 'bin', exe));
+  if (platform === 'darwin') {
+    out.push(join('/opt/homebrew/bin', exe));
+    out.push(join('/usr/local/bin', exe));
+  } else if (platform === 'linux') {
+    out.push(join('/usr/local/bin', exe));
+    out.push(join('/usr/bin', exe));
+  }
+  return out;
 }
 
 function attestRykCandidate(path: string, cwd?: string): boolean {
@@ -510,41 +541,69 @@ async function maybeToast(
   title: string,
   message: string
 ): Promise<void> {
+  // OpenCode PluginInput.client is the SDK client: client.tui.showToast(...)
   const showToast = ctx.client?.tui?.showToast;
-  if (!showToast) return;
+  if (typeof showToast !== 'function') {
+    if (process.env.RYK_OPENCODE_TOAST_DEBUG === '1') {
+      console.error('[ryk] toast unavailable: client.tui.showToast missing');
+    }
+    return;
+  }
+  const body = {
+    title,
+    message: message.slice(0, 280),
+    variant,
+    duration: variant === 'error' ? 8000 : 5000,
+  };
   try {
+    // Prefer body shape (SDK v1). Fall back to flat args if host rejects body.
+    const toastPromise = Promise.resolve(showToast({ body })).catch(() =>
+      Promise.resolve(showToast(body as never))
+    );
     await Promise.race([
-      showToast({
-        body: {
-          title,
-          message: message.slice(0, 280),
-          variant,
-          duration: variant === 'error' ? 8000 : 5000,
-        },
-      }),
+      toastPromise.then(() => undefined),
       new Promise<void>((resolve) => {
         setTimeout(resolve, TOAST_TIMEOUT_MS);
       }),
     ]);
-  } catch {
+  } catch (err: unknown) {
     // Host toast is best-effort; never fail open on UI (block path still throws).
+    if (process.env.RYK_OPENCODE_TOAST_DEBUG === '1') {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[ryk] toast failed: ${msg}`);
+    }
   }
 }
 
-/** Best-effort error toast then throw a short single-line Error. */
+/** Best-effort error toast then throw a short single-line Error.
+ *
+ * OpenCode surfaces console.error into the TUI status line, so default stderr
+ * must stay short (same copy as toast / Error.message). Full operator detail
+ * (Recourse/Next) is only logged when RYK_OPENCODE_VERBOSE=1.
+ */
 async function hardBlockWithToast(
   ctx: PluginContext,
   shortMsg: string,
   operatorDetail?: string
 ): Promise<never> {
-  console.error(`[ryk] ${operatorDetail ?? shortMsg}`);
+  // Toast first so TUI can paint before throw re-renders the tool row.
   await maybeToast(ctx, 'error', 'ryk blocked', shortMsg);
+  // Keep default stderr short: OpenCode often surfaces console.error in the status line.
+  console.error(`[ryk] ${shortMsg}`);
+  if (
+    operatorDetail &&
+    operatorDetail !== shortMsg &&
+    process.env.RYK_OPENCODE_VERBOSE === '1'
+  ) {
+    console.error(`[ryk] ${operatorDetail}`);
+  }
   throw new Error(shortMsg);
 }
 
 /**
  * Apply a blocking-path decision: warn/pass-through return; hard blocks toast
- * then throw a short Error. Full operator detail goes to stderr only.
+ * then throw a short Error. Operator Next/Recourse walls stay off the default
+ * console path (OpenCode shows console.error to the user).
  */
 async function applyBlockingDecision(
   response: RykResponse,

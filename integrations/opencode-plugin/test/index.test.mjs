@@ -549,7 +549,7 @@ printf '%s\\n' '{"decision":"block","message":"command blocked"}'
   );
 });
 
-test('hard block logs full operator detail to console.error', async () => {
+test('hard block logs short message to console.error by default', async () => {
   const errors = [];
   const originalError = console.error;
   console.error = (...args) => {
@@ -567,10 +567,12 @@ test('hard block logs full operator detail to console.error', async () => {
           )
         );
         const joined = errors.join('\n');
-        assert.match(joined, /Recourse:|Next:|allow-once|command blocked by ryk/);
+        assert.match(joined, /\[ryk\] ryk blocked tool execution:/);
+        assert.ok(!joined.includes('Next:'), `default stderr must stay short, got: ${JSON.stringify(joined)}`);
+        assert.ok(!joined.includes('Recourse:'), `default stderr must stay short, got: ${JSON.stringify(joined)}`);
       },
       `#!/bin/sh
-printf '%s\\n' '{"decision":"block","message":"command blocked by ryk policy\\nRecourse: operator can run ryk allow-once ABC","remediation_commands":["ryk allow-once ABC"]}'
+printf '%s\n' '{"decision":"block","message":"command blocked by ryk policy\nRecourse: operator can run ryk allow-once ABC","remediation_commands":["ryk allow-once ABC"]}'
 `
     );
   } finally {
@@ -677,7 +679,9 @@ test('missing binary hard-block toasts error and throws short message', async ()
   const originalPath = process.env.PATH;
   const originalAllow = process.env.RYK_ALLOW_WORKSPACE_BIN;
   const originalRykBin = process.env.RYK_BIN;
+  const originalHome = process.env.HOME;
   process.env.PATH = directory;
+  process.env.HOME = directory; // isolate well-known ~/.local/bin lookup
   delete process.env.RYK_ALLOW_WORKSPACE_BIN;
   delete process.env.RYK_BIN;
   const toasts = [];
@@ -709,6 +713,7 @@ test('missing binary hard-block toasts error and throws short message', async ()
     assert.equal(toasts[0]?.body?.variant, 'error');
   } finally {
     process.env.PATH = originalPath;
+    process.env.HOME = originalHome;
     if (originalAllow === undefined) delete process.env.RYK_ALLOW_WORKSPACE_BIN;
     else process.env.RYK_ALLOW_WORKSPACE_BIN = originalAllow;
     if (originalRykBin === undefined) delete process.env.RYK_BIN;
@@ -740,8 +745,10 @@ test('missing binary registers fail-closed veto hooks', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'ryk-opencode-plugin-'));
   const originalPath = process.env.PATH;
   const originalAllow = process.env.RYK_ALLOW_WORKSPACE_BIN;
-  // Empty PATH so `which ryk` fails; no workspace candidates without env gate.
+  const originalHome = process.env.HOME;
+  // Empty PATH + isolated HOME so well-known install lookup also fails.
   process.env.PATH = directory;
+  process.env.HOME = directory;
   delete process.env.RYK_ALLOW_WORKSPACE_BIN;
   try {
     const plugin = await rykPlugin({ directory, worktree: directory });
@@ -763,6 +770,7 @@ test('missing binary registers fail-closed veto hooks', async () => {
     assert.equal(output.status, 'deny');
   } finally {
     process.env.PATH = originalPath;
+    process.env.HOME = originalHome;
     if (originalAllow === undefined) delete process.env.RYK_ALLOW_WORKSPACE_BIN;
     else process.env.RYK_ALLOW_WORKSPACE_BIN = originalAllow;
     await rm(directory, { recursive: true, force: true });
@@ -917,21 +925,59 @@ test('findRyk does not shell-interpolate metacharacters in bare RYK_BIN', () => 
   }
 });
 
+
+test('findRyk accepts product install under HOME workspace', async () => {
+  // OpenCode often opens $HOME as the project; ~/.local/bin/ryk must still win.
+  const directory = await mkdtemp(join(tmpdir(), 'ryk-opencode-home-ws-'));
+  const localBin = join(directory, '.local', 'bin');
+  await mkdir(localBin, { recursive: true });
+  const rykBin = join(localBin, 'ryk');
+  await writeFile(
+    rykBin,
+    `#!/bin/sh
+printf '%s\\n' '{"product":"ryk","version":"1.2.16"}'
+`,
+    { mode: 0o755 }
+  );
+  const originalPath = process.env.PATH;
+  const originalAllow = process.env.RYK_ALLOW_WORKSPACE_BIN;
+  const originalHome = process.env.HOME;
+  const originalBin = process.env.RYK_BIN;
+  delete process.env.RYK_BIN;
+  delete process.env.RYK_ALLOW_WORKSPACE_BIN;
+  process.env.HOME = directory;
+  process.env.PATH = localBin;
+  try {
+    assert.equal(findRyk(directory), realpathSync(rykBin));
+  } finally {
+    process.env.PATH = originalPath;
+    process.env.HOME = originalHome;
+    if (originalAllow === undefined) delete process.env.RYK_ALLOW_WORKSPACE_BIN;
+    else process.env.RYK_ALLOW_WORKSPACE_BIN = originalAllow;
+    if (originalBin === undefined) delete process.env.RYK_BIN;
+    else process.env.RYK_BIN = originalBin;
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test('findRyk ignores workspace zig-out without RYK_ALLOW_WORKSPACE_BIN', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'ryk-opencode-plugin-'));
   const zigOutBin = join(directory, 'zig-out', 'bin');
   const rykBin = join(zigOutBin, 'ryk');
   const originalPath = process.env.PATH;
   const originalAllow = process.env.RYK_ALLOW_WORKSPACE_BIN;
+  const originalHome = process.env.HOME;
   await mkdir(zigOutBin, { recursive: true });
   await writeFile(rykBin, '#!/bin/sh\nif [ "$1" = version ] && [ "$2" = --json ]; then printf \'%s\\n\' \'{"product":"ryk","version":"0.0.0"}\'; else echo ok; fi\n');
   await chmod(rykBin, 0o755);
   process.env.PATH = directory; // no ryk on PATH
+  process.env.HOME = directory; // isolate well-known install lookup
   delete process.env.RYK_ALLOW_WORKSPACE_BIN;
   try {
     assert.equal(findRyk(directory), null);
   } finally {
     process.env.PATH = originalPath;
+    process.env.HOME = originalHome;
     if (originalAllow === undefined) delete process.env.RYK_ALLOW_WORKSPACE_BIN;
     else process.env.RYK_ALLOW_WORKSPACE_BIN = originalAllow;
     await rm(directory, { recursive: true, force: true });
@@ -945,6 +991,7 @@ test('findRyk accepts workspace zig-out when RYK_ALLOW_WORKSPACE_BIN=1', async (
   const rykBin = join(zigOutBin, 'ryk');
   const originalPath = process.env.PATH;
   const originalAllow = process.env.RYK_ALLOW_WORKSPACE_BIN;
+  const originalHome = process.env.HOME;
   const prevRyk = process.env.RYK_BIN;
   await mkdir(zigOutBin, { recursive: true });
   await writeFile(
@@ -954,13 +1001,15 @@ test('findRyk accepts workspace zig-out when RYK_ALLOW_WORKSPACE_BIN=1', async (
       'else\n  echo ok\nfi\n'
   );
   await chmod(rykBin, 0o755);
-  process.env.PATH = directory; // no ryk on PATH
+  process.env.PATH = directory;
+  process.env.HOME = directory; // no ryk on PATH
   process.env.RYK_ALLOW_WORKSPACE_BIN = '1';
   delete process.env.RYK_BIN;
   try {
     assert.equal(findRyk(directory), realpathSync(rykBin));
   } finally {
     process.env.PATH = originalPath;
+    process.env.HOME = originalHome;
     if (originalAllow === undefined) delete process.env.RYK_ALLOW_WORKSPACE_BIN;
     else process.env.RYK_ALLOW_WORKSPACE_BIN = originalAllow;
     if (prevRyk === undefined) delete process.env.RYK_BIN;
