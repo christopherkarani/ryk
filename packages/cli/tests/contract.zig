@@ -2,7 +2,7 @@ const std = @import("std");
 const ryk_cli = @import("ryk_cli");
 
 test "cli package exposes existing command surface without becoming edge" {
-    try std.testing.expectEqualStrings("23-product-split-cli-contract", ryk_cli.phase);
+    try std.testing.expect(!@hasDecl(ryk_cli, "phase"));
     try std.testing.expect(ryk_cli.cli.help.findCommand("run") != null);
     try std.testing.expect(ryk_cli.cli.help.findCommand("doctor") != null);
     try std.testing.expect(ryk_cli.cli.help.findCommand("redteam") != null);

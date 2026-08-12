@@ -8,5 +8,3 @@ pub const resources = @import("resources.zig");
 pub const prompts = @import("prompts.zig");
 pub const sampling = @import("sampling.zig");
 pub const manifests = @import("manifests.zig");
-
-pub const phase = "17-advanced-mcp-and-manifests";
