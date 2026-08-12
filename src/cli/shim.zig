@@ -78,7 +78,10 @@ fn execWithEnv(io: std.Io, allocator: std.mem.Allocator, command_argv: []const [
                 .ci_may_proceed = false,
             };
             // Deny still wins when in-sandbox audit cannot open (control write-deny).
-            var untrusted_audit = openShimAuditBestEffort(io, allocator, workspace_root, session_id, stderr, env_map) catch return exit_codes.general;
+            var untrusted_audit = openShimAuditBestEffort(io, allocator, workspace_root, session_id, stderr, env_map) catch |audit_err| switch (audit_err) {
+                error.ShimAuditTampered => return exit_codes.denial,
+                error.ShimAuditOpenFailed => return exit_codes.general,
+            };
             if (untrusted_audit) |*writer| {
                 defer writer.deinit();
                 try appendCommandEvent(io, writer, session_id, .command_attempt, display, null);
@@ -141,7 +144,10 @@ fn execWithEnv(io: std.Io, allocator: std.mem.Allocator, command_argv: []const [
             };
         } else {
             // Deny path: still deny when audit open fails under control write-deny.
-            var deny_audit = openShimAuditBestEffort(io, allocator, workspace_root, session_id, stderr, env_map) catch return exit_codes.general;
+            var deny_audit = openShimAuditBestEffort(io, allocator, workspace_root, session_id, stderr, env_map) catch |audit_err| switch (audit_err) {
+                error.ShimAuditTampered => return exit_codes.denial,
+                error.ShimAuditOpenFailed => return exit_codes.general,
+            };
             if (deny_audit) |*writer| {
                 defer writer.deinit();
                 try appendCommandEvent(io, writer, session_id, .command_attempt, display, null);
@@ -171,8 +177,14 @@ fn execWithEnv(io: std.Io, allocator: std.mem.Allocator, command_argv: []const [
     };
     defer allocator.free(real_binary);
 
-    // Allow path: still resolve + spawn when audit cannot open under control write-deny.
-    var allow_audit = openShimAuditBestEffort(io, allocator, workspace_root, session_id, stderr, env_map) catch return exit_codes.general;
+    // Allow path: resolve + spawn under the known control write-deny residual
+    // (parent reconciles via the gap marker), but fail closed when the open
+    // failure is tamper-shaped — an allowed exec with a silenced audit log must
+    // not run (P1-1).
+    var allow_audit = openShimAuditBestEffort(io, allocator, workspace_root, session_id, stderr, env_map) catch |audit_err| switch (audit_err) {
+        error.ShimAuditTampered => return exit_codes.denial,
+        error.ShimAuditOpenFailed => return exit_codes.general,
+    };
     if (allow_audit) |*writer| {
         defer writer.deinit();
         try appendCommandEvent(io, writer, session_id, .command_attempt, display, null);
@@ -279,13 +291,75 @@ fn shimAuditModeIsDegraded(
     return session != null;
 }
 
+/// Workspace-level gap marker (P1-1): written by the shim when the control
+/// write-deny residual is confirmed by probe. The parent reconciles the marker
+/// into an `audit_degraded` event at session end (`consumeShimAuditGapMarker`).
+/// The marker lives outside `.ryk` because that control root is exactly what the
+/// sandboxed shim cannot write; it is create-only (one per session) and carries
+/// no command payload.
+pub const shim_audit_gap_marker_prefix = ".ryk-shim-audit-gap-";
+
+fn shimAuditGapMarkerPath(allocator: std.mem.Allocator, workspace_root: []const u8, session_id: []const u8) ![]u8 {
+    const name = try std.fmt.allocPrint(allocator, "{s}{s}", .{ shim_audit_gap_marker_prefix, session_id });
+    defer allocator.free(name);
+    return try std.fs.path.join(allocator, &.{ workspace_root, name });
+}
+
+fn dropShimAuditGapMarker(io: std.Io, allocator: std.mem.Allocator, workspace_root: []const u8, session_id: []const u8) void {
+    const path = shimAuditGapMarkerPath(allocator, workspace_root, session_id) catch return;
+    defer allocator.free(path);
+    const file = std.Io.Dir.cwd().createFile(io, path, .{ .exclusive = true }) catch return;
+    defer file.close(io);
+    file.writeStreamingAll(io, "audit_degraded reason=shim_audit_open_control_write_deny_residual\n") catch {};
+}
+
+/// Parent-side reconciliation (P1-1): true when a shim reported the audit gap
+/// for this session. Consumes the marker so repeat checks stay idempotent.
+pub fn consumeShimAuditGapMarker(io: std.Io, allocator: std.mem.Allocator, workspace_root: []const u8, session_id: []const u8) !bool {
+    const path = try shimAuditGapMarkerPath(allocator, workspace_root, session_id);
+    defer allocator.free(path);
+    std.Io.Dir.cwd().deleteFile(io, path) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    return true;
+}
+
+/// Distinguish the by-design control-root write-deny residual (the OS sandbox
+/// denies the child writes to all of `.ryk`) from audit-file tamper (the audit
+/// file is unwritable while the control root stays writable, e.g. chmod 000).
+/// Probe = create + delete a unique sibling file in the session dir:
+/// - probe succeeds → control root writable → the open failure is tamper-shaped;
+/// - probe hits PermissionDenied/AccessDenied → whole control root is
+///   write-denied → the known residual.
+fn probeSessionControlRootWritable(io: std.Io, allocator: std.mem.Allocator, workspace_root: []const u8, session_id: []const u8) !bool {
+    const dir_path = try std.fs.path.join(allocator, &.{ workspace_root, ".ryk", "sessions", session_id });
+    defer allocator.free(dir_path);
+    var suffix_buf: [8]u8 = undefined;
+    const suffix = try core.util.randomHexSuffix(io, &suffix_buf);
+    const probe_name = try std.fmt.allocPrint(allocator, ".audit_probe_{s}", .{suffix});
+    defer allocator.free(probe_name);
+    const probe_path = try std.fs.path.join(allocator, &.{ dir_path, probe_name });
+    defer allocator.free(probe_path);
+    const file = std.Io.Dir.cwd().createFile(io, probe_path, .{ .exclusive = true }) catch |err| switch (err) {
+        error.PermissionDenied, error.AccessDenied => return false,
+        else => return err,
+    };
+    file.close(io);
+    std.Io.Dir.cwd().deleteFile(io, probe_path) catch {};
+    return true;
+}
+
 /// Best-effort session audit open for in-sandbox shims.
 /// - When parent **recorded** audit mode degraded|skip (session file): skip open,
 ///   no stderr (≤1 degraded line is the parent banner; never N× per shimmed cmd).
 /// - Child-only `RYK_SHIM_AUDIT_MODE` is ignored when a session id is present.
-/// - On control write-deny residuals without parent flag: warn on stderr and
-///   return null (allow continues; deny still denies). Residual spam path when
-///   parent did not mark attach.
+/// - On control write-deny residuals without parent flag: warn on stderr, drop
+///   the workspace gap marker for parent reconciliation, and return null
+///   (allow continues; deny still denies).
+/// - Tamper-shaped failure (audit file unwritable while the control root is
+///   writable): returns `error.ShimAuditTampered` so callers fail closed —
+///   an allowed exec with a silenced audit log must not run.
 /// - On other open failures: message printed; returns `error.ShimAuditOpenFailed`
 ///   so callers map to general exit (not silent swallow of OOM/corruption).
 /// Do **not** “fix” by making `.ryk` agent-writable.
@@ -296,14 +370,28 @@ fn openShimAuditBestEffort(
     session_id: []const u8,
     stderr: anytype,
     env_map: *const std.process.Environ.Map,
-) error{ShimAuditOpenFailed}!?core_api.AuditWriter {
+) error{ ShimAuditOpenFailed, ShimAuditTampered }!?core_api.AuditWriter {
     if (shimAuditModeIsDegraded(io, allocator, workspace_root, session_id, env_map)) return null;
     return core_api.openAuditWriter(io, allocator, workspace_root, session_id) catch |open_err| {
         if (isControlWriteDenyAuditError(open_err)) {
+            const control_root_writable = probeSessionControlRootWritable(io, allocator, workspace_root, session_id) catch |probe_err| {
+                // Probe itself failed oddly (disk full, vanished dir, …): the
+                // state is ambiguous — fail closed rather than guess residual.
+                stderr.print("ryk shim exec: audit append probe failed ({s}); refusing unaudited exec.\n", .{@errorName(probe_err)}) catch {};
+                return error.ShimAuditTampered;
+            };
+            if (control_root_writable) {
+                stderr.print(
+                    "ryk shim exec: session audit log not writable while the control root is writable (tamper-shaped, e.g. chmod); refusing unaudited exec.\n",
+                    .{},
+                ) catch {};
+                return error.ShimAuditTampered;
+            }
             stderr.print(
                 "ryk shim exec: audit append skipped (control write-deny residual: {s}); continuing without in-shim audit.\n",
                 .{@errorName(open_err)},
             ) catch {};
+            dropShimAuditGapMarker(io, allocator, workspace_root, session_id);
             return null;
         }
         stderr.print("ryk shim exec: failed to open audit log: {s}\n", .{@errorName(open_err)}) catch {};
@@ -897,7 +985,7 @@ test "shim ignores child RYK_MODE softening when session mode is strict" {
     try std.testing.expectEqual(exit_codes.denial, code);
 }
 
-test "shim allow continues when audit open is control write-deny" {
+test "shim allow continues under genuine control-root write-deny residual and drops gap marker" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     var fx = try prepareShimExecFixture(.{
         .mode = "observe",
@@ -906,8 +994,10 @@ test "shim allow continues when audit open is control write-deny" {
     });
     defer fx.deinit();
 
-    // Simulate Seatbelt control write-deny: session audit is no longer writable.
-    try makeSessionAuditNotWritable(fx.root, fx.session_id);
+    // Faithful Seatbelt residual: reads work, the whole control root rejects
+    // writes — the audit open AND the probe create both deny.
+    try makeSessionControlRootWriteDenied(fx.root, fx.session_id);
+    defer restoreSessionDirWritable(fx.root, fx.session_id) catch {};
 
     var stderr_buf: [2048]u8 = undefined;
     var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
@@ -915,6 +1005,49 @@ test "shim allow continues when audit open is control write-deny" {
     try std.testing.expectEqual(exit_codes.success, code);
     try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "control write-deny") != null);
     try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "failed to open audit log") == null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "tamper-shaped") == null);
+
+    // The workspace gap marker lets the parent reconcile the gap at session end.
+    try std.testing.expect(try consumeShimAuditGapMarker(std.testing.io, std.testing.allocator, fx.root, fx.session_id));
+    // Consumed: idempotent, one marker per session.
+    try std.testing.expect(!(try consumeShimAuditGapMarker(std.testing.io, std.testing.allocator, fx.root, fx.session_id)));
+}
+
+test "shim allow fails closed when audit open failure is tamper-shaped" {
+    // P1-1: chmod-style audit tamper (file unwritable while the control root
+    // stays writable) must not run an allowed exec with a silenced audit log.
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var fx = try prepareShimExecFixture(.{
+        .mode = "observe",
+        .real_bin = "true",
+        .shim_bin = "true",
+    });
+    defer fx.deinit();
+
+    try makeSessionAuditNotWritable(fx.root, fx.session_id);
+
+    var stderr_buf: [2048]u8 = undefined;
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+    const code = try execWithEnv(std.testing.io, std.testing.allocator, &.{"true"}, &fx.env_map, &stderr_writer, shell_eval.mockDaemonAllowEvaluator);
+    try std.testing.expectEqual(exit_codes.denial, code);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "tamper-shaped") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "control write-deny") == null);
+    // No gap marker: nothing executed, so there is no evidence gap to reconcile.
+    try std.testing.expect(!(try consumeShimAuditGapMarker(std.testing.io, std.testing.allocator, fx.root, fx.session_id)));
+}
+
+test "shim audit probe distinguishes tamper from control-root write-deny" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var fx = try prepareShimExecFixture(.{});
+    defer fx.deinit();
+
+    // Writable control root: probe succeeds (tamper-shaped when audit open fails).
+    try std.testing.expect(try probeSessionControlRootWritable(std.testing.io, std.testing.allocator, fx.root, fx.session_id));
+
+    // Whole control root write-denied: probe fails like the audit open did.
+    try makeSessionControlRootWriteDenied(fx.root, fx.session_id);
+    defer restoreSessionDirWritable(fx.root, fx.session_id) catch {};
+    try std.testing.expect(!(try probeSessionControlRootWritable(std.testing.io, std.testing.allocator, fx.root, fx.session_id)));
 }
 
 test "shim allow is silent when parent set RYK_SHIM_AUDIT_MODE=degraded" {
@@ -948,7 +1081,8 @@ test "shim ignores child-only RYK_SHIM_AUDIT_MODE without session file" {
         .shim_bin = "true",
     });
     defer fx.deinit();
-    try makeSessionAuditNotWritable(fx.root, fx.session_id);
+    try makeSessionControlRootWriteDenied(fx.root, fx.session_id);
+    defer restoreSessionDirWritable(fx.root, fx.session_id) catch {};
     try fx.env_map.put(shim_audit_mode_env, "degraded"); // child-only, no session file
 
     var stderr_buf: [2048]u8 = undefined;
@@ -1000,7 +1134,8 @@ test "shim deny still denies when audit open is control write-deny" {
     });
     defer fx.deinit();
 
-    try makeSessionAuditNotWritable(fx.root, fx.session_id);
+    try makeSessionControlRootWriteDenied(fx.root, fx.session_id);
+    defer restoreSessionDirWritable(fx.root, fx.session_id) catch {};
 
     var stderr_buf: [2048]u8 = undefined;
     var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
@@ -1020,6 +1155,9 @@ test "shim deny still denies when audit open is control write-deny" {
 }
 
 test "isControlWriteDenyAuditError classifies access residuals only" {
+    // P1-1: this classifier is now only the first stage. PermissionDenied /
+    // AccessDenied on audit open routes to the control-root probe; the probe
+    // decides residual (warn + gap marker) vs tamper-shaped (fail-closed deny).
     try std.testing.expect(isControlWriteDenyAuditError(error.PermissionDenied));
     try std.testing.expect(isControlWriteDenyAuditError(error.AccessDenied));
     try std.testing.expect(!isControlWriteDenyAuditError(error.FileNotFound));
@@ -1271,7 +1409,8 @@ fn readSessionEvents(allocator: std.mem.Allocator, root: []const u8, session_id:
 }
 
 /// Drop write bits on the session events file so openExisting (O_RDWR) fails with
-/// AccessDenied/PermissionDenied — same residual class as Seatbelt control write-deny.
+/// AccessDenied/PermissionDenied — the *tamper* shape (file unwritable while the
+/// control root stays writable), not the Seatbelt residual.
 fn makeSessionAuditNotWritable(root: []const u8, session_id: []const u8) !void {
     const events_path = try std.fs.path.join(std.testing.allocator, &.{ root, ".ryk", "sessions", session_id, "events.jsonl" });
     defer std.testing.allocator.free(events_path);
@@ -1279,6 +1418,34 @@ fn makeSessionAuditNotWritable(root: []const u8, session_id: []const u8) !void {
         std.testing.io,
         events_path,
         std.Io.File.Permissions.fromMode(0o444),
+        .{},
+    );
+}
+
+/// Faithful Seatbelt control write-deny residual: reads still work, but the
+/// whole control root rejects writes — the audit open AND the sibling probe
+/// create both fail with PermissionDenied/AccessDenied. Call
+/// `restoreSessionDirWritable` before fixture cleanup (tmp cleanup needs a
+/// writable dir).
+fn makeSessionControlRootWriteDenied(root: []const u8, session_id: []const u8) !void {
+    try makeSessionAuditNotWritable(root, session_id);
+    const dir_path = try std.fs.path.join(std.testing.allocator, &.{ root, ".ryk", "sessions", session_id });
+    defer std.testing.allocator.free(dir_path);
+    try std.Io.Dir.cwd().setFilePermissions(
+        std.testing.io,
+        dir_path,
+        std.Io.File.Permissions.fromMode(0o555),
+        .{},
+    );
+}
+
+fn restoreSessionDirWritable(root: []const u8, session_id: []const u8) !void {
+    const dir_path = try std.fs.path.join(std.testing.allocator, &.{ root, ".ryk", "sessions", session_id });
+    defer std.testing.allocator.free(dir_path);
+    try std.Io.Dir.cwd().setFilePermissions(
+        std.testing.io,
+        dir_path,
+        std.Io.File.Permissions.fromMode(0o755),
         .{},
     );
 }

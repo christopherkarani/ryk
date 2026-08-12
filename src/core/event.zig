@@ -57,6 +57,10 @@ pub const EventType = enum {
     phantom_denied,
     user_approval,
     user_denial,
+    /// The evidence plane itself degraded (e.g. in-shim audit dark under the
+    /// control-root write-deny residual). Emitted by the parent at session end;
+    /// never carries command payloads — reason codes only.
+    audit_degraded,
 
     pub fn toString(self: EventType) []const u8 {
         return switch (self) {

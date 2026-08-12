@@ -243,6 +243,7 @@ pub const EventType = enum {
     phantom_denied,
     user_approval,
     user_denial,
+    audit_degraded,
 };
 
 pub const DecisionInput = struct {
@@ -576,6 +577,7 @@ fn toCoreEventType(value: EventType) core_mod.event.EventType {
         .phantom_denied => .phantom_denied,
         .user_approval => .user_approval,
         .user_denial => .user_denial,
+        .audit_degraded => .audit_degraded,
     };
 }
 
@@ -625,6 +627,7 @@ pub fn fromCoreEventType(value: core_mod.event.EventType) EventType {
         .phantom_denied => .phantom_denied,
         .user_approval => .user_approval,
         .user_denial => .user_denial,
+        .audit_degraded => .audit_degraded,
     };
 }
 
