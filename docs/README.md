@@ -37,8 +37,8 @@ The docs describe the current CLI and its limits. When a platform detail matters
 
 ## Examples and contribution
 
-- [Agent recipes](agent-recipes.md)
-- [Contributing fixtures](contributing-fixtures.md)
+- [Launch path](quickstart.md)
+- [Fixture layout](../fixtures/README.md)
 - [Example projects](../examples/README.md)
 - [Script reference](../scripts/README.md)
 - [Release process](dev/release.md)
