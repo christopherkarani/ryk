@@ -7,7 +7,9 @@
 //! Invariants:
 //! - Interactive TTY with no args still shows help (not hook mode).
 //! - Shell commands route through the Zig shell_engine by default (fail-closed when unavailable).
-//! - Invalid / non-shell hook input fails open (exit 0, allow) matching Rust hook mode.
+//! - Invalid hook input fails closed: malformed/oversized/unknown-format payloads emit
+//!   dual-contract deny JSON on stdout and exit 2 (the Cursor/Claude hook block code).
+//!   Recognized non-shell tool hooks (Read/Edit/…) still pass through with empty stdout.
 
 const std = @import("std");
 const build_options = @import("build_options");
@@ -21,6 +23,12 @@ const core_api = @import("ryk_core").api;
 const policy = @import("ryk_core").policy;
 
 const max_payload_len = 256 * 1024;
+
+/// Host hook block exit code (Cursor beforeShellExecution and Claude-compatible
+/// PreToolUse both treat exit 2 as "block", independent of stdout JSON). Distinct
+/// from `exit_codes.denial` (3), which is the CLI-facing contract and would be
+/// fail-open on a host hook boundary.
+pub const fail_closed_deny_exit_code: u8 = 2;
 
 pub const InputFormat = enum {
     agent_hook,
@@ -53,8 +61,15 @@ pub fn commandWithEvaluator(
     defer _ = gpa_state.deinit();
     const allocator = gpa_state.allocator();
 
-    const payload = readBoundedStdin(io, allocator, max_payload_len) catch {
-        return exit_codes.success;
+    const payload = readBoundedStdin(io, allocator, max_payload_len) catch |err| {
+        // Unreadable or oversized payload: no evaluation happened, so the only
+        // honest answer on a shell-gating boundary is deny (fail closed).
+        const reason = if (err == error.PayloadTooLarge)
+            "ryk: hook payload exceeded size limit; denied fail-closed"
+        else
+            "ryk: failed to read hook payload; denied fail-closed";
+        try writeFailClosedDeny(stdout, reason);
+        return fail_closed_deny_exit_code;
     };
     defer allocator.free(payload);
 
@@ -163,14 +178,30 @@ pub fn evaluatePayloadWithModeOpts(
     }
 
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, payload, .{}) catch {
-        return exit_codes.success;
+        try writeFailClosedDeny(stdout, "ryk: hook payload was not valid JSON; denied fail-closed");
+        return fail_closed_deny_exit_code;
     };
     defer parsed.deinit();
 
-    const format = detectInputFormat(parsed.value) orelse return exit_codes.success;
-    const command_text = extractCommand(parsed.value, format) orelse return exit_codes.success;
+    const format = detectInputFormat(parsed.value) orelse {
+        try writeFailClosedDeny(stdout, "ryk: unrecognized hook payload format; denied fail-closed");
+        return fail_closed_deny_exit_code;
+    };
+    const command_text = extractCommand(parsed.value, format) orelse {
+        // Recognized agent-hook payloads for non-shell tools (Read/Edit/…) carry
+        // no command and pass through; everything else without a command is an
+        // anomalous shell-gating payload and fails closed.
+        if (format == .agent_hook and parsed.value == .object and
+            !isShellHookCandidate(parsed.value.object))
+        {
+            return exit_codes.success;
+        }
+        try writeFailClosedDeny(stdout, "ryk: shell hook payload missing command; denied fail-closed");
+        return fail_closed_deny_exit_code;
+    };
     if (std.mem.trim(u8, command_text, " \t\r\n").len == 0) {
-        return exit_codes.success;
+        try writeFailClosedDeny(stdout, "ryk: shell hook payload missing command; denied fail-closed");
+        return fail_closed_deny_exit_code;
     }
 
     const cwd = extractCwd(parsed.value, format);
@@ -350,6 +381,25 @@ fn writeDeny(stdout: anytype, format: InputFormat, reason: []const u8) !void {
         .agent_hook => try writeAgentPermission(stdout, "deny", reason),
         .cursor_shell => try writeCursorDenial(stdout, reason),
     }
+}
+
+/// Fail-closed deny for payloads that cannot be format-classified (malformed,
+/// oversized, unknown shape). Emits both host contracts in one object: Cursor's
+/// flat `permission` shape and the Claude-compatible nested `hookSpecificOutput`
+/// shape, so either host reads a deny. Reason strings are static — never echo
+/// payload bytes into host-visible output.
+fn writeFailClosedDeny(stdout: anytype, reason: []const u8) !void {
+    try stdout.writeAll("{\"permission\":\"deny\",\"continue\":false,\"userMessage\":");
+    try writeJsonString(stdout, reason);
+    try stdout.writeAll(",\"agentMessage\":");
+    try writeJsonString(stdout, reason);
+    try stdout.writeAll(",\"user_message\":");
+    try writeJsonString(stdout, reason);
+    try stdout.writeAll(",\"agent_message\":");
+    try writeJsonString(stdout, reason);
+    try stdout.writeAll(",\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":");
+    try writeJsonString(stdout, reason);
+    try stdout.writeAll("}}\n");
 }
 
 fn writeAgentPermission(stdout: anytype, decision: []const u8, reason: []const u8) !void {
@@ -544,12 +594,56 @@ test "evaluatePayload fails closed on daemon evaluate failures" {
     }
 }
 
-test "evaluatePayload invalid JSON fails open with no stdout" {
+test "evaluatePayload invalid JSON fails closed with dual-contract deny" {
     const allocator = std.testing.allocator;
-    var stdout_buf: [256]u8 = undefined;
+    var stdout_buf: [2048]u8 = undefined;
     var stdout: std.Io.Writer = .fixed(&stdout_buf);
 
     const code = try evaluatePayload(allocator, "not-json", &stdout, shell_eval.mockDaemonDenyEvaluator);
+    try std.testing.expectEqual(fail_closed_deny_exit_code, code);
+    const out = stdout.buffered();
+    // Both host contracts present: Cursor flat shape + Claude nested shape.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"permission\":\"deny\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"permissionDecision\":\"deny\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"continue\":false") != null);
+    // The deny payload itself must be valid JSON a host can parse.
+    var reparsed = try std.json.parseFromSlice(std.json.Value, allocator, std.mem.trim(u8, out, "\n"), .{});
+    defer reparsed.deinit();
+    try std.testing.expect(reparsed.value == .object);
+}
+
+test "evaluatePayload unknown-format and command-less shell payloads fail closed" {
+    const allocator = std.testing.allocator;
+
+    const deny_cases = [_][]const u8{
+        // Valid JSON but neither cursor_shell nor agent_hook shape.
+        "{\"version\":1}",
+        // Cursor shell shape without a command.
+        "{\"cwd\":\"/tmp\"}",
+        // Cursor shell shape with a blank command.
+        "{\"command\":\"   \",\"cwd\":\"/tmp\"}",
+        // Shell tool hook whose command cannot be extracted.
+        "{\"tool_name\":\"Bash\",\"tool_input\":{}}",
+        "{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"  \"}}",
+    };
+    for (deny_cases) |payload| {
+        var stdout_buf: [2048]u8 = undefined;
+        var stdout: std.Io.Writer = .fixed(&stdout_buf);
+        const code = try evaluatePayload(allocator, payload, &stdout, shell_eval.mockDaemonAllowEvaluator);
+        try std.testing.expectEqual(fail_closed_deny_exit_code, code);
+        try std.testing.expect(std.mem.indexOf(u8, stdout.buffered(), "\"permission\":\"deny\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, stdout.buffered(), "\"permissionDecision\":\"deny\"") != null);
+    }
+}
+
+test "evaluatePayload keeps non-shell agent hook pass-through" {
+    // Recognized agent-hook payloads for non-shell tools carry no command and
+    // must not be denied: empty stdout + exit 0 is the allow contract.
+    const allocator = std.testing.allocator;
+    var stdout_buf: [512]u8 = undefined;
+    var stdout: std.Io.Writer = .fixed(&stdout_buf);
+    const payload = "{\"tool_name\":\"Read\",\"tool_input\":{\"file_path\":\"/tmp/x\"}}";
+    const code = try evaluatePayload(allocator, payload, &stdout, shell_eval.mockDaemonAllowEvaluator);
     try std.testing.expectEqual(exit_codes.success, code);
     try std.testing.expectEqual(@as(usize, 0), stdout.buffered().len);
 }

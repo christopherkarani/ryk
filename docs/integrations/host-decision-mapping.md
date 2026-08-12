@@ -38,6 +38,26 @@ Where a host already hardens interactive outcomes:
 | **Claude Code** | `PreToolUse` / `PermissionRequest` | `permissionDecision: allow` | `permissionDecision: deny` | `permissionDecision: ask` (CI→deny) | proceed as allow | Partial | Host-shaped stdout JSON via `hookSpecificOutput` (hook grade; exit 0). See `host-output-mapping.md`. |
 | **Codex** | `PreToolUse` / `PermissionRequest` | allow | deny | host permission / ask shape | warn | Partial | Same pattern as Claude adapter. |
 | **Pi** | tool hooks | allow | deny | host-dependent | warn | Host-dependent | See `ryk-pi` extension docs. |
+| **Cursor** | `beforeShellExecution` (bare `ryk` stdin hook) | `permission: allow` JSON, exit 0 | `permission: deny` JSON, exit 0 | **deny** (no native ask) | log + allow | No | Malformed/oversized/unknown payloads: dual-contract deny JSON + exit 2 (host block code). See below. |
+
+### Cursor bare-hook fail-closed contract
+
+Bare `ryk` with piped stdin is the Cursor `beforeShellExecution` / Claude-compatible
+hook entry. Cursor honors two deny channels: `permission: "deny"` JSON on exit 0,
+and exit code 2 (block regardless of JSON). ryk uses both for defense in depth:
+
+- Evaluated denies (well-formed payloads): deny JSON on stdout, exit 0 — the rich
+  reason text rides the JSON contract.
+- Malformed JSON, oversized payloads, unknown formats, and shell payloads missing
+  a command: dual-contract deny JSON (flat `permission` + nested
+  `hookSpecificOutput`) on stdout **and** exit 2.
+
+Residual (host-side, not ryk-fixable): Cursor's default for hook *crashes*,
+timeouts, and non-0/2 exits is fail-open unless the hook entry sets
+`failClosed: true` in `hooks.json`. ryk's own deny paths never rely on that
+setting, but enabling it is recommended for defense in depth. Recognized
+non-shell tool hooks (e.g. Read/Edit on the Claude-compatible shape) carry no
+command and intentionally pass through with empty stdout + exit 0.
 
 ## Prompt / pre-LLM path matrix
 
