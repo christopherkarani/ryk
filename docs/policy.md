@@ -4,7 +4,14 @@ Policies are YAML files with `version: 1`.
 
 ## Locations And Load Order
 
-Commands accept `--policy <path>`. Without it, ryk discovers `.ryk/policy.yaml` from the workspace, then `$HOME/.config/ryk/policy.yaml`, then built-in defaults. If a discovered policy file exists but is invalid or unreadable, ryk fails closed instead of silently falling through.
+Commands accept `--policy <path>`. Without it, ryk discovers policy in this order:
+
+1. workspace `.ryk/policy.yaml`
+2. `$HOME/.config/ryk/policy.yaml` (user fallback; install/ensure create-only seeds this)
+3. `$HOME/.ryk/policy.yaml` (legacy home-workspace install layout, treated as user fallback when the workspace root is not already `$HOME`)
+4. built-in defaults (`builtin:strict`)
+
+If a discovered policy file exists but is invalid or unreadable, ryk fails closed instead of silently falling through to the next location.
 
 ```sh
 ./zig-out/bin/ryk init --preset generic-agent

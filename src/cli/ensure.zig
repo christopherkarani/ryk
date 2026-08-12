@@ -92,10 +92,8 @@ pub const EnsureOutcome = struct {
 /// Policy is always written at the resolved workspace root (D29) — never naively under
 /// a nested process cwd when a parent workspace marker exists.
 ///
-/// Install door (`from_install`): also create-only seeds `~/.config/ryk/policy.yaml`
-/// (runtime user fallback for projects without local `.ryk/policy.yaml`). Never overwrites.
-/// Without that seed, uninited projects fell through to `builtin:strict` and could block
-/// host launches (`ryk opencode`, etc.).
+/// Install door (`from_install`): create-only seeds `~/.config/ryk/policy.yaml` (user
+/// fallback when a project has no local policy). Never overwrites an existing file.
 ///
 /// D09/D10: missing → generic-agent coding DCG create (mode strict, matrix-only,
 /// commands.default allow; no ask main loop); present → never overwrite;
@@ -140,11 +138,7 @@ pub fn runEnsure(
     if (onboarding.policyExists(io, workspace_root)) {
         // Honesty depth (D10): inspect mode evidence; never claim Ask-on-risk without it.
         const outcome = try leaveAloneWithHonesty(io, allocator, workspace_root, options, stderr);
-        // Install door: also seed the runtime user fallback (~/.config/ryk/policy.yaml)
-        // so project launches do not fall through to builtin:strict.
-        if (options.from_install and outcome.core_ok) {
-            seedUserGlobalPolicyIfMissing(io, allocator, options, stderr);
-        }
+        maybeSeedUserGlobalPolicy(io, allocator, options, stderr, outcome.core_ok);
         return outcome;
     }
 
@@ -179,27 +173,32 @@ pub fn runEnsure(
         // Multi-process race: peer may have won exclusive create. Present policy is leave-alone (D23).
         if (onboarding.policyExists(io, workspace_root)) {
             const outcome = try leaveAloneWithHonesty(io, allocator, workspace_root, options, stderr);
-            if (options.from_install and outcome.core_ok) {
-                seedUserGlobalPolicyIfMissing(io, allocator, options, stderr);
-            }
+            maybeSeedUserGlobalPolicy(io, allocator, options, stderr, outcome.core_ok);
             return outcome;
         }
         return coreFailedOutcome();
     }
 
-    // Install door: seed runtime user fallback so uninited projects get coding DCG,
-    // not builtin:strict permit-list refuse (host launch block).
-    if (options.from_install) {
-        seedUserGlobalPolicyIfMissing(io, allocator, options, stderr);
-    }
-
     // Policy created → auto-wire detected hosts (soft); zero hosts → partial, never full claim.
-    return try coreOkOutcomeWithHosts(io, allocator, workspace_root, options, true, false);
+    const outcome = try coreOkOutcomeWithHosts(io, allocator, workspace_root, options, true, false);
+    maybeSeedUserGlobalPolicy(io, allocator, options, stderr, outcome.core_ok);
+    return outcome;
 }
 
-/// Create-only `~/.config/ryk/policy.yaml` (same path `policy.load.discover` uses as user
-/// fallback). Soft: never fails ensure; never overwrites. Install historically wrote only
-/// `$HOME/.ryk/policy.yaml`, which is invisible when cwd is another project.
+/// Install door only: create-only seed of the runtime user policy fallback.
+fn maybeSeedUserGlobalPolicy(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    options: EnsureOptions,
+    stderr: anytype,
+    core_ok: bool,
+) void {
+    if (options.from_install and core_ok) {
+        seedUserGlobalPolicyIfMissing(io, allocator, options, stderr);
+    }
+}
+
+/// Create-only `~/.config/ryk/policy.yaml` (discover user fallback). Soft; never overwrites.
 fn seedUserGlobalPolicyIfMissing(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -218,11 +217,26 @@ fn seedUserGlobalPolicyIfMissing(
         return;
     };
     defer allocator.free(home);
-    if (home.len == 0 or !std.fs.path.isAbsolute(home)) return;
+    if (home.len == 0 or !std.fs.path.isAbsolute(home)) {
+        if (!options.quiet) {
+            stderr.writeAll("ryk ensure: HOME not absolute; skipped user policy seed\n") catch {};
+        }
+        return;
+    }
 
-    const config_dir = std.fs.path.join(allocator, &.{ home, ".config", "ryk" }) catch return;
+    const config_dir = std.fs.path.join(allocator, &.{ home, ".config", "ryk" }) catch {
+        if (!options.quiet) {
+            stderr.writeAll("ryk ensure: could not join user policy path (OOM); skipped seed\n") catch {};
+        }
+        return;
+    };
     defer allocator.free(config_dir);
-    const user_path = std.fs.path.join(allocator, &.{ config_dir, "policy.yaml" }) catch return;
+    const user_path = std.fs.path.join(allocator, &.{ config_dir, "policy.yaml" }) catch {
+        if (!options.quiet) {
+            stderr.writeAll("ryk ensure: could not join user policy path (OOM); skipped seed\n") catch {};
+        }
+        return;
+    };
     defer allocator.free(user_path);
 
     // Leave alone when present (never overwrite operator policy).
@@ -242,19 +256,52 @@ fn seedUserGlobalPolicyIfMissing(
         },
     };
 
-    const file = std.Io.Dir.cwd().createFile(io, user_path, .{ .exclusive = true }) catch |err| switch (err) {
-        error.PathAlreadyExists => return, // race: peer won
-        else => {
+    // Atomic create-only: temp write + sync + rename so partial bodies never land as
+    // discoverable user policy (fail-closed poison that leave-alone would never repair).
+    var nonce: u64 = undefined;
+    io.random(std.mem.asBytes(&nonce));
+    const temp_path = std.fmt.allocPrint(allocator, "{s}.tmp.{x}", .{ user_path, nonce }) catch {
+        if (!options.quiet) {
+            stderr.writeAll("ryk ensure: could not allocate temp path for user policy seed\n") catch {};
+        }
+        return;
+    };
+    defer allocator.free(temp_path);
+
+    const file = std.Io.Dir.cwd().createFile(io, temp_path, .{ .exclusive = true }) catch |err| {
+        if (!options.quiet) {
+            stderr.print("ryk ensure: could not write {s}: {s}\n", .{ user_path, @errorName(err) }) catch {};
+        }
+        return;
+    };
+    {
+        defer file.close(io);
+        file.writeStreamingAll(io, body) catch |err| {
+            std.Io.Dir.cwd().deleteFile(io, temp_path) catch {};
             if (!options.quiet) {
-                stderr.print("ryk ensure: could not write {s}: {s}\n", .{ user_path, @errorName(err) }) catch {};
+                stderr.print("ryk ensure: failed writing user policy: {s}\n", .{@errorName(err)}) catch {};
             }
             return;
-        },
-    };
-    defer file.close(io);
-    file.writeStreamingAll(io, body) catch |err| {
+        };
+        file.sync(io) catch |err| {
+            std.Io.Dir.cwd().deleteFile(io, temp_path) catch {};
+            if (!options.quiet) {
+                stderr.print("ryk ensure: failed syncing user policy: {s}\n", .{@errorName(err)}) catch {};
+            }
+            return;
+        };
+    }
+
+    // Race: peer finished first — keep their file, drop our temp.
+    if (plugin.fileExistsAbsolute(io, user_path)) {
+        std.Io.Dir.cwd().deleteFile(io, temp_path) catch {};
+        return;
+    }
+
+    std.Io.Dir.renameAbsolute(temp_path, user_path, io) catch |err| {
+        std.Io.Dir.cwd().deleteFile(io, temp_path) catch {};
         if (!options.quiet) {
-            stderr.print("ryk ensure: failed writing user policy: {s}\n", .{@errorName(err)}) catch {};
+            stderr.print("ryk ensure: could not publish user policy {s}: {s}\n", .{ user_path, @errorName(err) }) catch {};
         }
         return;
     };

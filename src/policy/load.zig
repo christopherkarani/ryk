@@ -621,13 +621,10 @@ pub fn discover(
             error.FileNotFound => {},
             else => return err,
         }
-        // Legacy install wrote only $HOME/.ryk/policy.yaml (HOME-as-workspace). When
-        // cwd is another project that file is invisible as workspace policy; treat it
-        // as user fallback before builtin:strict so already-installed machines work.
-        // Prefer .config path above when both exist.
+        // Legacy HOME workspace policy as user fallback; prefer .config when both exist.
         const home_workspace_path = try std.fs.path.join(allocator, &.{ home, ".ryk", "policy.yaml" });
         defer allocator.free(home_workspace_path);
-        // Skip if workspace_root is already HOME (would have matched workspace step).
+        // Skip when workspace_root is already HOME (matched workspace step above).
         if (!std.mem.eql(u8, workspace_path, home_workspace_path)) {
             if (loadFile(io, allocator, home_workspace_path)) |policy| {
                 return loadedPolicyWithPath(allocator, policy, .user, home_workspace_path);
