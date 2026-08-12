@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.2.17] - 2026-08-12
+
+## What's Changed
+* fix(opencode): find product ryk under HOME + short toast path by @christopherkarani in https://github.com/christopherkarani/ryk/pull/125
+* fix(install): seed user policy so agents work after curl install by @christopherkarani in https://github.com/christopherkarani/ryk/pull/126
+
+
+**Full Changelog**: https://github.com/christopherkarani/ryk/compare/v1.2.16...v1.2.17
+
 ## [1.2.16] - 2026-08-11
 
 ## What's Changed
