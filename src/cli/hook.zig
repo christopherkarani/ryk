@@ -1900,7 +1900,50 @@ fn tryIssuePendingShortCode(
         now_iso,
         true,
     ) catch return;
-    issued.deinit(allocator);
+    defer issued.deinit(allocator);
+
+    // The pending store holds only a keyed hash — the plaintext redeem code is
+    // memory-only. Surface it exclusively on the operator's controlling terminal
+    // (/dev/tty), never on the agent-visible hook JSON or stderr (M-1 / P0-2).
+    emitRedeemCodeToOperator(issued.redeem_code);
+}
+
+/// Test seam: captures the operator-facing redeem code instead of writing to
+/// /dev/tty. Production leaves this null. Tests use it to drive the operator
+/// redeem path now that the code is no longer recoverable from the store. The
+/// sink is a fixed test buffer (no allocator) so capture cannot fail or leak.
+var test_operator_redeem_sink: ?*TestRedeemSink = null;
+
+const TestRedeemSink = struct {
+    buf: [64]u8 = undefined,
+    len: usize = 0,
+
+    fn set(self: *TestRedeemSink, value: []const u8) void {
+        const n = @min(value.len, self.buf.len);
+        @memcpy(self.buf[0..n], value[0..n]);
+        self.len = n;
+    }
+
+    fn code(self: *const TestRedeemSink) []const u8 {
+        return self.buf[0..self.len];
+    }
+};
+
+/// Best-effort: print the redeem code on the controlling terminal only. Fails
+/// silently when there is no TTY (unattended / CI) — the code is simply not
+/// shown, and the pending row remains for an operator to inspect via other means.
+fn emitRedeemCodeToOperator(code: []const u8) void {
+    if (test_operator_redeem_sink) |sink| {
+        sink.set(code);
+        return;
+    }
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const io = threaded.io();
+    var tty = std.Io.Dir.cwd().openFile(io, "/dev/tty", .{ .mode = .write_only }) catch return;
+    defer tty.close(io);
+    var buf: [128]u8 = undefined;
+    const line = std.fmt.bufPrint(&buf, "\nryk: allow-once redeem code (operator only): {s}\n", .{code}) catch return;
+    tty.writeStreamingAll(io, line) catch {};
 }
 
 fn hookResponseFromDaemonEvaluate(
@@ -5235,28 +5278,20 @@ fn sOnceCliHookExtractShortCode(blob: []const u8) ?[]const u8 {
     return null;
 }
 
-/// Load the pending short code for a command from the store (operator channel).
+/// Capture the operator-facing redeem code for a command via the /dev/tty test
+/// sink (P0-2: the code is no longer recoverable from the pending store).
 fn sOnceCliHookPendingCodeForCommand(
     allocator: std.mem.Allocator,
     xdg_data: []const u8,
     cmd_text: []const u8,
     now_iso: []const u8,
 ) ![]const u8 {
-    const pending_path = try sOnceCliHookPendingPath(xdg_data);
-    defer allocator.free(pending_path);
-    var loaded = try shell_engine.allow_once.loadPendingActive(
-        std.testing.io,
-        allocator,
-        pending_path,
-        now_iso,
-    );
-    defer loaded.deinit(allocator);
-    for (loaded.list.records) |rec| {
-        if (std.mem.eql(u8, rec.command_raw, cmd_text)) {
-            return try allocator.dupe(u8, rec.short_code);
-        }
-    }
-    return error.TestUnexpectedResult;
+    _ = xdg_data;
+    _ = now_iso;
+    _ = cmd_text;
+    const sink = test_operator_redeem_sink orelse return error.TestUnexpectedResult;
+    if (sink.code().len != 6) return error.TestUnexpectedResult;
+    return try allocator.dupe(u8, sink.code());
 }
 
 fn sOnceCliHookConcatRemediation(allocator: std.mem.Allocator, result: HookResponse) ![]u8 {
@@ -5332,7 +5367,8 @@ test "s-once-cli: hook pack deny issues pending short code when store enabled" {
     try std.testing.expect(std.mem.indexOf(u8, result.message, "Recourse") == null);
     try std.testing.expect(std.mem.indexOf(u8, blob, "<code>") != null);
 
-    // Pending store must still hold a real 6-digit code for this command (operator path).
+    // Pending store must hold a row for this command, but only the keyed hash —
+    // never a redeemable code (P0-2). The plaintext code is memory/TTY-only.
     const pending_path = try sOnceCliHookPendingPath(xdg.data_root);
     defer allocator.free(pending_path);
     var loaded = try shell_engine.allow_once.loadPendingActive(
@@ -5345,20 +5381,13 @@ test "s-once-cli: hook pack deny issues pending short code when store enabled" {
     try std.testing.expect(loaded.list.records.len >= 1);
     var found = false;
     for (loaded.list.records) |rec| {
-        if (std.mem.eql(u8, rec.command_raw, cmd_text) and rec.short_code.len == 6) {
-            var digits_ok = true;
-            for (rec.short_code) |c| {
-                if (c < '0' or c > '9') {
-                    digits_ok = false;
-                    break;
-                }
-            }
-            if (digits_ok) {
-                // And that code must not leak into agent-visible blob.
-                try std.testing.expect(std.mem.indexOf(u8, blob, rec.short_code) == null);
-                found = true;
-                break;
-            }
+        if (std.mem.eql(u8, rec.command_raw, cmd_text)) {
+            // At-rest row carries a 64-hex code_hash, not a 6-digit code.
+            try std.testing.expectEqual(@as(usize, 64), rec.code_hash.len);
+            // The hash must not leak into agent-visible blob either.
+            try std.testing.expect(std.mem.indexOf(u8, blob, rec.code_hash) == null);
+            found = true;
+            break;
         }
     }
     try std.testing.expect(found);
@@ -5378,6 +5407,12 @@ test "s-once-cli: human deny panel redacts allow-once code (operator path only)"
 
     const allocator = std.testing.allocator;
     const cmd_text = "git reset --hard";
+
+    // Capture the operator-facing redeem code (P0-2: not recoverable from store).
+    var sink: TestRedeemSink = .{};
+    test_operator_redeem_sink = &sink;
+    defer test_operator_redeem_sink = null;
+
     var result = try sOnceCliHookRealZigDeny(allocator, cmd_text, ws_root, ws_root);
     defer result.deinit(allocator);
     try std.testing.expectEqual(PluginDecision.block, result.decision);
@@ -5420,6 +5455,12 @@ test "s-once-cli: codex guard deny redacts short code when store enabled" {
 
     const allocator = std.testing.allocator;
     const cmd_text = "git reset --hard";
+
+    // Capture the operator-facing redeem code (P0-2: not recoverable from store).
+    var sink: TestRedeemSink = .{};
+    test_operator_redeem_sink = &sink;
+    defer test_operator_redeem_sink = null;
+
     var result = try sOnceCliHookRealZigDeny(allocator, cmd_text, ws_root, ws_root);
     defer result.deinit(allocator);
     try std.testing.expectEqual(PluginDecision.block, result.decision);
@@ -5477,6 +5518,12 @@ test "hook agent-facing message is short: no Recourse or Next when pending short
 
     const allocator = std.testing.allocator;
     const cmd_text = "git reset --hard";
+
+    // Capture the operator-facing redeem code (P0-2: not recoverable from store).
+    var sink: TestRedeemSink = .{};
+    test_operator_redeem_sink = &sink;
+    defer test_operator_redeem_sink = null;
+
     var result = try sOnceCliHookRealZigDeny(allocator, cmd_text, ws_root, ws_root);
     defer result.deinit(allocator);
 
@@ -5860,6 +5907,11 @@ test "s-once-cli: hook deny → pending code → redeem → evaluate allows once
     const cmd_text = "git reset --hard";
     const now = "2026-07-25T12:00:00Z";
 
+    // Capture the operator-facing redeem code (P0-2: not recoverable from store).
+    var sink: TestRedeemSink = .{};
+    test_operator_redeem_sink = &sink;
+    defer test_operator_redeem_sink = null;
+
     var deny = try sOnceCliHookRealZigDeny(allocator, cmd_text, ws_root, ws_root);
     defer deny.deinit(allocator);
     try std.testing.expectEqual(PluginDecision.block, deny.decision);
@@ -5873,11 +5925,10 @@ test "s-once-cli: hook deny → pending code → redeem → evaluate allows once
     try std.testing.expectEqual(@as(usize, 6), code.len);
     try std.testing.expect(std.mem.indexOf(u8, blob, code) == null);
 
-    // Redeem via allow-once CLI (operator-bound env; same XDG data dir).
+    // Redeem via allow-once CLI (operator TTY seam; same XDG data dir).
     const allow_once_cli = @import("allow_once.zig");
-    const prev_op = try sOnceCliHookDupEnvZ("RYK_OPERATOR");
-    defer sOnceCliHookRestoreEnv("RYK_OPERATOR", prev_op);
-    try std.testing.expectEqual(@as(c_int, 0), setenv("RYK_OPERATOR", "1", 1));
+    allow_once_cli.test_operator_tty_override = true;
+    defer allow_once_cli.test_operator_tty_override = null;
 
     var stdout_alloc: std.Io.Writer.Allocating = .init(allocator);
     defer stdout_alloc.deinit();

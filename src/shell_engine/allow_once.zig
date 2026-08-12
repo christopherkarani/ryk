@@ -1,14 +1,18 @@
 //! Allow-once pending + active stores (JSONL under XDG data).
 //!
 //! Product paths (brand `ryk`, not `dcg`):
-//! - Dir: `$XDG_DATA_HOME/ryk/` or `~/.local/share/ryk/`
-//! - `pending_exceptions.jsonl` — issued on deny (short code, full hash, command, cwd, reason, expires)
+//! - Dir: `$XDG_DATA_HOME/ryk/` or `~/.local/share/ryk/` (hardened to 0700)
+//! - `pending_exceptions.jsonl` — issued on deny (0600). Stores only a keyed
+//!   `code_hash` — never the redeemable short code. The plaintext code lives
+//!   in memory (`PendingIssue.redeem_code`) for the operator-facing surface.
 //! - `allow_once.jsonl` — redeemed active entries (scope cwd|project, single_use, expires, command)
 //!
 //! Reference behavior: DCG `pending_exceptions.rs` (TTL, prune, exact match, single-use consume,
 //! lock spirit, bounded growth). Tests inject absolute paths — no env required.
 //!
-//! JSONL: one object per line; unknown/corrupt lines skipped (not fatal).
+//! JSONL: one object per line; unknown/corrupt lines skipped (not fatal). Legacy
+//! v1 lines with a plaintext `short_code` are treated as corrupt and pruned on
+//! load (fail closed — pending rows are short-lived).
 //! Errors include `CodeNotFound`, `Expired`, `AlreadyConsumed`, `StoreFull`, `AmbiguousCode`.
 //! Re-exported via `shell_engine` and covered by `test-shell-engine`.
 
@@ -19,7 +23,8 @@ const builtin = @import("builtin");
 // Types & constants
 // ---------------------------------------------------------------------------
 
-pub const schema_version: u32 = 1;
+/// v2: pending rows store `code_hash` (keyed SHA-256), never the redeemable code.
+pub const schema_version: u32 = 2;
 pub const default_ttl_hours: i64 = 24;
 pub const max_pending_lines: usize = 10_000;
 pub const max_pending_bytes: u64 = 10 * 1024 * 1024;
@@ -54,7 +59,10 @@ pub const Maintenance = struct {
 
 pub const PendingRecord = struct {
     schema_version: u32 = schema_version,
-    short_code: []const u8,
+    /// Keyed hash of the redeem code (`computeCodeHash`). Never the code itself:
+    /// the pending file is same-user readable, so a plaintext code here would let
+    /// any agent process self-authorize a redeem.
+    code_hash: []const u8,
     full_hash: []const u8,
     created_at: []const u8,
     expires_at: []const u8,
@@ -67,7 +75,9 @@ pub const PendingRecord = struct {
 
 pub const AllowOnceEntry = struct {
     schema_version: u32 = schema_version,
-    source_short_code: []const u8,
+    /// Keyed hash of the redeemed code (informational / revoke key only — the
+    /// pending row is burned at redeem, so this value cannot authorize anything).
+    source_code_hash: []const u8,
     source_full_hash: []const u8,
     created_at: []const u8,
     expires_at: []const u8,
@@ -111,10 +121,15 @@ pub const AllowOnceList = struct {
 
 pub const PendingIssue = struct {
     record: PendingRecord,
+    /// The plaintext redeem code, minted by CSPRNG. Memory-only: it is never
+    /// written to any store. Callers show it exclusively on operator-facing
+    /// surfaces (e.g. the controlling terminal), never on agent-visible channels.
+    redeem_code: []u8,
     maintenance: Maintenance = .{},
 
     pub fn deinit(self: *PendingIssue, gpa: std.mem.Allocator) void {
         freePendingRecord(gpa, self.record);
+        gpa.free(self.redeem_code);
         self.* = undefined;
     }
 };
@@ -145,7 +160,7 @@ pub const ClearResult = struct {
 };
 
 pub fn freePendingRecord(gpa: std.mem.Allocator, r: PendingRecord) void {
-    gpa.free(r.short_code);
+    gpa.free(r.code_hash);
     gpa.free(r.full_hash);
     gpa.free(r.created_at);
     gpa.free(r.expires_at);
@@ -156,7 +171,7 @@ pub fn freePendingRecord(gpa: std.mem.Allocator, r: PendingRecord) void {
 }
 
 pub fn freeAllowOnceEntry(gpa: std.mem.Allocator, e: AllowOnceEntry) void {
-    gpa.free(e.source_short_code);
+    gpa.free(e.source_code_hash);
     gpa.free(e.source_full_hash);
     gpa.free(e.created_at);
     gpa.free(e.expires_at);
@@ -190,6 +205,42 @@ pub fn computeFullHash(
         hex[i * 2 + 1] = hex_digits[byte & 0xf];
     }
     return try gpa.dupe(u8, hex[0..]);
+}
+
+/// Keyed hash of a redeem code for at-rest storage:
+/// SHA-256 hex of `"ryk-pending-v1:" ++ full_hash ++ ":" ++ code`.
+/// The constant is a ryk-controlled domain separator; the per-record `full_hash`
+/// (itself SHA-256 over issue time + cwd + command) acts as the per-record salt,
+/// so identical codes on different rows hash differently. The plaintext code is
+/// never persisted.
+pub fn computeCodeHash(gpa: std.mem.Allocator, full_hash: []const u8, code: []const u8) ![]u8 {
+    const payload = try std.fmt.allocPrint(gpa, "ryk-pending-v1:{s}:{s}", .{ full_hash, code });
+    defer gpa.free(payload);
+
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(payload, &digest, .{});
+
+    var hex: [64]u8 = undefined;
+    const hex_digits = "0123456789abcdef";
+    for (digest, 0..) |byte, i| {
+        hex[i * 2] = hex_digits[byte >> 4];
+        hex[i * 2 + 1] = hex_digits[byte & 0xf];
+    }
+    return try gpa.dupe(u8, hex[0..]);
+}
+
+/// True when `code` redeems against `record` (constant-shape compare on hashes).
+pub fn codeMatchesPending(gpa: std.mem.Allocator, record: PendingRecord, code: []const u8) !bool {
+    const presented = try computeCodeHash(gpa, record.full_hash, code);
+    defer gpa.free(presented);
+    return std.mem.eql(u8, record.code_hash, presented);
+}
+
+/// True when `code` is the source code of `entry` (hash via the entry's full hash).
+pub fn codeMatchesEntry(gpa: std.mem.Allocator, entry: AllowOnceEntry, code: []const u8) !bool {
+    const presented = try computeCodeHash(gpa, entry.source_full_hash, code);
+    defer gpa.free(presented);
+    return std.mem.eql(u8, entry.source_code_hash, presented);
 }
 
 /// Last 8 hex chars → u32 → % 1_000_000 → zero-padded 6 digits.
@@ -274,10 +325,11 @@ pub fn issuePending(
     // Bounded growth: rotate oldest non-grace rows until under line/byte caps.
     try rotatePendingToFit(gpa, &state, 1, now_iso);
 
-    // Ensure short_code is unique among active pending (re-mint CSPRNG on collision).
-    const record = try buildPendingRecordUnique(runtime_io, gpa, state.active.items, command, cwd, reason, now_iso, single_use);
-    var record_owned = true;
-    errdefer if (record_owned) freePendingRecord(gpa, record);
+    // Ensure the minted code is unique among active pending (re-mint CSPRNG on collision).
+    const built = try buildPendingRecordUnique(runtime_io, gpa, state.active.items, command, cwd, reason, now_iso, single_use);
+    var built_owned = true;
+    errdefer if (built_owned) built.deinit(gpa);
+    const record = built.record;
 
     // Byte-cap check for the new line before commit.
     const trial_line = try renderPendingLine(gpa, record);
@@ -301,18 +353,23 @@ pub fn issuePending(
     }
 
     try state.active.append(gpa, record);
-    record_owned = false; // now owned by state.active (defer frees it)
+    built_owned = false; // record now owned by state.active (defer frees it)
     state.active_bytes += trial_line.len + 1;
 
     // Clone return ownership before durable write so OOM after write cannot orphan
     // a caller-visible "issue failed" while the row is already on disk (M-16).
     const owned = try clonePendingRecord(gpa, state.active.items[state.active.items.len - 1]);
     errdefer freePendingRecord(gpa, owned);
+    // The plaintext code moves out to the caller (operator surface); it is never
+    // written to the store.
+    const redeem_code = built.redeem_code;
+    errdefer gpa.free(redeem_code);
 
     try writePendingFile(runtime_io, gpa, pending_path, state.active.items);
 
     return .{
         .record = owned,
+        .redeem_code = redeem_code,
         .maintenance = state.maintenance,
     };
 }
@@ -369,7 +426,7 @@ pub fn lookupPendingByCode(
     }
 
     for (state.active.items) |r| {
-        if (std.mem.eql(u8, r.short_code, code)) {
+        if (try codeMatchesPending(gpa, r, code)) {
             try matched.append(gpa, try clonePendingRecord(gpa, r));
         }
     }
@@ -433,10 +490,15 @@ pub fn revokePending(
     }
 
     // In-place compact: single owner for all records (avoids dual-list OOM double-free).
+    // Key may be a stored code_hash / full_hash (direct) or a plaintext code
+    // (hashed per record) — all are non-authorizing identifiers.
     var removed: usize = 0;
     var write_idx: usize = 0;
     for (state.active.items) |r| {
-        if (std.mem.eql(u8, r.short_code, code_or_hash) or std.mem.eql(u8, r.full_hash, code_or_hash)) {
+        const hit = std.mem.eql(u8, r.code_hash, code_or_hash) or
+            std.mem.eql(u8, r.full_hash, code_or_hash) or
+            try codeMatchesPending(gpa, r, code_or_hash);
+        if (hit) {
             freePendingRecord(gpa, r);
             removed += 1;
         } else {
@@ -480,11 +542,11 @@ pub fn redeem(
         pending_state.active.deinit(gpa);
     }
 
-    // Resolve active short_code matches first (live wins over expired-on-disk collisions).
+    // Resolve active code matches first (live wins over expired-on-disk collisions).
     var match_count: usize = 0;
     var found_idx: ?usize = null;
     for (pending_state.active.items, 0..) |r, i| {
-        if (std.mem.eql(u8, r.short_code, code)) {
+        if (try codeMatchesPending(gpa, r, code)) {
             match_count += 1;
             if (found_idx == null) found_idx = i;
         }
@@ -649,12 +711,15 @@ pub fn revokeAllowOnce(
     }
 
     // In-place compact: single owner for all entries (avoids dual-list OOM double-free).
+    // Key may be a stored source_code_hash / source_full_hash (direct) or a
+    // plaintext code (hashed per entry).
     var removed: usize = 0;
     var write_idx: usize = 0;
     for (state.active.items) |e| {
-        if (std.mem.eql(u8, e.source_short_code, code_or_hash) or
-            std.mem.eql(u8, e.source_full_hash, code_or_hash))
-        {
+        const hit = std.mem.eql(u8, e.source_code_hash, code_or_hash) or
+            std.mem.eql(u8, e.source_full_hash, code_or_hash) or
+            try codeMatchesEntry(gpa, e, code_or_hash);
+        if (hit) {
             freeAllowOnceEntry(gpa, e);
             removed += 1;
         } else {
@@ -817,8 +882,10 @@ fn parsePendingLine(gpa: std.mem.Allocator, line: []const u8) !PendingRecord {
     if (parsed.value != .object) return error.Corrupt;
     const obj = parsed.value.object;
 
-    const short_code = try dupeJsonString(gpa, obj, "short_code");
-    errdefer gpa.free(short_code);
+    // v2 rows carry `code_hash` only. Legacy v1 rows with a plaintext
+    // `short_code` are corrupt here → pruned on load (fail-closed invalidation).
+    const code_hash = try dupeJsonString(gpa, obj, "code_hash");
+    errdefer gpa.free(code_hash);
     const full_hash = try dupeJsonString(gpa, obj, "full_hash");
     errdefer gpa.free(full_hash);
     const created_at = try dupeJsonString(gpa, obj, "created_at");
@@ -838,7 +905,7 @@ fn parsePendingLine(gpa: std.mem.Allocator, line: []const u8) !PendingRecord {
 
     return .{
         .schema_version = schema,
-        .short_code = short_code,
+        .code_hash = code_hash,
         .full_hash = full_hash,
         .created_at = created_at,
         .expires_at = expires_at,
@@ -853,7 +920,7 @@ fn parsePendingLine(gpa: std.mem.Allocator, line: []const u8) !PendingRecord {
 fn renderPendingLine(gpa: std.mem.Allocator, r: PendingRecord) ![]u8 {
     const payload = .{
         .schema_version = r.schema_version,
-        .short_code = r.short_code,
+        .code_hash = r.code_hash,
         .full_hash = r.full_hash,
         .created_at = r.created_at,
         .expires_at = r.expires_at,
@@ -884,8 +951,8 @@ fn writePendingFile(
 }
 
 fn clonePendingRecord(gpa: std.mem.Allocator, r: PendingRecord) !PendingRecord {
-    const short_code = try gpa.dupe(u8, r.short_code);
-    errdefer gpa.free(short_code);
+    const code_hash = try gpa.dupe(u8, r.code_hash);
+    errdefer gpa.free(code_hash);
     const full_hash = try gpa.dupe(u8, r.full_hash);
     errdefer gpa.free(full_hash);
     const created_at = try gpa.dupe(u8, r.created_at);
@@ -901,7 +968,7 @@ fn clonePendingRecord(gpa: std.mem.Allocator, r: PendingRecord) !PendingRecord {
     const consumed_at = if (r.consumed_at) |c| try gpa.dupe(u8, c) else null;
     return .{
         .schema_version = r.schema_version,
-        .short_code = short_code,
+        .code_hash = code_hash,
         .full_hash = full_hash,
         .created_at = created_at,
         .expires_at = expires_at,
@@ -936,7 +1003,7 @@ fn pendingCodeIsExpiredOnDisk(
         if (line.len == 0) continue;
         const parsed = parsePendingLine(gpa, line) catch continue;
         defer freePendingRecord(gpa, parsed);
-        if (!std.mem.eql(u8, parsed.short_code, code)) continue;
+        if (!try codeMatchesPending(gpa, parsed, code)) continue;
         if (parsed.consumed_at != null) continue;
         if (isExpired(parsed.expires_at, now_iso)) return true;
     }
@@ -1028,8 +1095,10 @@ fn parseAllowOnceLine(gpa: std.mem.Allocator, line: []const u8) !AllowOnceEntry 
     if (parsed.value != .object) return error.Corrupt;
     const obj = parsed.value.object;
 
-    const source_short_code = try dupeJsonString(gpa, obj, "source_short_code");
-    errdefer gpa.free(source_short_code);
+    // v2 rows carry `source_code_hash`; legacy `source_short_code` rows are
+    // corrupt here → pruned on load (fail closed).
+    const source_code_hash = try dupeJsonString(gpa, obj, "source_code_hash");
+    errdefer gpa.free(source_code_hash);
     const source_full_hash = try dupeJsonString(gpa, obj, "source_full_hash");
     errdefer gpa.free(source_full_hash);
     const created_at = try dupeJsonString(gpa, obj, "created_at");
@@ -1057,7 +1126,7 @@ fn parseAllowOnceLine(gpa: std.mem.Allocator, line: []const u8) !AllowOnceEntry 
 
     return .{
         .schema_version = schema,
-        .source_short_code = source_short_code,
+        .source_code_hash = source_code_hash,
         .source_full_hash = source_full_hash,
         .created_at = created_at,
         .expires_at = expires_at,
@@ -1077,7 +1146,7 @@ fn renderAllowOnceLine(gpa: std.mem.Allocator, e: AllowOnceEntry) ![]u8 {
     };
     const payload = .{
         .schema_version = e.schema_version,
-        .source_short_code = e.source_short_code,
+        .source_code_hash = e.source_code_hash,
         .source_full_hash = e.source_full_hash,
         .created_at = e.created_at,
         .expires_at = e.expires_at,
@@ -1109,8 +1178,8 @@ fn writeAllowOnceFile(
 }
 
 fn cloneAllowOnceEntry(gpa: std.mem.Allocator, e: AllowOnceEntry) !AllowOnceEntry {
-    const source_short_code = try gpa.dupe(u8, e.source_short_code);
-    errdefer gpa.free(source_short_code);
+    const source_code_hash = try gpa.dupe(u8, e.source_code_hash);
+    errdefer gpa.free(source_code_hash);
     const source_full_hash = try gpa.dupe(u8, e.source_full_hash);
     errdefer gpa.free(source_full_hash);
     const created_at = try gpa.dupe(u8, e.created_at);
@@ -1126,7 +1195,7 @@ fn cloneAllowOnceEntry(gpa: std.mem.Allocator, e: AllowOnceEntry) !AllowOnceEntr
     const consumed_at = if (e.consumed_at) |c| try gpa.dupe(u8, c) else null;
     return .{
         .schema_version = e.schema_version,
-        .source_short_code = source_short_code,
+        .source_code_hash = source_code_hash,
         .source_full_hash = source_full_hash,
         .created_at = created_at,
         .expires_at = expires_at,
@@ -1254,15 +1323,26 @@ fn addSecondsIso(gpa: std.mem.Allocator, iso: []const u8, seconds: i64) ![]u8 {
     });
 }
 
-fn shortCodeInUse(records: []const PendingRecord, code: []const u8) bool {
+/// True when `code` would redeem against any active record (hash compare).
+fn codeInUse(gpa: std.mem.Allocator, records: []const PendingRecord, code: []const u8) !bool {
     for (records) |r| {
-        if (std.mem.eql(u8, r.short_code, code)) return true;
+        if (try codeMatchesPending(gpa, r, code)) return true;
     }
     return false;
 }
 
-/// Build a pending record whose short_code is unique among `active`.
-/// On collision, re-mint a fresh CSPRNG short_code (created_at stays at now_iso).
+const BuiltPending = struct {
+    record: PendingRecord,
+    redeem_code: []u8,
+
+    fn deinit(self: BuiltPending, gpa: std.mem.Allocator) void {
+        freePendingRecord(gpa, self.record);
+        gpa.free(self.redeem_code);
+    }
+};
+
+/// Build a pending record whose minted code is unique among `active`.
+/// On collision, re-mint a fresh CSPRNG code (created_at stays at now_iso).
 fn buildPendingRecordUnique(
     runtime_io: std.Io,
     gpa: std.mem.Allocator,
@@ -1272,14 +1352,14 @@ fn buildPendingRecordUnique(
     reason: []const u8,
     now_iso: []const u8,
     single_use: bool,
-) !PendingRecord {
+) !BuiltPending {
     // 1e6 code space; bound retries well below that for pathological stores.
     const max_attempts: usize = 64;
     var attempt: usize = 0;
     while (attempt < max_attempts) : (attempt += 1) {
-        const record = try buildPendingRecord(runtime_io, gpa, command, cwd, reason, now_iso, single_use);
-        if (!shortCodeInUse(active, record.short_code)) return record;
-        freePendingRecord(gpa, record);
+        const built = try buildPendingRecord(runtime_io, gpa, command, cwd, reason, now_iso, single_use);
+        if (!try codeInUse(gpa, active, built.redeem_code)) return built;
+        built.deinit(gpa);
     }
     return error.StoreFull;
 }
@@ -1300,14 +1380,17 @@ fn buildPendingRecord(
     reason: []const u8,
     now_iso: []const u8,
     single_use: bool,
-) !PendingRecord {
+) !BuiltPending {
     const expires_at = try addHoursIso(gpa, now_iso, default_ttl_hours);
     errdefer gpa.free(expires_at);
     const full_hash = try computeFullHash(gpa, now_iso, cwd, command);
     errdefer gpa.free(full_hash);
     // Live short codes are CSPRNG (M-7). shortCodeFromHash remains a pure test/metadata helper.
-    const short_code = try mintShortCode(runtime_io, gpa);
-    errdefer gpa.free(short_code);
+    const redeem_code = try mintShortCode(runtime_io, gpa);
+    errdefer gpa.free(redeem_code);
+    // At-rest rows carry only the keyed hash — never the redeemable code.
+    const code_hash = try computeCodeHash(gpa, full_hash, redeem_code);
+    errdefer gpa.free(code_hash);
     const created_at = try gpa.dupe(u8, now_iso);
     errdefer gpa.free(created_at);
     const cwd_owned = try gpa.dupe(u8, cwd);
@@ -1317,16 +1400,19 @@ fn buildPendingRecord(
     const reason_owned = try gpa.dupe(u8, reason);
     errdefer gpa.free(reason_owned);
     return .{
-        .schema_version = schema_version,
-        .short_code = short_code,
-        .full_hash = full_hash,
-        .created_at = created_at,
-        .expires_at = expires_at,
-        .cwd = cwd_owned,
-        .command_raw = command_raw,
-        .reason = reason_owned,
-        .single_use = single_use,
-        .consumed_at = null,
+        .record = .{
+            .schema_version = schema_version,
+            .code_hash = code_hash,
+            .full_hash = full_hash,
+            .created_at = created_at,
+            .expires_at = expires_at,
+            .cwd = cwd_owned,
+            .command_raw = command_raw,
+            .reason = reason_owned,
+            .single_use = single_use,
+            .consumed_at = null,
+        },
+        .redeem_code = redeem_code,
     };
 }
 
@@ -1339,8 +1425,10 @@ fn buildAllowOnceFromPending(
 ) !AllowOnceEntry {
     const expires_at = try addHoursIso(gpa, now_iso, default_ttl_hours);
     errdefer gpa.free(expires_at);
-    const source_short_code = try gpa.dupe(u8, pending.short_code);
-    errdefer gpa.free(source_short_code);
+    // The pending row only carries the hash; the entry copies it. The
+    // plaintext code never touches the at-rest allow-once store.
+    const source_code_hash = try gpa.dupe(u8, pending.code_hash);
+    errdefer gpa.free(source_code_hash);
     const source_full_hash = try gpa.dupe(u8, pending.full_hash);
     errdefer gpa.free(source_full_hash);
     const created_at = try gpa.dupe(u8, now_iso);
@@ -1353,7 +1441,7 @@ fn buildAllowOnceFromPending(
     errdefer gpa.free(reason);
     return .{
         .schema_version = schema_version,
-        .source_short_code = source_short_code,
+        .source_code_hash = source_code_hash,
         .source_full_hash = source_full_hash,
         .created_at = created_at,
         .expires_at = expires_at,
@@ -1461,6 +1549,18 @@ fn writeFile(runtime_io: std.Io, gpa: std.mem.Allocator, path: []const u8, body:
             error.PathAlreadyExists => {},
             else => return err,
         };
+        // Defense in depth (P0-2): the pending/allow-once dir holds break-glass
+        // state (0600 files). Keep the directory operator-private (0700) so other
+        // users cannot enumerate it. Best-effort; the keyed-hash storage is the
+        // primary defense, not these bits.
+        if (comptime builtin.os.tag != .windows) {
+            std.Io.Dir.cwd().setFilePermissions(
+                runtime_io,
+                dir,
+                std.Io.File.Permissions.fromMode(0o700),
+                .{},
+            ) catch {};
+        }
     }
 
     const parent = std.fs.path.dirname(path) orelse ".";
@@ -1602,18 +1702,63 @@ test "s3-once-store: issuePending mints 6-digit CSPRNG short codes (not hash-der
     var b = try issuePending(io, allocator, paths.pending, "cmd-rand-b", "/repo", "reason b enough", fixed_now, true);
     defer b.deinit(allocator);
 
-    try testing.expect(isSixDigitNumeric(a.record.short_code));
-    try testing.expect(isSixDigitNumeric(b.record.short_code));
+    try testing.expect(isSixDigitNumeric(a.redeem_code));
+    try testing.expect(isSixDigitNumeric(b.redeem_code));
+    // At-rest rows carry only the keyed hash — never the redeemable code.
+    try testing.expectEqual(@as(usize, 64), a.record.code_hash.len);
+    try testing.expect(!std.mem.eql(u8, a.record.code_hash, a.redeem_code));
     // Distinct commands → distinct CSPRNG codes almost always; codes must not both equal
     // the deterministic hash helper for the same inputs (collision still ok if random hits).
     const hash_a = try computeFullHash(allocator, fixed_now, "/repo", "cmd-rand-a");
     defer allocator.free(hash_a);
     const det = shortCodeFromHash(hash_a);
     // Redeem still accepts whatever code was minted.
-    const entry = try redeem(io, allocator, paths.pending, paths.allow_once, a.record.short_code, fixed_now, .cwd, "/repo");
+    const entry = try redeem(io, allocator, paths.pending, paths.allow_once, a.redeem_code, fixed_now, .cwd, "/repo");
     defer freeAllowOnceEntry(allocator, entry);
-    try testing.expectEqualStrings(a.record.short_code, entry.source_short_code);
+    try testing.expectEqualStrings(a.record.code_hash, entry.source_code_hash);
     _ = det; // retained to document separation from hash helper
+}
+
+test "s3-once-store: code_hash read from the pending file cannot be redeemed (P0-2)" {
+    // Closes the allow-once self-service bypass: an agent that reads
+    // pending_exceptions.jsonl recovers only the keyed hash, which must not
+    // redeem. The plaintext code is memory/operator-TTY only.
+    var tmp = try tmpRoot();
+    defer {
+        allocator.free(tmp.path);
+        tmp.dir.cleanup();
+    }
+    const paths = try storePaths(tmp.path);
+    defer {
+        allocator.free(paths.pending);
+        allocator.free(paths.allow_once);
+    }
+
+    var issued = try issuePending(io, allocator, paths.pending, "git reset --hard", "/repo", "p0-2 self-serve gate", fixed_now, true);
+    defer issued.deinit(allocator);
+
+    // At-rest file carries the keyed hash, never the redeemable code.
+    const on_disk = try readFileAbsolute(paths.pending);
+    defer allocator.free(on_disk);
+    try testing.expect(std.mem.indexOf(u8, on_disk, issued.record.code_hash) != null);
+    try testing.expect(std.mem.indexOf(u8, on_disk, issued.redeem_code) == null);
+
+    // Presenting the file's hash as the code must fail closed.
+    try testing.expectError(error.CodeNotFound, redeem(
+        io,
+        allocator,
+        paths.pending,
+        paths.allow_once,
+        issued.record.code_hash,
+        fixed_now,
+        .cwd,
+        "/repo",
+    ));
+
+    // Control: the real minted code still redeems.
+    const entry = try redeem(io, allocator, paths.pending, paths.allow_once, issued.redeem_code, fixed_now, .cwd, "/repo");
+    defer freeAllowOnceEntry(allocator, entry);
+    try testing.expectEqualStrings("git reset --hard", entry.command_raw);
 }
 
 test "s3-once-store: isExpired lexicographic ISO compare" {
@@ -1625,7 +1770,7 @@ test "s3-once-store: isExpired lexicographic ISO compare" {
 
 test "s3-once-store: scopeMatches cwd exact and project prefix" {
     const cwd_entry = AllowOnceEntry{
-        .source_short_code = "510755",
+        .source_code_hash = "510755",
         .source_full_hash = "ab",
         .created_at = fixed_now,
         .expires_at = far_future,
@@ -1639,7 +1784,7 @@ test "s3-once-store: scopeMatches cwd exact and project prefix" {
     try testing.expect(!scopeMatches(cwd_entry, "/other"));
 
     const project_entry = AllowOnceEntry{
-        .source_short_code = "510755",
+        .source_code_hash = "510755",
         .source_full_hash = "ab",
         .created_at = fixed_now,
         .expires_at = far_future,
@@ -1659,7 +1804,7 @@ test "s3-once-store: scopeMatches cwd exact and project prefix" {
     try testing.expect(!scopeMatches(project_entry, "/repo//secret"));
     try testing.expect(!scopeMatches(project_entry, "../repo"));
     const dirty_root = AllowOnceEntry{
-        .source_short_code = "510755",
+        .source_code_hash = "510755",
         .source_full_hash = "ab",
         .created_at = fixed_now,
         .expires_at = far_future,
@@ -1698,8 +1843,9 @@ test "s3-once-store: issue pending writes JSONL with 6-digit short code" {
     );
     defer issued.deinit(allocator);
 
-    try testing.expect(isSixDigitNumeric(issued.record.short_code));
+    try testing.expect(isSixDigitNumeric(issued.redeem_code));
     try testing.expectEqual(@as(usize, 64), issued.record.full_hash.len);
+    try testing.expectEqual(@as(usize, 64), issued.record.code_hash.len);
     try testing.expectEqualStrings("git reset --hard HEAD", issued.record.command_raw);
     try testing.expectEqualStrings("/repo", issued.record.cwd);
     try testing.expect(issued.record.single_use);
@@ -1710,9 +1856,12 @@ test "s3-once-store: issue pending writes JSONL with 6-digit short code" {
 
     const raw = try readFileAbsolute(paths.pending);
     defer allocator.free(raw);
-    try testing.expect(std.mem.indexOf(u8, raw, issued.record.short_code) != null);
+    // The pending file must NOT contain the redeemable code (P0-2: no self-service).
+    try testing.expect(std.mem.indexOf(u8, raw, issued.redeem_code) == null);
+    try testing.expect(std.mem.indexOf(u8, raw, issued.record.code_hash) != null);
     try testing.expect(std.mem.indexOf(u8, raw, "git reset --hard HEAD") != null);
-    try testing.expect(std.mem.indexOf(u8, raw, "short_code") != null);
+    try testing.expect(std.mem.indexOf(u8, raw, "code_hash") != null);
+    try testing.expect(std.mem.indexOf(u8, raw, "short_code") == null);
     try testing.expect(std.mem.indexOf(u8, raw, "full_hash") != null);
 }
 
@@ -1739,7 +1888,7 @@ test "s3-once-store: issue redeem exact command+scope match" {
         true,
     );
     defer issued.deinit(allocator);
-    const code = issued.record.short_code;
+    const code = issued.redeem_code;
 
     const entry = try redeem(
         io,
@@ -1753,7 +1902,7 @@ test "s3-once-store: issue redeem exact command+scope match" {
     );
     defer freeAllowOnceEntry(allocator, entry);
 
-    try testing.expectEqualStrings(code, entry.source_short_code);
+    try testing.expectEqualStrings(issued.record.code_hash, entry.source_code_hash);
     try testing.expectEqualStrings("git reset --hard HEAD", entry.command_raw);
     try testing.expect(entry.scope_kind == .cwd);
     try testing.expectEqualStrings("/work/project", entry.scope_path);
@@ -1815,7 +1964,7 @@ test "s3-once-store: wrong cwd does not match cwd-scoped entry" {
         allocator,
         paths.pending,
         paths.allow_once,
-        issued.record.short_code,
+        issued.redeem_code,
         fixed_now,
         .cwd,
         "/allowed/cwd",
@@ -1879,7 +2028,7 @@ test "s3-once-store: expired pending cannot redeem" {
         allocator,
         paths.pending,
         paths.allow_once,
-        issued.record.short_code,
+        issued.redeem_code,
         fixed_now,
         .cwd,
         "/repo",
@@ -1915,7 +2064,7 @@ test "s3-once-store: redeem consumes pending so code cannot redeem twice" {
         true,
     );
     defer issued.deinit(allocator);
-    const code = try allocator.dupe(u8, issued.record.short_code);
+    const code = try allocator.dupe(u8, issued.redeem_code);
     defer allocator.free(code);
 
     const entry = try redeem(
@@ -1975,7 +2124,7 @@ test "s3-once-store: consume removes single-use entry; second match misses" {
         allocator,
         paths.pending,
         paths.allow_once,
-        issued.record.short_code,
+        issued.redeem_code,
         fixed_now,
         .cwd,
         "/repo",
@@ -2041,7 +2190,7 @@ test "s3-once-store: match with consume=false leaves single-use entry intact" {
         allocator,
         paths.pending,
         paths.allow_once,
-        issued.record.short_code,
+        issued.redeem_code,
         fixed_now,
         .cwd,
         "/repo",
@@ -2083,9 +2232,9 @@ test "s3-once-store: list revoke clear on allow-once store" {
     var b = try issuePending(io, allocator, paths.pending, "cmd-b", "/repo", "reason b long enough", fixed_now, true);
     defer b.deinit(allocator);
 
-    const ea = try redeem(io, allocator, paths.pending, paths.allow_once, a.record.short_code, fixed_now, .cwd, "/repo");
+    const ea = try redeem(io, allocator, paths.pending, paths.allow_once, a.redeem_code, fixed_now, .cwd, "/repo");
     defer freeAllowOnceEntry(allocator, ea);
-    const eb = try redeem(io, allocator, paths.pending, paths.allow_once, b.record.short_code, fixed_now, .project, "/repo");
+    const eb = try redeem(io, allocator, paths.pending, paths.allow_once, b.redeem_code, fixed_now, .project, "/repo");
     defer freeAllowOnceEntry(allocator, eb);
 
     {
@@ -2095,7 +2244,7 @@ test "s3-once-store: list revoke clear on allow-once store" {
     }
 
     // Revoke by short code removes one.
-    const rev = try revokeAllowOnce(io, allocator, paths.allow_once, a.record.short_code, fixed_now);
+    const rev = try revokeAllowOnce(io, allocator, paths.allow_once, a.redeem_code, fixed_now);
     try testing.expectEqual(@as(usize, 1), rev.removed);
 
     {
@@ -2118,7 +2267,7 @@ test "s3-once-store: list revoke clear on allow-once store" {
     // Re-seed and clear all.
     var c = try issuePending(io, allocator, paths.pending, "cmd-c", "/repo", "reason c long enough", fixed_now, true);
     defer c.deinit(allocator);
-    const ec = try redeem(io, allocator, paths.pending, paths.allow_once, c.record.short_code, fixed_now, .cwd, "/repo");
+    const ec = try redeem(io, allocator, paths.pending, paths.allow_once, c.redeem_code, fixed_now, .cwd, "/repo");
     freeAllowOnceEntry(allocator, ec);
 
     const cleared = try clearAllowOnce(io, allocator, paths.allow_once, fixed_now);
@@ -2155,13 +2304,13 @@ test "s3-once-store: list revoke clear on pending store" {
     }
 
     {
-        var by_code = try lookupPendingByCode(io, allocator, paths.pending, a.record.short_code, fixed_now);
+        var by_code = try lookupPendingByCode(io, allocator, paths.pending, a.redeem_code, fixed_now);
         defer by_code.deinit(allocator);
         try testing.expectEqual(@as(usize, 1), by_code.list.records.len);
         try testing.expectEqualStrings("pend-a", by_code.list.records[0].command_raw);
     }
 
-    const rev = try revokePending(io, allocator, paths.pending, a.record.short_code, fixed_now);
+    const rev = try revokePending(io, allocator, paths.pending, a.redeem_code, fixed_now);
     try testing.expectEqual(@as(usize, 1), rev.removed);
 
     {
@@ -2207,13 +2356,13 @@ test "s3-once-store: loadPendingActive prunes expired and consumed from file" {
     );
     defer active.deinit(allocator);
 
-    // Append expired + consumed raw JSONL lines (schema-compatible).
+    // Append expired + consumed raw JSONL lines (v2 schema-compatible hashes).
     const existing = try readFileAbsolute(paths.pending);
     defer allocator.free(existing);
 
     const extra = try std.fmt.allocPrint(allocator,
-        \\{{"schema_version":1,"short_code":"111111","full_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","created_at":"2026-07-20T00:00:00Z","expires_at":"2026-07-21T00:00:00Z","cwd":"/repo","command_raw":"old cmd","reason":"expired","single_use":true,"consumed_at":null}}
-        \\{{"schema_version":1,"short_code":"222222","full_hash":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","created_at":"{s}","expires_at":"2026-07-26T15:00:00Z","cwd":"/repo","command_raw":"used cmd","reason":"consumed","single_use":true,"consumed_at":"{s}"}}
+        \\{{"schema_version":2,"code_hash":"1111111111111111111111111111111111111111111111111111111111111111","full_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","created_at":"2026-07-20T00:00:00Z","expires_at":"2026-07-21T00:00:00Z","cwd":"/repo","command_raw":"old cmd","reason":"expired","single_use":true,"consumed_at":null}}
+        \\{{"schema_version":2,"code_hash":"2222222222222222222222222222222222222222222222222222222222222222","full_hash":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","created_at":"{s}","expires_at":"2026-07-26T15:00:00Z","cwd":"/repo","command_raw":"used cmd","reason":"consumed","single_use":true,"consumed_at":"{s}"}}
         \\
     , .{ fixed_now, fixed_now });
     defer allocator.free(extra);
@@ -2230,12 +2379,12 @@ test "s3-once-store: loadPendingActive prunes expired and consumed from file" {
     try testing.expect(loaded.maintenance.pruned_expired >= 1);
     try testing.expect(loaded.maintenance.pruned_consumed >= 1);
 
-    // File rewritten to active-only (no expired short code left).
+    // File rewritten to active-only (no expired code hash left).
     const after = try readFileAbsolute(paths.pending);
     defer allocator.free(after);
-    try testing.expect(std.mem.indexOf(u8, after, "111111") == null);
-    try testing.expect(std.mem.indexOf(u8, after, "222222") == null);
-    try testing.expect(std.mem.indexOf(u8, after, active.record.short_code) != null);
+    try testing.expect(std.mem.indexOf(u8, after, "1111111111111111111111111111111111111111111111111111111111111111") == null);
+    try testing.expect(std.mem.indexOf(u8, after, "2222222222222222222222222222222222222222222222222222222222222222") == null);
+    try testing.expect(std.mem.indexOf(u8, after, active.record.code_hash) != null);
 }
 
 test "s3-once-store: loadAllowOnceActive prunes expired entries" {
@@ -2252,14 +2401,14 @@ test "s3-once-store: loadAllowOnceActive prunes expired entries" {
 
     var issued = try issuePending(io, allocator, paths.pending, "alive-cmd", "/repo", "alive reason text", fixed_now, true);
     defer issued.deinit(allocator);
-    const entry = try redeem(io, allocator, paths.pending, paths.allow_once, issued.record.short_code, fixed_now, .cwd, "/repo");
+    const entry = try redeem(io, allocator, paths.pending, paths.allow_once, issued.redeem_code, fixed_now, .cwd, "/repo");
     freeAllowOnceEntry(allocator, entry);
 
     const existing = try readFileAbsolute(paths.allow_once);
     defer allocator.free(existing);
 
     const expired_line =
-        \\{"schema_version":1,"source_short_code":"999999","source_full_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","created_at":"2026-07-20T00:00:00Z","expires_at":"2026-07-21T00:00:00Z","scope_kind":"cwd","scope_path":"/repo","command_raw":"dead-cmd","reason":"expired allow","single_use":true,"consumed_at":null}
+        \\{"schema_version":2,"source_code_hash":"9999999999999999999999999999999999999999999999999999999999999999","source_full_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","created_at":"2026-07-20T00:00:00Z","expires_at":"2026-07-21T00:00:00Z","scope_kind":"cwd","scope_path":"/repo","command_raw":"dead-cmd","reason":"expired allow","single_use":true,"consumed_at":null}
         \\
     ;
     const merged = try std.fmt.allocPrint(allocator, "{s}{s}", .{ existing, expired_line });
@@ -2328,11 +2477,11 @@ test "s3-once-store: bounded growth refuses or rotates past max_pending_lines" {
 
     var i: usize = 0;
     while (i < max_pending_lines + 50) : (i += 1) {
-        // Minimal schema-valid line; unique short_code via zero-padded index mod 1e6.
+        // Minimal v2 schema-valid line; unique code_hash via zero-padded index.
         const line = try std.fmt.allocPrint(allocator,
-            \\{{"schema_version":1,"short_code":"{d:0>6}","full_hash":"{d:0>64}","created_at":"{s}","expires_at":"2026-07-26T15:00:00Z","cwd":"/r","command_raw":"c{d}","reason":"b","single_use":true,"consumed_at":null}}
+            \\{{"schema_version":2,"code_hash":"{d:0>64}","full_hash":"{d:0>64}","created_at":"{s}","expires_at":"2026-07-26T15:00:00Z","cwd":"/r","command_raw":"c{d}","reason":"b","single_use":true,"consumed_at":null}}
             \\
-        , .{ i % 1_000_000, i, fixed_now, i });
+        , .{ i, i, fixed_now, i });
         defer allocator.free(line);
         try buf.appendSlice(allocator, line);
     }
@@ -2423,7 +2572,7 @@ test "s3-once-store: project scope matches subdirectory cwd" {
         allocator,
         paths.pending,
         paths.allow_once,
-        issued.record.short_code,
+        issued.redeem_code,
         fixed_now,
         .project,
         "/repo",
@@ -2439,7 +2588,7 @@ test "s3-once-store: project scope matches subdirectory cwd" {
 }
 
 test "s3-once-store: constants and file names match product brand" {
-    try testing.expectEqual(@as(u32, 1), schema_version);
+    try testing.expectEqual(@as(u32, 2), schema_version);
     try testing.expectEqual(@as(i64, 24), default_ttl_hours);
     try testing.expectEqual(@as(usize, 10_000), max_pending_lines);
     try testing.expectEqual(@as(u64, 10 * 1024 * 1024), max_pending_bytes);

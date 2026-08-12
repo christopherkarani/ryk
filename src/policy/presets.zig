@@ -636,12 +636,13 @@ const common_strict_rules =
     \\    - "make build*"
     \\    - "make check*"
     \\    - "./scripts/zig *"
-    \\    # Ryk recovery / inspect (never deadlock allow-once / explain)
+    \\    # Ryk recovery / inspect. `ryk allow-once` is intentionally NOT
+    \\    # auto-allowed: redemption is operator-only (TTY-gated) and runs
+    \\    # outside the managed session, so it falls through to `ask`.
     \\    - "ryk version"
     \\    - "ryk help *"
     \\    - "ryk doctor *"
     \\    - "ryk explain *"
-    \\    - "ryk allow-once *"
     \\    - "ryk allowlist *"
     \\    - "ryk packs *"
     \\  deny:

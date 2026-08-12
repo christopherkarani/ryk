@@ -219,8 +219,10 @@ pub fn formatDetailLines(
 
 /// Whether a baseline disable needs a second press (in-loop soft confirm).
 /// Returns true when this press should proceed with the write.
+/// The TUI only runs on an interactive TTY, so operator presence is implied by
+/// the surrounding alt-screen session; the soft-arm is a UX confirmation, not an
+/// authentication boundary (the RYK_OPERATOR env break-glass was removed).
 pub fn baselineDisableArmed(pending_id: ?[]const u8, pack_id: []const u8) bool {
-    if (pack_config.isOperatorBreakGlass()) return true;
     if (pending_id) |p| return std.mem.eql(u8, p, pack_id);
     return false;
 }
@@ -532,19 +534,16 @@ fn applyMutate(
     var proceed = false;
     if (kind == .disable) {
         if (pack_config.isBaselinePackId(pack.id)) {
-            if (pack_config.isOperatorBreakGlass()) {
-                proceed = true;
-            } else {
-                const decision = danger_confirmation.decide(
-                    io,
-                    stdout,
-                    "Disable baseline safety pack? This weakens default shell protection.",
-                    false,
-                    true,
-                    null,
-                ) catch .cancelled;
-                proceed = decision == .proceed;
-            }
+            // TUI runs on an interactive TTY; always confirm baseline disable.
+            const decision = danger_confirmation.decide(
+                io,
+                stdout,
+                "Disable baseline safety pack? This weakens default shell protection.",
+                false,
+                true,
+                null,
+            ) catch .cancelled;
+            proceed = decision == .proceed;
         } else {
             var msg_buf: [160]u8 = undefined;
             const msg = std.fmt.bufPrint(&msg_buf, "Disable pack '{s}'?", .{pack.id}) catch "Disable pack?";
@@ -852,7 +851,7 @@ test "packs browse: baseline pack ids still recognized for danger gate" {
     try std.testing.expect(!pack_config.isBaselinePackId("containers.docker"));
     // Armed same-id helper still true when pending matches (legacy soft-arm API).
     try std.testing.expect(baselineDisableArmed("core.git", "core.git"));
-    try std.testing.expect(!baselineDisableArmed("core.git", "core.shell") or pack_config.isOperatorBreakGlass());
+    try std.testing.expect(!baselineDisableArmed("core.git", "core.shell"));
 }
 
 test "packs browse: enable is one-shot; disable is separate kind" {

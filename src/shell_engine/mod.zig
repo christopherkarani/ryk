@@ -2133,7 +2133,7 @@ fn sEngineSeedAllowOnce(
         std.testing.allocator,
         pending_path,
         allow_once_path,
-        issued.record.short_code,
+        issued.redeem_code,
         s_engine_now,
         .cwd,
         cwd,

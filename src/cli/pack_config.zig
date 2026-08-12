@@ -74,20 +74,15 @@ pub fn isBaselineDisabledToken(id: []const u8) bool {
     return false;
 }
 
-/// True when `RYK_OPERATOR=1` (or `true`/`yes`) is set — CLI break-glass for
-/// baseline pack disable and other operator-only mutations.
-pub fn isOperatorBreakGlass() bool {
-    return envFlagTruthy("RYK_OPERATOR");
-}
-
-fn envFlagTruthy(name: [*:0]const u8) bool {
-    const raw = std.c.getenv(name) orelse return false;
-    const value = std.mem.span(raw);
-    return std.mem.eql(u8, value, "1") or
-        std.mem.eql(u8, value, "true") or
-        std.mem.eql(u8, value, "yes") or
-        std.mem.eql(u8, value, "TRUE") or
-        std.mem.eql(u8, value, "YES");
+/// Operator presence for break-glass mutations (baseline pack disable and other
+/// operator-only changes). The only trustworthy signal is an interactive
+/// controlling terminal: environment variables are per-invocation and fully
+/// child-controlled, so an agent subprocess can set any var on itself. A TTY is
+/// the boundary an agent cannot fabricate for a human. Non-TTY → false (fail
+/// closed); callers then run the interactive danger-confirmation prompt.
+pub fn isOperatorBreakGlass(io: std.Io) bool {
+    return (std.Io.File.stdin().isTty(io) catch false) and
+        (std.Io.File.stdout().isTty(io) catch false);
 }
 
 /// Project pack config markers: same as workspace product markers (`.git` or policy).

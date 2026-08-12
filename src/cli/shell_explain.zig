@@ -264,7 +264,7 @@ fn sProductWireSeedAllowOnce(
         std.testing.allocator,
         pending_path,
         once_path,
-        issued.record.short_code,
+        issued.redeem_code,
         s_product_wire_now_seed,
         .cwd,
         cwd,
