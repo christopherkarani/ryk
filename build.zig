@@ -295,9 +295,9 @@ pub fn build(b: *std.Build) void {
     });
     const run_cli_contract_tests = addRunTestTerminal(b, cli_contract_tests);
 
-    const phase2d_daemon_hook_matrix_tests = b.addTest(.{
+    const hook_host_matrix_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/phase2d_daemon_hook_matrix.zig"),
+            .root_source_file = b.path("tests/hook_host_matrix.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
@@ -305,11 +305,11 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    const run_phase2d_daemon_hook_matrix_tests = addRunTestTerminal(b, phase2d_daemon_hook_matrix_tests);
+    const run_hook_host_matrix_tests = addRunTestTerminal(b, hook_host_matrix_tests);
 
-    const phase2e_hook_dispatch_tests = b.addTest(.{
+    const hook_dispatch_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/phase2e_hook_dispatch.zig"),
+            .root_source_file = b.path("tests/hook_dispatch.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
@@ -317,11 +317,11 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    const run_phase2e_hook_dispatch_tests = addRunTestTerminal(b, phase2e_hook_dispatch_tests);
+    const run_hook_dispatch_tests = addRunTestTerminal(b, hook_dispatch_tests);
 
-    const phase2f_hook_validation_tests = b.addTest(.{
+    const hook_validation_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/phase2f_hook_validation.zig"),
+            .root_source_file = b.path("tests/hook_validation.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
@@ -329,11 +329,11 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    const run_phase2f_hook_validation_tests = addRunTestTerminal(b, phase2f_hook_validation_tests);
+    const run_hook_validation_tests = addRunTestTerminal(b, hook_validation_tests);
 
-    const phase2510_gui_audit_feed_tests = b.addTest(.{
+    const dashboard_feed_redaction_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/phase2510_gui_audit_feed.zig"),
+            .root_source_file = b.path("tests/dashboard_feed_redaction.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
@@ -341,11 +341,11 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    const run_phase2510_gui_audit_feed_tests = addRunTestTerminal(b, phase2510_gui_audit_feed_tests);
+    const run_dashboard_feed_redaction_tests = addRunTestTerminal(b, dashboard_feed_redaction_tests);
 
-    const phase_zh2_presentation_redaction_tests = b.addTest(.{
+    const presentation_redaction_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/phase_zh2_presentation_redaction.zig"),
+            .root_source_file = b.path("tests/presentation_redaction.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
@@ -353,11 +353,11 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    const run_phase_zh2_presentation_redaction_tests = addRunTestTerminal(b, phase_zh2_presentation_redaction_tests);
+    const run_presentation_redaction_tests = addRunTestTerminal(b, presentation_redaction_tests);
 
-    const phase25_hardening_tests = b.addTest(.{
+    const release_packaging_contract_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/phase25_cli_hardening.zig"),
+            .root_source_file = b.path("tests/release_packaging_contract.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
@@ -365,7 +365,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    const run_phase25_hardening_tests = addRunTestTerminal(b, phase25_hardening_tests);
+    const run_release_packaging_contract_tests = addRunTestTerminal(b, release_packaging_contract_tests);
 
     const daemon_ipc_hardening_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -389,27 +389,27 @@ pub fn build(b: *std.Build) void {
     });
     const run_public_surface_contract_tests = addRunTestTerminal(b, public_surface_contract_tests);
 
-    const phase36_codex_plugin_tests = b.addTest(.{
+    const plugin_codex_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/phase36_codex_plugin.zig"),
+            .root_source_file = b.path("tests/plugin_codex.zig"),
             .target = target,
             .optimize = optimize,
         }),
     });
-    const run_phase36_codex_plugin_tests = addRunTestTerminal(b, phase36_codex_plugin_tests);
+    const run_plugin_codex_tests = addRunTestTerminal(b, plugin_codex_tests);
 
-    const phase37_claude_plugin_tests = b.addTest(.{
+    const plugin_claude_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/phase37_claude_plugin.zig"),
+            .root_source_file = b.path("tests/plugin_claude.zig"),
             .target = target,
             .optimize = optimize,
         }),
     });
-    const run_phase37_claude_plugin_tests = addRunTestTerminal(b, phase37_claude_plugin_tests);
+    const run_plugin_claude_tests = addRunTestTerminal(b, plugin_claude_tests);
 
-    const phase38_plugin_security_tests = b.addTest(.{
+    const plugin_security_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/phase38_plugin_security_and_compatibility.zig"),
+            .root_source_file = b.path("tests/plugin_security.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
@@ -417,50 +417,38 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    const run_phase38_plugin_security_tests = addRunTestTerminal(b, phase38_plugin_security_tests);
+    const run_plugin_security_tests = addRunTestTerminal(b, plugin_security_tests);
 
-    const phase39_openclaw_plugin_tests = b.addTest(.{
+    const plugin_openclaw_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/phase39_openclaw_plugin.zig"),
+            .root_source_file = b.path("tests/plugin_openclaw.zig"),
             .target = target,
             .optimize = optimize,
         }),
     });
-    const run_phase39_openclaw_plugin_tests = addRunTestTerminal(b, phase39_openclaw_plugin_tests);
+    const run_plugin_openclaw_tests = addRunTestTerminal(b, plugin_openclaw_tests);
 
-    const phase43_hermes_plugin_tests = b.addTest(.{
+    const plugin_hermes_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/phase43_hermes_plugin.zig"),
+            .root_source_file = b.path("tests/plugin_hermes.zig"),
             .target = target,
             .optimize = optimize,
         }),
     });
-    const run_phase43_hermes_plugin_tests = addRunTestTerminal(b, phase43_hermes_plugin_tests);
+    const run_plugin_hermes_tests = addRunTestTerminal(b, plugin_hermes_tests);
 
-    const phase44_version_drift_tests = b.addTest(.{
+    const install_version_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/phase44_version_drift.zig"),
+            .root_source_file = b.path("tests/install_version.zig"),
             .target = target,
             .optimize = optimize,
         }),
     });
-    const run_phase44_version_drift_tests = addRunTestTerminal(b, phase44_version_drift_tests);
+    const run_install_version_tests = addRunTestTerminal(b, install_version_tests);
 
-    const phase44_setup_opencode_tests = b.addTest(.{
+    const install_opencode_detect_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/phase44_setup_opencode_detection.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "ryk", .module = ryk_mod },
-            },
-        }),
-    });
-    const run_phase44_setup_opencode_tests = addRunTestTerminal(b, phase44_setup_opencode_tests);
-
-    const phase44_install_workspace_paths_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/phase44_install_workspace_paths.zig"),
+            .root_source_file = b.path("tests/install_opencode_detect.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
@@ -468,11 +456,11 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    const run_phase44_install_workspace_paths_tests = addRunTestTerminal(b, phase44_install_workspace_paths_tests);
+    const run_install_opencode_detect_tests = addRunTestTerminal(b, install_opencode_detect_tests);
 
-    const phase45_start_onboarding_tests = b.addTest(.{
+    const install_paths_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/phase45_start_onboarding.zig"),
+            .root_source_file = b.path("tests/install_paths.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
@@ -480,7 +468,19 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    const run_phase45_start_onboarding_tests = addRunTestTerminal(b, phase45_start_onboarding_tests);
+    const run_install_paths_tests = addRunTestTerminal(b, install_paths_tests);
+
+    const start_onboarding_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/start_onboarding.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ryk", .module = ryk_mod },
+            },
+        }),
+    });
+    const run_start_onboarding_tests = addRunTestTerminal(b, start_onboarding_tests);
 
     const setup_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -568,30 +568,30 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_core_contract_tests.step);
     test_step.dependOn(&run_cli_package_tests.step);
     test_step.dependOn(&run_cli_contract_tests.step);
-    test_step.dependOn(&run_phase25_hardening_tests.step);
+    test_step.dependOn(&run_release_packaging_contract_tests.step);
     test_step.dependOn(&run_daemon_ipc_hardening_tests.step);
-    // Named subset for hook host-matrix work (phase2d/2e/2f + phase38).
-    const test_phase_hooks_step = b.step("test-phase-hooks", "Run phase2d/2e/2f/38 hook integration tests");
-    test_phase_hooks_step.dependOn(&run_phase2d_daemon_hook_matrix_tests.step);
-    test_phase_hooks_step.dependOn(&run_phase2e_hook_dispatch_tests.step);
-    test_phase_hooks_step.dependOn(&run_phase2f_hook_validation_tests.step);
-    test_phase_hooks_step.dependOn(&run_phase38_plugin_security_tests.step);
+    // Named subset for hook host-matrix, dispatch, validation, and plugin-security.
+    const test_hooks_step = b.step("test-hooks", "Run hook host-matrix, dispatch, validation, and plugin-security tests");
+    test_hooks_step.dependOn(&run_hook_host_matrix_tests.step);
+    test_hooks_step.dependOn(&run_hook_dispatch_tests.step);
+    test_hooks_step.dependOn(&run_hook_validation_tests.step);
+    test_hooks_step.dependOn(&run_plugin_security_tests.step);
 
-    test_step.dependOn(&run_phase2d_daemon_hook_matrix_tests.step);
-    test_step.dependOn(&run_phase2e_hook_dispatch_tests.step);
-    test_step.dependOn(&run_phase2f_hook_validation_tests.step);
-    test_step.dependOn(&run_phase2510_gui_audit_feed_tests.step);
-    test_step.dependOn(&run_phase_zh2_presentation_redaction_tests.step);
+    test_step.dependOn(&run_hook_host_matrix_tests.step);
+    test_step.dependOn(&run_hook_dispatch_tests.step);
+    test_step.dependOn(&run_hook_validation_tests.step);
+    test_step.dependOn(&run_dashboard_feed_redaction_tests.step);
+    test_step.dependOn(&run_presentation_redaction_tests.step);
     test_step.dependOn(&run_public_surface_contract_tests.step);
-    test_step.dependOn(&run_phase36_codex_plugin_tests.step);
-    test_step.dependOn(&run_phase37_claude_plugin_tests.step);
-    test_step.dependOn(&run_phase38_plugin_security_tests.step);
-    test_step.dependOn(&run_phase39_openclaw_plugin_tests.step);
-    test_step.dependOn(&run_phase43_hermes_plugin_tests.step);
-    test_step.dependOn(&run_phase44_version_drift_tests.step);
-    test_step.dependOn(&run_phase44_setup_opencode_tests.step);
-    test_step.dependOn(&run_phase44_install_workspace_paths_tests.step);
-    test_step.dependOn(&run_phase45_start_onboarding_tests.step);
+    test_step.dependOn(&run_plugin_codex_tests.step);
+    test_step.dependOn(&run_plugin_claude_tests.step);
+    test_step.dependOn(&run_plugin_security_tests.step);
+    test_step.dependOn(&run_plugin_openclaw_tests.step);
+    test_step.dependOn(&run_plugin_hermes_tests.step);
+    test_step.dependOn(&run_install_version_tests.step);
+    test_step.dependOn(&run_install_opencode_detect_tests.step);
+    test_step.dependOn(&run_install_paths_tests.step);
+    test_step.dependOn(&run_start_onboarding_tests.step);
     test_step.dependOn(&run_setup_tests.step);
 
     const fuzz_tests = b.addTest(.{
