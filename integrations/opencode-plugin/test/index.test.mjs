@@ -555,7 +555,7 @@ printf '%s\\n' '{"decision":"block","message":"command blocked"}'
   );
 });
 
-test('hard block logs short message to console.error by default', async () => {
+test('hard block does not console.error by default (OpenCode status-line noise)', async () => {
   const errors = [];
   const originalError = console.error;
   console.error = (...args) => {
@@ -573,9 +573,13 @@ test('hard block logs short message to console.error by default', async () => {
           )
         );
         const joined = errors.join('\n');
-        assert.match(joined, /\[ryk\] ryk blocked tool execution:/);
-        assert.ok(!joined.includes('Next:'), `default stderr must stay short, got: ${JSON.stringify(joined)}`);
-        assert.ok(!joined.includes('Recourse:'), `default stderr must stay short, got: ${JSON.stringify(joined)}`);
+        // OpenCode paints console.error as a red TUI status line — keep it quiet by default.
+        assert.ok(
+          !/\[ryk\] ryk blocked tool execution:/.test(joined),
+          `default hard-block must not console.error, got: ${JSON.stringify(joined)}`
+        );
+        assert.ok(!joined.includes('Next:'), `default stderr must stay quiet, got: ${JSON.stringify(joined)}`);
+        assert.ok(!joined.includes('Recourse:'), `default stderr must stay quiet, got: ${JSON.stringify(joined)}`);
       },
       `#!/bin/sh
 printf '%s\n' '{"decision":"block","message":"command blocked by ryk policy\nRecourse: operator can run ryk allow-once ABC","remediation_commands":["ryk allow-once ABC"]}'
