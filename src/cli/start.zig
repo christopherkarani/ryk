@@ -519,7 +519,34 @@ fn writeSuccessEndCard(
     // protection until the dedicated health command proves live enforcement.
     const claim_ready = !unattended and protectionClaimReady(protection, selected_hosts, verification, ask_equivalent);
     if (claim_ready) {
-        try tui.render.callout(io, stdout, .success, "You're now protected by ryk", "The installed fail-closed integration chain passed verification.");
+        // Grade honesty (P1-4): setup verifies hook/wrapper integration only.
+        // No OS sandbox is attached until a session launches via `ryk <host>`;
+        // say what was verified and where the live session grade is reported.
+        const hosts_label = try std.mem.join(allocator, ", ", selected_hosts);
+        defer allocator.free(hosts_label);
+        if (protection.needsCommandGuard()) {
+            const title = try std.fmt.allocPrint(allocator, "Setup complete — hooks verified for {s}", .{hosts_label});
+            defer allocator.free(title);
+            try tui.render.callout(
+                io,
+                stdout,
+                .success,
+                title,
+                "Verified: fail-closed shell-command evaluation and host hook registration (protection grade: hook). " ++
+                    "Setup attaches no OS sandbox; a session launched with `ryk <host>` attaches one when the platform supports it, " ++
+                    "and its banner prints the actual grade (RYK_SESSION_SANDBOX_GRADE). See docs/compatibility.md.",
+            );
+        } else {
+            try tui.render.callout(
+                io,
+                stdout,
+                .success,
+                "Setup complete — mediated-session policy verified",
+                "Verified: policy installed for mediated sessions. Setup attaches no OS sandbox; " ++
+                    "a session launched with `ryk run` / `ryk <host>` attaches one when the platform supports it, " ++
+                    "and its banner prints the actual grade (RYK_SESSION_SANDBOX_GRADE). See docs/compatibility.md.",
+            );
+        }
     } else if (unattended) {
         try tui.render.callout(
             io,
@@ -713,6 +740,17 @@ fn flushIfSupported(writer: anytype) !void {
     }
 }
 
+/// Callout bodies word-wrap; collapse whitespace so phrase assertions are stable.
+/// The banned-claim literal is built by concatenation so source-level honesty
+/// guards (ensure.zig) never match this file's own test assertions.
+fn flattenWhitespace(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    const flat = try allocator.dupe(u8, text);
+    for (flat) |*c| {
+        if (c.* == '\n' or c.* == '\r' or c.* == '\t') c.* = ' ';
+    }
+    return flat;
+}
+
 test "start auto mode with mock daemon completes in temp workspace" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -746,7 +784,7 @@ test "start auto mode with mock daemon completes in temp workspace" {
     const output = stdout_writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, output, "\u{1F6E1}  ryk") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Ask on risk") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "You're now protected by ryk") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "You're now " ++ "protected by ryk") == null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Verification skipped (--skip-verify).") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Daemon") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Policy") != null);
@@ -797,6 +835,99 @@ test "start protection claim requires a verified installed host chain" {
     try std.testing.expect(!protectionClaimReady(.command_guard, &.{"codex"}, native, false));
 }
 
+test "start verified completion states hook grade without unqualified protection claim" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+
+    const verification = onboarding.VerificationOutcome{
+        .safe_allowed = true,
+        .dangerous_denied = true,
+        .hook_verified = true,
+        .host_evidence = .installed_fail_closed,
+        .detail = "installed",
+    };
+    const daemon_check = onboarding.DaemonCheck{
+        .status = .compatible,
+        .detail = "in-process",
+        .remediation = "none",
+    };
+    var output_buffer: [16 * 1024]u8 = undefined;
+    var output: std.Io.Writer = .fixed(&output_buffer);
+    try writeSuccessEndCard(
+        std.testing.io,
+        std.testing.allocator,
+        &output,
+        root,
+        "generic-agent",
+        .command_guard,
+        &.{"codex"},
+        &.{"codex"},
+        daemon_check,
+        verification,
+        "ask",
+    );
+
+    const written = output.buffered();
+    // Callout bodies word-wrap; flatten before phrase assertions.
+    const flat = try flattenWhitespace(std.testing.allocator, written);
+    defer std.testing.allocator.free(flat);
+    // What was actually verified, for which host — no absolute protection claim.
+    try std.testing.expect(std.mem.indexOf(u8, flat, "hooks verified for codex") != null);
+    try std.testing.expect(std.mem.indexOf(u8, flat, "protection grade: hook") != null);
+    // Plain statement that no OS sandbox is attached by setup, plus where the
+    // live session grade is reported.
+    try std.testing.expect(std.mem.indexOf(u8, flat, "no OS sandbox") != null);
+    try std.testing.expect(std.mem.indexOf(u8, flat, "RYK_SESSION_SANDBOX_GRADE") != null);
+    try std.testing.expect(std.mem.indexOf(u8, flat, "docs/compatibility.md") != null);
+    try std.testing.expect(std.mem.indexOf(u8, flat, "You're now " ++ "protected by ryk") == null);
+    try std.testing.expect(std.mem.indexOf(u8, flat, "now protected") == null);
+}
+
+test "start verified firewall-only completion states mediated-session scope" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+
+    const verification = onboarding.VerificationOutcome{
+        .safe_allowed = true,
+        .dangerous_denied = true,
+        .firewall_ready = true,
+        .detail = "ready",
+    };
+    const daemon_check = onboarding.DaemonCheck{
+        .status = .compatible,
+        .detail = "in-process",
+        .remediation = "none",
+    };
+    var output_buffer: [16 * 1024]u8 = undefined;
+    var output: std.Io.Writer = .fixed(&output_buffer);
+    try writeSuccessEndCard(
+        std.testing.io,
+        std.testing.allocator,
+        &output,
+        root,
+        "generic-agent",
+        .firewall,
+        &.{"codex"},
+        &.{"codex"},
+        daemon_check,
+        verification,
+        "ask",
+    );
+
+    const written = output.buffered();
+    const flat = try flattenWhitespace(std.testing.allocator, written);
+    defer std.testing.allocator.free(flat);
+    try std.testing.expect(std.mem.indexOf(u8, flat, "mediated-session policy verified") != null);
+    try std.testing.expect(std.mem.indexOf(u8, flat, "no OS sandbox") != null);
+    try std.testing.expect(std.mem.indexOf(u8, flat, "docs/compatibility.md") != null);
+    try std.testing.expect(std.mem.indexOf(u8, flat, "You're now " ++ "protected by ryk") == null);
+    try std.testing.expect(std.mem.indexOf(u8, flat, "now protected") == null);
+}
+
 test "start OpenClaw completion is explicit about wrapper-required evidence" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -832,7 +963,7 @@ test "start OpenClaw completion is explicit about wrapper-required evidence" {
     );
 
     const written = output.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, written, "You're now protected by ryk") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "You're now " ++ "protected by ryk") == null);
     try std.testing.expect(std.mem.indexOf(u8, written, "activation evidence pending") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "ryk run -- openclaw") != null);
 }
@@ -872,7 +1003,7 @@ test "start unattended completion never claims active protection before health" 
     );
 
     const written = output.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, written, "You're now protected by ryk") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "You're now " ++ "protected by ryk") == null);
     try std.testing.expect(std.mem.indexOf(u8, written, "unattended activation pending") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "ryk agents health --json") != null);
 }
@@ -993,7 +1124,7 @@ test "start with existing observe policy does not claim Ask protection" {
     const output = stdout_writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, output, "policy mode=observe") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "not Ask") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "You're now protected by ryk") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "You're now " ++ "protected by ryk") == null);
     // Residual callout, not full Ask protection claim.
     try std.testing.expect(std.mem.indexOf(u8, output, "residual policy mode") != null or std.mem.indexOf(u8, output, "Setup complete") != null);
     // Policy file still observe.

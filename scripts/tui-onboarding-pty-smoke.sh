@@ -105,8 +105,13 @@ verified_output="$SMOKE_ROOT/verified.out"
     fail "verified auto onboarding did not render exactly one banner"
 grep -Fq "codex  ✓ fail-closed chain verified" "$verified_output" ||
     fail "verified auto onboarding did not verify the Codex integration chain"
-[[ "$(grep -Fc "You're now protected by ryk" "$verified_output")" == "1" ]] ||
-    fail "verified auto onboarding did not render exactly one protected end card"
+[[ "$(grep -Fc "Setup complete — hooks verified for codex" "$verified_output")" == "1" ]] ||
+    fail "verified auto onboarding did not render exactly one verified-hooks end card"
+grep -Fq "protection grade: hook" "$verified_output" ||
+    fail "verified auto onboarding did not state the hook protection grade"
+if grep -Fq "You're now protected by ryk" "$verified_output"; then
+    fail "verified auto onboarding claimed unqualified protection"
+fi
 [[ -f "$SMOKE_ROOT/verified-workspace/.agents/plugins/ryk/.codex-plugin/plugin.json" ]] ||
     fail "verified auto onboarding did not install the managed Codex plugin"
 
