@@ -208,9 +208,16 @@ pub fn evaluateCommand(allocator: std.mem.Allocator, command: []const u8, option
         // cannot poison a full-string regex match. Also keep the full command
         // for patterns that legitimately span segments (after sanitize).
         try appendSegments(allocator, &candidates, trimmed);
-        if (candidates.items.len <= 1) {
+        if (candidates.items.len == 0) {
             // No separators — evaluate the whole line.
-            if (candidates.items.len == 0) try candidates.append(allocator, trimmed);
+            try candidates.append(allocator, trimmed);
+        } else if (candidates.items.len == 1) {
+            // A lone segment can be a truncated view of the line (e.g. comment
+            // handling dropped the tail). Evaluate the full original string as
+            // well so a truncated candidate is never the only thing checked.
+            if (!std.mem.eql(u8, candidates.items[0], trimmed)) {
+                try candidates.append(allocator, trimmed);
+            }
         } else {
             // Multi-segment: still include a sanitized full-string candidate for
             // spanning patterns, with assignment RHS masked.

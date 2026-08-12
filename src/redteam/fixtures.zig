@@ -50,6 +50,7 @@ pub const Category = enum {
 pub const AttemptKind = enum {
     file_read,
     command_exec,
+    shell_eval,
     network_connect,
     mcp_tool,
     mcp_metadata,
@@ -59,6 +60,7 @@ pub const AttemptKind = enum {
         const prefixes = [_]struct { prefix: []const u8, kind: AttemptKind }{
             .{ .prefix = "file.read:", .kind = .file_read },
             .{ .prefix = "command.exec:", .kind = .command_exec },
+            .{ .prefix = "shell.eval:", .kind = .shell_eval },
             .{ .prefix = "network.connect:", .kind = .network_connect },
             .{ .prefix = "mcp.tool:", .kind = .mcp_tool },
             .{ .prefix = "mcp.metadata:", .kind = .mcp_metadata },
@@ -76,6 +78,7 @@ pub const AttemptKind = enum {
         return switch (self) {
             .file_read, .symlink_read => "file.read",
             .command_exec => "command.exec",
+            .shell_eval => "shell.eval",
             .network_connect => "network.connect",
             .mcp_tool => "mcp.tool",
             .mcp_metadata => "mcp.metadata",
