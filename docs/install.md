@@ -66,8 +66,13 @@ curl -fsSL https://rykanv.com/install | sh
 
 It downloads the matching GitHub Release archive, verifies `checksums.txt`,
 installs the CLI and runtime assets, and prints the activation command. The
-`packaging/` directory contains build and container inputs; it is not a user
-installation channel.
+installer runs `ryk doctor --fix --from-install`, which creates a coding
+default policy under `$HOME/.ryk/policy.yaml` and seeds the runtime user
+fallback at `~/.config/ryk/policy.yaml` (create-only; never overwrites). That
+user path is what `ryk <agent>` loads when a project has no local
+`.ryk/policy.yaml` — without it, uninited directories fell back to
+`builtin:strict` and could block host launches. The `packaging/` directory
+contains build and container inputs; it is not a user installation channel.
 
 ## macOS Notes
 

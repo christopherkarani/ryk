@@ -92,6 +92,11 @@ pub const EnsureOutcome = struct {
 /// Policy is always written at the resolved workspace root (D29) — never naively under
 /// a nested process cwd when a parent workspace marker exists.
 ///
+/// Install door (`from_install`): also create-only seeds `~/.config/ryk/policy.yaml`
+/// (runtime user fallback for projects without local `.ryk/policy.yaml`). Never overwrites.
+/// Without that seed, uninited projects fell through to `builtin:strict` and could block
+/// host launches (`ryk opencode`, etc.).
+///
 /// D09/D10: missing → generic-agent coding DCG create (mode strict, matrix-only,
 /// commands.default allow; no ask main loop); present → never overwrite;
 /// unreadable / non-mediating / no-mode → operator-visible residual or core_failed
@@ -134,7 +139,13 @@ pub fn runEnsure(
 
     if (onboarding.policyExists(io, workspace_root)) {
         // Honesty depth (D10): inspect mode evidence; never claim Ask-on-risk without it.
-        return try leaveAloneWithHonesty(io, allocator, workspace_root, options, stderr);
+        const outcome = try leaveAloneWithHonesty(io, allocator, workspace_root, options, stderr);
+        // Install door: also seed the runtime user fallback (~/.config/ryk/policy.yaml)
+        // so project launches do not fall through to builtin:strict.
+        if (options.from_install and outcome.core_ok) {
+            seedUserGlobalPolicyIfMissing(io, allocator, options, stderr);
+        }
+        return outcome;
     }
 
     var root_dir = std.Io.Dir.openDirAbsolute(io, workspace_root, .{}) catch |err| {
@@ -167,13 +178,89 @@ pub fn runEnsure(
     if (code != exit_codes.success) {
         // Multi-process race: peer may have won exclusive create. Present policy is leave-alone (D23).
         if (onboarding.policyExists(io, workspace_root)) {
-            return try leaveAloneWithHonesty(io, allocator, workspace_root, options, stderr);
+            const outcome = try leaveAloneWithHonesty(io, allocator, workspace_root, options, stderr);
+            if (options.from_install and outcome.core_ok) {
+                seedUserGlobalPolicyIfMissing(io, allocator, options, stderr);
+            }
+            return outcome;
         }
         return coreFailedOutcome();
     }
 
+    // Install door: seed runtime user fallback so uninited projects get coding DCG,
+    // not builtin:strict permit-list refuse (host launch block).
+    if (options.from_install) {
+        seedUserGlobalPolicyIfMissing(io, allocator, options, stderr);
+    }
+
     // Policy created → auto-wire detected hosts (soft); zero hosts → partial, never full claim.
     return try coreOkOutcomeWithHosts(io, allocator, workspace_root, options, true, false);
+}
+
+/// Create-only `~/.config/ryk/policy.yaml` (same path `policy.load.discover` uses as user
+/// fallback). Soft: never fails ensure; never overwrites. Install historically wrote only
+/// `$HOME/.ryk/policy.yaml`, which is invisible when cwd is another project.
+fn seedUserGlobalPolicyIfMissing(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    options: EnsureOptions,
+    stderr: anytype,
+) void {
+    const home = (homeDirOwned(allocator) catch {
+        if (!options.quiet) {
+            stderr.writeAll("ryk ensure: could not resolve HOME for user policy seed\n") catch {};
+        }
+        return;
+    }) orelse {
+        if (!options.quiet) {
+            stderr.writeAll("ryk ensure: HOME unset; skipped user policy seed (~/.config/ryk/policy.yaml)\n") catch {};
+        }
+        return;
+    };
+    defer allocator.free(home);
+    if (home.len == 0 or !std.fs.path.isAbsolute(home)) return;
+
+    const config_dir = std.fs.path.join(allocator, &.{ home, ".config", "ryk" }) catch return;
+    defer allocator.free(config_dir);
+    const user_path = std.fs.path.join(allocator, &.{ config_dir, "policy.yaml" }) catch return;
+    defer allocator.free(user_path);
+
+    // Leave alone when present (never overwrite operator policy).
+    if (plugin.fileExistsAbsolute(io, user_path)) return;
+
+    const preset_name = options.preset orelse onboarding.default_preset;
+    const agent = ryk_policy.presets.AgentPreset.parse(preset_name) orelse .generic_agent;
+    const body = ryk_policy.presets.agentPresetText(agent);
+
+    std.Io.Dir.cwd().createDirPath(io, config_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => {
+            if (!options.quiet) {
+                stderr.print("ryk ensure: could not create {s}: {s}\n", .{ config_dir, @errorName(err) }) catch {};
+            }
+            return;
+        },
+    };
+
+    const file = std.Io.Dir.cwd().createFile(io, user_path, .{ .exclusive = true }) catch |err| switch (err) {
+        error.PathAlreadyExists => return, // race: peer won
+        else => {
+            if (!options.quiet) {
+                stderr.print("ryk ensure: could not write {s}: {s}\n", .{ user_path, @errorName(err) }) catch {};
+            }
+            return;
+        },
+    };
+    defer file.close(io);
+    file.writeStreamingAll(io, body) catch |err| {
+        if (!options.quiet) {
+            stderr.print("ryk ensure: failed writing user policy: {s}\n", .{@errorName(err)}) catch {};
+        }
+        return;
+    };
+    if (!options.quiet) {
+        stderr.print("ryk ensure: created user policy {s} (project fallback)\n", .{user_path}) catch {};
+    }
 }
 
 fn coreFailedOutcome() EnsureOutcome {
@@ -2517,6 +2604,16 @@ test "EnsureSoft from_install HOME is policy root not process nested cwd (D32/D2
     try std.testing.expect(policy.len > 0);
     try std.testing.expect(std.mem.indexOf(u8, policy, "mode:") != null or std.mem.indexOf(u8, policy, "version:") != null);
 
+    // Runtime user fallback: discover looks at ~/.config/ryk/policy.yaml for projects
+    // without local .ryk/policy.yaml. Install must seed it (create-only).
+    const user_policy = try home_tmp.dir.readFileAlloc(io, ".config/ryk/policy.yaml", allocator, .limited(64 * 1024));
+    defer allocator.free(user_policy);
+    try std.testing.expect(user_policy.len > 0);
+    try std.testing.expect(std.mem.indexOf(u8, user_policy, "mode:") != null or std.mem.indexOf(u8, user_policy, "version:") != null);
+    // Coding DCG shape (not builtin:strict permit list).
+    try std.testing.expect(std.mem.indexOf(u8, user_policy, "generic-agent") != null);
+    try std.testing.expect(std.mem.indexOf(u8, user_policy, "default: allow") != null);
+
     // Soft success map: zero/soft hosts keep exit 0; never full-protection claim on empty proof.
     try std.testing.expectEqual(@as(u8, exit_codes.success), processExitForOutcome(outcome));
     try std.testing.expect(outcome.protection_label != .core_failed);
@@ -2529,6 +2626,84 @@ test "EnsureSoft from_install HOME is policy root not process nested cwd (D32/D2
         try std.testing.expect(ensureSoftHasPartialToken(receipt));
         try std.testing.expect(ensureSoftHasDoctorRepair(receipt));
     }
+}
+
+test "EnsureSoft from_install seeds user config policy leave-alone never overwrites" {
+    // Install re-run: HOME workspace policy present; user global missing → seed.
+    // User global present with sentinel → never overwrite.
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+
+    var home_tmp = std.testing.tmpDir(.{});
+    defer home_tmp.cleanup();
+
+    const home_abs = try home_tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(home_abs);
+
+    // Pre-existing HOME workspace policy (legacy install shape).
+    try home_tmp.dir.createDirPath(io, ".ryk");
+    {
+        const f = try home_tmp.dir.createFile(io, ".ryk/policy.yaml", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io,
+            \\version: 1
+            \\mode: strict
+            \\# home-workspace-leave-alone
+            \\
+        );
+    }
+
+    const prev_home = try ensureSoftDupEnvZ("HOME");
+    defer ensureSoftRestoreEnv("HOME", prev_home);
+    const home_z = try allocator.dupeZ(u8, home_abs);
+    defer allocator.free(home_z);
+    try std.testing.expectEqual(@as(c_int, 0), setenv("HOME", home_z.ptr, 1));
+
+    var stdout_buf: [4096]u8 = undefined;
+    var stderr_buf: [2048]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+
+    var first = try runEnsure(io, allocator, home_tmp.dir, .{
+        .from_install = true,
+        .quiet = true,
+        .preset = onboarding.default_preset,
+        .skip_verify = true,
+    }, &stdout_writer, &stderr_writer);
+    defer first.deinit(allocator);
+    try std.testing.expect(first.core_ok);
+    try std.testing.expect(first.policy_left_alone);
+
+    const seeded = try home_tmp.dir.readFileAlloc(io, ".config/ryk/policy.yaml", allocator, .limited(64 * 1024));
+    defer allocator.free(seeded);
+    try std.testing.expect(seeded.len > 0);
+
+    // HOME workspace policy must stay untouched.
+    const home_pol = try home_tmp.dir.readFileAlloc(io, ".ryk/policy.yaml", allocator, .limited(4096));
+    defer allocator.free(home_pol);
+    try std.testing.expect(std.mem.indexOf(u8, home_pol, "home-workspace-leave-alone") != null);
+
+    // Overwrite guard: plant sentinel, re-ensure, still sentinel.
+    const sentinel = "# user-global-sentinel-never-overwrite\nversion: 1\nmode: observe\n";
+    {
+        const f = try home_tmp.dir.createFile(io, ".config/ryk/policy.yaml", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, sentinel);
+    }
+    stdout_writer = .fixed(&stdout_buf);
+    stderr_writer = .fixed(&stderr_buf);
+    var second = try runEnsure(io, allocator, home_tmp.dir, .{
+        .from_install = true,
+        .quiet = true,
+        .preset = "generic-agent",
+        .skip_verify = true,
+    }, &stdout_writer, &stderr_writer);
+    defer second.deinit(allocator);
+    try std.testing.expect(second.core_ok);
+
+    const after = try home_tmp.dir.readFileAlloc(io, ".config/ryk/policy.yaml", allocator, .limited(4096));
+    defer allocator.free(after);
+    try std.testing.expectEqualStrings(sentinel, after);
 }
 
 test "EnsureSoft from_install without absolute HOME is core_failed fail-closed (D32/D33)" {

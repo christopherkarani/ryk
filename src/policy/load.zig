@@ -612,6 +612,7 @@ pub fn discover(
 
     if (std.c.getenv("HOME")) |home_c| {
         const home = std.mem.sliceTo(home_c, 0);
+        // Canonical user fallback (XDG-style) — install/ensure seeds this path.
         const user_path = try std.fs.path.join(allocator, &.{ home, ".config", "ryk", "policy.yaml" });
         defer allocator.free(user_path);
         if (loadFile(io, allocator, user_path)) |policy| {
@@ -619,6 +620,21 @@ pub fn discover(
         } else |err| switch (err) {
             error.FileNotFound => {},
             else => return err,
+        }
+        // Legacy install wrote only $HOME/.ryk/policy.yaml (HOME-as-workspace). When
+        // cwd is another project that file is invisible as workspace policy; treat it
+        // as user fallback before builtin:strict so already-installed machines work.
+        // Prefer .config path above when both exist.
+        const home_workspace_path = try std.fs.path.join(allocator, &.{ home, ".ryk", "policy.yaml" });
+        defer allocator.free(home_workspace_path);
+        // Skip if workspace_root is already HOME (would have matched workspace step).
+        if (!std.mem.eql(u8, workspace_path, home_workspace_path)) {
+            if (loadFile(io, allocator, home_workspace_path)) |policy| {
+                return loadedPolicyWithPath(allocator, policy, .user, home_workspace_path);
+            } else |err| switch (err) {
+                error.FileNotFound => {},
+                else => return err,
+            }
         }
     }
 
@@ -1357,7 +1373,7 @@ test "policy discovery honors CLI path before workspace policy" {
     const cli_path = try tmp.dir.realPathFileAlloc(std.testing.io, "strict.yaml", std.testing.allocator);
     defer std.testing.allocator.free(cli_path);
 
-    var loaded = try discover(std.testing.allocator, cli_path, root);
+    var loaded = try discover(std.testing.io, std.testing.allocator, cli_path, root);
     defer loaded.deinit();
     try std.testing.expectEqual(schema.LoadSource.cli, loaded.source);
     try std.testing.expectEqual(schema.Mode.strict, loaded.policy.mode);
@@ -1375,7 +1391,62 @@ test "workspace policy discovery falls back only when missing" {
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(root);
 
-    try std.testing.expectError(error.UnsupportedPolicyMode, discover(std.testing.allocator, null, root));
+    try std.testing.expectError(error.UnsupportedPolicyMode, discover(std.testing.io, std.testing.allocator, null, root));
+}
+
+// HOME mutation for discover fallback tests (same pattern as ensure Soft).
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+
+test "policy discovery falls back to HOME .ryk policy before builtin strict" {
+    // Legacy install wrote only $HOME/.ryk/policy.yaml. Project cwd without local
+    // policy must not fall through to builtin:strict when that file exists.
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+
+    var home_tmp = std.testing.tmpDir(.{});
+    defer home_tmp.cleanup();
+    var project_tmp = std.testing.tmpDir(.{});
+    defer project_tmp.cleanup();
+
+    try home_tmp.dir.createDirPath(io, ".ryk");
+    {
+        const f = try home_tmp.dir.createFile(io, ".ryk/policy.yaml", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, presets.agentPresetText(.generic_agent));
+    }
+
+    const home_abs_z = try home_tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(home_abs_z);
+    const home_abs = try allocator.dupe(u8, home_abs_z);
+    defer allocator.free(home_abs);
+
+    const project_abs_z = try project_tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(project_abs_z);
+    const project_abs = try allocator.dupe(u8, project_abs_z);
+    defer allocator.free(project_abs);
+
+    const prev: ?[:0]u8 = if (std.c.getenv("HOME")) |v| try allocator.dupeZ(u8, std.mem.span(v)) else null;
+    defer {
+        if (prev) |p| {
+            _ = setenv("HOME", p.ptr, 1);
+            allocator.free(p);
+        } else {
+            _ = unsetenv("HOME");
+        }
+    }
+    const home_z = try allocator.dupeZ(u8, home_abs);
+    defer allocator.free(home_z);
+    try std.testing.expectEqual(@as(c_int, 0), setenv("HOME", home_z.ptr, 1));
+
+    var loaded = try discover(io, allocator, null, project_abs);
+    defer loaded.deinit();
+    try std.testing.expectEqual(schema.LoadSource.user, loaded.source);
+    try std.testing.expect(std.mem.indexOf(u8, loaded.path, ".ryk/policy.yaml") != null);
+    try std.testing.expect(std.mem.indexOf(u8, loaded.path, ".config") == null);
+    // generic-agent is mode strict with matrix-only allow (not builtin permit refuse).
+    try std.testing.expectEqual(schema.Mode.strict, loaded.policy.mode);
+    try std.testing.expectEqual(@as(usize, 0), loaded.policy.commands.allow.len);
 }
 
 test "JSON policies reject unknown keys instead of silently changing policy meaning" {
@@ -1721,7 +1792,7 @@ fn parsePolicyAllocationFailureProbe(allocator: std.mem.Allocator) !void {
 }
 
 fn discoverPolicyAllocationFailureProbe(allocator: std.mem.Allocator, policy_path: []const u8, root: []const u8) !void {
-    var loaded = try discover(allocator, policy_path, root);
+    var loaded = try discover(std.testing.io, allocator, policy_path, root);
     defer loaded.deinit();
 }
 
