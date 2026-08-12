@@ -52,7 +52,7 @@ JSON includes a top-level `provenance` object, for example:
 
 ## Adding Fixtures
 
-Read [contributing-fixtures.md](contributing-fixtures.md). Fixtures must use synthetic data, no real secrets, no real LLMs, and no external network services.
+Read [../fixtures/README.md](../fixtures/README.md). Fixtures must use synthetic data, no real secrets, no real LLMs, and no external network services.
 
 ## Skipped Or Unsupported
 
