@@ -740,15 +740,25 @@ fn flushIfSupported(writer: anytype) !void {
     }
 }
 
-/// Callout bodies word-wrap; collapse whitespace so phrase assertions are stable.
+/// Callout bodies word-wrap (with re-indent); collapse all whitespace runs to
+/// single spaces so phrase assertions are stable regardless of wrap position.
 /// The banned-claim literal is built by concatenation so source-level honesty
 /// guards (ensure.zig) never match this file's own test assertions.
 fn flattenWhitespace(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
-    const flat = try allocator.dupe(u8, text);
-    for (flat) |*c| {
-        if (c.* == '\n' or c.* == '\r' or c.* == '\t') c.* = ' ';
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var in_ws = false;
+    for (text) |c| {
+        if (c == ' ' or c == '\n' or c == '\r' or c == '\t') {
+            if (in_ws) continue;
+            in_ws = true;
+            try out.append(allocator, ' ');
+        } else {
+            in_ws = false;
+            try out.append(allocator, c);
+        }
     }
-    return flat;
+    return try out.toOwnedSlice(allocator);
 }
 
 test "start auto mode with mock daemon completes in temp workspace" {
