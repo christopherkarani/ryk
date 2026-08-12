@@ -404,16 +404,16 @@ test "summary json records final hash and bounded command metadata" {
         .mode = .observe,
         .platform = core.platform.detectOs(),
     };
-    var list: std.ArrayList(u8) = .empty;
-    defer list.deinit(std.testing.allocator);
-    try writeJson(list.writer(std.testing.allocator), .{
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    try writeJson(&aw.writer, .{
         .session = session,
         .status = .{ .exited = 0 },
         .event_count = 3,
         .final_event_hash = "abc",
     });
-    try std.testing.expect(std.mem.indexOf(u8, list.items, "\"final_event_hash\":\"abc\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, list.items, "\"command\":[\"echo\",\"hello\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, aw.written(), "\"final_event_hash\":\"abc\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, aw.written(), "\"command\":[\"echo\",\"hello\"]") != null);
 }
 
 test "summary redacts synthetic secret command metadata" {
@@ -428,16 +428,55 @@ test "summary redacts synthetic secret command metadata" {
         .mode = .observe,
         .platform = core.platform.detectOs(),
     };
-    var list: std.ArrayList(u8) = .empty;
-    defer list.deinit(std.testing.allocator);
-    try writeJson(list.writer(std.testing.allocator), .{
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    try writeJson(&aw.writer, .{
         .session = session,
         .status = .{ .exited = 0 },
         .event_count = 3,
         .final_event_hash = "abc",
     });
-    try std.testing.expect(std.mem.indexOf(u8, list.items, "fake_secret_value") == null);
-    try std.testing.expect(std.mem.indexOf(u8, list.items, "[REDACTED:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, aw.written(), "fake_secret_value") == null);
+    try std.testing.expect(std.mem.indexOf(u8, aw.written(), "[REDACTED:") != null);
+}
+
+test "p0-4 summary redacts structured secrets classifyString missed" {
+    const ts = core.time.Timestamp.fromUnixSeconds(1_777_983_130);
+    const session: core.session.Session = .{
+        .id = try core.session.generateSessionId(ts),
+        .started_at = ts,
+        .ended_at = ts,
+        .command = "psql",
+        .args = &.{ "mysql://user:pw@dbhost/app", "{\"password\":\"hunter2\"}" },
+        .workspace_root = "/tmp/ryk",
+        .mode = .observe,
+        .platform = core.platform.detectOs(),
+    };
+    // summary.json: command args carry a connection-string password + JSON password.
+    var json_aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer json_aw.deinit();
+    try writeJson(&json_aw.writer, .{
+        .session = session,
+        .status = .{ .exited = 0 },
+        .event_count = 1,
+        .final_event_hash = "abc",
+    });
+    try std.testing.expect(std.mem.indexOf(u8, json_aw.written(), "user:pw") == null);
+    try std.testing.expect(std.mem.indexOf(u8, json_aw.written(), "hunter2") == null);
+    try std.testing.expect(std.mem.indexOf(u8, json_aw.written(), "[REDACTED") != null);
+
+    // summary.md: the policy field carries an Authorization header credential.
+    var md_aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer md_aw.deinit();
+    try writeMarkdown(&md_aw.writer, .{
+        .session = session,
+        .status = .{ .exited = 0 },
+        .event_count = 1,
+        .final_event_hash = "abc",
+        .policy = "Authorization: Bearer abc123def456ghi",
+    });
+    try std.testing.expect(std.mem.indexOf(u8, md_aw.written(), "abc123def456ghi") == null);
+    try std.testing.expect(std.mem.indexOf(u8, md_aw.written(), "[REDACTED") != null);
 }
 
 test "summary markdown is product neutral unless caller provides label" {
@@ -452,21 +491,21 @@ test "summary markdown is product neutral unless caller provides label" {
         .mode = .observe,
         .platform = core.platform.detectOs(),
     };
-    var generic: std.ArrayList(u8) = .empty;
-    defer generic.deinit(std.testing.allocator);
-    try writeMarkdown(generic.writer(std.testing.allocator), .{
+    var generic: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer generic.deinit();
+    try writeMarkdown(&generic.writer, .{
         .session = session,
         .status = .{ .exited = 0 },
         .event_count = 3,
         .final_event_hash = "abc",
     });
     const labeled_heading_text = "ryk" ++ " Session";
-    try std.testing.expect(std.mem.indexOf(u8, generic.items, labeled_heading_text) == null);
-    try std.testing.expect(std.mem.indexOf(u8, generic.items, "# Session ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, generic.written(), labeled_heading_text) == null);
+    try std.testing.expect(std.mem.indexOf(u8, generic.written(), "# Session ") != null);
 
-    var labeled: std.ArrayList(u8) = .empty;
-    defer labeled.deinit(std.testing.allocator);
-    try writeMarkdown(labeled.writer(std.testing.allocator), .{
+    var labeled: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer labeled.deinit();
+    try writeMarkdown(&labeled.writer, .{
         .session = session,
         .status = .{ .exited = 0 },
         .event_count = 3,
@@ -475,7 +514,7 @@ test "summary markdown is product neutral unless caller provides label" {
         .product_label = "ryk",
     });
     const labeled_heading_prefix = "# " ++ "ryk" ++ " Session ";
-    try std.testing.expect(std.mem.indexOf(u8, labeled.items, labeled_heading_prefix) != null);
+    try std.testing.expect(std.mem.indexOf(u8, labeled.written(), labeled_heading_prefix) != null);
 }
 
 test "update final hash rejects tampered summary before rewriting" {
@@ -486,7 +525,7 @@ test "update final hash rejects tampered summary before rewriting" {
 
     const session_dir = try std.fs.path.join(std.testing.allocator, &.{ root, ".ryk", "sessions", "summary-tamper" });
     defer std.testing.allocator.free(session_dir);
-    try std.Io.Dir.cwd().makePath(std.testing.io, session_dir);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, session_dir);
 
     const ts = core.time.Timestamp.fromUnixSeconds(1_777_983_130);
     const session: core.session.Session = .{
@@ -508,7 +547,7 @@ test "update final hash rejects tampered summary before rewriting" {
 
     const summary_path = try std.fs.path.join(std.testing.allocator, &.{ session_dir, "summary.json" });
     defer std.testing.allocator.free(summary_path);
-    const original = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, summary_path, core.limits.max_event_field_len);
+    const original = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, summary_path, std.testing.allocator, std.Io.Limit.limited(core.limits.max_event_field_len));
     defer std.testing.allocator.free(original);
     const tampered = try std.mem.replaceOwned(u8, std.testing.allocator, original, "hello", "changed");
     defer std.testing.allocator.free(tampered);
@@ -520,7 +559,7 @@ test "update final hash rejects tampered summary before rewriting" {
 
     try std.testing.expectError(error.InvalidEventSchema, updateFinalHash(std.testing.allocator, session_dir, 4, "def"));
 
-    const after = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, summary_path, core.limits.max_event_field_len);
+    const after = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, summary_path, std.testing.allocator, std.Io.Limit.limited(core.limits.max_event_field_len));
     defer std.testing.allocator.free(after);
     try std.testing.expect(std.mem.indexOf(u8, after, "changed") != null);
     try std.testing.expect(std.mem.indexOf(u8, after, "\"final_event_hash\":\"def\"") == null);

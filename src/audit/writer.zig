@@ -3,6 +3,7 @@ const std = @import("std");
 const core = @import("../core/public.zig");
 const hash_chain = @import("hash_chain.zig");
 const replay = @import("replay.zig");
+const audit_summary = @import("summary.zig");
 
 pub const SessionWriter = struct {
     io: std.Io,
@@ -14,6 +15,10 @@ pub const SessionWriter = struct {
     events_file: std.Io.File,
     previous_hash: ?hash_chain.HashHex = null,
     event_count: usize = 0,
+    /// Bytes of events.jsonl this writer has already accounted for. Used to detect
+    /// interleaved appends by other writers (shims) cheaply: if the on-disk size
+    /// diverges, re-sync the chain tip from disk before the next append (P0-5).
+    synced_size: u64 = 0,
 
     pub fn init(io: std.Io, allocator: std.mem.Allocator, session: core.session.Session) !SessionWriter {
         return initWithDirName(io, allocator, session, ".ryk");
@@ -65,10 +70,9 @@ pub const SessionWriter = struct {
 
         var events_file = try std.Io.Dir.cwd().openFile(io, events_path, .{ .mode = .read_write });
         errdefer events_file.close(io);
+        // Appends are positional (see `appendEvent`), so no global-seek setup is
+        // needed here; only record the current size for the resync fast path.
         const end_offset = (try events_file.stat(io)).size;
-        var seek_buf: [1]u8 = undefined;
-        var end_writer = events_file.writer(io, &seek_buf);
-        try end_writer.seekToUnbuffered(end_offset);
 
         var session_id: core.session.SessionId = .{ .value = undefined, .len = 0 };
         if (session_id_text.len > session_id.value.len) return error.InvalidSessionId;
@@ -85,6 +89,7 @@ pub const SessionWriter = struct {
             .events_file = events_file,
             .previous_hash = state.previous_hash,
             .event_count = state.event_count,
+            .synced_size = end_offset,
         };
     }
 
@@ -95,6 +100,13 @@ pub const SessionWriter = struct {
     }
 
     pub fn appendEvent(self: *SessionWriter, ev: core.event.Event) !void {
+        // P0-5: a long-lived writer must not chain to a stale in-memory tip. Shims
+        // append to the same events.jsonl through their own `openExisting` handle,
+        // so between two of our appends the on-disk tip may have advanced. Re-sync
+        // from disk when the file grew underneath us; otherwise the parent forks
+        // the hash chain, making legitimate evidence read as tampered.
+        const write_offset = try self.resyncEof();
+
         var previous: ?[]const u8 = null;
         if (self.previous_hash) |*hash| previous = hash[0..];
         const canonical = try hash_chain.canonicalEventAlloc(self.allocator, ev, previous);
@@ -106,11 +118,41 @@ pub const SessionWriter = struct {
         try hash_chain.writeEventJsonLine(&out.writer, ev, previous, &hash);
         const line = try out.toOwnedSlice();
         defer self.allocator.free(line);
-        try self.events_file.writeStreamingAll(self.io, line);
+
+        // Positional append at the true EOF. `writeStreamingAll` targets the OS
+        // global seek offset, which a positional `openExisting` seek never moves,
+        // so a resumed/shim writer would otherwise clobber existing rows from
+        // offset 0. A positional writer pwrites exactly at `write_offset` (P0-5).
+        var write_buf: [1024]u8 = undefined;
+        var file_writer = self.events_file.writer(self.io, &write_buf);
+        try file_writer.seekTo(write_offset);
+        try file_writer.interface.writeAll(line);
+        try file_writer.interface.flush();
         try self.events_file.sync(self.io);
 
         self.previous_hash = hash;
         self.event_count += 1;
+        self.synced_size = write_offset + line.len;
+    }
+
+    /// Return the true end-of-file offset to append at, re-reading chain state
+    /// (tip hash + event count) first when the events file grew since our last
+    /// append — i.e. another writer (a shim) appended. Fast path is a single
+    /// `stat`; the full re-read only runs when interleaving actually happened. A
+    /// mid-chain edit still fails `readExistingState`'s strict
+    /// `previous_hash == tip` check, so the append fails closed and tamper-evidence
+    /// is preserved.
+    fn resyncEof(self: *SessionWriter) !u64 {
+        const size = (try self.events_file.stat(self.io)).size;
+        if (size == self.synced_size) return size;
+
+        const events_path = try std.fs.path.join(self.allocator, &.{ self.session_dir_path, "events.jsonl" });
+        defer self.allocator.free(events_path);
+        const state = try readExistingState(self.io, self.allocator, events_path);
+        self.previous_hash = state.previous_hash;
+        self.event_count = state.event_count;
+        self.synced_size = size;
+        return size;
     }
 
     pub fn finalHash(self: *const SessionWriter) ?[]const u8 {
@@ -342,6 +384,56 @@ test "session writer redacts embedded secret assignments in command targets" {
     try std.testing.expect(std.mem.indexOf(u8, events, "[REDACTED:env:OPENAI_API_KEY:sha256:") != null);
 }
 
+test "p0-4 write path redacts structured secrets classifyString missed in events.jsonl" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const ts = core.time.Timestamp.fromUnixSeconds(1_777_983_130);
+    const session: core.session.Session = .{
+        .id = try core.session.generateSessionId(ts),
+        .started_at = ts,
+        .command = "psql",
+        .args = &.{"connect"},
+        .workspace_root = root,
+        .mode = .observe,
+        .platform = core.platform.detectOs(),
+    };
+    var event_id: core.event.EventId = .{ .value = undefined, .len = 0 };
+    const event_id_text = try std.fmt.bufPrint(&event_id.value, "evt_000001", .{});
+    event_id.len = event_id_text.len;
+    // Connection-string password (target), JSON password + Authorization header
+    // (reason) all bypassed the weak write-time redactor before P0-4.
+    const ev: core.event.Event = .{
+        .session_id = session.id,
+        .event_id = event_id,
+        .timestamp = ts,
+        .event_type = .command_denied,
+        .actor = .{ .kind = .ryk, .display = "ryk" },
+        .target = .{ .kind = .command, .value = "psql mysql://user:pw@dbhost/app" },
+        .decision = .{
+            .result = .deny,
+            .reason = "blocked: {\"password\":\"hunter2\"} Authorization: Bearer abc123def456ghi",
+            .ci_may_proceed = false,
+        },
+    };
+
+    var session_writer = try SessionWriter.init(std.testing.io, std.testing.allocator, session);
+    defer session_writer.deinit();
+    try session_writer.appendEvent(ev);
+
+    const rel_events_path = try std.fs.path.join(std.testing.allocator, &.{ ".ryk", "sessions", session.id.slice(), "events.jsonl" });
+    defer std.testing.allocator.free(rel_events_path);
+    const events = try tmp.dir.readFileAlloc(std.testing.io, rel_events_path, std.testing.allocator, .limited(8192));
+    defer std.testing.allocator.free(events);
+
+    try std.testing.expect(std.mem.indexOf(u8, events, "user:pw") == null);
+    try std.testing.expect(std.mem.indexOf(u8, events, "hunter2") == null);
+    try std.testing.expect(std.mem.indexOf(u8, events, "abc123def456ghi") == null);
+    try std.testing.expect(std.mem.indexOf(u8, events, "[REDACTED") != null);
+}
+
 test "openExisting fails closed on tampered existing event chain" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -388,7 +480,7 @@ test "openExisting fails closed on tampered existing event chain" {
         try file.writeStreamingAll(std.testing.io, events);
     }
 
-    try std.testing.expectError(error.InvalidEventSchema, SessionWriter.openExisting(std.testing.allocator, root, session.id.slice()));
+    try std.testing.expectError(error.InvalidEventSchema, SessionWriter.openExisting(std.testing.io, std.testing.allocator, root, session.id.slice()));
 }
 
 test "openExisting rejects dot segment session ids before resolving paths" {
@@ -397,8 +489,8 @@ test "openExisting rejects dot segment session ids before resolving paths" {
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(root);
 
-    try std.testing.expectError(error.InvalidSessionId, SessionWriter.openExisting(std.testing.allocator, root, "."));
-    try std.testing.expectError(error.InvalidSessionId, SessionWriter.openExisting(std.testing.allocator, root, ".."));
+    try std.testing.expectError(error.InvalidSessionId, SessionWriter.openExisting(std.testing.io, std.testing.allocator, root, "."));
+    try std.testing.expectError(error.InvalidSessionId, SessionWriter.openExisting(std.testing.io, std.testing.allocator, root, ".."));
 }
 
 test "openExisting accepts valid audit logs larger than one MCP message" {
@@ -443,7 +535,7 @@ test "openExisting accepts valid audit logs larger than one MCP message" {
         }
     }
 
-    var resumed = try SessionWriter.openExisting(std.testing.allocator, root, session.id.slice());
+    var resumed = try SessionWriter.openExisting(std.testing.io, std.testing.allocator, root, session.id.slice());
     defer resumed.deinit();
     try std.testing.expectEqual(@as(usize, 18), resumed.event_count);
 }
@@ -470,14 +562,14 @@ test "session writer preserves interleaved parent and shim appends" {
     try parent.appendEvent(try testEvent(session.id, ts, "evt_parent_1", .session_start, .session, session.id.slice()));
 
     {
-        var shim = try SessionWriter.openExisting(std.testing.allocator, root, session.id.slice());
+        var shim = try SessionWriter.openExisting(std.testing.io, std.testing.allocator, root, session.id.slice());
         defer shim.deinit();
         try shim.appendEvent(try testEvent(session.id, ts, "evt_shim_2", .command_allowed, .command, "git status with a longer shim-side target value"));
     }
 
     try parent.appendEvent(try testEvent(session.id, ts, "evt_parent_3", .session_exit, .session, session.id.slice()));
 
-    var resumed = try SessionWriter.openExisting(std.testing.allocator, root, session.id.slice());
+    var resumed = try SessionWriter.openExisting(std.testing.io, std.testing.allocator, root, session.id.slice());
     defer resumed.deinit();
     try std.testing.expectEqual(@as(usize, 3), resumed.event_count);
 
@@ -487,6 +579,36 @@ test "session writer preserves interleaved parent and shim appends" {
     defer std.testing.allocator.free(events);
     try std.testing.expect(std.mem.indexOf(u8, events, "evt_shim_2") != null);
     try std.testing.expect(std.mem.indexOf(u8, events, "evt_parent_3") != null);
+
+    // P0-5: the events chain must ALSO satisfy the `ryk replay` verifier
+    // (strict `previous_hash == tip`). Before the fix the parent chained its
+    // session_exit to a stale tip, so this verification failed even though the
+    // evidence was legitimate. Write a matching summary and verify clean.
+    var ended = session;
+    ended.ended_at = ts;
+    const final_hash = resumed.finalHash().?;
+    try audit_summary.writeFiles(std.testing.allocator, resumed.session_dir_path, .{
+        .session = ended,
+        .status = .{ .exited = 0 },
+        .event_count = resumed.event_count,
+        .final_event_hash = final_hash,
+    });
+
+    var clean = try replay.verifySessionDir(std.testing.io, std.testing.allocator, resumed.session_dir_path);
+    defer clean.deinit(std.testing.allocator);
+    try std.testing.expect(clean.ok);
+
+    // A mid-chain edit must still fail verification (tamper-evidence preserved).
+    const tampered = try std.mem.replaceOwned(u8, std.testing.allocator, events, "evt_shim_2", "evt_shim_9");
+    defer std.testing.allocator.free(tampered);
+    {
+        const file = try tmp.dir.createFile(std.testing.io, rel_events_path, .{ .truncate = true });
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, tampered);
+    }
+    var tamper = try replay.verifySessionDir(std.testing.io, std.testing.allocator, resumed.session_dir_path);
+    defer tamper.deinit(std.testing.allocator);
+    try std.testing.expect(!tamper.ok);
 }
 
 fn testEvent(
