@@ -330,6 +330,11 @@ export function findRyk(cwd?: string, platform: NodeJS.Platform = process.platfo
   const pathBin = resolveOnPath('ryk', platform);
   if (pathBin && attestRykCandidate(pathBin, cwd)) return canonicalPath(pathBin);
 
+  // Product installs (GUI/TUI hosts often strip login PATH).
+  for (const p of wellKnownRykBins(platform)) {
+    if (attestRykCandidate(p, cwd)) return canonicalPath(p);
+  }
+
   // Dev-only: never trust agent-writable workspace bins in production loads.
   if (process.env.RYK_ALLOW_WORKSPACE_BIN === '1') {
     const candidates: string[] = [];
@@ -360,13 +365,53 @@ function canonicalPath(path: string): string {
   }
 }
 
+function isWithin(candidate: string, root: string): boolean {
+  const normalizedCandidate = candidate.replaceAll('\\', '/').replace(/\/$/, '');
+  const normalizedRoot = root.replaceAll('\\', '/').replace(/\/$/, '');
+  return normalizedCandidate === normalizedRoot || normalizedCandidate.startsWith(`${normalizedRoot}/`);
+}
+
+/** Product install roots trusted even when OpenCode opens $HOME as the project. */
+function managedInstallRoots(): string[] {
+  const home = process.env.HOME?.trim() || process.env.USERPROFILE?.trim();
+  if (!home) return [];
+  return [
+    canonicalPath(join(home, '.local', 'bin')),
+    canonicalPath(join(home, '.ryk', 'bin')),
+  ];
+}
+
+function isManagedInstallPath(canonical: string): boolean {
+  return managedInstallRoots().some((root) => isWithin(canonical, root));
+}
+
+/**
+ * True when the path must not be attested without RYK_ALLOW_WORKSPACE_BIN=1.
+ * Managed install roots (`~/.local/bin`, `~/.ryk/bin`) stay trusted; everything
+ * else under cwd is treated as an agent-writable plant.
+ */
 function isWorkspaceCandidate(path: string, cwd?: string): boolean {
   if (process.env.RYK_ALLOW_WORKSPACE_BIN === '1') return false;
   const canonical = canonicalPath(path).replaceAll('\\', '/');
   if (canonical.includes('/node_modules/.bin/')) return true;
+  if (isManagedInstallPath(canonical)) return false;
   if (!cwd) return false;
   const workspace = canonicalPath(cwd).replaceAll('\\', '/').replace(/\/$/, '');
-  return canonical === workspace || canonical.startsWith(`${workspace}/`);
+  return isWithin(canonical, workspace);
+}
+
+/** Well-known product install locations when host PATH is stripped. */
+function wellKnownRykBins(platform: NodeJS.Platform): string[] {
+  const exe = platform === 'win32' ? 'ryk.exe' : 'ryk';
+  const out: string[] = managedInstallRoots().map((root) => join(root, exe));
+  if (platform === 'darwin') {
+    out.push(join('/opt/homebrew/bin', exe));
+    out.push(join('/usr/local/bin', exe));
+  } else if (platform === 'linux') {
+    out.push(join('/usr/local/bin', exe));
+    out.push(join('/usr/bin', exe));
+  }
+  return out;
 }
 
 function attestRykCandidate(path: string, cwd?: string): boolean {
@@ -511,41 +556,56 @@ async function maybeToast(
   message: string
 ): Promise<void> {
   const showToast = ctx.client?.tui?.showToast;
-  if (!showToast) return;
+  if (typeof showToast !== 'function') {
+    if (process.env.RYK_OPENCODE_TOAST_DEBUG === '1') {
+      console.error('[ryk] toast unavailable: client.tui.showToast missing');
+    }
+    return;
+  }
+  const body = {
+    title,
+    message: message.slice(0, 280),
+    variant,
+    duration: variant === 'error' ? 8000 : 5000,
+  };
   try {
     await Promise.race([
-      showToast({
-        body: {
-          title,
-          message: message.slice(0, 280),
-          variant,
-          duration: variant === 'error' ? 8000 : 5000,
-        },
-      }),
+      Promise.resolve(showToast({ body })).then(() => undefined),
       new Promise<void>((resolve) => {
         setTimeout(resolve, TOAST_TIMEOUT_MS);
       }),
     ]);
-  } catch {
+  } catch (err: unknown) {
     // Host toast is best-effort; never fail open on UI (block path still throws).
+    if (process.env.RYK_OPENCODE_TOAST_DEBUG === '1') {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[ryk] toast failed: ${msg}`);
+    }
   }
 }
 
-/** Best-effort error toast then throw a short single-line Error. */
+/**
+ * Best-effort error toast then throw a short single-line Error.
+ * Default stderr matches toast copy; set RYK_OPENCODE_VERBOSE=1 for operator Next/Recourse.
+ */
 async function hardBlockWithToast(
   ctx: PluginContext,
   shortMsg: string,
   operatorDetail?: string
 ): Promise<never> {
-  console.error(`[ryk] ${operatorDetail ?? shortMsg}`);
   await maybeToast(ctx, 'error', 'ryk blocked', shortMsg);
+  console.error(`[ryk] ${shortMsg}`);
+  if (
+    operatorDetail &&
+    operatorDetail !== shortMsg &&
+    process.env.RYK_OPENCODE_VERBOSE === '1'
+  ) {
+    console.error(`[ryk] ${operatorDetail}`);
+  }
   throw new Error(shortMsg);
 }
 
-/**
- * Apply a blocking-path decision: warn/pass-through return; hard blocks toast
- * then throw a short Error. Full operator detail goes to stderr only.
- */
+/** Apply a blocking-path decision: warn/pass-through return; hard blocks toast then throw. */
 async function applyBlockingDecision(
   response: RykResponse,
   context: string,
