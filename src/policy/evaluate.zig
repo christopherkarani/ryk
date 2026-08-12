@@ -971,6 +971,24 @@ test "quick install bare zig build allows under generic-agent preset" {
     try std.testing.expectEqual(core.decision.DecisionResult.allow, suffixed.decision.result);
 }
 
+// P0-2: `ryk allow-once *` must not sit in the default permit list, or an agent
+// could redeem its own break-glass by running the redeem CLI as an ordinary
+// allowed command. Load the shipped default policy and prove allow-once is not
+// auto-allowed, while a still-permitted entry (`ryk explain *`) is.
+test "default policy does not auto-allow ryk allow-once (P0-2)" {
+    const load = @import("load.zig");
+    var policy = try load.loadFile(std.testing.io, std.testing.allocator, "policies/default.yaml");
+    defer policy.deinit();
+
+    var once = try command(&policy, "ryk allow-once 000000", std.testing.allocator);
+    defer once.deinit(std.testing.allocator);
+    try std.testing.expect(once.decision.result != .allow);
+
+    var explain = try command(&policy, "ryk explain git status", std.testing.allocator);
+    defer explain.deinit(std.testing.allocator);
+    try std.testing.expectEqual(core.decision.DecisionResult.allow, explain.decision.result);
+}
+
 test "effects deny blocks send_email even when mcp allows all" {
     const load = @import("load.zig");
     var policy = try load.parseFromSlice(std.testing.allocator,

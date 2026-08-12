@@ -138,3 +138,6 @@
 {"command": "cat secrets/.env", "expected": "deny", "source": "phase2_credentials", "description": "multi-segment path ending /.env must deny"}
 {"command": "less rm -rf /", "expected": "allow", "source": "phase2_credentials", "description": "less data-only argv must not false-deny filesystem packs"}
 {"command": "more rm -rf /", "expected": "allow", "source": "phase2_credentials", "description": "more data-only argv must not false-deny filesystem packs"}
+{"command": "echo safe#; rm -rf /", "expected": "deny", "source": "p0_comment_truncation", "description": "glued # is literal text, not a comment; rm -rf / segment must deny"}
+{"command": "echo x#$(rm -rf /)", "expected": "deny", "source": "p0_comment_truncation", "description": "glued # must not suppress substitution extraction; $(rm -rf /) body denies"}
+{"command": "echo foo # comment", "expected": "allow", "source": "p0_comment_truncation", "description": "word-start # remains a comment; evaluates as echo foo"}

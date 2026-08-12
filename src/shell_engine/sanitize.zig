@@ -2,6 +2,7 @@
 //! (rg patterns, git commit messages, echo data) so destructive substrings
 //! inside data do not trigger pack matches.
 const std = @import("std");
+const segments = @import("segments.zig");
 
 /// Return a heap-owned command with safe data arguments replaced by spaces.
 pub fn sanitizeForMatching(allocator: std.mem.Allocator, command: []const u8) ![]u8 {
@@ -221,7 +222,10 @@ fn maskComments(buf: []u8) void {
             in_double = !in_double;
             continue;
         }
-        if (!in_single and !in_double and c == '#') {
+        // POSIX: `#` opens a comment only at the start of a word. A glued `#`
+        // (`safe#; rm -rf /`) is literal text — masking it would hide the
+        // payload from pack matching. Must agree with segments.isCommentStart.
+        if (!in_single and !in_double and c == '#' and segments.isCommentStart(buf, i)) {
             while (i < buf.len and buf[i] != '\n') : (i += 1) {
                 buf[i] = ' ';
             }
@@ -889,6 +893,21 @@ test "sanitize masks echo unquoted destructive text" {
 
 test "sanitize masks shell comment body" {
     const s = try sanitizeForMatching(std.testing.allocator, "ls -la # rm -rf /");
+    defer std.testing.allocator.free(s);
+    try std.testing.expect(std.mem.indexOf(u8, s, "rm -rf") == null);
+}
+
+test "sanitize does not mask glued hash as a comment" {
+    // `safe#` is one word — the `#` is literal text, so `; rm -rf /` must
+    // stay visible for pack matching (comment-truncation bypass). Use a
+    // non-data-only first word so only maskComments decides visibility.
+    const s = try sanitizeForMatching(std.testing.allocator, "curl safe#; rm -rf /");
+    defer std.testing.allocator.free(s);
+    try std.testing.expect(std.mem.indexOf(u8, s, "rm -rf") != null);
+}
+
+test "sanitize keeps word-start comment masking after fix" {
+    const s = try sanitizeForMatching(std.testing.allocator, "echo ok # explanation; rm -rf /");
     defer std.testing.allocator.free(s);
     try std.testing.expect(std.mem.indexOf(u8, s, "rm -rf") == null);
 }

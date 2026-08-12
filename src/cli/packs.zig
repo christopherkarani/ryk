@@ -268,7 +268,10 @@ fn runDisable(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: any
     // M-2: baseline pack disable is operator break-glass only (agent-reachable CLI).
     if (idsIncludeBaseline(ids)) {
         const gate = try confirmBaselineDisable(io, stdout, stderr);
-        if (!gate) return exit_codes.usage;
+        if (!gate) {
+            try stderr.writeAll("ryk packs disable: baseline packs left enabled (operator confirmation required).\n");
+            return exit_codes.usage;
+        }
     }
 
     const workspace_root = onboarding.resolveWorkspaceRoot(io, allocator) catch {
@@ -293,16 +296,22 @@ fn idsIncludeBaseline(ids: []const []const u8) bool {
     return false;
 }
 
-/// Require `RYK_OPERATOR=1` or interactive TTY confirm before disabling baseline packs.
-fn confirmBaselineDisable(io: std.Io, stdout: anytype, stderr: anytype) !bool {
-    if (pack_config.isOperatorBreakGlass()) return true;
+/// Test seam: when non-null, overrides the real TTY probe for the baseline
+/// disable gate. Production leaves this null; tests set it to simulate operator
+/// presence (the RYK_OPERATOR env break-glass was removed).
+pub var test_operator_tty_override: ?bool = null;
 
-    const stdin = std.Io.File.stdin();
-    const is_tty = (stdin.isTty(io) catch false) and (std.Io.File.stdout().isTty(io) catch false);
-    if (!is_tty) {
+/// Require an interactive TTY before disabling baseline packs. Non-TTY (agent /
+/// script / CI) fails closed — there is no env-var break-glass (RYK_OPERATOR was
+/// removed: env vars are child-controlled and authenticate nobody).
+fn confirmBaselineDisable(io: std.Io, stdout: anytype, stderr: anytype) !bool {
+    // Test seam: explicit operator presence/absence without a real terminal.
+    if (test_operator_tty_override) |v| return v;
+
+    if (!pack_config.isOperatorBreakGlass(io)) {
         try stderr.writeAll(
             \\ryk packs disable: refusing to disable baseline packs (core, core.*, system.disk)
-            \\without break-glass. Set RYK_OPERATOR=1 or re-run in an interactive TTY to confirm.
+            \\without an interactive TTY. Re-run in a terminal to confirm.
             \\Baseline opt-outs are written to user config; project .ryk.toml cannot drop them.
             \\
         );
@@ -956,17 +965,18 @@ const SPacksXdg = struct {
     tmp: std.testing.TmpDir,
     root: []u8,
     prev_xdg: ?[:0]u8,
-    prev_operator: ?[:0]u8,
 
     fn deinit(self: *@This()) void {
         sPacksRestoreEnv("XDG_CONFIG_HOME", self.prev_xdg);
-        sPacksRestoreEnv("RYK_OPERATOR", self.prev_operator);
+        // Always clear the TTY test seam so tests cannot leak operator presence.
+        test_operator_tty_override = null;
         std.testing.allocator.free(self.root);
         self.tmp.cleanup();
     }
 };
 
-/// Isolate user pack config + grant RYK_OPERATOR break-glass for baseline disable tests.
+/// Isolate user pack config + simulate operator TTY for baseline disable tests
+/// (the RYK_OPERATOR env break-glass was removed; presence is TTY-only).
 fn sPacksIsolateXdgWithOperator() !SPacksXdg {
     var tmp = std.testing.tmpDir(.{});
     errdefer tmp.cleanup();
@@ -977,19 +987,16 @@ fn sPacksIsolateXdgWithOperator() !SPacksXdg {
 
     const prev_xdg = try sPacksDupEnvZ("XDG_CONFIG_HOME");
     errdefer if (prev_xdg) |p| std.testing.allocator.free(p);
-    const prev_operator = try sPacksDupEnvZ("RYK_OPERATOR");
-    errdefer if (prev_operator) |p| std.testing.allocator.free(p);
 
     const root_z0 = try std.testing.allocator.dupeZ(u8, root);
     defer std.testing.allocator.free(root_z0);
     try std.testing.expectEqual(@as(c_int, 0), setenv("XDG_CONFIG_HOME", root_z0.ptr, 1));
-    try std.testing.expectEqual(@as(c_int, 0), setenv("RYK_OPERATOR", "1", 1));
+    test_operator_tty_override = true;
 
     return .{
         .tmp = tmp,
         .root = root,
         .prev_xdg = prev_xdg,
-        .prev_operator = prev_operator,
     };
 }
 
@@ -1248,12 +1255,16 @@ test "s-packs: disable core.git uses shipped pack_config semantics without hard-
     }.body);
 }
 
-test "s-packs: disable baseline without RYK_OPERATOR refuses non-interactively" {
+test "s-packs: disable baseline on non-TTY refuses even with RYK_OPERATOR set" {
     try withGitWorkspace(struct {
         fn body(_: []const u8) !void {
+            // The removed RYK_OPERATOR env var must never authorize anything.
             const prev = try sPacksDupEnvZ("RYK_OPERATOR");
             defer sPacksRestoreEnv("RYK_OPERATOR", prev);
-            _ = unsetenv("RYK_OPERATOR");
+            _ = setenv("RYK_OPERATOR", "1", 1);
+            // Force the non-TTY path explicitly via the test seam.
+            test_operator_tty_override = false;
+            defer test_operator_tty_override = null;
 
             var stdout_buf: [4096]u8 = undefined;
             var stderr_buf: [2048]u8 = undefined;
@@ -1269,7 +1280,8 @@ test "s-packs: disable baseline without RYK_OPERATOR refuses non-interactively" 
             );
             try std.testing.expect(code != exit_codes.success);
             const err = stderr_writer.buffered();
-            try std.testing.expect(std.mem.indexOf(u8, err, "RYK_OPERATOR") != null or
+            try std.testing.expect(std.mem.indexOf(u8, err, "TTY") != null or
+                std.mem.indexOf(u8, err, "terminal") != null or
                 std.mem.indexOf(u8, err, "baseline") != null);
         }
     }.body);

@@ -643,7 +643,7 @@ test "verification detects modified event fields" {
     const session_id = try core.session.generateSessionId(ts);
     const session_dir = try std.fs.path.join(std.testing.allocator, &.{ root, ".ryk", "sessions", session_id.slice() });
     defer std.testing.allocator.free(session_dir);
-    try std.Io.Dir.cwd().makePath(std.testing.io, session_dir);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, session_dir);
 
     const event_path = try std.fs.path.join(std.testing.allocator, &.{ session_dir, "events.jsonl" });
     defer std.testing.allocator.free(event_path);
@@ -661,7 +661,7 @@ test "verification detects modified event fields" {
         const file = try std.Io.Dir.cwd().createFile(std.testing.io, event_path, .{});
         defer file.close(std.testing.io);
         var buf: [1024]u8 = undefined;
-        var file_writer = file.writer(&buf);
+        var file_writer = file.writer(std.testing.io, &buf);
         try file_writer.interface.print("{s},\"event_hash\":\"{s}\"}}\n", .{ event_text, &hash });
         try file_writer.interface.flush();
     }
@@ -674,7 +674,7 @@ test "verification detects modified event fields" {
         const file = try std.Io.Dir.cwd().createFile(std.testing.io, event_path, .{});
         defer file.close(std.testing.io);
         var buf: [1024]u8 = undefined;
-        var file_writer = file.writer(&buf);
+        var file_writer = file.writer(std.testing.io, &buf);
         try file_writer.interface.print("{s},\"event_hash\":\"{s}\"}}\n", .{ "{\"version\":1,\"session_id\":\"tampered\",\"event_id\":\"e\",\"timestamp\":\"2026-05-05T12:12:10Z\",\"type\":\"session_start\",\"actor\":{\"kind\":\"ryk\",\"id\":null,\"display\":\"ryk\"},\"target\":{\"kind\":\"session\",\"value\":\"s\"},\"decision\":null,\"redactions\":{\"count\":0,\"labels\":[]},\"previous_hash\":null", &hash });
         try file_writer.interface.flush();
     }
@@ -721,7 +721,7 @@ test "verification accepts rust shell metadata in audit events" {
 
     const session_dir = try std.fs.path.join(std.testing.allocator, &.{ root, ".ryk", "sessions", sid.slice() });
     defer std.testing.allocator.free(session_dir);
-    try std.Io.Dir.cwd().makePath(std.testing.io, session_dir);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, session_dir);
 
     const event_path = try std.fs.path.join(std.testing.allocator, &.{ session_dir, "events.jsonl" });
     defer std.testing.allocator.free(event_path);
@@ -736,7 +736,7 @@ test "verification accepts rust shell metadata in audit events" {
         const file = try std.Io.Dir.cwd().createFile(std.testing.io, event_path, .{});
         defer file.close(std.testing.io);
         var buf: [2048]u8 = undefined;
-        var file_writer = file.writer(&buf);
+        var file_writer = file.writer(std.testing.io, &buf);
         try hash_chain.writeEventJsonLine(&file_writer.interface, ev, null, &hash);
         try file_writer.interface.flush();
     }
@@ -755,7 +755,7 @@ test "verification rejects event records with unauthenticated extra keys" {
 
     const session_dir = try std.fs.path.join(std.testing.allocator, &.{ root, ".ryk", "sessions", "extra-key" });
     defer std.testing.allocator.free(session_dir);
-    try std.Io.Dir.cwd().makePath(std.testing.io, session_dir);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, session_dir);
 
     const event_path = try std.fs.path.join(std.testing.allocator, &.{ session_dir, "events.jsonl" });
     defer std.testing.allocator.free(event_path);
@@ -773,7 +773,7 @@ test "verification rejects event records with unauthenticated extra keys" {
         const file = try std.Io.Dir.cwd().createFile(std.testing.io, event_path, .{});
         defer file.close(std.testing.io);
         var buf: [1024]u8 = undefined;
-        var file_writer = file.writer(&buf);
+        var file_writer = file.writer(std.testing.io, &buf);
         try file_writer.interface.print("{s},\"extra\":\"fake_secret_value\",\"event_hash\":\"{s}\"}}\n", .{ event_text, &hash });
         try file_writer.interface.flush();
     }
@@ -793,7 +793,7 @@ test "verification rejects tampered summary display fields" {
 
     const session_dir = try std.fs.path.join(std.testing.allocator, &.{ root, ".ryk", "sessions", "summary-tamper" });
     defer std.testing.allocator.free(session_dir);
-    try std.Io.Dir.cwd().makePath(std.testing.io, session_dir);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, session_dir);
 
     const event_path = try std.fs.path.join(std.testing.allocator, &.{ session_dir, "events.jsonl" });
     defer std.testing.allocator.free(event_path);
@@ -811,7 +811,7 @@ test "verification rejects tampered summary display fields" {
         const file = try std.Io.Dir.cwd().createFile(std.testing.io, event_path, .{});
         defer file.close(std.testing.io);
         var buf: [1024]u8 = undefined;
-        var file_writer = file.writer(&buf);
+        var file_writer = file.writer(std.testing.io, &buf);
         try file_writer.interface.print("{s},\"event_hash\":\"{s}\"}}\n", .{ event_text, &hash });
         try file_writer.interface.flush();
     }
@@ -848,7 +848,7 @@ test "verification reports malformed events instead of panicking" {
 
     const session_dir = try std.fs.path.join(std.testing.allocator, &.{ root, ".ryk", "sessions", "malformed" });
     defer std.testing.allocator.free(session_dir);
-    try std.Io.Dir.cwd().makePath(std.testing.io, session_dir);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, session_dir);
 
     const event_path = try std.fs.path.join(std.testing.allocator, &.{ session_dir, "events.jsonl" });
     defer std.testing.allocator.free(event_path);
@@ -876,7 +876,7 @@ test "verification detects summary event count mismatch" {
     defer std.testing.allocator.free(root);
     const session_dir = try std.fs.path.join(std.testing.allocator, &.{ root, ".ryk", "sessions", "count-mismatch" });
     defer std.testing.allocator.free(session_dir);
-    try std.Io.Dir.cwd().makePath(std.testing.io, session_dir);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, session_dir);
 
     const event_path = try std.fs.path.join(std.testing.allocator, &.{ session_dir, "events.jsonl" });
     defer std.testing.allocator.free(event_path);
@@ -893,7 +893,7 @@ test "verification detects summary event count mismatch" {
         const file = try std.Io.Dir.cwd().createFile(std.testing.io, event_path, .{});
         defer file.close(std.testing.io);
         var buf: [1024]u8 = undefined;
-        var file_writer = file.writer(&buf);
+        var file_writer = file.writer(std.testing.io, &buf);
         try file_writer.interface.print("{s},\"event_hash\":\"{s}\"}}\n", .{ event_text, &hash });
         try file_writer.interface.flush();
     }
@@ -903,6 +903,46 @@ test "verification detects summary event count mismatch" {
     defer result.deinit(std.testing.allocator);
     try std.testing.expect(!result.ok);
     try std.testing.expectEqualStrings("summary event count mismatch", result.reason.?);
+}
+
+test "p0-4 replay redacts structured secrets in command display" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+
+    const session_dir = try std.fs.path.join(std.testing.allocator, &.{ root, ".ryk", "sessions", "redact-display" });
+    defer std.testing.allocator.free(session_dir);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, session_dir);
+
+    const event_path = try std.fs.path.join(std.testing.allocator, &.{ session_dir, "events.jsonl" });
+    defer std.testing.allocator.free(event_path);
+    const summary_path = try std.fs.path.join(std.testing.allocator, &.{ session_dir, "summary.json" });
+    defer std.testing.allocator.free(summary_path);
+
+    const event_text =
+        "{\"version\":1,\"session_id\":\"s\",\"event_id\":\"e\",\"timestamp\":\"2026-05-05T12:12:10Z\",\"type\":\"command_denied\",\"actor\":{\"kind\":\"ryk\",\"id\":null,\"display\":\"ryk\"},\"target\":{\"kind\":\"command\",\"value\":\"psql\"},\"decision\":{\"result\":\"deny\",\"rule_id\":null,\"reason\":\"blocked\",\"risk_score\":null,\"requires_user\":false,\"ci_may_proceed\":false},\"redactions\":{\"count\":0,\"labels\":[]},\"previous_hash\":null";
+    const hash = blk: {
+        const canonical = try std.fmt.allocPrint(std.testing.allocator, "{s}}}", .{event_text});
+        defer std.testing.allocator.free(canonical);
+        break :blk hash_chain.eventHash(null, canonical);
+    };
+    {
+        const file = try std.Io.Dir.cwd().createFile(std.testing.io, event_path, .{});
+        defer file.close(std.testing.io);
+        var buf: [1024]u8 = undefined;
+        var file_writer = file.writer(std.testing.io, &buf);
+        try file_writer.interface.print("{s},\"event_hash\":\"{s}\"}}\n", .{ event_text, &hash });
+        try file_writer.interface.flush();
+    }
+    // summary command carries a connection-string credential (`ryk replay` trusts
+    // at-rest redaction, so display redaction must still scrub it — P0-4).
+    try writeTestSummary(summary_path, 1, &hash, "[\"psql\",\"mysql://user:pw@dbhost/app\"]");
+
+    var session = try load(std.testing.io, std.testing.allocator, root, .{ .session = "redact-display" });
+    defer session.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, session.command_display, "user:pw") == null);
+    try std.testing.expect(std.mem.indexOf(u8, session.command_display, "[REDACTED") != null);
 }
 
 test "replay loading cleans up every allocation failure path" {
@@ -928,7 +968,7 @@ test "replay rejects session ids with path traversal" {
 
     const audit_dir = try std.fs.path.join(std.testing.allocator, &.{ root, ".ryk" });
     defer std.testing.allocator.free(audit_dir);
-    try std.Io.Dir.cwd().makePath(std.testing.io, audit_dir);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, audit_dir);
     const last_path = try std.fs.path.join(std.testing.allocator, &.{ audit_dir, "last" });
     defer std.testing.allocator.free(last_path);
     {
@@ -954,7 +994,7 @@ fn loadReplayAllocationFailureProbe(allocator: std.mem.Allocator, root: []const 
 fn writeValidReplayFixture(root: []const u8, session_id: []const u8) !void {
     const session_dir = try std.fs.path.join(std.testing.allocator, &.{ root, ".ryk", "sessions", session_id });
     defer std.testing.allocator.free(session_dir);
-    try std.Io.Dir.cwd().makePath(std.testing.io, session_dir);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, session_dir);
 
     const event_path = try std.fs.path.join(std.testing.allocator, &.{ session_dir, "events.jsonl" });
     defer std.testing.allocator.free(event_path);
@@ -972,7 +1012,7 @@ fn writeValidReplayFixture(root: []const u8, session_id: []const u8) !void {
         const file = try std.Io.Dir.cwd().createFile(std.testing.io, event_path, .{});
         defer file.close(std.testing.io);
         var buf: [1024]u8 = undefined;
-        var file_writer = file.writer(&buf);
+        var file_writer = file.writer(std.testing.io, &buf);
         try file_writer.interface.print("{s},\"event_hash\":\"{s}\"}}\n", .{ event_text, &hash });
         try file_writer.interface.flush();
     }
