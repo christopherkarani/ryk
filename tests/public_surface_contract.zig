@@ -92,3 +92,9 @@ test "public README stays product-focused and safety-bounded" {
     try expectNotContains(text, "ghp_");
     try expectNotContains(text, "sk-");
 }
+
+test "public README does not contain you would be surprised" {
+    const text = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "README.md", std.testing.allocator, .limited(512 * 1024));
+    defer std.testing.allocator.free(text);
+    try expectNotContains(text, "you would be surprised");
+}
