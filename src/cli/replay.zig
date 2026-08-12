@@ -175,24 +175,8 @@ fn writeReplayHuman(
         try stdout.writeByte('\n');
     }
 
-    // Evidence-plane degradation is prominent too (P1-1): a session with
-    // audit_degraded events has shim execs with no in-shim audit record.
-    var degraded_count: usize = 0;
-    var first_degraded_reason: ?[]u8 = null;
-    defer if (first_degraded_reason) |reason| allocator.free(reason);
-    for (session.events) |event| {
-        if (!std.mem.eql(u8, event.event_type, "audit_degraded")) continue;
-        degraded_count += 1;
-        if (first_degraded_reason == null) first_degraded_reason = try degradedReasonFromRaw(allocator, event.raw);
-    }
-    if (degraded_count > 0) {
-        var degraded_body: std.ArrayList(u8) = .empty;
-        defer degraded_body.deinit(allocator);
-        try degraded_body.print(allocator, "{d} audit_degraded event(s): session evidence is incomplete — some allowed shim execs have no in-shim audit record.", .{degraded_count});
-        if (first_degraded_reason) |reason| try degraded_body.print(allocator, " Reason: {s}", .{reason});
-        try tui.render.callout(io, stdout, .warn, "Audit degraded", degraded_body.items);
-        try stdout.writeByte('\n');
-    }
+    // Evidence-plane degradation is prominent too (P1-1).
+    try writeAuditDegradedCallout(io, allocator, stdout, session.events);
 
     // Build grouped timeline rows (collapse runs of secret_redacted).
     const rows = try allocator.alloc(ReplayTimelineRow, session.events.len);
@@ -277,6 +261,26 @@ fn replayEventIcon(event_type: []const u8) []const u8 {
     if (std.mem.eql(u8, event_type, "audit_degraded")) return "⚠";
     if (std.mem.startsWith(u8, event_type, "session_")) return "ℹ";
     return "•";
+}
+
+/// Evidence-plane degradation callout (P1-1): a session with audit_degraded
+/// events has shim execs with no in-shim audit record — surface it prominently.
+fn writeAuditDegradedCallout(io: std.Io, allocator: std.mem.Allocator, stdout: anytype, events: []const core_api.ReplayEvent) !void {
+    var degraded_count: usize = 0;
+    var first_degraded_reason: ?[]u8 = null;
+    defer if (first_degraded_reason) |reason| allocator.free(reason);
+    for (events) |event| {
+        if (!std.mem.eql(u8, event.event_type, "audit_degraded")) continue;
+        degraded_count += 1;
+        if (first_degraded_reason == null) first_degraded_reason = try degradedReasonFromRaw(allocator, event.raw);
+    }
+    if (degraded_count == 0) return;
+    var degraded_body: std.ArrayList(u8) = .empty;
+    defer degraded_body.deinit(allocator);
+    try degraded_body.print(allocator, "{d} audit_degraded event(s): session evidence is incomplete — some allowed shim execs have no in-shim audit record.", .{degraded_count});
+    if (first_degraded_reason) |reason| try degraded_body.print(allocator, " Reason: {s}", .{reason});
+    try tui.render.callout(io, stdout, .warn, "Audit degraded", degraded_body.items);
+    try stdout.writeByte('\n');
 }
 
 /// Pull `decision.reason` out of a raw event line for the degraded callout.
