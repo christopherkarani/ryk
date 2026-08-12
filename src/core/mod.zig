@@ -10,8 +10,6 @@ pub const limits = @import("limits.zig");
 pub const util = @import("util.zig");
 pub const process = @import("process.zig");
 
-pub const phase = "03-core-types-and-allocators";
-
 test {
     _ = errors;
     _ = types;

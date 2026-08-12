@@ -9,8 +9,6 @@ pub const desktop = struct {
 };
 pub const core = ryk_core;
 
-pub const phase = "23-product-split-cli-contract";
-
 test {
     _ = cli;
     _ = desktop;

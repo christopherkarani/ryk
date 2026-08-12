@@ -27,8 +27,6 @@ pub const linux_capabilities = @import("linux_capabilities.zig");
 pub const linux_workspace_view_bootstrap = @import("linux_workspace_view_bootstrap.zig");
 pub const linux_workspace_view_spawn = @import("linux_workspace_view_spawn.zig");
 
-pub const phase = "02-repo-bootstrap";
-
 test {
     _ = backend;
     _ = observe;

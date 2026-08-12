@@ -18,8 +18,6 @@ pub const util = engine.core.util;
 pub const types = engine.core.types;
 pub const event = engine.core.event;
 
-pub const phase = "core-boundary-isolation";
-
 test {
     _ = api;
     _ = abi;

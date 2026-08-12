@@ -9,8 +9,6 @@ pub const process = @import("process.zig");
 pub const limits = @import("limits.zig");
 pub const util = @import("util.zig");
 
-pub const phase = "core-engine-hard-split";
-
 test {
     _ = errors;
     _ = types;

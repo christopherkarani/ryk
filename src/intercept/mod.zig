@@ -12,5 +12,3 @@ pub const approvals = @import("approvals.zig");
 test {
     _ = @import("provider_gateway_tests.zig");
 }
-
-pub const phase = "02-repo-bootstrap";
