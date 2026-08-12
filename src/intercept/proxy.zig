@@ -175,6 +175,10 @@ const State = struct {
     threaded: std.Io.Threaded = undefined,
     thread: std.Thread = undefined,
     thread_started: bool = false,
+    /// DNS resolution seam (P1-6 tests inject fixed answers; production uses
+    /// `defaultLookup`). Resolved answers are fenced before connect.
+    lookup_fn: LookupFn = defaultLookup,
+    lookup_context: ?*anyopaque = null,
 
     fn record(self: *State, event_type: core.event.EventType, target: []const u8, maybe_decision: ?core.decision.Decision) !void {
         const owned_target = try self.allocator.dupe(u8, target);
@@ -402,10 +406,24 @@ fn handleConnection(state: *State, io: std.Io, client: std.Io.net.Stream) !void 
     state.record(.network_connect_allowed, decision.redacted_target, decision.decision) catch {};
 
     if (request.https_connect) {
-        try tunnelConnect(state, io, client, request.host, request.port orelse 443);
+        tunnelConnect(state, io, client, request.host, request.port orelse 443) catch |err| {
+            // Post-resolution fence (P1-6): rebinding deny answers 403 like a
+            // policy deny instead of silently dropping the client connection.
+            if (err == error.ResolvedAddressDenied) {
+                try writeProxyError(io, client, 403, "Forbidden");
+                return;
+            }
+            return err;
+        };
         return;
     }
-    try forwardHttp(state, io, client, request, buffer[0..read_len]);
+    forwardHttp(state, io, client, request, buffer[0..read_len]) catch |err| {
+        if (err == error.ResolvedAddressDenied) {
+            try writeProxyError(io, client, 403, "Forbidden");
+            return;
+        }
+        return err;
+    };
 }
 
 fn readHeaders(io: std.Io, stream: std.Io.net.Stream, buffer: []u8) !usize {
@@ -494,26 +512,92 @@ pub fn parseRequest(bytes: []const u8) !ParsedRequest {
     };
 }
 
+/// DNS resolution seam: resolves `host` to up to `out.len` addresses and
+/// returns the count. Tests inject fixed answers to exercise the rebind fence
+/// hermetically; production resolves via `HostName.lookup`.
+const LookupFn = *const fn (context: ?*anyopaque, io: std.Io, host: []const u8, port: u16, out: []std.Io.net.IpAddress) anyerror!usize;
+
+fn defaultLookup(context: ?*anyopaque, io: std.Io, host: []const u8, port: u16, out: []std.Io.net.IpAddress) !usize {
+    _ = context;
+    const hostname = try std.Io.net.HostName.init(host);
+    var lookup_buffer: [32]std.Io.net.HostName.LookupResult = undefined;
+    var lookup_queue: std.Io.Queue(std.Io.net.HostName.LookupResult) = .init(&lookup_buffer);
+    var lookup_future = io.async(std.Io.net.HostName.lookup, .{ hostname, io, &lookup_queue, .{ .port = port } });
+    defer lookup_future.cancel(io) catch {};
+
+    var count: usize = 0;
+    while (lookup_queue.getOne(io)) |result| {
+        switch (result) {
+            .address => |address| {
+                if (count < out.len) {
+                    out[count] = address;
+                    count += 1;
+                }
+            },
+            .canonical_name => {},
+        }
+    } else |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        // Queue closed: lookup finished. Propagate a lookup failure, else keep
+        // the addresses collected so far.
+        error.Closed => try lookup_future.await(io),
+    }
+    return count;
+}
+
 /// Dial upstream by IP literal or DNS hostname.
-/// Zig 0.16 `IpAddress.resolve` only parses IP text (not DNS). Hostnames need
-/// `HostName.connect` (lookup + connect). Using resolve alone abort CONNECT tunnels
-/// after policy allow — empty reply / "Proxy CONNECT aborted" for example.com.
+/// Zig 0.16 `IpAddress.resolve` only parses IP text (not DNS). Hostnames resolve
+/// through `state.lookup_fn`, then every answer passes the post-resolution fence
+/// (`network.resolvedAddressFence`, P1-6): loopback / private / link-local /
+/// cloud-metadata answers are skipped unless policy explicitly allows the class,
+/// and the connection pins the first validated address — no re-resolution
+/// between check and connect (TOCTOU). When every answer is fenced, the attempt
+/// is denied and audited (`network_connect_denied`) as a rebinding shape.
 ///
 /// Honors Runtime stop before dial. Zig 0.16 Threaded `netConnectIp` panics if
 /// `ConnectOptions.timeout != .none`, so dials are not OS-timeout bound here;
 /// `Runtime.deinit` force-closes client+upstream FDs and uses a hard reclaim budget
 /// so teardown cannot hang forever on blackhole mid-dial workers.
-fn connectUpstream(io: std.Io, host: []const u8, port: u16, stop: ?*const std.atomic.Value(bool)) !std.Io.net.Stream {
-    if (stop) |s| {
-        if (s.load(.acquire)) return error.ProxyStopped;
-    }
+fn connectUpstream(state: *State, io: std.Io, host: []const u8, port: u16) !std.Io.net.Stream {
+    if (state.stop.load(.acquire)) return error.ProxyStopped;
     // Never pass ConnectOptions.timeout — Threaded backend panics (Zig 0.16 TODO).
     if (std.Io.net.IpAddress.parse(host, port)) |address| {
+        // IP literals were policy-evaluated as the destination itself.
         return address.connect(io, .{ .mode = .stream });
-    } else |_| {
-        const hostname = try std.Io.net.HostName.init(host);
-        return hostname.connect(io, port, .{ .mode = .stream });
+    } else |_| {}
+
+    var addresses: [32]std.Io.net.IpAddress = undefined;
+    const count = try state.lookup_fn(state.lookup_context, io, host, port, &addresses);
+    if (count == 0) return error.UnknownHostName;
+
+    var connect_err: ?anyerror = null;
+    var fenced: ?network.ResolvedAddressFence = null;
+    for (addresses[0..count]) |address| {
+        const fence = network.resolvedAddressFence(state.selected_policy, address, port);
+        if (!fence.allowed) {
+            fenced = fence;
+            continue;
+        }
+        return address.connect(io, .{ .mode = .stream }) catch |err| {
+            connect_err = err;
+            continue;
+        };
     }
+    if (connect_err == null and fenced != null) {
+        var reason_buf: [192]u8 = undefined;
+        const reason = std.fmt.bufPrint(
+            &reason_buf,
+            "resolved to {s} address denied by network policy (possible DNS rebinding)",
+            .{@tagName(fenced.?.host_class)},
+        ) catch "resolved address denied by network policy";
+        state.record(.network_connect_denied, host, .{
+            .result = .deny,
+            .reason = reason,
+            .ci_may_proceed = false,
+        }) catch {};
+        return error.ResolvedAddressDenied;
+    }
+    return connect_err orelse error.UnknownHostName;
 }
 
 fn forwardHttp(
@@ -524,7 +608,7 @@ fn forwardHttp(
     first_read: []const u8,
 ) !void {
     if (state.stop.load(.acquire)) return error.ProxyStopped;
-    var upstream = try connectUpstream(io, request.host, request.port orelse 80, &state.stop);
+    var upstream = try connectUpstream(state, io, request.host, request.port orelse 80);
     // Register before tunnel so deinit force-closes blackholed upstream ends.
     state.registerUpstream(io, upstream) catch {
         upstream.close(io);
@@ -555,7 +639,7 @@ fn tunnelConnect(
     port: u16,
 ) !void {
     if (state.stop.load(.acquire)) return error.ProxyStopped;
-    var upstream = try connectUpstream(io, host, port, &state.stop);
+    var upstream = try connectUpstream(state, io, host, port);
     state.registerUpstream(io, upstream) catch {
         upstream.close(io);
         return error.OutOfMemory;
@@ -1413,6 +1497,21 @@ test "connectUpstream dials IP literals and DNS hostnames" {
     var threaded: std.Io.Threaded = .init_single_threaded;
     const io = threaded.io();
 
+    // localhost resolves to loopback; the post-resolution fence requires an
+    // explicit class allow, so the test policy carries one.
+    var loaded = try @import("ryk_core").policy.load.parseFromSlice(std.testing.allocator,
+        \\version: 1
+        \\mode: observe
+        \\network:
+        \\  mode: allowlist
+        \\  allow:
+        \\    - "localhost"
+    , "connect-upstream.yaml");
+    defer loaded.deinit();
+    var runtime = try listen(std.testing.allocator, &loaded, .observe);
+    defer runtime.deinit();
+    const state = runtime.state;
+
     // IP path (loopback listen + dial)
     const listen_addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
     var server = try listen_addr.listen(io, .{ .reuse_address = true });
@@ -1425,7 +1524,7 @@ test "connectUpstream dials IP literals and DNS hostnames" {
         }
     }.run, .{ &server, io });
     defer accept_thread.join();
-    var ip_stream = try connectUpstream(io, "127.0.0.1", port, null);
+    var ip_stream = try connectUpstream(state, io, "127.0.0.1", port);
     ip_stream.close(io);
 
     // DNS path via localhost (hermetic: no external resolv / offline skip).
@@ -1440,8 +1539,145 @@ test "connectUpstream dials IP literals and DNS hostnames" {
         }
     }.run, .{ &host_server, io });
     defer host_accept.join();
-    var host_stream = try connectUpstream(io, "localhost", host_port, null);
+    var host_stream = try connectUpstream(state, io, "localhost", host_port);
     host_stream.close(io);
+}
+
+const FakeLookup = struct {
+    answers: []const std.Io.net.IpAddress,
+    calls: usize = 0,
+
+    fn lookup(self: *FakeLookup, out: []std.Io.net.IpAddress) usize {
+        self.calls += 1;
+        const n = @min(self.answers.len, out.len);
+        @memcpy(out[0..n], self.answers[0..n]);
+        return n;
+    }
+};
+
+fn fakeLookupThunk(context: ?*anyopaque, io: std.Io, host: []const u8, port: u16, out: []std.Io.net.IpAddress) anyerror!usize {
+    _ = io;
+    _ = host;
+    _ = port;
+    const fake: *FakeLookup = @ptrCast(@alignCast(context.?));
+    return fake.lookup(out);
+}
+
+fn connectViaProxy(io: std.Io, proxy_port: u16, host: []const u8, port: u16) ![]u8 {
+    const proxy_addr = try std.Io.net.IpAddress.parse("127.0.0.1", proxy_port);
+    var client = try std.Io.net.IpAddress.connect(&proxy_addr, io, .{ .mode = .stream });
+    defer client.close(io);
+    var req_buf: [256]u8 = undefined;
+    const req = try std.fmt.bufPrint(&req_buf, "CONNECT {s}:{d} HTTP/1.1\r\nHost: {s}:{d}\r\n\r\n", .{ host, port, host, port });
+    var write_buf: [512]u8 = undefined;
+    var writer = client.writer(io, &write_buf);
+    try writer.interface.writeAll(req);
+    try writer.interface.flush();
+    var response_buf: [1024]u8 = undefined;
+    const response_len = try readHttpResponse(io, client, &response_buf);
+    return std.testing.allocator.dupe(u8, response_buf[0..response_len]);
+}
+
+test "proxy denies allowlisted hostname that resolves to fenced addresses (DNS rebinding)" {
+    // P1-6: policy allows the hostname (domain class), but every resolved
+    // answer is loopback / metadata / private — the connection must be refused
+    // with a deny audit event on every connection, not just the first.
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    var loaded = try @import("ryk_core").policy.load.parseFromSlice(std.testing.allocator,
+        \\version: 1
+        \\mode: strict
+        \\network:
+        \\  mode: allowlist
+        \\  backend: proxy
+        \\  allow:
+        \\    - "allowed.example"
+    , "proxy-rebind-deny.yaml");
+    defer loaded.deinit();
+
+    const answer_metadata = try std.Io.net.IpAddress.parse("169.254.169.254", 443);
+    const answer_loopback = try std.Io.net.IpAddress.parse("127.0.0.1", 443);
+    const answer_private = try std.Io.net.IpAddress.parse("10.0.0.9", 443);
+    const rebind_answers = [_]std.Io.net.IpAddress{ answer_metadata, answer_loopback, answer_private };
+    var fake = FakeLookup{ .answers = &rebind_answers };
+
+    var runtime = try start(std.testing.allocator, &loaded, .strict);
+    defer runtime.deinit();
+    runtime.state.lookup_fn = fakeLookupThunk;
+    runtime.state.lookup_context = &fake;
+
+    const io = std.testing.io;
+    std.Io.sleep(io, std.Io.Duration.fromNanoseconds(50 * std.time.ns_per_ms), .awake) catch {};
+    const proxy_port = try bindPort(runtime.bindUrl());
+
+    // Every connection re-fences: two attempts, both denied.
+    for (0..2) |_| {
+        const response = try connectViaProxy(io, proxy_port, "allowed.example", 443);
+        defer std.testing.allocator.free(response);
+        try std.testing.expect(std.mem.indexOf(u8, response, "403") != null);
+    }
+    try std.testing.expect(fake.calls >= 2);
+
+    try runtime.waitForIdle(2 * std.time.ns_per_s);
+    const events = try runtime.snapshotAuditEvents(std.testing.allocator);
+    defer runtime.freeAuditEvents(std.testing.allocator, events);
+    var saw_rebind_deny = false;
+    for (events) |ev| {
+        if (ev.event_type == .network_connect_denied and
+            ev.reason != null and
+            std.mem.indexOf(u8, ev.reason.?, "DNS rebinding") != null)
+        {
+            saw_rebind_deny = true;
+        }
+    }
+    try std.testing.expect(saw_rebind_deny);
+}
+
+test "proxy connects when resolved loopback is covered by an explicit class allow" {
+    // Explicit `localhost` class allow lifts the fence: the pinned resolved
+    // address connects (proves allow path + no re-resolution between check
+    // and connect — the fake answers once per lookup).
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    const io = std.testing.io;
+    const upstream_addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var upstream = try upstream_addr.listen(io, .{ .reuse_address = true });
+    defer upstream.deinit(io);
+    const upstream_port = upstream.socket.address.getPort();
+    const accept_thread = try std.Thread.spawn(.{}, struct {
+        fn run(s: *std.Io.net.Server, thread_io: std.Io) void {
+            var stream = s.accept(thread_io) catch return;
+            stream.close(thread_io);
+        }
+    }.run, .{ &upstream, io });
+    defer accept_thread.join();
+
+    var loaded = try @import("ryk_core").policy.load.parseFromSlice(std.testing.allocator,
+        \\version: 1
+        \\mode: strict
+        \\network:
+        \\  mode: allowlist
+        \\  backend: proxy
+        \\  allow:
+        \\    - "allowed.example"
+        \\    - "localhost"
+    , "proxy-rebind-allow.yaml");
+    defer loaded.deinit();
+
+    const answer_loopback = try std.Io.net.IpAddress.parse("127.0.0.1", upstream_port);
+    const loopback_answers = [_]std.Io.net.IpAddress{answer_loopback};
+    var fake = FakeLookup{ .answers = &loopback_answers };
+
+    var runtime = try start(std.testing.allocator, &loaded, .strict);
+    defer runtime.deinit();
+    runtime.state.lookup_fn = fakeLookupThunk;
+    runtime.state.lookup_context = &fake;
+
+    std.Io.sleep(io, std.Io.Duration.fromNanoseconds(50 * std.time.ns_per_ms), .awake) catch {};
+    const proxy_port = try bindPort(runtime.bindUrl());
+    const response = try connectViaProxy(io, proxy_port, "allowed.example", upstream_port);
+    defer std.testing.allocator.free(response);
+    try std.testing.expect(std.mem.indexOf(u8, response, "200 Connection Established") != null);
 }
 
 test "proxy CONNECT allowlisted hostname returns 200 Connection Established" {

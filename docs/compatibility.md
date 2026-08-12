@@ -65,4 +65,6 @@ Reserve marketing “firewall” / “maximum protection” for a **verified** m
 
 **Probe vs session-attach:** Doctor and platform matrices may report sandbox **capability** (`partial` / API present). That is not a live session `active` claim. Trust **`OS-enforced`** filesystem isolation only for a protected agent session that completed child apply-before-exec attach (profile hash present). Use advanced `ryk run --os-sandbox on` to fail closed when attach cannot complete.
 
+**DNS rebinding fence (proxy grade):** after a hostname passes policy, the intercept proxy re-checks every resolved address before connecting and pins the validated address (no re-resolution). Answers in loopback, RFC1918/private, link-local, or cloud-metadata classes are refused unless `network.allow` explicitly lists the class token (`localhost`, `private`, `metadata`) or the exact IP; the attempt is denied with a `network_connect_denied` audit event. A hostname allow therefore covers public-unicast answers only.
+
 **Capability matrix vs CI attach evidence:** Landlock/Seatbelt version gates (Linux ABI ≥ 1; macOS product majors 14–26) describe **where attach may run**. Continuous **CI attach evidence** today is **linux amd64** and **macos-14** only; other OS/arch/major cells are local until freeze jobs exist — do not treat every gated major as CI-proven.
