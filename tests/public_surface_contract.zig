@@ -62,6 +62,22 @@ test "public docs contain no customer acquisition collateral" {
     }
 }
 
+test "agent handoff docs are excluded from the public repository" {
+    const excluded = [_][]const u8{
+        "docs/handoffs/coding-agent-pack-ux-2026-08-11.md",
+        "docs/handoffs/coding-agent-pack-ux-prompt.md",
+    };
+    for (excluded) |path| try expectMissing(path);
+}
+
+test "gitignore blocks handoffs, releases, and orca husks" {
+    const text = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, ".gitignore", std.testing.allocator, .limited(512 * 1024));
+    defer std.testing.allocator.free(text);
+    try expectContains(text, "docs/handoffs/");
+    try expectContains(text, "docs/releases/");
+    try expectContains(text, "orca-*/");
+}
+
 test "public README stays product-focused and safety-bounded" {
     const text = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "README.md", std.testing.allocator, .limited(512 * 1024));
     defer std.testing.allocator.free(text);

@@ -91,6 +91,10 @@ scripts/orchestrator.sh
 scripts/validate-go-to-market.sh
 
 # Session-local planning and private project material
+docs/handoffs/
+docs/releases/
+docs/superpowers/
+orca-*/
 planning/**
 plans/
 .plan/
