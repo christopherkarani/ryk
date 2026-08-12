@@ -47,6 +47,17 @@ ryk policy-gates:
 
 ryk also observes and audits `tools/list`, `resources/list`, and `prompts/list` metadata so later calls can be evaluated with the discovered risk context.
 
+## Unmediated Methods: deny by default
+
+The proxy forwards only an explicit allowlist of known-safe, side-effect-free methods without policy gating:
+
+- `initialize` — protocol handshake
+- `ping` — keepalive (no params, no side effects; forwarded unaudited)
+- `notifications/*` — spec notification channel (forwarded, audited)
+- `tools/list`, `resources/list`, `prompts/list` — read-only discovery (responses inspected/audited)
+
+Every other method is denied with a JSON-RPC error and an audited `mcp_unknown_method` deny event. This includes `completion/complete` (argument content would leave the client unmediated), `logging/setLevel` (server side effect), vendor/extension namespaces such as `vendor/private`, and any future spec method until it is reviewed and allowlisted. A request-shaped message without an `id` that is not a `notifications/*` method is likewise denied rather than forwarded.
+
 ## Protocol Warning
 
 Stdio MCP stdout must contain only newline-delimited JSON-RPC protocol messages. Human logs belong on stderr.

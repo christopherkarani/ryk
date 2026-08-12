@@ -102,6 +102,18 @@ pub fn runWithServer(
                 });
                 continue;
             }
+            // Deny-default (P1-3): only spec-shaped notifications/* forward.
+            // A request-shaped method without an id is not a valid notification
+            // and fails closed rather than passing through unmediated.
+            if (!std.mem.startsWith(u8, method, "notifications/")) {
+                try jsonrpc.writeErrorResponse(client_writer, null, .invalid_request, "unknown MCP method denied by ryk policy proxy");
+                try appendAudit(config.audit_writer, .mcp_unknown_method, .unknown, method, .{
+                    .result = .deny,
+                    .reason = "unknown MCP method denied by default (not a notifications/* method)",
+                    .ci_may_proceed = false,
+                });
+                continue;
+            }
             try server.notify(server.context, owned_line);
             if (!std.mem.eql(u8, method, "notifications/initialized")) {
                 try appendAudit(config.audit_writer, .mcp_unknown_method, .unknown, method, .{
@@ -122,6 +134,19 @@ pub fn runWithServer(
         } else if (sampling.isSamplingMethod(method)) {
             try handleSamplingRequest(allocator, config, client_reader, client_writer, server, owned_line, message.value());
         } else {
+            // Deny-default (P1-3): only allowlisted side-effect-free methods
+            // forward without policy gating. Unknown, vendor-namespaced, or
+            // side-effecting methods (completion/complete, logging/setLevel, …)
+            // are denied and audited — never passed through unmediated.
+            if (!isAllowlistedPassthroughMethod(method)) {
+                try appendAudit(config.audit_writer, .mcp_unknown_method, .unknown, method, .{
+                    .result = .deny,
+                    .reason = "unknown MCP method denied by default (not on the side-effect-free allowlist)",
+                    .ci_may_proceed = false,
+                });
+                try jsonrpc.writeErrorResponse(client_writer, message.id(), .policy_denied, "MCP method denied by ryk policy proxy (unknown method)");
+                continue;
+            }
             const response = try requestServerForClient(allocator, config, client_reader, client_writer, server, owned_line);
             defer allocator.free(response);
             var parsed_response = jsonrpc.parseLine(allocator, response) catch {
@@ -170,15 +195,29 @@ pub fn runWithServer(
                     .ci_may_proceed = true,
                 });
             } else {
+                // ping: keepalive with no params and no side effects — forwarded
+                // unaudited (same treatment as notifications/initialized).
                 try @import("stdio.zig").writeRawMessage(client_writer, response);
-                try appendAudit(config.audit_writer, .mcp_unknown_method, .unknown, method, .{
-                    .result = .observe,
-                    .reason = "passed through unknown MCP method",
-                    .ci_may_proceed = true,
-                });
             }
         }
     }
+}
+
+/// Known-safe, side-effect-free MCP request methods that forward without
+/// policy gating (P1-3 deny-default). Verified against MCP spec semantics:
+/// - `initialize`: protocol handshake.
+/// - `ping`: keepalive; no params, no side effects.
+/// - `tools/list`, `resources/list`, `prompts/list`: read-only discovery;
+///   responses are inspected/audited (tools/list feeds metadata gates).
+/// Deliberately NOT allowlisted: `completion/complete` (argument content would
+/// leave the client unmediated), `logging/setLevel` (server side effect),
+/// vendor/extension namespaces, and any future spec method until reviewed.
+fn isAllowlistedPassthroughMethod(method: []const u8) bool {
+    return std.mem.eql(u8, method, "initialize") or
+        std.mem.eql(u8, method, "ping") or
+        std.mem.eql(u8, method, "tools/list") or
+        std.mem.eql(u8, method, "resources/list") or
+        std.mem.eql(u8, method, "prompts/list");
 }
 
 fn isPolicyCoveredMethod(method: []const u8) bool {
@@ -1660,6 +1699,110 @@ test "proxy denies send_email when effects.deny includes comms.message" {
     try std.testing.expect(!server.saw_safe_call);
     try std.testing.expect(std.mem.indexOf(u8, output_writer.buffered(), "\"error\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, output_writer.buffered(), "policy") != null or std.mem.indexOf(u8, output_writer.buffered(), "denied") != null);
+}
+
+const MethodRecordingServer = struct {
+    saw_unknown_request: bool = false,
+    saw_unknown_notification: bool = false,
+    saw_ping: bool = false,
+
+    fn request(context: *anyopaque, allocator: std.mem.Allocator, line: []const u8) ![]u8 {
+        const self: *MethodRecordingServer = @ptrCast(@alignCast(context));
+        var parsed = try jsonrpc.parseLine(allocator, line);
+        defer parsed.deinit();
+        const method = parsed.method().?;
+        const id = parsed.id().?;
+        if (std.mem.eql(u8, method, "ping")) {
+            self.saw_ping = true;
+            var out: std.Io.Writer.Allocating = .init(allocator);
+            errdefer out.deinit();
+            try out.writer.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
+            switch (id) {
+                .integer => |integer| try out.writer.print("{d}", .{integer}),
+                .string => |string| try core.util.writeJsonString(&out.writer, string),
+                else => try out.writer.writeAll("null"),
+            }
+            try out.writer.writeAll(",\"result\":{}}");
+            return try out.toOwnedSlice();
+        }
+        self.saw_unknown_request = true;
+        return allocator.dupe(u8, "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}");
+    }
+
+    fn notify(context: *anyopaque, line: []const u8) !void {
+        const self: *MethodRecordingServer = @ptrCast(@alignCast(context));
+        if (std.mem.indexOf(u8, line, "notifications/") == null) {
+            self.saw_unknown_notification = true;
+        }
+    }
+};
+
+test "unknown MCP methods are denied by default and never forwarded" {
+    const load = policy_mod.load;
+    var policy = try load.loadPreset(std.testing.allocator, .strict);
+    defer policy.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const session = try testSession(root);
+    var writer = try audit.writer.SessionWriter.init(std.testing.io, std.testing.allocator, session);
+    defer writer.deinit();
+
+    var server = MethodRecordingServer{};
+    var input: std.Io.Reader = .fixed("{\"jsonrpc\":\"2.0\",\"id\":20,\"method\":\"vendor/private\",\"params\":{}}\n" ++
+        "{\"jsonrpc\":\"2.0\",\"id\":21,\"method\":\"completion/complete\",\"params\":{\"argument\":{\"text\":\"sk\"}}}\n" ++
+        "{\"jsonrpc\":\"2.0\",\"id\":22,\"method\":\"logging/setLevel\",\"params\":{\"level\":\"debug\"}}\n" ++
+        "{\"jsonrpc\":\"2.0\",\"id\":23,\"method\":\"ping\"}\n");
+    var output_buf: [4096]u8 = undefined;
+    var output_writer: std.Io.Writer = .fixed(&output_buf);
+    try runWithServer(std.testing.allocator, .{
+        .server_name = "fake",
+        .server_command_display = "fake",
+        .policy = &policy,
+        .mode = .strict,
+        .audit_writer = &writer,
+    }, &input, &output_writer, .{ .context = &server, .request = MethodRecordingServer.request, .notify = MethodRecordingServer.notify });
+
+    // Unknown / vendor / side-effecting methods: denied, never reached the server.
+    try std.testing.expect(!server.saw_unknown_request);
+    const out = output_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"policy_denied\"") != null or std.mem.indexOf(u8, out, "denied by ryk policy proxy") != null);
+    // ping is allowlisted and relayed.
+    try std.testing.expect(server.saw_ping);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"id\":23") != null);
+
+    // Denials are audited as mcp_unknown_method with deny decisions.
+    const events_path = try std.fs.path.join(std.testing.allocator, &.{ writer.session_dir_path, "events.jsonl" });
+    defer std.testing.allocator.free(events_path);
+    const events = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, events_path, std.testing.allocator, .limited(64 * 1024));
+    defer std.testing.allocator.free(events);
+    try std.testing.expect(std.mem.indexOf(u8, events, "\"type\":\"mcp_unknown_method\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, events, "vendor/private") != null);
+    try std.testing.expect(std.mem.indexOf(u8, events, "completion/complete") != null);
+    try std.testing.expect(std.mem.indexOf(u8, events, "logging/setLevel") != null);
+    try std.testing.expect(std.mem.indexOf(u8, events, "\"result\":\"deny\"") != null);
+}
+
+test "request-shaped MCP message without id is denied instead of forwarded" {
+    const load = policy_mod.load;
+    var policy = try load.loadPreset(std.testing.allocator, .strict);
+    defer policy.deinit();
+    var server = MethodRecordingServer{};
+    var input: std.Io.Reader = .fixed("{\"jsonrpc\":\"2.0\",\"method\":\"vendor/notify\",\"params\":{}}\n" ++
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\",\"params\":{}}\n");
+    var output_buf: [1024]u8 = undefined;
+    var output_writer: std.Io.Writer = .fixed(&output_buf);
+    try runWithServer(std.testing.allocator, .{
+        .server_name = "fake",
+        .server_command_display = "fake",
+        .policy = &policy,
+        .mode = .strict,
+    }, &input, &output_writer, .{ .context = &server, .request = MethodRecordingServer.request, .notify = MethodRecordingServer.notify });
+    // Vendor request-shaped notification denied; spec notifications/* still forward.
+    try std.testing.expect(!server.saw_unknown_notification);
+    try std.testing.expect(std.mem.indexOf(u8, output_writer.buffered(), "denied by ryk policy proxy") != null);
 }
 
 test "proxy denies notify with structural to+body under effects.deny" {
