@@ -406,24 +406,19 @@ fn handleConnection(state: *State, io: std.Io, client: std.Io.net.Stream) !void 
     state.record(.network_connect_allowed, decision.redacted_target, decision.decision) catch {};
 
     if (request.https_connect) {
-        tunnelConnect(state, io, client, request.host, request.port orelse 443) catch |err| {
-            // Post-resolution fence (P1-6): rebinding deny answers 403 like a
-            // policy deny instead of silently dropping the client connection.
-            if (err == error.ResolvedAddressDenied) {
-                try writeProxyError(io, client, 403, "Forbidden");
-                return;
-            }
-            return err;
-        };
+        try (tunnelConnect(state, io, client, request.host, request.port orelse 443) catch |err|
+            writeForbiddenIfResolvedAddressDenied(err, io, client));
         return;
     }
-    forwardHttp(state, io, client, request, buffer[0..read_len]) catch |err| {
-        if (err == error.ResolvedAddressDenied) {
-            try writeProxyError(io, client, 403, "Forbidden");
-            return;
-        }
-        return err;
-    };
+    try (forwardHttp(state, io, client, request, buffer[0..read_len]) catch |err|
+        writeForbiddenIfResolvedAddressDenied(err, io, client));
+}
+
+/// Post-resolution fence (P1-6): a rebinding deny answers 403 like a policy
+/// deny instead of silently dropping the client connection.
+fn writeForbiddenIfResolvedAddressDenied(err: anyerror, io: std.Io, client: std.Io.net.Stream) !void {
+    if (err == error.ResolvedAddressDenied) return writeProxyError(io, client, 403, "Forbidden");
+    return err;
 }
 
 fn readHeaders(io: std.Io, stream: std.Io.net.Stream, buffer: []u8) !usize {
