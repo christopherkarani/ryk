@@ -832,6 +832,9 @@ pub fn classifyResolvedIp(ip: std.Io.net.IpAddress) HostClass {
 fn classifyIpv4Bytes(ip: [4]u8) HostClass {
     if (isCloudMetadataIp(ip)) return .cloud_metadata;
     if (isLocalhostIp(ip)) return .localhost;
+    // 0/8 is "this network" (RFC 1122): connect() to 0.0.0.0 routes to loopback
+    // on Linux/macOS, so unspecified answers are loopback-class, not direct_ip.
+    if (ip[0] == 0) return .localhost;
     if (isPrivateIpv4(ip)) return .private_network;
     return .direct_ip;
 }
@@ -842,6 +845,12 @@ fn classifyIpv6Bytes(bytes: [16]u8) HostClass {
         return classifyIpv4Bytes(bytes[12..16].*);
     }
     if (std.mem.allEqual(u8, bytes[0..15], 0) and bytes[15] == 1) return .localhost; // ::1
+    // Deprecated v4-compatible (::a.b.c.d, RFC 4291) and the v6 unspecified
+    // address (::) embed IPv4 in the low 32 bits — inherit that class so ::
+    // fences as loopback (0.0.0.0) and ::127.0.0.1 cannot slip loopback through.
+    if (std.mem.allEqual(u8, bytes[0..12], 0)) {
+        return classifyIpv4Bytes(bytes[12..16].*);
+    }
     if (bytes[0] == 0xfe and (bytes[1] & 0xc0) == 0x80) return .private_network; // fe80::/10 link-local
     if ((bytes[0] & 0xfe) == 0xfc) return .private_network; // fc00::/7 unique-local
     return .direct_ip;
@@ -1134,6 +1143,13 @@ test "resolved address fence denies loopback private and metadata answers by def
         .{ .text = "::ffff:169.254.169.254", .class = .cloud_metadata },
         .{ .text = "fc00::1", .class = .private_network }, // ULA
         .{ .text = "fe80::1", .class = .private_network }, // v6 link-local
+        // Loopback aliases (review 2026-08-13): connect() to the unspecified
+        // address routes to loopback on Linux/macOS, so 0/8 and :: must not
+        // pass the fence as direct_ip.
+        .{ .text = "0.0.0.0", .class = .localhost },
+        .{ .text = "0.1.2.3", .class = .localhost }, // 0/8 "this network" (RFC 1122)
+        .{ .text = "::", .class = .localhost }, // v6 unspecified
+        .{ .text = "::ffff:0.0.0.0", .class = .localhost }, // v4-mapped unspecified
     };
     for (denied_cases) |case| {
         const ip = try std.Io.net.IpAddress.parse(case.text, 443);
@@ -1142,6 +1158,18 @@ test "resolved address fence denies loopback private and metadata answers by def
         try std.testing.expectEqual(case.class, fence.host_class);
         try std.testing.expect(fence.reason.len > 0);
     }
+
+    // Deprecated v4-compatible form (::a.b.c.d, RFC 4291): Zig's parser rejects
+    // the text, but a hostile AAAA answer can still carry these bytes — the
+    // embedded IPv4 class must apply (here: loopback).
+    const v4_compatible_loopback = std.Io.net.IpAddress{ .ip6 = .{
+        .bytes = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 127, 0, 0, 1 },
+        .port = 443,
+        .interface = .none,
+    } };
+    const v4_compat_fence = resolvedAddressFence(&policy, v4_compatible_loopback, 443);
+    try std.testing.expect(!v4_compat_fence.allowed);
+    try std.testing.expectEqual(HostClass.localhost, v4_compat_fence.host_class);
 
     // Public unicast answers pass: the expected resolution of an allowlisted host.
     const public_ip = try std.Io.net.IpAddress.parse("93.184.216.34", 443);
