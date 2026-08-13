@@ -1,7 +1,6 @@
 const std = @import("std");
 
 const env_util = @import("../env_util.zig");
-const audit = @import("ryk_core").audit.redact_bridge;
 const policy_schema = @import("ryk_core").policy.schema;
 
 pub const BrokerKind = policy_schema.CredentialBrokerKind;
@@ -71,12 +70,15 @@ pub const Broker = struct {
     kind: BrokerKind,
 
     pub fn envReference(self: Broker, allocator: std.mem.Allocator, name: []const u8, raw_value: []const u8) !CredentialRef {
-        const fingerprint = audit.fingerprint8(raw_value);
+        _ = raw_value;
+        const opaque_id = credential_ref_counter.fetchAdd(1, .monotonic);
         return .{
-            .value = try std.fmt.allocPrint(allocator, "ryk-secret://{s}/env/{s}/{s}", .{ self.kind.toString(), name, &fingerprint }),
+            .value = try std.fmt.allocPrint(allocator, "ryk-secret://{s}/env/{s}/{x:0>16}", .{ self.kind.toString(), name, opaque_id }),
         };
     }
 };
+
+var credential_ref_counter: std.atomic.Value(u64) = .init(1);
 
 const CommandResult = struct {
     stdout: []u8,
@@ -468,6 +470,17 @@ test "local dummy broker creates raw-secret-free env references" {
 
     try std.testing.expect(std.mem.startsWith(u8, ref.value, "ryk-secret://local-dummy/env/GITHUB_TOKEN/"));
     try std.testing.expect(std.mem.indexOf(u8, ref.value, "ghp_fakeSyntheticTokenValue") == null);
+}
+
+test "local dummy broker references are opaque and not stable secret verifiers" {
+    const broker = localDummyBroker();
+    const first = try broker.envReference(std.testing.allocator, "TOKEN", "same-low-entropy-secret");
+    defer first.deinit(std.testing.allocator);
+    const second = try broker.envReference(std.testing.allocator, "TOKEN", "same-low-entropy-secret");
+    defer second.deinit(std.testing.allocator);
+
+    try std.testing.expect(!std.mem.eql(u8, first.value, second.value));
+    try std.testing.expect(std.mem.indexOf(u8, first.value, "same-low-entropy-secret") == null);
 }
 
 test "env-file dev broker resolves and redacts check output" {

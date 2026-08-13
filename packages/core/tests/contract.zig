@@ -216,16 +216,16 @@ test "core API writes redacted audit events and verifies replay hash chain" {
     const events = try tmp.dir.readFileAlloc(std.testing.io, events_path, std.testing.allocator, .limited(16 * 1024));
     defer std.testing.allocator.free(events);
     try std.testing.expect(std.mem.indexOf(u8, events, "fake_secret_value_phase24") == null);
-    try std.testing.expect(std.mem.indexOf(u8, events, "[REDACTED:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, events, "[REDACTED") != null);
 
     var replay = try ryk_core.api.loadReplay(std.testing.io, std.testing.allocator, root, .{ .session = session.id.slice(), .verify = true });
     defer replay.deinit();
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(std.testing.allocator);
     var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer aw.deinit();
     try ryk_core.api.writeReplayJson(&aw.writer, replay);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "fake_secret_value_phase24") == null);
+    const replay_json = aw.written();
+    try std.testing.expect(std.mem.indexOf(u8, replay_json, "fake_secret_value_phase24") == null);
+    try std.testing.expect(std.mem.indexOf(u8, replay_json, "[REDACTED") != null);
 }
 
 test "cli compatibility facade dead code has been removed" {

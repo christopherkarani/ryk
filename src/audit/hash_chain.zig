@@ -16,16 +16,16 @@ pub fn eventHash(previous_hash: ?[]const u8, canonical_event_without_hash: []con
     return std.fmt.bytesToHex(digest, .lower);
 }
 
-pub fn writeCanonicalEventWithoutHash(writer: anytype, ev: core.event.Event, previous_hash: ?[]const u8) !void {
-    try writeEventFields(writer, ev, previous_hash, null);
+pub fn writeCanonicalEventWithoutHashAlloc(allocator: std.mem.Allocator, writer: anytype, ev: core.event.Event, previous_hash: ?[]const u8) !void {
+    try writeEventFields(allocator, writer, ev, previous_hash, null);
 }
 
-pub fn writeEventJsonLine(writer: anytype, ev: core.event.Event, previous_hash: ?[]const u8, event_hash_value: []const u8) !void {
-    try writeEventFields(writer, ev, previous_hash, event_hash_value);
+pub fn writeEventJsonLineAlloc(allocator: std.mem.Allocator, writer: anytype, ev: core.event.Event, previous_hash: ?[]const u8, event_hash_value: []const u8) !void {
+    try writeEventFields(allocator, writer, ev, previous_hash, event_hash_value);
     try writer.writeByte('\n');
 }
 
-fn writeEventFields(writer: anytype, ev: core.event.Event, previous_hash: ?[]const u8, event_hash_value: ?[]const u8) !void {
+fn writeEventFields(allocator: std.mem.Allocator, writer: anytype, ev: core.event.Event, previous_hash: ?[]const u8, event_hash_value: ?[]const u8) !void {
     var timestamp_buf: [32]u8 = undefined;
     const timestamp = try ev.timestamp.formatIso(&timestamp_buf);
 
@@ -40,16 +40,16 @@ fn writeEventFields(writer: anytype, ev: core.event.Event, previous_hash: ?[]con
     try writer.writeAll(",\"type\":");
     try core.util.writeJsonString(writer, ev.event_type.toString());
     try writer.writeAll(",\"actor\":");
-    try writeActor(writer, ev.actor);
+    try writeActor(allocator, writer, ev.actor);
     try writer.writeAll(",\"target\":");
-    try writeTarget(writer, ev.target);
+    try writeTarget(allocator, writer, ev.target);
     try writer.writeAll(",\"decision\":");
-    try writeDecision(writer, ev.decision);
+    try writeDecision(allocator, writer, ev.decision);
     try writer.writeAll(",\"redactions\":");
-    try writeRedactions(writer, ev.redactions);
+    try writeRedactions(allocator, writer, ev.redactions);
     if (!ev.metadata.isEmpty()) {
         try writer.writeAll(",\"metadata\":");
-        try writeMetadata(writer, ev.metadata);
+        try writeMetadata(allocator, writer, ev.metadata);
     }
     try writer.writeAll(",\"previous_hash\":");
     try writeNullableRawString(writer, previous_hash);
@@ -60,28 +60,29 @@ fn writeEventFields(writer: anytype, ev: core.event.Event, previous_hash: ?[]con
     try writer.writeByte('}');
 }
 
-fn writeActor(writer: anytype, actor: core.types.Actor) !void {
+fn writeActor(allocator: std.mem.Allocator, writer: anytype, actor: core.types.Actor) !void {
     try writer.writeByte('{');
     try writer.writeAll("\"kind\":");
     try core.util.writeJsonString(writer, @tagName(actor.kind));
     try writer.writeAll(",\"id\":");
-    try writeNullableString(writer, actor.id);
+    try writeNullableString(allocator, writer, actor.id);
     try writer.writeAll(",\"display\":");
-    try writeNullableString(writer, actor.display);
+    try writeNullableString(allocator, writer, actor.display);
     try writer.writeByte('}');
 }
 
-fn writeTarget(writer: anytype, target: core.types.Target) !void {
+fn writeTarget(allocator: std.mem.Allocator, writer: anytype, target: core.types.Target) !void {
     try writer.writeByte('{');
     try writer.writeAll("\"kind\":");
     try core.util.writeJsonString(writer, @tagName(target.kind));
     try writer.writeAll(",\"value\":");
-    var redacted_buf: [256]u8 = undefined;
-    try core.util.writeJsonString(writer, redact_bridge.redactTargetValueBounded(@tagName(target.kind), target.value, &redacted_buf));
+    const redacted = redact_bridge.redactTargetValueAlloc(allocator, @tagName(target.kind), target.value) catch redacted_bridge_fallback;
+    defer if (redacted.ptr != redacted_bridge_fallback.ptr) allocator.free(redacted);
+    try core.util.writeJsonString(writer, redacted);
     try writer.writeByte('}');
 }
 
-fn writeDecision(writer: anytype, maybe_decision: ?core.decision.Decision) !void {
+fn writeDecision(allocator: std.mem.Allocator, writer: anytype, maybe_decision: ?core.decision.Decision) !void {
     const decision = maybe_decision orelse {
         try writer.writeAll("null");
         return;
@@ -90,10 +91,9 @@ fn writeDecision(writer: anytype, maybe_decision: ?core.decision.Decision) !void
     try writer.writeAll("\"result\":");
     try core.util.writeJsonString(writer, decision.result.toString());
     try writer.writeAll(",\"rule_id\":");
-    try writeNullableString(writer, decision.rule_id);
+    try writeNullableString(allocator, writer, decision.rule_id);
     try writer.writeAll(",\"reason\":");
-    var reason_buf: [256]u8 = undefined;
-    try core.util.writeJsonString(writer, redact_bridge.redactStringBounded(decision.reason, &reason_buf));
+    try writeRedactedString(allocator, writer, decision.reason);
     try writer.writeAll(",\"risk_score\":");
     if (decision.risk_score) |score| {
         try writer.print("{d}", .{score});
@@ -104,17 +104,16 @@ fn writeDecision(writer: anytype, maybe_decision: ?core.decision.Decision) !void
     try writer.writeByte('}');
 }
 
-fn writeRedactions(writer: anytype, redactions: core.event.RedactionSummary) !void {
+fn writeRedactions(allocator: std.mem.Allocator, writer: anytype, redactions: core.event.RedactionSummary) !void {
     try writer.print("{{\"count\":{d},\"labels\":[", .{redactions.count});
     for (redactions.labels, 0..) |label, index| {
         if (index > 0) try writer.writeByte(',');
-        var redacted_buf: [256]u8 = undefined;
-        try core.util.writeJsonString(writer, redact_bridge.redactStringBounded(label, &redacted_buf));
+        try writeRedactedString(allocator, writer, label);
     }
     try writer.writeAll("]}");
 }
 
-fn writeMetadata(writer: anytype, metadata: core.event.EventMetadata) !void {
+fn writeMetadata(allocator: std.mem.Allocator, writer: anytype, metadata: core.event.EventMetadata) !void {
     try writer.writeByte('{');
     var wrote_field = false;
     inline for (.{
@@ -131,21 +130,27 @@ fn writeMetadata(writer: anytype, metadata: core.event.EventMetadata) !void {
             try writer.writeAll("\"");
             try writer.writeAll(field[0]);
             try writer.writeAll("\":");
-            var redacted_buf: [512]u8 = undefined;
-            try core.util.writeJsonString(writer, redact_bridge.redactStringBounded(value, &redacted_buf));
+            try writeRedactedString(allocator, writer, value);
             wrote_field = true;
         }
     }
     try writer.writeByte('}');
 }
 
-fn writeNullableString(writer: anytype, value: ?[]const u8) !void {
+fn writeNullableString(allocator: std.mem.Allocator, writer: anytype, value: ?[]const u8) !void {
     if (value) |string| {
-        var redacted_buf: [256]u8 = undefined;
-        try core.util.writeJsonString(writer, redact_bridge.redactStringBounded(string, &redacted_buf));
+        try writeRedactedString(allocator, writer, string);
     } else {
         try writer.writeAll("null");
     }
+}
+
+const redacted_bridge_fallback = redact_bridge.redacted_value;
+
+fn writeRedactedString(allocator: std.mem.Allocator, writer: anytype, value: []const u8) !void {
+    const redacted = redact_bridge.redactAlloc(allocator, value) catch redacted_bridge_fallback;
+    defer if (redacted.ptr != redacted_bridge_fallback.ptr) allocator.free(redacted);
+    try core.util.writeJsonString(writer, redacted);
 }
 
 fn writeNullableRawString(writer: anytype, value: ?[]const u8) !void {
@@ -159,7 +164,21 @@ fn writeNullableRawString(writer: anytype, value: ?[]const u8) !void {
 pub fn canonicalEventAlloc(allocator: std.mem.Allocator, ev: core.event.Event, previous_hash: ?[]const u8) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
-    try writeCanonicalEventWithoutHash(&out.writer, ev, previous_hash);
+    try writeCanonicalEventWithoutHashAlloc(allocator, &out.writer, ev, previous_hash);
+    return try out.toOwnedSlice();
+}
+
+/// Build the persisted row from the exact canonical bytes that were hashed.
+/// This prevents a second redaction/serialization pass from producing bytes
+/// that differ from the hash input.
+pub fn eventJsonLineFromCanonicalAlloc(allocator: std.mem.Allocator, canonical: []const u8, event_hash_value: []const u8) ![]u8 {
+    if (canonical.len == 0 or canonical[canonical.len - 1] != '}') return error.InvalidCanonicalEvent;
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    try out.writer.writeAll(canonical[0 .. canonical.len - 1]);
+    try out.writer.writeAll(",\"event_hash\":");
+    try core.util.writeJsonString(&out.writer, event_hash_value);
+    try out.writer.writeAll("}\n");
     return try out.toOwnedSlice();
 }
 
@@ -189,6 +208,29 @@ test "event serialization is deterministic and excludes event_hash from hash inp
     try std.testing.expectEqual(@as(usize, hex_hash_len), hash.len);
 }
 
+test "persisted event line contains the exact canonical hash input" {
+    const ts = core.time.Timestamp.fromUnixSeconds(1_777_983_130);
+    const sid = try core.session.generateSessionId(ts);
+    var eid: core.event.EventId = .{ .value = undefined, .len = 0 };
+    eid.len = (try std.fmt.bufPrint(&eid.value, "evt_exact_bytes", .{})).len;
+    const ev: core.event.Event = .{
+        .session_id = sid,
+        .event_id = eid,
+        .timestamp = ts,
+        .event_type = .process_launch,
+        .actor = .{ .kind = .ryk, .display = "password=correct-horse-battery-staple" },
+        .target = .{ .kind = .command, .value = "token%253Dcorrect-horse-battery-staple" },
+    };
+    const canonical = try canonicalEventAlloc(std.testing.allocator, ev, null);
+    defer std.testing.allocator.free(canonical);
+    const hash = eventHash(null, canonical);
+    const line = try eventJsonLineFromCanonicalAlloc(std.testing.allocator, canonical, &hash);
+    defer std.testing.allocator.free(line);
+    try std.testing.expectEqualStrings(canonical[0 .. canonical.len - 1], line[0 .. canonical.len - 1]);
+    try std.testing.expect(std.mem.indexOf(u8, line, "correct-horse") == null);
+    try std.testing.expect(std.mem.endsWith(u8, line, "\"}\n"));
+}
+
 test "redaction labels are redacted at the audit serialization boundary" {
     const ts = core.time.Timestamp.fromUnixSeconds(1_777_983_130);
     const sid = try core.session.generateSessionId(ts);
@@ -208,11 +250,10 @@ test "redaction labels are redacted at the audit serialization boundary" {
 
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
-    try writeEventJsonLine(&out.writer, ev, null, "abc");
+    try writeEventJsonLineAlloc(std.testing.allocator, &out.writer, ev, null, "abc");
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "fake_secret_value") == null);
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "[REDACTED:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), redact_bridge.redacted_value) != null);
 }
-
 
 test "sandbox_posture serializes posture hash and fs_scope without full profile" {
     const ts = core.time.Timestamp.fromUnixSeconds(1_777_983_130);
@@ -237,7 +278,7 @@ test "sandbox_posture serializes posture hash and fs_scope without full profile"
 
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
-    try writeEventJsonLine(&out.writer, ev, null, "deadbeef");
+    try writeEventJsonLineAlloc(std.testing.allocator, &out.writer, ev, null, "deadbeef");
     const line = out.written();
     try std.testing.expect(std.mem.indexOf(u8, line, "\"type\":\"sandbox_posture\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, line, "posture=active") != null);

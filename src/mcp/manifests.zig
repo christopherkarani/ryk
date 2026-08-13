@@ -406,22 +406,27 @@ fn countIndent(line: []const u8) usize {
     return count;
 }
 
-pub fn writeStarterManifest(writer: anytype, server_name: []const u8, command: []const u8, args: []const []const u8) !void {
+pub fn writeStarterManifestAlloc(allocator: std.mem.Allocator, writer: anytype, server_name: []const u8, command: []const u8, args: []const []const u8) !void {
     try writer.writeAll("version: 1\nserver:\n");
-    try writer.print("  name: {s}\n", .{server_name});
+    try writer.writeAll("  name: ");
+    try writeRedactedYamlString(allocator, writer, server_name);
+    try writer.writeByte('\n');
     try writer.writeAll("  transport: stdio\n");
-    try writer.print("  command: {s}\n", .{command});
+    try writer.writeAll("  command: ");
+    try writeRedactedYamlString(allocator, writer, command);
+    try writer.writeByte('\n');
     if (args.len == 0) {
         try writer.writeAll("  args: []\n");
     } else {
         try writer.writeAll("  args:\n");
         for (args, 0..) |arg, index| {
-            var redacted_buf: [256]u8 = undefined;
-            const safe_arg = if (index > 0 and looksLikeSecretFlag(args[index - 1]))
-                "[REDACTED]"
-            else
-                redact_bridge.redactStringBounded(arg, &redacted_buf);
-            try writer.print("    - {s}\n", .{safe_arg});
+            try writer.writeAll("    - ");
+            if (index > 0 and looksLikeSecretFlag(args[index - 1])) {
+                try core.util.writeJsonString(writer, "[REDACTED]");
+            } else {
+                try writeRedactedYamlString(allocator, writer, arg);
+            }
+            try writer.writeByte('\n');
         }
     }
     try writer.writeAll(
@@ -439,6 +444,26 @@ pub fn writeStarterManifest(writer: anytype, server_name: []const u8, command: [
         \\  default: deny
         \\
     );
+}
+
+fn writeRedactedYamlString(allocator: std.mem.Allocator, writer: anytype, value: []const u8) !void {
+    const redacted = try redact_bridge.redactAlloc(allocator, value);
+    defer allocator.free(redacted);
+    if (isPlainYamlScalar(redacted)) {
+        try writer.writeAll(redacted);
+    } else {
+        // JSON double-quoted strings are valid YAML scalars and neutralize
+        // newlines, comments, colons, and other structure-changing characters.
+        try core.util.writeJsonString(writer, redacted);
+    }
+}
+
+fn isPlainYamlScalar(value: []const u8) bool {
+    if (value.len == 0) return false;
+    for (value) |char| {
+        if (!(std.ascii.isAlphanumeric(char) or char == '_' or char == '-' or char == '.' or char == '/')) return false;
+    }
+    return true;
 }
 
 fn looksLikeSecretFlag(value: []const u8) bool {
@@ -537,8 +562,32 @@ test "invalid manifest validation rejects unsafe or ambiguous schema" {
 test "starter manifest omits raw secret values" {
     var out_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out_writer.deinit();
-    try writeStarterManifest(&out_writer.writer, "github", "github-mcp-server", &.{ "--token", "ghp_fakeSecretShouldNotBeHere" });
+    try writeStarterManifestAlloc(std.testing.allocator, &out_writer.writer, "github", "github-mcp-server", &.{ "--token", "ghp_fakeSecretShouldNotBeHere" });
     const out = try out_writer.toOwnedSlice();
     defer std.testing.allocator.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, "ghp_fakeSecretShouldNotBeHere") == null);
+}
+
+test "starter manifest redacts server and command and safely quotes yaml scalars" {
+    const synthetic_secret = "ghp_syntheticManifestSecret123456";
+    var out_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out_writer.deinit();
+    try writeStarterManifestAlloc(
+        std.testing.allocator,
+        &out_writer.writer,
+        "server: injected\nadmin: true # ghp_syntheticManifestSecret123456",
+        "command: injected\nghp_syntheticManifestSecret123456",
+        &.{ "plain: value # comment", synthetic_secret },
+    );
+    const out = try out_writer.toOwnedSlice();
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, synthetic_secret) == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\nadmin: true") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\ncommand: injected") == null);
+
+    var parsed = try parseFromSlice(std.testing.allocator, out, "generated.yaml");
+    defer parsed.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.server.name, "admin: true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.server.command, "command: injected") != null);
+    try std.testing.expectEqualStrings("plain: value # comment", parsed.server.args[0]);
 }

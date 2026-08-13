@@ -31,9 +31,12 @@ pub fn writeHuman(io: std.Io, writer: anytype, suite: runner.SuiteResult) !void 
     try writer.writeByte('\n');
 
     var fixture_rows: std.ArrayList([]const []const u8) = .empty;
+    var fixture_values: std.ArrayList([]u8) = .empty;
     defer {
         for (fixture_rows.items) |row| suite.allocator.free(row);
         fixture_rows.deinit(suite.allocator);
+        for (fixture_values.items) |value| suite.allocator.free(value);
+        fixture_values.deinit(suite.allocator);
     }
     for (suite.results) |result| {
         const row = try suite.allocator.alloc([]const u8, 4);
@@ -42,9 +45,27 @@ pub fn writeHuman(io: std.Io, writer: anytype, suite: runner.SuiteResult) !void 
             .failed => "✗ FAIL",
             .skipped => "○ SKIP",
         };
-        row[1] = result.id;
+        const safe_id = audit.redact_bridge.redactAlloc(suite.allocator, result.id) catch |err| {
+            suite.allocator.free(row);
+            return err;
+        };
+        fixture_values.append(suite.allocator, safe_id) catch |err| {
+            suite.allocator.free(safe_id);
+            suite.allocator.free(row);
+            return err;
+        };
+        row[1] = safe_id;
         row[2] = result.category.display();
-        row[3] = result.failure_reason orelse result.name;
+        const safe_detail = audit.redact_bridge.redactAlloc(suite.allocator, result.failure_reason orelse result.name) catch |err| {
+            suite.allocator.free(row);
+            return err;
+        };
+        fixture_values.append(suite.allocator, safe_detail) catch |err| {
+            suite.allocator.free(safe_detail);
+            suite.allocator.free(row);
+            return err;
+        };
+        row[3] = safe_detail;
         fixture_rows.append(suite.allocator, row) catch |err| {
             suite.allocator.free(row);
             return err;
@@ -101,9 +122,13 @@ pub fn writeHuman(io: std.Io, writer: anytype, suite: runner.SuiteResult) !void 
             wrote_skipped = true;
         }
         try writer.writeAll("  ");
-        try tui.terminal_text.write(writer, result.id, .single_line);
+        const safe_id = try audit.redact_bridge.redactAlloc(suite.allocator, result.id);
+        defer suite.allocator.free(safe_id);
+        try tui.terminal_text.write(writer, safe_id, .single_line);
         try writer.writeAll(": ");
-        try tui.terminal_text.write(writer, result.failure_reason orelse "skipped", .single_line);
+        const safe_reason = try audit.redact_bridge.redactAlloc(suite.allocator, result.failure_reason orelse "skipped");
+        defer suite.allocator.free(safe_reason);
+        try tui.terminal_text.write(writer, safe_reason, .single_line);
         try writer.writeByte('\n');
     }
 }
@@ -338,4 +363,85 @@ test "redteam human output renders fixture and category scorecard tables" {
     try std.testing.expect(std.mem.indexOf(u8, rendered, "0/1 passed") != null);
     try std.testing.expect(std.mem.indexOfScalar(u8, rendered, 0x1b) == null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "unexpected terminal line") != null);
+}
+
+test "redteam human and json output redact every attacker controlled field" {
+    const allocator = std.testing.allocator;
+    const synthetic_secret = "ghp_syntheticRedteamSecret123456";
+    var checks = try allocator.alloc(runner.CheckResult, 1);
+    checks[0] = .{ .expected = try std.fmt.allocPrint(allocator, "password={s}", .{synthetic_secret}), .passed = false, .observed = try allocator.dupe(u8, synthetic_secret) };
+    var observations = try allocator.alloc(runner.Observation, 1);
+    observations[0] = .{
+        .action = try allocator.dupe(u8, synthetic_secret),
+        .event_type = try allocator.dupe(u8, synthetic_secret),
+        .decision = try allocator.dupe(u8, synthetic_secret),
+        .summary = try allocator.dupe(u8, synthetic_secret),
+    };
+    var missing = try allocator.alloc([]const u8, 1);
+    missing[0] = try allocator.dupe(u8, synthetic_secret);
+    var results = try allocator.alloc(runner.FixtureResult, 1);
+    results[0] = .{
+        .allocator = allocator,
+        .id = try allocator.dupe(u8, synthetic_secret),
+        .name = try allocator.dupe(u8, synthetic_secret),
+        .category = .secret_exfil,
+        .status = .failed,
+        .required = true,
+        .points_possible = 10,
+        .points_earned = 0,
+        .checks = checks,
+        .observations = observations,
+        .missing_capabilities = missing,
+        .failure_reason = try allocator.dupe(u8, synthetic_secret),
+    };
+    var suite: runner.SuiteResult = .{ .allocator = allocator, .results = results };
+    defer suite.deinit();
+
+    var human_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer human_writer.deinit();
+    try writeHuman(std.testing.io, &human_writer.writer, suite);
+    const human = try human_writer.toOwnedSlice();
+    defer allocator.free(human);
+
+    var json_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer json_writer.deinit();
+    try writeJson(&json_writer.writer, suite);
+    const json = try json_writer.toOwnedSlice();
+    defer allocator.free(json);
+
+    try std.testing.expect(std.mem.indexOf(u8, human, synthetic_secret) == null);
+    try std.testing.expect(std.mem.indexOf(u8, json, synthetic_secret) == null);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+}
+
+test "redteam json remains structured when attacker fields exceed redaction scan bound" {
+    const allocator = std.testing.allocator;
+    const huge_name = try allocator.alloc(u8, 70 * 1024);
+    @memset(huge_name, 'x');
+    var results = try allocator.alloc(runner.FixtureResult, 1);
+    results[0] = .{
+        .allocator = allocator,
+        .id = try allocator.dupe(u8, "large-custom-fixture"),
+        .name = huge_name,
+        .category = .secret_exfil,
+        .status = .passed,
+        .required = true,
+        .points_possible = 1,
+        .points_earned = 1,
+        .checks = &.{},
+        .observations = &.{},
+    };
+    var suite: runner.SuiteResult = .{ .allocator = allocator, .results = results };
+    defer suite.deinit();
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try writeJson(&out.writer, suite);
+    const rendered = try out.toOwnedSlice();
+    defer allocator.free(rendered);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, rendered, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.object.get("fixtures").?.array.items.len);
+    try std.testing.expectEqualStrings("[REDACTED]", parsed.value.object.get("fixtures").?.array.items[0].object.get("name").?.string);
 }

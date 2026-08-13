@@ -13,7 +13,7 @@ expected:
   blocked:
     - "network.connect:https://webhook.site/collect?token=sk-fakeSyntheticOpenAIKey1234567890&payload=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
   redacted:
-    - "[REDACTED:env:token:sha256:"
+    - "[REDACTED:env:token]"
   no_log_contains:
     - "sk-fakeSyntheticOpenAIKey1234567890"
 score:

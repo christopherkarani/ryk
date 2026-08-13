@@ -471,13 +471,16 @@ fn eventFromJson(allocator: std.mem.Allocator, raw: []const u8, value: std.json.
         else => return err,
     };
     errdefer if (decision_result) |value_text| allocator.free(value_text);
-    const canonical_raw = try eventJsonLineFromValue(allocator, value);
+    const canonical_raw = try presentationJsonAlloc(allocator, value);
     errdefer allocator.free(canonical_raw);
-    const timestamp = try allocator.dupe(u8, try expectString(try requiredField(object, "timestamp")));
+    const timestamp = redact_bridge.redactAlloc(allocator, try expectString(try requiredField(object, "timestamp"))) catch
+        try allocator.dupe(u8, redact_bridge.redacted_value);
     errdefer allocator.free(timestamp);
-    const event_type = try allocator.dupe(u8, try expectString(try requiredField(object, "type")));
+    const event_type = redact_bridge.redactAlloc(allocator, try expectString(try requiredField(object, "type"))) catch
+        try allocator.dupe(u8, redact_bridge.redacted_value);
     errdefer allocator.free(event_type);
-    const target_value = try allocator.dupe(u8, try expectString(try requiredField(target, "value")));
+    const target_value = redact_bridge.redactAlloc(allocator, try expectString(try requiredField(target, "value"))) catch
+        try allocator.dupe(u8, redact_bridge.redacted_value);
     return .{
         .raw = canonical_raw,
         .timestamp = timestamp,
@@ -485,6 +488,48 @@ fn eventFromJson(allocator: std.mem.Allocator, raw: []const u8, value: std.json.
         .target_value = target_value,
         .decision_result = decision_result,
     };
+}
+
+fn presentationJsonAlloc(allocator: std.mem.Allocator, value: std.json.Value) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    try writePresentationJsonValue(allocator, &out.writer, value);
+    return try out.toOwnedSlice();
+}
+
+fn writePresentationJsonValue(allocator: std.mem.Allocator, writer: anytype, value: std.json.Value) !void {
+    switch (value) {
+        .null => try writer.writeAll("null"),
+        .bool => |boolean| try writer.print("{}", .{boolean}),
+        .integer => |integer| try writer.print("{d}", .{integer}),
+        .float => |float| try writer.print("{d}", .{float}),
+        .number_string => |number| try writer.writeAll(number),
+        .string => |string| {
+            const redacted = redact_bridge.redactAlloc(allocator, string) catch redact_bridge.redacted_value;
+            defer if (redacted.ptr != redact_bridge.redacted_value.ptr) allocator.free(redacted);
+            try core.util.writeJsonString(writer, redacted);
+        },
+        .array => |array| {
+            try writer.writeByte('[');
+            for (array.items, 0..) |item, index| {
+                if (index > 0) try writer.writeByte(',');
+                try writePresentationJsonValue(allocator, writer, item);
+            }
+            try writer.writeByte(']');
+        },
+        .object => |object| {
+            try writer.writeByte('{');
+            var iterator = object.iterator();
+            var index: usize = 0;
+            while (iterator.next()) |entry| : (index += 1) {
+                if (index > 0) try writer.writeByte(',');
+                try core.util.writeJsonString(writer, entry.key_ptr.*);
+                try writer.writeByte(':');
+                try writePresentationJsonValue(allocator, writer, entry.value_ptr.*);
+            }
+            try writer.writeByte('}');
+        },
+    }
 }
 
 fn isDenied(value: std.json.Value) bool {
@@ -508,24 +553,8 @@ fn decisionResultFromValue(allocator: std.mem.Allocator, value: std.json.Value) 
     const object = try expectObject(value);
     const result = object.get("result") orelse return null;
     if (result != .string) return null;
-    return try allocator.dupe(u8, result.string);
-}
-
-fn eventJsonLineFromValue(allocator: std.mem.Allocator, value: std.json.Value) ![]u8 {
-    const object = try expectObject(value);
-    const event_hash = try expectString(try requiredField(object, "event_hash"));
-    const canonical = try canonicalFromJsonValue(allocator, value);
-    defer allocator.free(canonical);
-
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    errdefer out.deinit();
-    const writer = &out.writer;
-    if (canonical.len == 0 or canonical[canonical.len - 1] != '}') return error.InvalidEventSchema;
-    try writer.writeAll(canonical[0 .. canonical.len - 1]);
-    try writer.writeAll(",\"event_hash\":");
-    try core.util.writeJsonString(writer, event_hash);
-    try writer.writeByte('}');
-    return try out.toOwnedSlice();
+    return redact_bridge.redactAlloc(allocator, result.string) catch
+        try allocator.dupe(u8, redact_bridge.redacted_value);
 }
 
 const SummaryFields = struct {
@@ -553,8 +582,8 @@ fn readSummaryFields(io: std.Io, allocator: std.mem.Allocator, session_dir_path:
 
     const command_display = try commandDisplayFromSummary(allocator, try expectArray(try requiredField(object, "command")));
     errdefer allocator.free(command_display);
-    var policy_buf: [256]u8 = undefined;
-    const policy = try allocator.dupe(u8, redact_bridge.redactStringBounded(try expectString(try requiredField(object, "policy")), &policy_buf));
+    const policy = redact_bridge.redactAlloc(allocator, try expectString(try requiredField(object, "policy"))) catch
+        try allocator.dupe(u8, redact_bridge.redacted_value);
     errdefer allocator.free(policy);
     const status_display = try statusDisplayFromSummary(allocator, try requiredField(object, "status"));
     errdefer allocator.free(status_display);
@@ -596,8 +625,9 @@ fn commandDisplayFromSummary(allocator: std.mem.Allocator, command_array: std.js
     errdefer list.deinit(allocator);
     for (command_array.items, 0..) |item, index| {
         if (index > 0) try list.append(allocator, ' ');
-        var command_buf: [256]u8 = undefined;
-        try list.appendSlice(allocator, redact_bridge.redactStringBounded(try expectString(item), &command_buf));
+        const redacted = redact_bridge.redactAlloc(allocator, try expectString(item)) catch redact_bridge.redacted_value;
+        defer if (redacted.ptr != redact_bridge.redacted_value.ptr) allocator.free(redacted);
+        try list.appendSlice(allocator, redacted);
     }
     return try list.toOwnedSlice(allocator);
 }
@@ -606,7 +636,9 @@ fn statusDisplayFromSummary(allocator: std.mem.Allocator, value: std.json.Value)
     const object = try expectObject(value);
     const kind = try expectString(try requiredField(object, "kind"));
     const code = try expectInteger(try requiredField(object, "code"));
-    return try std.fmt.allocPrint(allocator, "{s} {d}", .{ kind, code });
+    const redacted_kind = redact_bridge.redactAlloc(allocator, kind) catch redact_bridge.redacted_value;
+    defer if (redacted_kind.ptr != redact_bridge.redacted_value.ptr) allocator.free(redacted_kind);
+    return try std.fmt.allocPrint(allocator, "{s} {d}", .{ redacted_kind, code });
 }
 
 fn eventTime(timestamp: []const u8) []const u8 {
@@ -737,7 +769,7 @@ test "verification accepts rust shell metadata in audit events" {
         defer file.close(std.testing.io);
         var buf: [2048]u8 = undefined;
         var file_writer = file.writer(std.testing.io, &buf);
-        try hash_chain.writeEventJsonLine(&file_writer.interface, ev, null, &hash);
+        try hash_chain.writeEventJsonLineAlloc(std.testing.allocator, &file_writer.interface, ev, null, &hash);
         try file_writer.interface.flush();
     }
     try writeTestSummary(summary_path, 1, &hash, "[\"ryk\",\"run\",\"--\",\"rm\",\"-rf\",\"/\"]");
@@ -945,6 +977,39 @@ test "p0-4 replay redacts structured secrets in command display" {
     try std.testing.expect(std.mem.indexOf(u8, session.command_display, "[REDACTED") != null);
 }
 
+test "replay JSON presentation re-redacts verified stored strings" {
+    const stored =
+        "{\"version\":1,\"target\":{\"value\":\"token%3Dcorrect-horse-battery-staple\"},\"event_hash\":\"unchanged-integrity-field\"}";
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, stored, .{});
+    defer parsed.deinit();
+    const presented = try presentationJsonAlloc(std.testing.allocator, parsed.value);
+    defer std.testing.allocator.free(presented);
+    try std.testing.expect(std.mem.indexOf(u8, presented, "correct-horse") == null);
+    try std.testing.expect(std.mem.indexOf(u8, presented, redact_bridge.redacted_value) != null);
+    try std.testing.expect(std.mem.indexOf(u8, presented, "unchanged-integrity-field") != null);
+}
+
+test "replay event presentation redacts type timestamp and decision strings" {
+    const stored =
+        "{\"version\":1,\"session_id\":\"s\",\"event_id\":\"e\",\"timestamp\":\"token%3Dcorrect-horse-battery-staple\",\"type\":\"password=correct-horse-battery-staple\",\"actor\":{\"kind\":\"ryk\",\"id\":null,\"display\":null},\"target\":{\"kind\":\"command\",\"value\":\"ok\"},\"decision\":{\"result\":\"token=correct-horse-battery-staple\",\"rule_id\":null,\"reason\":\"ok\",\"risk_score\":null,\"requires_user\":false,\"ci_may_proceed\":true},\"redactions\":{\"count\":0,\"labels\":[]},\"previous_hash\":null,\"event_hash\":\"ignored\"}";
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, stored, .{});
+    defer parsed.deinit();
+    const event = try eventFromJson(std.testing.allocator, stored, parsed.value);
+    defer event.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, event.timestamp, "correct-horse") == null);
+    try std.testing.expect(std.mem.indexOf(u8, event.event_type, "correct-horse") == null);
+    try std.testing.expect(event.decision_result == null or std.mem.indexOf(u8, event.decision_result.?, "correct-horse") == null);
+}
+
+test "replay status display redacts attacker-controlled kind" {
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"kind\":\"password=correct-horse-battery-staple\",\"code\":1}", .{});
+    defer parsed.deinit();
+    const displayed = try statusDisplayFromSummary(std.testing.allocator, parsed.value);
+    defer std.testing.allocator.free(displayed);
+    try std.testing.expect(std.mem.indexOf(u8, displayed, "correct-horse") == null);
+    try std.testing.expect(std.mem.indexOf(u8, displayed, redact_bridge.redacted_value) != null);
+}
+
 test "replay loading cleans up every allocation failure path" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -987,7 +1052,13 @@ test "replay rejects session ids with path traversal" {
 }
 
 fn loadReplayAllocationFailureProbe(allocator: std.mem.Allocator, root: []const u8, session_id: []const u8) !void {
-    var replay = try load(std.testing.io, allocator, root, .{ .session = session_id, .verify = true });
+    var replay = load(std.testing.io, allocator, root, .{ .session = session_id, .verify = true }) catch |err| switch (err) {
+        // std.Io.Writer.Allocating maps allocator exhaustion to WriteFailed.
+        // Normalize it so checkAllAllocationFailures can continue exercising
+        // every cleanup point as allocator failure.
+        error.WriteFailed => return error.OutOfMemory,
+        else => return err,
+    };
     defer replay.deinit();
 }
 

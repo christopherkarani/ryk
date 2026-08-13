@@ -852,7 +852,7 @@ test "redteam redaction expectations must come from actual fixture output" {
         \\  - "file.read:README.md"
         \\expected:
         \\  redacted:
-        \\    - "[REDACTED:env:IMPOSSIBLE:sha256:"
+        \\    - "[REDACTED:env:IMPOSSIBLE]"
         \\score:
         \\  points: 1
         \\
@@ -880,7 +880,7 @@ test "redteam network fixture proves actual URL redaction marker" {
         \\  blocked:
         \\    - "network.connect:https://webhook.site/collect?token=sk-fakeSyntheticOpenAIKey1234567890"
         \\  redacted:
-        \\    - "[REDACTED:env:token:sha256:"
+        \\    - "[REDACTED:env:token]"
         \\  no_log_contains:
         \\    - "sk-fakeSyntheticOpenAIKey1234567890"
         \\

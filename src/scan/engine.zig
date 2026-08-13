@@ -90,14 +90,8 @@ pub fn runScan(io: std.Io, allocator: std.mem.Allocator, options: ScanOptions) !
             for (parsed.commands.items) |cmd| {
                 try processCommand(allocator, &findings, &scorecard, h.host, file.session_id, evidence_path, ts, cmd);
             }
-            // Dedup material by fingerprint/label within this session file.
-            var seen_material: std.ArrayList([]const u8) = .empty;
-            defer {
-                for (seen_material.items) |s| allocator.free(s);
-                seen_material.deinit(allocator);
-            }
             for (parsed.text_blobs.items) |blob| {
-                try processMaterialDedup(allocator, &findings, &scorecard, &seen_material, h.host, file.session_id, evidence_path, ts, blob);
+                try processMaterial(allocator, &findings, &scorecard, h.host, file.session_id, evidence_path, ts, blob);
             }
         }
         if (options.progress) |pf| pf(options.progress_ctx, h.host, .host_done, file_total);
@@ -182,11 +176,10 @@ fn processCommand(
     }
 }
 
-fn processMaterialDedup(
+fn processMaterial(
     allocator: std.mem.Allocator,
     findings: *std.ArrayList(types.Finding),
     scorecard: *types.Scorecard,
-    seen: *std.ArrayList([]const u8),
     host: types.Host,
     session_id: []const u8,
     path: []const u8,
@@ -197,18 +190,7 @@ fn processMaterialDedup(
     const hit = hit_opt orelse return;
     var material = hit;
     defer material.deinit(allocator);
-
-    const key = try std.fmt.allocPrint(allocator, "{s}|{s}", .{ material.label, material.fingerprint_hex });
-    for (seen.items) |s| {
-        if (std.mem.eql(u8, s, key)) {
-            allocator.free(key);
-            return;
-        }
-    }
-    seen.append(allocator, key) catch |err| {
-        allocator.free(key);
-        return err;
-    };
+    const material_count = @max(@as(usize, 1), secrets.countMaterials(blob));
 
     // Title/detail stay free of nested REDACTED blobs — present layer maps label.
     const title = try allocator.dupe(u8, "Secret-like value in session");
@@ -217,9 +199,6 @@ fn processMaterialDedup(
     errdefer allocator.free(detail);
     const label = try allocator.dupe(u8, material.label);
     errdefer allocator.free(label);
-    const fp = try allocator.dupe(u8, material.fingerprint_hex);
-    errdefer allocator.free(fp);
-
     try pushFinding(allocator, findings, .{
         .kind = .secret_material,
         .severity = .high,
@@ -230,10 +209,11 @@ fn processMaterialDedup(
         .title = title,
         .detail = detail,
         .secret_label = label,
-        .secret_fingerprint = fp,
+        .secret_fingerprint = null,
         .evidence_ref = path,
     });
-    scorecard.secret_material_count += 1;
+    scorecard.secret_material_count += material_count;
+    findings.items[findings.items.len - 1].occurrence_count = material_count;
 }
 
 const FindingSeed = struct {

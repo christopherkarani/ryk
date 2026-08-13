@@ -1371,7 +1371,7 @@ test "redacted network targets do not include fake secrets" {
     const redacted = try redactedDestinationAlloc(std.testing.allocator, destination);
     defer std.testing.allocator.free(redacted);
     try std.testing.expect(std.mem.indexOf(u8, redacted, "sk-fakeSyntheticOpenAIKey") == null);
-    try std.testing.expect(std.mem.indexOf(u8, redacted, "[REDACTED:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, redacted, "[REDACTED") != null);
 }
 
 test "percent-encoded secret URL values are detected and redacted" {
@@ -1387,7 +1387,7 @@ test "percent-encoded secret URL values are detected and redacted" {
     const redacted = try redactedDestinationAlloc(std.testing.allocator, destination);
     defer std.testing.allocator.free(redacted);
     try std.testing.expect(std.mem.indexOf(u8, redacted, "sk%2DfakeSyntheticOpenAIKey") == null);
-    try std.testing.expect(std.mem.indexOf(u8, redacted, "[REDACTED:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, redacted, "[REDACTED") != null);
 }
 
 test "many unknown domains signal only counts policy-unknown domains" {

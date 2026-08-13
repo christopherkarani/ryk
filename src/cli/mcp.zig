@@ -4,6 +4,7 @@ const env_util = @import("../env_util.zig");
 const mcp_mod = @import("../mcp/mod.zig");
 const sandbox = @import("../sandbox/mod.zig");
 const core = @import("ryk_core").core;
+const audit = @import("ryk_core").audit;
 const supervisor = core.supervisor;
 const core_api = @import("ryk_core").api;
 const brand = @import("brand.zig");
@@ -256,20 +257,37 @@ fn inspect(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: anytyp
     };
     defer effect_packs.deinit();
 
-    try stdout.print("MCP Server: {s}\nTransport: stdio\nTools:\n", .{options.server_name});
+    try writeInspectReport(allocator, stdout, options.server_name, inventory, policy_ref, &effect_packs);
+    return exit_codes.success;
+}
+
+fn writeInspectReport(
+    allocator: std.mem.Allocator,
+    stdout: anytype,
+    server_name: []const u8,
+    inventory: mcp_mod.tools.Inventory,
+    loaded_policy: ?*const policy.schema.Policy,
+    effect_packs: *const policy.effects.PackSet,
+) !void {
+    const safe_server_name = try core_api.redactAlloc(allocator, server_name);
+    defer allocator.free(safe_server_name);
+    try stdout.print("MCP Server: {s}\nTransport: stdio\nTools:\n", .{safe_server_name});
     for (inventory.tools) |tool| {
-        try writeInspectToolLine(allocator, stdout, options.server_name, tool, policy_ref, &effect_packs);
+        try writeInspectToolLine(allocator, stdout, server_name, tool, loaded_policy, effect_packs);
     }
     try stdout.writeAll("\nFindings:\n");
     var finding_count: usize = 0;
     for (inventory.tools) |tool| {
         for (tool.findings) |finding| {
             finding_count += 1;
-            try stdout.print("  {s}: {s} ({s})\n", .{ tool.name, finding.reason, finding.risk.toString() });
+            const safe_tool_name = try core_api.redactAlloc(allocator, tool.name);
+            defer allocator.free(safe_tool_name);
+            const safe_reason = try core_api.redactAlloc(allocator, finding.reason);
+            defer allocator.free(safe_reason);
+            try stdout.print("  {s}: {s} ({s})\n", .{ safe_tool_name, safe_reason, finding.risk.toString() });
         }
     }
     if (finding_count == 0) try stdout.writeAll("  none\n");
-    return exit_codes.success;
 }
 
 fn writeInspectToolLine(
@@ -280,8 +298,10 @@ fn writeInspectToolLine(
     loaded_policy: ?*const policy.schema.Policy,
     effect_packs: *const policy.effects.PackSet,
 ) !void {
+    const safe_tool_name = try core_api.redactAlloc(allocator, tool.name);
+    defer allocator.free(safe_tool_name);
     try stdout.print("  {s:<24} risk: {s:<8} default: {s}", .{
-        tool.name,
+        safe_tool_name,
         tool.risk.toString(),
         mcp_mod.tools.defaultDecisionForRisk(tool.risk),
     });
@@ -300,7 +320,9 @@ fn writeInspectToolLine(
     defer classified.deinit(allocator);
     const effects_text = try policy.effects.formatHitsCompact(classified.hits, allocator);
     defer allocator.free(effects_text);
-    try stdout.print(" effects: {s}", .{effects_text});
+    const safe_effects_text = try core_api.redactAlloc(allocator, effects_text);
+    defer allocator.free(safe_effects_text);
+    try stdout.print(" effects: {s}", .{safe_effects_text});
     if (loaded_policy) |selected| {
         var evaluation = try policy.evaluate.action(
             selected,
@@ -310,7 +332,11 @@ fn writeInspectToolLine(
         );
         defer evaluation.deinit(allocator);
         try stdout.print(" policy: {s}", .{evaluation.decision.result.toString()});
-        if (evaluation.decision.rule_id) |rule_id| try stdout.print(" rule: {s}", .{rule_id});
+        if (evaluation.decision.rule_id) |rule_id| {
+            const safe_rule_id = try core_api.redactAlloc(allocator, rule_id);
+            defer allocator.free(safe_rule_id);
+            try stdout.print(" rule: {s}", .{safe_rule_id});
+        }
     }
     try stdout.writeByte('\n');
 }
@@ -364,7 +390,11 @@ fn proxy(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: anytype)
             return exit_codes.usage;
         };
         if (!std.mem.eql(u8, loaded_manifest.?.server.name, options.server_name)) {
-            try stderr.print("ryk mcp proxy: manifest server '{s}' does not match --name '{s}'.\n", .{ loaded_manifest.?.server.name, options.server_name });
+            const safe_manifest_name = try audit.redact_bridge.redactAlloc(allocator, loaded_manifest.?.server.name);
+            defer allocator.free(safe_manifest_name);
+            const safe_requested_name = try audit.redact_bridge.redactAlloc(allocator, options.server_name);
+            defer allocator.free(safe_requested_name);
+            try stderr.print("ryk mcp proxy: manifest server '{s}' does not match --name '{s}'.\n", .{ safe_manifest_name, safe_requested_name });
             return exit_codes.usage;
         }
         bound_launch = bindManifestLaunch(
@@ -532,18 +562,20 @@ fn list(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: anytype) 
             const path = try std.fs.path.join(allocator, &.{ ".ryk", "mcp", entry.name });
             defer allocator.free(path);
             var manifest = mcp_mod.manifests.loadFile(io, allocator, path) catch |err| {
-                try tui.render.callout(io, stdout, .warn, "Invalid MCP manifest", path);
+                const safe_path = try audit.redact_bridge.redactAlloc(allocator, path);
+                defer allocator.free(safe_path);
+                try tui.render.callout(io, stdout, .warn, "Invalid MCP manifest", safe_path);
                 try stdout.print("  Reason: {s}\n", .{@errorName(err)});
                 continue;
             };
             defer manifest.deinit(allocator);
-            const name = try allocator.dupe(u8, manifest.server.name);
+            const name = try audit.redact_bridge.redactAlloc(allocator, manifest.server.name);
             errdefer allocator.free(name);
             const transport = try allocator.dupe(u8, manifest.server.transport.toString());
             errdefer allocator.free(transport);
-            const command_text = try allocator.dupe(u8, manifest.server.command);
+            const command_text = try audit.redact_bridge.redactAlloc(allocator, manifest.server.command);
             errdefer allocator.free(command_text);
-            const owned_path = try allocator.dupe(u8, path);
+            const owned_path = try audit.redact_bridge.redactAlloc(allocator, path);
             errdefer allocator.free(owned_path);
             try inventory.append(allocator, .{ .name = name, .transport = transport, .command = command_text, .path = owned_path });
         }
@@ -592,6 +624,11 @@ fn trust(argv: []const []const u8, stdout: anytype, stderr: anytype) !u8 {
         try stderr.writeAll("ryk mcp trust: server and tool must be simple selector names.\n");
         return exit_codes.usage;
     }
+    const allocator = std.heap.page_allocator;
+    const safe_server = try audit.redact_bridge.redactAlloc(allocator, server);
+    defer allocator.free(safe_server);
+    const safe_tool = try audit.redact_bridge.redactAlloc(allocator, tool);
+    defer allocator.free(safe_tool);
     try stdout.print(
         \\Direct policy mutation is not implemented for this command.
         \\Add this snippet to your policy after reviewing the server manifest:
@@ -600,7 +637,7 @@ fn trust(argv: []const []const u8, stdout: anytype, stderr: anytype) !u8 {
         \\  allow:
         \\    - "{s}.{s}"
         \\
-    , .{ server, tool });
+    , .{ safe_server, safe_tool });
     return exit_codes.success;
 }
 
@@ -634,16 +671,23 @@ fn manifestCheck(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: 
         return exit_codes.usage;
     };
     defer manifest.deinit(allocator);
+    const safe_server_name = try core_api.redactAlloc(allocator, manifest.server.name);
+    defer allocator.free(safe_server_name);
+    const safe_command = try core_api.redactAlloc(allocator, manifest.server.command);
+    defer allocator.free(safe_command);
     try stdout.print("valid MCP manifest: server={s} transport={s} command={s} tools={d}\n", .{
-        manifest.server.name,
+        safe_server_name,
         manifest.server.transport.toString(),
-        manifest.server.command,
+        safe_command,
         manifest.tools.len,
     });
     return exit_codes.success;
 }
 
 fn manifestGenerate(argv: []const []const u8, stdout: anytype, stderr: anytype) !u8 {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const allocator = gpa_state.allocator();
     var command_name: ?[]const u8 = null;
     var server_name: ?[]const u8 = null;
     var args_start: ?usize = null;
@@ -671,7 +715,7 @@ fn manifestGenerate(argv: []const []const u8, stdout: anytype, stderr: anytype) 
     };
     const command_text = command_name orelse name;
     const extra_args = if (args_start) |start| argv[start..] else &.{};
-    try mcp_mod.manifests.writeStarterManifest(stdout, name, command_text, extra_args);
+    try mcp_mod.manifests.writeStarterManifestAlloc(allocator, stdout, name, command_text, extra_args);
     return exit_codes.success;
 }
 
@@ -954,6 +998,18 @@ test "mcp list empty state is friendly plain output" {
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "No MCP servers configured") != null);
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "ryk mcp manifest generate") != null);
     try std.testing.expect(std.mem.indexOfScalar(u8, stdout_writer.buffered(), 0x1b) == null);
+}
+
+test "mcp proxy mismatch error redacts manifest and requested names" {
+    const allocator = std.testing.allocator;
+    const manifest_name = "ghp_syntheticManifestMismatch123456";
+    const requested_name = "sk-fakeSyntheticRequestedName1234567890";
+    const safe_manifest = try audit.redact_bridge.redactAlloc(allocator, manifest_name);
+    defer allocator.free(safe_manifest);
+    const safe_requested = try audit.redact_bridge.redactAlloc(allocator, requested_name);
+    defer allocator.free(safe_requested);
+    try std.testing.expect(std.mem.indexOf(u8, safe_manifest, manifest_name) == null);
+    try std.testing.expect(std.mem.indexOf(u8, safe_requested, requested_name) == null);
 }
 
 test "mcp unknown flag and manifest subcommand include actionable suggestions" {
@@ -1366,4 +1422,81 @@ test "mcp manifest check list trust and generate commands are safe" {
     const generate_code = try command(std.testing.io, &.{ "manifest", "generate", "--command", "github-mcp-server", "--", "--token", "ghp_fakeSecretShouldNotPrint" }, &stdout_writer, &stderr_writer);
     try std.testing.expectEqual(exit_codes.success, generate_code);
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "ghp_fakeSecretShouldNotPrint") == null);
+}
+
+test "mcp manifest check redacts attacker-controlled server and command" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const prev_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(prev_cwd);
+    try std.process.setCurrentDir(std.testing.io, tmp.dir);
+    defer std.process.setCurrentPath(std.testing.io, prev_cwd) catch {};
+
+    const server_secret = "manifest-server-password=correct-horse-battery-staple";
+    const command_secret = "api_key=manifest-command-secret-value";
+    {
+        const file = try tmp.dir.createFile(std.testing.io, "hostile.yaml", .{});
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io,
+            \\version: 1
+            \\server:
+            \\  name: manifest-server-password=correct-horse-battery-staple
+            \\  transport: stdio
+            \\  command: api_key=manifest-command-secret-value
+            \\tools:
+            \\resources:
+            \\  default: ask
+            \\prompts:
+            \\  default: ask
+            \\sampling:
+            \\  default: deny
+        );
+    }
+
+    var stdout_buf: [4096]u8 = undefined;
+    var stderr_buf: [1024]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+    const code = try command(std.testing.io, &.{ "manifest", "check", "hostile.yaml" }, &stdout_writer, &stderr_writer);
+    try std.testing.expectEqual(exit_codes.success, code);
+    const output = stdout_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, output, server_secret) == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, command_secret) == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "[REDACTED]") != null);
+}
+
+test "mcp inspect report redacts attacker-controlled dynamic fields" {
+    const server_secret = "token=inspect-server-secret-value";
+    const tool_secret = "ghp_abcdefghijklmnopqrstuvwxyz123456";
+    const finding_secret = "password=inspect-finding-secret-value";
+    const findings = [_]mcp_mod.tools.Finding{.{
+        .tool_name = tool_secret,
+        .reason = finding_secret,
+        .risk = .critical,
+    }};
+    const tools = [_]mcp_mod.tools.ToolInfo{.{
+        .name = tool_secret,
+        .description = "",
+        .risk = .critical,
+        .findings = @constCast(&findings),
+    }};
+    const inventory: mcp_mod.tools.Inventory = .{ .tools = @constCast(&tools) };
+
+    const pack = try policy.effects.packs.parsePackFromSlice(std.testing.allocator,
+        \\version: 1
+        \\id: hostile
+        \\names:
+        \\  ghp_abcdefghijklmnopqrstuvwxyz123456: comms.message
+    , "hostile.yaml");
+    var packs = try policy.effects.PackSet.fromPack(std.testing.allocator, pack);
+    defer packs.deinit();
+
+    var stdout_buf: [8192]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    try writeInspectReport(std.testing.allocator, &stdout_writer, server_secret, inventory, null, &packs);
+    const output = stdout_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, output, server_secret) == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, tool_secret) == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, finding_secret) == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "[REDACTED]") != null);
 }
