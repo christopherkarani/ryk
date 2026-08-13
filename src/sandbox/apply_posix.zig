@@ -452,8 +452,8 @@ fn runChildAfterFork(
     if (!preflightExecTarget(path)) failExit(status_w);
 
     const keep_fds = [_]i32{ 0, 1, 2, status_w };
-    const scrubbed = fd_scrub.closeInheritedFdsAndVerify(&keep_fds);
-    if (!writeStatusIfScrubbed(status_w, scrubbed)) failExit(status_w);
+    if (!fd_scrub.closeInheritedFdsAndVerify(&keep_fds)) failExit(status_w);
+    if (!writeStatusOk(status_w)) failExit(status_w);
     closeFd(status_w);
 
     switch (builtin.os.tag) {
@@ -536,11 +536,6 @@ fn writeStatusOk(write_fd: i32) bool {
         if (libcEintr(n)) continue;
         return false;
     }
-}
-
-fn writeStatusIfScrubbed(write_fd: i32, scrubbed: bool) bool {
-    if (!scrubbed) return false;
-    return writeStatusOk(write_fd);
 }
 
 /// Kill + reap on every handshake failure exit so the parent never returns
@@ -1195,19 +1190,6 @@ test "fd scrub keep-set retains status_w and closes non-kept FDs" {
     try std.testing.expect(fd_scrub.shouldCloseFd(18, &keep));
     try std.testing.expect(fd_scrub.shouldCloseFd(42, &keep));
     try std.testing.expect(!fd_scrub.shouldCloseFd(0, &keep));
-}
-
-test "incomplete FD scrub emits no success handshake byte" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
-    const pipe = try openStatusPipe();
-    defer closeFd(pipe[0]);
-
-    try std.testing.expect(!writeStatusIfScrubbed(pipe[1], false));
-    closeFd(pipe[1]);
-
-    var byte: [1]u8 = undefined;
-    const read_count = std.c.read(pipe[0], &byte, byte.len);
-    try std.testing.expectEqual(@as(isize, 0), read_count);
 }
 
 test "planted non-kept FD is closed after successful handshake" {

@@ -21,6 +21,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const profile = @import("profile.zig");
 
 /// Env-relative authority write-deny path template.
 ///
@@ -272,14 +273,10 @@ fn canonicalExistingPath(
         error.OutOfMemory => return error.OutOfMemory,
         else => return null,
     };
+    // realPathFileAlloc returns a sentinel slice ([:0]u8 over a len+1 allocation);
+    // dupe to shed the sentinel so callers free with the exact visible length.
     defer allocator.free(canonical_z);
     return try allocator.dupe(u8, canonical_z);
-}
-
-fn pathIsWithin(candidate: []const u8, root: []const u8) bool {
-    if (candidate.len <= root.len or !std.mem.startsWith(u8, candidate, root)) return false;
-    if (root.len == 1 and root[0] == '/') return true;
-    return candidate[root.len] == '/';
 }
 
 /// Collect owned absolute host-config grant paths for a **trusted** table host key.
@@ -335,7 +332,7 @@ pub fn collectHostConfigPaths(
         // boundary so a host-side `.claude -> ~/.ssh` (or outside-HOME) symlink
         // cannot retarget a narrow grant.
         const canonical = (try canonicalExistingPath(io, allocator, joined)) orelse continue;
-        if (!pathIsWithin(canonical, canonical_home) or
+        if (!profile.isPathWithin(canonical, canonical_home) or
             isForbiddenHostConfigPath(canonical, canonical_home))
         {
             allocator.free(canonical);
@@ -641,8 +638,14 @@ pub fn collectAncestorInstructionRoPaths(
             current = std.fs.path.dirname(current) orelse break;
             continue;
         }
-        const canonical_current = try canonicalExistingPath(io, allocator, current);
-        defer if (canonical_current) |path| allocator.free(path);
+        const canonical_current = (try canonicalExistingPath(io, allocator, current)) orelse {
+            // Ancestor dir not canonically resolvable: no candidate inside it can
+            // be verified against its canonical parent, so nothing here grants.
+            if (shouldStopAncestorWalk(current, home_abs)) break;
+            current = std.fs.path.dirname(current) orelse break;
+            continue;
+        };
+        defer allocator.free(canonical_current);
 
         for (ancestor_instruction_basenames) |base| {
             if (list.items.len >= max_ancestor_instruction_paths) break;
@@ -654,15 +657,16 @@ pub fn collectAncestorInstructionRoPaths(
             if (!regularFileExists(io, candidate)) continue;
 
             const canonical = (try canonicalExistingPath(io, allocator, candidate)) orelse continue;
-            const canonical_parent = std.fs.path.dirname(canonical);
-            if (canonical_current == null or canonical_parent == null or
-                !std.mem.eql(u8, canonical_parent.?, canonical_current.?))
-            {
+            const canonical_parent = std.fs.path.dirname(canonical) orelse {
+                allocator.free(canonical);
+                continue;
+            };
+            if (!std.mem.eql(u8, canonical_parent, canonical_current)) {
                 allocator.free(canonical);
                 continue;
             }
             if (canonical_home) |approved_home| {
-                if ((std.mem.eql(u8, canonical, approved_home) or pathIsWithin(canonical, approved_home)) and
+                if (profile.isPathWithin(canonical, approved_home) and
                     isForbiddenHostConfigPath(canonical, approved_home))
                 {
                     allocator.free(canonical);

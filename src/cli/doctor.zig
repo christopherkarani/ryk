@@ -437,6 +437,24 @@ fn doctorDisplayNote(feature: sandbox.backend.Feature, level: sandbox.backend.Le
     return note;
 }
 
+/// Optional probe detail appended to a feature line (e.g. the probed Landlock
+/// ABI). Single source for the report and panel renderers so the ABI-floor
+/// warning cannot drift between views. Returns null when the feature carries
+/// no probe detail.
+fn featureProbeDetail(
+    backend_report: sandbox.backend.ReportSet,
+    feature: sandbox.backend.Feature,
+    buf: []u8,
+) ?[]const u8 {
+    if (feature != .landlock) return null;
+    const abi = backend_report.landlock_abi orelse return null;
+    const suffix = if (abi < sandbox.landlock.MIN_ABI)
+        "; ABI 3+ required for truncation mediation"
+    else
+        "";
+    return std.fmt.bufPrint(buf, "ABI {d}{s}", .{ abi, suffix }) catch null;
+}
+
 fn countCapabilitySummary(os: core.platform.Os, backend_report: sandbox.backend.ReportSet) struct { active: usize, limited: usize, unavailable: usize } {
     var active_count: usize = 0;
     var limited_count: usize = 0;
@@ -593,17 +611,9 @@ fn writeReport(io: std.Io, stdout: anytype, os: core.platform.Os, backend_report
             try writeBackendLine(io, stdout, backend_report, .mount_namespaces);
             try writeBackendLine(io, stdout, backend_report, .seccomp);
             try writeBackendLine(io, stdout, backend_report, .landlock);
-            if (backend_report.landlock_abi) |abi| {
-                try stdout.print(
-                    "  Landlock probed ABI: {d}{s}\n",
-                    .{
-                        abi,
-                        if (abi < sandbox.landlock.MIN_ABI)
-                            " (ABI 3+ required; older ABIs do not mediate truncation)"
-                        else
-                            "",
-                    },
-                );
+            var abi_detail_buf: [96]u8 = undefined;
+            if (featureProbeDetail(backend_report, .landlock, &abi_detail_buf)) |detail| {
+                try stdout.print("  Landlock probed {s}\n", .{detail});
             }
             try writeBackendLine(io, stdout, backend_report, .cgroups);
         }
@@ -637,26 +647,19 @@ fn writeDefaultPanels(
     try stdout.writeByte('\n');
 
     var capability_storage: [doctor_capabilities.len][160]u8 = undefined;
+    var detail_storage: [doctor_capabilities.len][96]u8 = undefined;
     var capability_lines: [doctor_capabilities.len][]const u8 = undefined;
     for (doctor_capabilities, 0..) |item, index| {
         if (item.feature) |feature| {
             const report = backend_report.get(feature);
             const display_level = doctorDisplayLevel(feature, report.level);
-            capability_lines[index] = if (feature == .landlock and backend_report.landlock_abi != null)
-                try std.fmt.bufPrint(
-                    &capability_storage[index],
-                    "{s}  {s}: {s} (ABI {d}{s})",
-                    .{
-                        levelColorAndGlyph(display_level).glyph,
-                        item.label,
-                        display_level.toString(),
-                        backend_report.landlock_abi.?,
-                        if (backend_report.landlock_abi.? < sandbox.landlock.MIN_ABI)
-                            "; ABI 3+ required for truncation mediation"
-                        else
-                            "",
-                    },
-                )
+            capability_lines[index] = if (featureProbeDetail(backend_report, feature, &detail_storage[index])) |detail|
+                try std.fmt.bufPrint(&capability_storage[index], "{s}  {s}: {s} ({s})", .{
+                    levelColorAndGlyph(display_level).glyph,
+                    item.label,
+                    display_level.toString(),
+                    detail,
+                })
             else
                 try std.fmt.bufPrint(&capability_storage[index], "{s}  {s}: {s}", .{
                     levelColorAndGlyph(display_level).glyph,

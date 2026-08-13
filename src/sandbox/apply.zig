@@ -31,6 +31,7 @@ const macos_seatbelt = @import("macos_seatbelt.zig");
 const macos_profile = @import("macos_profile.zig");
 const apply_posix = @import("apply_posix.zig");
 const session_tmp = @import("session_tmp.zig");
+const path_list = @import("path_list.zig");
 pub const host_config_grants = @import("host_config_grants.zig");
 
 /// Re-export session-tmp surface for callers that only import apply.
@@ -64,23 +65,6 @@ pub const ChildApplyKind = enum {
     seatbelt,
 };
 
-fn clonePathList(allocator: std.mem.Allocator, paths: []const []const u8) ![][]const u8 {
-    const owned = try allocator.alloc([]const u8, paths.len);
-    errdefer allocator.free(owned);
-    var initialized: usize = 0;
-    errdefer for (owned[0..initialized]) |path| allocator.free(path);
-    for (paths, 0..) |path, index| {
-        owned[index] = try allocator.dupe(u8, path);
-        initialized += 1;
-    }
-    return owned;
-}
-
-fn freePathList(allocator: std.mem.Allocator, paths: []const []const u8) void {
-    for (paths) |path| allocator.free(path);
-    allocator.free(paths);
-}
-
 /// Owned child-apply materials for agent spawn.
 /// Invalid both-set states are unrepresentable: at most one backend payload.
 pub const ChildMaterials = union(enum) {
@@ -92,6 +76,9 @@ pub const ChildMaterials = union(enum) {
         /// Original compile input (not recoverable from grants when workspace is /tmp).
         include_tmp: bool = false,
         /// Original profile inputs required by the sealed FUSE bootstrap rebuild.
+        /// Invariant: must be identical to the inputs `compiled` was built from.
+        /// Divergence rebuilds a different profile hash and fails the attach
+        /// handshake with no diagnostic pointing at the mismatch.
         ro_paths: [][]const u8,
         host_rw_paths: [][]const u8,
     },
@@ -111,8 +98,8 @@ pub const ChildMaterials = union(enum) {
             .none => {},
             .landlock => |*p| {
                 p.compiled.deinit();
-                freePathList(p.allocator, p.ro_paths);
-                freePathList(p.allocator, p.host_rw_paths);
+                path_list.free(p.allocator, p.ro_paths);
+                path_list.free(p.allocator, p.host_rw_paths);
             },
             .seatbelt => |*s| s.allocator.free(s.sbpl_z),
         }
@@ -1644,10 +1631,10 @@ pub fn applyBeforeExec(boundary: ApplyBoundary) ApplyError!ApplyResult {
             // Posture is `prepared`, not grade-drop `unavailable`.
             // Linux: transfer landlock profile. macOS: keep SBPL. Spawn path applies then activates.
             if (platform.mechanism == .landlock) {
-                const ro_paths = try clonePathList(boundary.allocator, boundary.launch_ro_paths);
-                errdefer freePathList(boundary.allocator, ro_paths);
-                const host_rw_paths = try clonePathList(boundary.allocator, boundary.launch_host_rw_paths);
-                errdefer freePathList(boundary.allocator, host_rw_paths);
+                const ro_paths = try path_list.clone(boundary.allocator, boundary.launch_ro_paths);
+                errdefer path_list.free(boundary.allocator, ro_paths);
+                const host_rw_paths = try path_list.clone(boundary.allocator, boundary.launch_host_rw_paths);
+                errdefer path_list.free(boundary.allocator, host_rw_paths);
                 transfer_landlock = true;
                 return .{
                     .receipt = posture.preparedReceipt(.landlock, platform.reason_code),
@@ -1820,19 +1807,16 @@ fn mapSeatbeltPrepareFailure(reason_code: []const u8) ApplyError!PlatformApplyOu
 /// on the production hot path — real Landlock attach is the agent child in apply_posix.
 /// `landlock.verifyApplyInChild` remains available for unit tests in landlock.zig.
 fn tryPlatformApplyLinux(network_proxy_port: ?u16) PlatformApplyOutcome {
-    const abi = if (landlock.probeAbi()) |info| info.version else null;
-    return tryPlatformApplyLinuxForAbi(abi, network_proxy_port);
+    const info = landlock.probeAbi() orelse return .{
+        .status = .unavailable,
+        .mechanism = .none,
+        .reason_code = "landlock_unavailable",
+    };
+    return tryPlatformApplyLinuxForAbi(info.version, network_proxy_port);
 }
 
-fn tryPlatformApplyLinuxForAbi(abi: ?u32, network_proxy_port: ?u16) PlatformApplyOutcome {
-    const version = abi orelse {
-        return .{
-            .status = .unavailable,
-            .mechanism = .none,
-            .reason_code = "landlock_unavailable",
-        };
-    };
-    if (!landlock.abiSupportsWriteIntegrity(version)) {
+fn tryPlatformApplyLinuxForAbi(abi_version: u32, network_proxy_port: ?u16) PlatformApplyOutcome {
+    if (!landlock.abiSupportsWriteIntegrity(abi_version)) {
         return .{
             .status = .unavailable,
             .mechanism = .none,
@@ -1841,7 +1825,7 @@ fn tryPlatformApplyLinuxForAbi(abi: ?u32, network_proxy_port: ?u16) PlatformAppl
     }
 
     const route_forcing: ?landlock.RouteForcing = if (network_proxy_port) |port|
-        if (landlock.handledNetRights(version) != 0) .{ .proxy_port = port } else null
+        if (landlock.handledNetRights(abi_version) != 0) .{ .proxy_port = port } else null
     else
         null;
 
@@ -1855,9 +1839,6 @@ fn tryPlatformApplyLinuxForAbi(abi: ?u32, network_proxy_port: ?u16) PlatformAppl
 }
 
 test "Landlock prepare enforces ABI 3 truncation floor with distinct reason" {
-    const unavailable = tryPlatformApplyLinuxForAbi(null, null);
-    try std.testing.expectEqualStrings("landlock_unavailable", unavailable.reason_code);
-
     inline for (.{ @as(u32, 1), 2 }) |abi| {
         const below_floor = tryPlatformApplyLinuxForAbi(abi, null);
         try std.testing.expectEqual(PlatformApplyStatus.unavailable, below_floor.status);
@@ -1867,6 +1848,14 @@ test "Landlock prepare enforces ABI 3 truncation floor with distinct reason" {
     const prepared = tryPlatformApplyLinuxForAbi(3, null);
     try std.testing.expectEqual(PlatformApplyStatus.prepared_child, prepared.status);
     try std.testing.expectEqual(posture.BackendMechanism.landlock, prepared.mechanism);
+}
+
+test "Landlock prepare is unavailable when the ABI probe fails" {
+    // probeAbi is null off Linux, exercising the wrapper's fail-closed arm.
+    if (builtin.os.tag == .linux) return error.SkipZigTest;
+    const outcome = tryPlatformApplyLinux(null);
+    try std.testing.expectEqual(PlatformApplyStatus.unavailable, outcome.status);
+    try std.testing.expectEqualStrings("landlock_unavailable", outcome.reason_code);
 }
 
 test "mode off returns disabled receipt without scrub or active claim" {

@@ -168,6 +168,10 @@ main() {
   log "version=$("${RYK}" version 2>/dev/null | head -1 || echo unknown)"
 
   WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ryk-stress.XXXXXX")"
+  # Trusted fixture HOME must be outside the workspace but NOT under a tmp tree:
+  # host_identity never trusts realpaths under TMPDIR (anti-spoof fence), so a
+  # TMPDIR fixture would silently lose mediation. zig-cache is repo-local and
+  # gitignored; the cleanup trap removes the fixture on exit.
   mkdir -p "${REPO_ROOT}/zig-cache"
   STRESS_HOME="$(mktemp -d "${REPO_ROOT}/zig-cache/ryk-stress-home.XXXXXX")"
   mkdir -p "${WORK_DIR}/.ryk" "${WORK_DIR}/tmp"

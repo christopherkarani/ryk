@@ -9,6 +9,9 @@ const std = @import("std");
 
 pub const cookie_len = 32;
 pub const profile_hash_len = 32;
+/// v3 (2026-08-13): fixed payload grew 28 → 36 bytes with ro_path_count +
+/// host_rw_path_count (2 × u32) and two new string lists (ro_paths,
+/// host_rw_paths). v2 bootstrap children reject v3 parents as UnsupportedVersion.
 pub const protocol_version: u16 = 3;
 
 const magic = [4]u8{ 'R', 'Y', 'K', 'W' };
@@ -21,6 +24,9 @@ const response_status_offset = header_len + cookie_len + profile_hash_len;
 const response_proof_offset = response_status_offset + 1;
 const response_reason_offset = response_proof_offset + 1;
 pub const response_frame_len = header_len + cookie_len + profile_hash_len + 8;
+/// Allocations in `decodeRequestAlloc`: 1 frame storage copy + 6 slice tables
+/// (control_roots, exec_paths, ro_paths, host_rw_paths, argv, environ). The
+/// allocation-failure injection test walks every index below this count.
 const decode_allocation_count = 7;
 
 const option_include_tmp: u8 = 1 << 0;

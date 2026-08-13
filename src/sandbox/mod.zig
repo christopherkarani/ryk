@@ -12,6 +12,7 @@ pub const profile = @import("profile.zig");
 pub const session_tmp = @import("session_tmp.zig");
 pub const apply = @import("apply.zig");
 pub const host_config_grants = @import("host_config_grants.zig");
+pub const path_list = @import("path_list.zig");
 pub const host_identity = @import("host_identity.zig");
 pub const mcp_runtime_grants = @import("mcp_runtime_grants.zig");
 pub const tool_pack = @import("tool_pack.zig");
@@ -44,6 +45,7 @@ test {
     _ = session_tmp;
     _ = apply;
     _ = host_config_grants;
+    _ = path_list;
     _ = host_identity;
     _ = mcp_runtime_grants;
     _ = tool_pack;
