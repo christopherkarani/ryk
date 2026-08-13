@@ -5,6 +5,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const profile = @import("profile.zig");
 const landlock = @import("landlock.zig");
+const host_config_grants = @import("host_config_grants.zig");
 
 const applySelf = landlock.applySelf;
 const buildChildLandlockPlan = landlock.buildChildLandlockPlan;
@@ -22,7 +23,7 @@ fn childConnectsTcp4(port: u16) bool {
 
 test "real FS deny: outside denied; neighbor RW; control root not writable" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
-    if (probeAbi() == null) return error.SkipZigTest;
+    if (!landlock.isAbiAvailable()) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -33,6 +34,8 @@ test "real FS deny: outside denied; neighbor RW; control root not writable" {
     try ws_tmp.dir.createDirPath(io, ".ryk");
     try ws_tmp.dir.createDirPath(io, ".git");
     try ws_tmp.dir.writeFile(io, .{ .sub_path = "neighbor.txt", .data = "WORKSPACE_NEIGHBOR_OK" });
+    try ws_tmp.dir.writeFile(io, .{ .sub_path = ".ryk/policy.yaml", .data = "CONTROL_CANARY" });
+    try ws_tmp.dir.writeFile(io, .{ .sub_path = ".git/phase2-probe", .data = "GIT_CONTROL_CANARY" });
     const ws_root = try ws_tmp.dir.realPathFileAlloc(io, ".", allocator);
     defer allocator.free(ws_root);
 
@@ -125,6 +128,67 @@ test "real FS deny: outside denied; neighbor RW; control root not writable" {
             linux.exit(9); // .git control write leak
         }
 
+        // ABI 3 floor: every truncation form must be denied outside and under
+        // control roots, including O_RDONLY|O_TRUNC (which needs no WRITE_FILE).
+        @memcpy(path_buf[0..canary_path.len], canary_path);
+        path_buf[canary_path.len] = 0;
+        if (linux.errno(linux.syscall2(.truncate, @intFromPtr(path_buf[0..canary_path.len :0].ptr), 0)) == .SUCCESS) {
+            linux.exit(10);
+        }
+        const outside_trunc = linux.open(
+            path_buf[0..canary_path.len :0].ptr,
+            .{ .ACCMODE = .WRONLY, .TRUNC = true, .CLOEXEC = true },
+            0,
+        );
+        if (linux.errno(outside_trunc) == .SUCCESS) {
+            _ = linux.close(@intCast(outside_trunc));
+            linux.exit(11);
+        }
+        const outside_read_trunc = linux.open(
+            path_buf[0..canary_path.len :0].ptr,
+            .{ .ACCMODE = .RDONLY, .TRUNC = true, .CLOEXEC = true },
+            0,
+        );
+        if (linux.errno(outside_read_trunc) == .SUCCESS) {
+            _ = linux.close(@intCast(outside_read_trunc));
+            linux.exit(12);
+        }
+
+        @memcpy(path_buf[0..control_write.len], control_write);
+        path_buf[control_write.len] = 0;
+        if (linux.errno(linux.syscall2(.truncate, @intFromPtr(path_buf[0..control_write.len :0].ptr), 0)) == .SUCCESS) {
+            linux.exit(13);
+        }
+        const control_trunc = linux.open(
+            path_buf[0..control_write.len :0].ptr,
+            .{ .ACCMODE = .WRONLY, .TRUNC = true, .CLOEXEC = true },
+            0,
+        );
+        if (linux.errno(control_trunc) == .SUCCESS) {
+            _ = linux.close(@intCast(control_trunc));
+            linux.exit(14);
+        }
+        const control_read_trunc = linux.open(
+            path_buf[0..control_write.len :0].ptr,
+            .{ .ACCMODE = .RDONLY, .TRUNC = true, .CLOEXEC = true },
+            0,
+        );
+        if (linux.errno(control_read_trunc) == .SUCCESS) {
+            _ = linux.close(@intCast(control_read_trunc));
+            linux.exit(15);
+        }
+
+        // The same operation remains available on a workspace RW file.
+        @memcpy(path_buf[0..neighbor_path.len], neighbor_path);
+        path_buf[neighbor_path.len] = 0;
+        const workspace_trunc = linux.open(
+            path_buf[0..neighbor_path.len :0].ptr,
+            .{ .ACCMODE = .RDONLY, .TRUNC = true, .CLOEXEC = true },
+            0,
+        );
+        if (linux.errno(workspace_trunc) != .SUCCESS) linux.exit(16);
+        _ = linux.close(@intCast(workspace_trunc));
+
         // F-2: workspace root is listable (RO expand), but create-at-root is denied
         // (MAKE on parent would cover control trees).
         @memcpy(path_buf[0..ws_root.len], ws_root);
@@ -176,6 +240,96 @@ test "real FS deny: outside denied; neighbor RW; control root not writable" {
         7 => return error.WorkspaceRootUnlistableUnderExpand,
         8 => return error.CreateAtWorkspaceRootAllowedUnderExpand,
         9 => return error.GitControlRootWritableUnderSandbox,
+        10 => return error.OutsideCanaryTruncateAllowedUnderSandbox,
+        11 => return error.OutsideCanaryOpenTruncAllowedUnderSandbox,
+        12 => return error.OutsideCanaryReadOnlyOpenTruncAllowedUnderSandbox,
+        13 => return error.ControlRootTruncateAllowedUnderSandbox,
+        14 => return error.ControlRootOpenTruncAllowedUnderSandbox,
+        15 => return error.ControlRootReadOnlyOpenTruncAllowedUnderSandbox,
+        16 => return error.WorkspaceReadOnlyOpenTruncDeniedUnderSandbox,
+        else => return error.UnexpectedSandboxProbeExit,
+    }
+
+    const outside_after = try std.Io.Dir.cwd().readFileAlloc(io, canary_path, allocator, .limited(64));
+    defer allocator.free(outside_after);
+    try std.testing.expectEqualStrings("OUTSIDE_SECRET", outside_after);
+    const control_after = try std.Io.Dir.cwd().readFileAlloc(io, control_write, allocator, .limited(64));
+    defer allocator.free(control_after);
+    try std.testing.expectEqualStrings("CONTROL_CANARY", control_after);
+    const neighbor_after = try std.Io.Dir.cwd().readFileAlloc(io, neighbor_path, allocator, .limited(64));
+    defer allocator.free(neighbor_after);
+    try std.testing.expectEqual(@as(usize, 0), neighbor_after.len);
+}
+
+test "real FS deny: symlinked host config cannot retarget grant into secret tree" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (!landlock.isAbiAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const linux = std.os.linux;
+
+    var ws_tmp = std.testing.tmpDir(.{});
+    defer ws_tmp.cleanup();
+    try ws_tmp.dir.createDirPath(io, ".ryk");
+    const ws_root = try ws_tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(ws_root);
+
+    var home_tmp = std.testing.tmpDir(.{});
+    defer home_tmp.cleanup();
+    try home_tmp.dir.createDirPath(io, ".ssh");
+    try home_tmp.dir.writeFile(io, .{ .sub_path = ".ssh/id", .data = "SYNTHETIC_SECRET_CANARY" });
+    home_tmp.dir.symLink(io, ".ssh", ".claude", .{ .is_directory = true }) catch
+        return error.SkipZigTest;
+    const home = try home_tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(home);
+    const secret_path = try std.fs.path.join(allocator, &.{ home, ".ssh", "id" });
+    defer allocator.free(secret_path);
+
+    const host_rw = try host_config_grants.collectHostConfigPaths(io, allocator, "claude", home);
+    defer host_config_grants.freeHostConfigPaths(allocator, host_rw);
+    try std.testing.expectEqual(@as(usize, 0), host_rw.len);
+
+    var compiled = try profile.compileProfile(allocator, .{
+        .workspace_root = ws_root,
+        .host_rw_paths = host_rw,
+        .system_ro_prefixes = profile.defaultSystemRoPrefixes(),
+        .include_tmp = false,
+    });
+    defer compiled.deinit();
+    var plan = try buildChildLandlockPlan(allocator, &compiled);
+    defer plan.deinit();
+
+    const pid_rc = linux.fork();
+    if (linux.errno(pid_rc) != .SUCCESS) return error.SkipZigTest;
+    if (pid_rc == 0) {
+        applySelf(&compiled, &plan, null) catch linux.exit(2);
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        if (secret_path.len >= path_buf.len) linux.exit(3);
+        @memcpy(path_buf[0..secret_path.len], secret_path);
+        path_buf[secret_path.len] = 0;
+        const fd = linux.open(path_buf[0..secret_path.len :0].ptr, .{ .CLOEXEC = true }, 0);
+        if (linux.errno(fd) == .SUCCESS) {
+            _ = linux.close(@intCast(fd));
+            linux.exit(4);
+        }
+        linux.exit(0);
+    }
+
+    const child_pid: i32 = @intCast(pid_rc);
+    var status: u32 = 0;
+    while (true) {
+        const waited = linux.waitpid(child_pid, &status, 0);
+        if (linux.errno(waited) == .INTR) continue;
+        if (linux.errno(waited) != .SUCCESS) return error.ApplyFailed;
+        break;
+    }
+    if ((status & 0x7f) != 0) return error.ApplyFailed;
+    switch ((status >> 8) & 0xff) {
+        0 => {},
+        2 => return error.LandlockApplyFailedOnHost,
+        3 => return error.TestPathTooLong,
+        4 => return error.SymlinkedHostConfigGrantedSecretTree,
         else => return error.UnexpectedSandboxProbeExit,
     }
 }
@@ -252,7 +406,7 @@ test "real network route forcing: proxy port allowed and neighboring loopback po
 // production grant set still denies outside + control write and allows neighbor.
 test "real FS deny under production defaults: outside denied; neighbor RW; control not writable" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
-    if (probeAbi() == null) return error.SkipZigTest;
+    if (!landlock.isAbiAvailable()) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -409,7 +563,7 @@ test "real FS deny under production defaults: outside denied; neighbor RW; contr
 // Banner "workspace RW" remains honest when a child RW surface exists.
 test "control expand: chdir workspace root works; create at root denied; control not writable" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
-    if (probeAbi() == null) return error.SkipZigTest;
+    if (!landlock.isAbiAvailable()) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -514,7 +668,7 @@ test "control expand: chdir workspace root works; create at root denied; control
 // RW/RO grant on the outside target (O_NOFOLLOW + skip .sym_link during expand).
 test "symlink to outside is not granted by control expand" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
-    if (probeAbi() == null) return error.SkipZigTest;
+    if (!landlock.isAbiAvailable()) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -628,7 +782,7 @@ test "symlink to outside is not granted by control expand" {
 // not be readable/writable under the sandboxed child (expand skips nlink>1 leaves).
 test "hardlink to outside is not granted by control expand" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
-    if (probeAbi() == null) return error.SkipZigTest;
+    if (!landlock.isAbiAvailable()) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -732,7 +886,7 @@ test "hardlink to outside is not granted by control expand" {
 // (outside read + control write must still fail; neighbor read must work).
 test "landlock inheritance: grandchild after nested exec still denies outside and control write" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
-    if (probeAbi() == null) return error.SkipZigTest;
+    if (!landlock.isAbiAvailable()) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
     const io = std.testing.io;

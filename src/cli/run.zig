@@ -811,6 +811,8 @@ fn commandWithStdioAndEnv(io: std.Io, argv: []const []const u8, stdout: anytype,
         last_denied_remediation: ?[]const u8 = null,
         /// When true, filter child PATH for sandbox honesty after shim prepend.
         os_attach_planned: bool = false,
+        /// Prepared mechanism for session-level backend requirements.
+        os_attach_kind: sandbox.apply.ChildApplyKind = .none,
 
         pub fn beforeProcessLaunch(context: *anyopaque, session: core.session.Session) !void {
             const self: *@This() = @ptrCast(@alignCast(context));
@@ -822,6 +824,8 @@ fn commandWithStdioAndEnv(io: std.Io, argv: []const []const u8, stdout: anytype,
                 if (self.backend_report.featureSatisfiesRequirement(feature)) continue;
                 if (feature == .network_proxy_enforce and self.proxy_bind != null) continue;
                 if (feature == .network_enforce and self.network_route_forced) continue;
+                if (feature == .strong_sandbox and self.os_attach_planned) continue;
+                if (feature == .landlock and self.os_attach_kind == .landlock) continue;
                 const missing = self.backend_report.get(feature);
                 try self.auditBackendRequirementDenied(session, missing);
                 return error.BackendRequirementUnavailable;
@@ -1187,6 +1191,7 @@ fn commandWithStdioAndEnv(io: std.Io, argv: []const []const u8, stdout: anytype,
         .shell_evaluator = shell_evaluator,
         // PATH honesty only when child will actually OS-attach (not soft-degraded unboxed).
         .os_attach_planned = apply_result.requiresChildApply(),
+        .os_attach_kind = apply_result.childApplyKind(),
     };
     // Fail closed if proxy dies when policy/backend requires it, session is
     // route-forced onto the proxy port (M-7), or host-alias mediation is active.
@@ -5952,6 +5957,96 @@ test "ryk run notes attach-ok residual when agent exits non-zero after active at
     try std.testing.expect(std.mem.indexOf(u8, err, "OS sandbox attach succeeded") != null);
     try std.testing.expect(std.mem.indexOf(u8, err, "after sandbox attach") != null);
     try std.testing.expect(std.mem.indexOf(u8, err, "pre-exec handshake residual") == null);
+}
+
+test "require-backend strong-sandbox accepts planned attach and rejects off" {
+    try skipUnlessOsSandboxBackend();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, ".ryk");
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const true_bin: []const u8 = blk: {
+        std.Io.Dir.cwd().access(std.testing.io, "/usr/bin/true", .{}) catch break :blk "/bin/true";
+        break :blk "/usr/bin/true";
+    };
+
+    var on_stdout_buf: [8192]u8 = undefined;
+    var on_stderr_buf: [4096]u8 = undefined;
+    var on_stdout: std.Io.Writer = .fixed(&on_stdout_buf);
+    var on_stderr: std.Io.Writer = .fixed(&on_stderr_buf);
+    const on_code = try commandForGuardTestWithShellEvaluator(
+        &.{
+            "--workspace",       root,
+            "--mode",            "observe",
+            "--os-sandbox",      "on",
+            "--require-backend", "strong-sandbox",
+            "--",                true_bin,
+        },
+        &on_stdout,
+        &on_stderr,
+        .ignore,
+        shell_eval.mockDaemonAllowEvaluator,
+    );
+    try std.testing.expectEqual(exit_codes.success, on_code);
+    try std.testing.expect(std.mem.indexOf(u8, on_stdout.buffered(), "OS sandbox: active") != null);
+
+    var off_stdout_buf: [4096]u8 = undefined;
+    var off_stderr_buf: [4096]u8 = undefined;
+    var off_stdout: std.Io.Writer = .fixed(&off_stdout_buf);
+    var off_stderr: std.Io.Writer = .fixed(&off_stderr_buf);
+    const off_code = try commandForGuardTestWithShellEvaluator(
+        &.{
+            "--workspace",       root,
+            "--mode",            "observe",
+            "--os-sandbox",      "off",
+            "--require-backend", "strong-sandbox",
+            "--",                true_bin,
+        },
+        &off_stdout,
+        &off_stderr,
+        .ignore,
+        shell_eval.mockDaemonAllowEvaluator,
+    );
+    try std.testing.expectEqual(exit_codes.unsupported, off_code);
+}
+
+test "require-backend landlock requires planned Landlock mechanism" {
+    try skipUnlessOsSandboxBackend();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, ".ryk");
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const true_bin: []const u8 = blk: {
+        std.Io.Dir.cwd().access(std.testing.io, "/usr/bin/true", .{}) catch break :blk "/bin/true";
+        break :blk "/usr/bin/true";
+    };
+
+    var stdout_buf: [8192]u8 = undefined;
+    var stderr_buf: [4096]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+    const code = try commandForGuardTestWithShellEvaluator(
+        &.{
+            "--workspace",       root,
+            "--mode",            "observe",
+            "--os-sandbox",      "on",
+            "--require-backend", "landlock",
+            "--",                true_bin,
+        },
+        &stdout_writer,
+        &stderr_writer,
+        .ignore,
+        shell_eval.mockDaemonAllowEvaluator,
+    );
+    if (builtin.os.tag == .linux) {
+        try std.testing.expectEqual(exit_codes.success, code);
+    } else {
+        try std.testing.expectEqual(exit_codes.unsupported, code);
+    }
 }
 
 // M-31: fail-closed spawn/handshake under on and auto (preflight fails → ApplyFailed).

@@ -593,6 +593,18 @@ fn writeReport(io: std.Io, stdout: anytype, os: core.platform.Os, backend_report
             try writeBackendLine(io, stdout, backend_report, .mount_namespaces);
             try writeBackendLine(io, stdout, backend_report, .seccomp);
             try writeBackendLine(io, stdout, backend_report, .landlock);
+            if (backend_report.landlock_abi) |abi| {
+                try stdout.print(
+                    "  Landlock probed ABI: {d}{s}\n",
+                    .{
+                        abi,
+                        if (abi < sandbox.landlock.MIN_ABI)
+                            " (ABI 3+ required; older ABIs do not mediate truncation)"
+                        else
+                            "",
+                    },
+                );
+            }
             try writeBackendLine(io, stdout, backend_report, .cgroups);
         }
         try writeBackendLine(io, stdout, backend_report, .network_enforce);
@@ -630,11 +642,27 @@ fn writeDefaultPanels(
         if (item.feature) |feature| {
             const report = backend_report.get(feature);
             const display_level = doctorDisplayLevel(feature, report.level);
-            capability_lines[index] = try std.fmt.bufPrint(&capability_storage[index], "{s}  {s}: {s}", .{
-                levelColorAndGlyph(display_level).glyph,
-                item.label,
-                display_level.toString(),
-            });
+            capability_lines[index] = if (feature == .landlock and backend_report.landlock_abi != null)
+                try std.fmt.bufPrint(
+                    &capability_storage[index],
+                    "{s}  {s}: {s} (ABI {d}{s})",
+                    .{
+                        levelColorAndGlyph(display_level).glyph,
+                        item.label,
+                        display_level.toString(),
+                        backend_report.landlock_abi.?,
+                        if (backend_report.landlock_abi.? < sandbox.landlock.MIN_ABI)
+                            "; ABI 3+ required for truncation mediation"
+                        else
+                            "",
+                    },
+                )
+            else
+                try std.fmt.bufPrint(&capability_storage[index], "{s}  {s}: {s}", .{
+                    levelColorAndGlyph(display_level).glyph,
+                    item.label,
+                    display_level.toString(),
+                });
         } else if (item.capability) |capability| {
             const report = core.platform.reportCapability(os, capability);
             capability_lines[index] = try std.fmt.bufPrint(&capability_storage[index], "{s}  {s}: {s}", .{

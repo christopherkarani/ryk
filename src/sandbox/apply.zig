@@ -64,15 +64,36 @@ pub const ChildApplyKind = enum {
     seatbelt,
 };
 
+fn clonePathList(allocator: std.mem.Allocator, paths: []const []const u8) ![][]const u8 {
+    const owned = try allocator.alloc([]const u8, paths.len);
+    errdefer allocator.free(owned);
+    var initialized: usize = 0;
+    errdefer for (owned[0..initialized]) |path| allocator.free(path);
+    for (paths, 0..) |path, index| {
+        owned[index] = try allocator.dupe(u8, path);
+        initialized += 1;
+    }
+    return owned;
+}
+
+fn freePathList(allocator: std.mem.Allocator, paths: []const []const u8) void {
+    for (paths) |path| allocator.free(path);
+    allocator.free(paths);
+}
+
 /// Owned child-apply materials for agent spawn.
 /// Invalid both-set states are unrepresentable: at most one backend payload.
 pub const ChildMaterials = union(enum) {
     none,
     landlock: struct {
+        allocator: std.mem.Allocator,
         compiled: profile.CompiledProfile,
         route_forcing: ?landlock.RouteForcing = null,
         /// Original compile input (not recoverable from grants when workspace is /tmp).
         include_tmp: bool = false,
+        /// Original profile inputs required by the sealed FUSE bootstrap rebuild.
+        ro_paths: [][]const u8,
+        host_rw_paths: [][]const u8,
     },
     seatbelt: struct {
         sbpl_z: [:0]u8,
@@ -88,7 +109,11 @@ pub const ChildMaterials = union(enum) {
     pub fn deinit(self: *ChildMaterials) void {
         switch (self.*) {
             .none => {},
-            .landlock => |*p| p.compiled.deinit(),
+            .landlock => |*p| {
+                p.compiled.deinit();
+                freePathList(p.allocator, p.ro_paths);
+                freePathList(p.allocator, p.host_rw_paths);
+            },
             .seatbelt => |*s| s.allocator.free(s.sbpl_z),
         }
         self.* = .none;
@@ -315,6 +340,8 @@ pub const ApplyResult = struct {
                 &ll.compiled,
                 ll.route_forcing,
                 ll.include_tmp,
+                ll.ro_paths,
+                ll.host_rw_paths,
                 argv_owned,
                 env_map,
                 workspace_root,
@@ -1617,6 +1644,10 @@ pub fn applyBeforeExec(boundary: ApplyBoundary) ApplyError!ApplyResult {
             // Posture is `prepared`, not grade-drop `unavailable`.
             // Linux: transfer landlock profile. macOS: keep SBPL. Spawn path applies then activates.
             if (platform.mechanism == .landlock) {
+                const ro_paths = try clonePathList(boundary.allocator, boundary.launch_ro_paths);
+                errdefer freePathList(boundary.allocator, ro_paths);
+                const host_rw_paths = try clonePathList(boundary.allocator, boundary.launch_host_rw_paths);
+                errdefer freePathList(boundary.allocator, host_rw_paths);
                 transfer_landlock = true;
                 return .{
                     .receipt = posture.preparedReceipt(.landlock, platform.reason_code),
@@ -1626,9 +1657,12 @@ pub fn applyBeforeExec(boundary: ApplyBoundary) ApplyError!ApplyResult {
                     .profile_compiled = true,
                     .profile_hash_hex = hash_copy,
                     .materials = .{ .landlock = .{
+                        .allocator = boundary.allocator,
                         .compiled = compiled,
                         .route_forcing = platform.landlock_route_forcing,
                         .include_tmp = boundary.include_tmp,
+                        .ro_paths = ro_paths,
+                        .host_rw_paths = host_rw_paths,
                     } },
                     .network_route_forced = platform.network_route_forced,
                     .session_tmp = blk: {
@@ -1786,16 +1820,28 @@ fn mapSeatbeltPrepareFailure(reason_code: []const u8) ApplyError!PlatformApplyOu
 /// on the production hot path — real Landlock attach is the agent child in apply_posix.
 /// `landlock.verifyApplyInChild` remains available for unit tests in landlock.zig.
 fn tryPlatformApplyLinux(network_proxy_port: ?u16) PlatformApplyOutcome {
-    if (!landlock.isAbiAvailable()) {
+    const abi = if (landlock.probeAbi()) |info| info.version else null;
+    return tryPlatformApplyLinuxForAbi(abi, network_proxy_port);
+}
+
+fn tryPlatformApplyLinuxForAbi(abi: ?u32, network_proxy_port: ?u16) PlatformApplyOutcome {
+    const version = abi orelse {
         return .{
             .status = .unavailable,
             .mechanism = .none,
             .reason_code = "landlock_unavailable",
         };
+    };
+    if (!landlock.abiSupportsWriteIntegrity(version)) {
+        return .{
+            .status = .unavailable,
+            .mechanism = .none,
+            .reason_code = "landlock_abi_below_truncate_floor",
+        };
     }
 
     const route_forcing: ?landlock.RouteForcing = if (network_proxy_port) |port|
-        if (landlock.supportsTcpRouteForcing()) .{ .proxy_port = port } else null
+        if (landlock.handledNetRights(version) != 0) .{ .proxy_port = port } else null
     else
         null;
 
@@ -1806,6 +1852,21 @@ fn tryPlatformApplyLinux(network_proxy_port: ?u16) PlatformApplyOutcome {
         .network_route_forced = route_forcing != null,
         .landlock_route_forcing = route_forcing,
     };
+}
+
+test "Landlock prepare enforces ABI 3 truncation floor with distinct reason" {
+    const unavailable = tryPlatformApplyLinuxForAbi(null, null);
+    try std.testing.expectEqualStrings("landlock_unavailable", unavailable.reason_code);
+
+    inline for (.{ @as(u32, 1), 2 }) |abi| {
+        const below_floor = tryPlatformApplyLinuxForAbi(abi, null);
+        try std.testing.expectEqual(PlatformApplyStatus.unavailable, below_floor.status);
+        try std.testing.expectEqualStrings("landlock_abi_below_truncate_floor", below_floor.reason_code);
+    }
+
+    const prepared = tryPlatformApplyLinuxForAbi(3, null);
+    try std.testing.expectEqual(PlatformApplyStatus.prepared_child, prepared.status);
+    try std.testing.expectEqual(posture.BackendMechanism.landlock, prepared.mechanism);
 }
 
 test "mode off returns disabled receipt without scrub or active claim" {
@@ -2264,7 +2325,7 @@ test "activateAfterHandshake sets seatbelt loopback route-forced network_scope" 
     try std.testing.expect(result.receipt.isActive());
     try std.testing.expectEqual(macos_profile.SeatbeltProfileGrade.hardened, result.receipt.seatbelt_profile.?);
     try std.testing.expectEqualStrings(
-        "proxy route-forced (outbound TCP to ryk loopback proxy only; inbound/bind unrestricted)",
+        "proxy route-forced (outbound TCP to ryk loopback proxy only; inbound/bind unrestricted; UDP/QUIC unrestricted)",
         result.receipt.network_scope,
     );
     var banner_buf: [posture.session_banner_buf_len]u8 = undefined;
@@ -2313,7 +2374,7 @@ test "activateAfterHandshake strict route-forced denies inbound/bind in network_
     _ = try result.activateAfterHandshake();
     try std.testing.expectEqual(macos_profile.SeatbeltProfileGrade.strict, result.receipt.seatbelt_profile.?);
     try std.testing.expectEqualStrings(
-        "proxy route-forced (outbound TCP to ryk loopback proxy only; inbound/bind denied)",
+        "proxy route-forced (outbound TCP to ryk loopback proxy only; inbound/bind denied; UDP/QUIC unrestricted)",
         result.receipt.network_scope,
     );
     var banner_buf: [posture.session_banner_buf_len]u8 = undefined;

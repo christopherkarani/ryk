@@ -413,7 +413,7 @@ test "activeReceiptWithNetwork + banner surfaces route-forced network_scope" {
     try std.testing.expect(std.mem.indexOf(u8, landlock_line, "Landlock") == null); // mechanism-neutral banner
 
     // Seatbelt: outbound loopback proxy only; inbound/bind residual is explicit.
-    const seatbelt_scope = "proxy route-forced (outbound TCP to ryk loopback proxy only; inbound/bind unrestricted)";
+    const seatbelt_scope = "proxy route-forced (outbound TCP to ryk loopback proxy only; inbound/bind unrestricted; UDP/QUIC unrestricted)";
     const seatbelt = try activeReceiptWithNetwork(
         .seatbelt,
         test_hash_64,
@@ -424,6 +424,7 @@ test "activeReceiptWithNetwork + banner surfaces route-forced network_scope" {
     const seatbelt_line = try formatSessionBanner(&buf, seatbelt);
     try std.testing.expect(std.mem.indexOf(u8, seatbelt_line, "loopback proxy only") != null);
     try std.testing.expect(std.mem.indexOf(u8, seatbelt_line, "inbound/bind unrestricted") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seatbelt_line, "UDP/QUIC unrestricted") != null);
     try std.testing.expect(std.mem.indexOf(u8, seatbelt_line, "Seatbelt") == null);
 }
 
@@ -493,7 +494,7 @@ test "landlock active banner and audit omit seatbelt_profile token" {
 }
 
 test "session_banner_buf_len fits seatbelt grade token with route-forced network" {
-    const seatbelt_scope = "proxy route-forced (outbound TCP to ryk loopback proxy only; inbound/bind unrestricted)";
+    const seatbelt_scope = "proxy route-forced (outbound TCP to ryk loopback proxy only; inbound/bind unrestricted; UDP/QUIC unrestricted)";
     const fs_scope = "workspace RW, system RO, platform tmp RW, no home, control write-deny (readable), mach-lookup residual";
     const receipt = try activeReceiptWithNetworkAndGrade(
         .seatbelt,

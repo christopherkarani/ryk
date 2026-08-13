@@ -84,8 +84,8 @@ pub fn networkScopeSummary(grade: SeatbeltProfileGrade, route_forced: bool) []co
         };
     }
     return switch (grade) {
-        .compatible, .hardened => "proxy route-forced (outbound TCP to ryk loopback proxy only; inbound/bind unrestricted)",
-        .strict => "proxy route-forced (outbound TCP to ryk loopback proxy only; inbound/bind denied)",
+        .compatible, .hardened => "proxy route-forced (outbound TCP to ryk loopback proxy only; inbound/bind unrestricted; UDP/QUIC unrestricted)",
+        .strict => "proxy route-forced (outbound TCP to ryk loopback proxy only; inbound/bind denied; UDP/QUIC unrestricted)",
     };
 }
 
@@ -1417,7 +1417,7 @@ test "SBPL strict route forcing denies inbound/bind" {
     try std.testing.expect(std.mem.indexOf(u8, sbpl, "(allow network-outbound (remote tcp \"localhost:43123\"))") != null);
     try std.testing.expect(std.mem.indexOf(u8, sbpl, "(allow process*)") == null);
     try std.testing.expectEqualStrings(
-        "proxy route-forced (outbound TCP to ryk loopback proxy only; inbound/bind denied)",
+        "proxy route-forced (outbound TCP to ryk loopback proxy only; inbound/bind denied; UDP/QUIC unrestricted)",
         networkScopeSummary(.strict, true),
     );
 }
@@ -1509,14 +1509,14 @@ test "grade residual matrix: SBPL tokens match networkScopeSummary invariants" {
                 .compatible, .hardened => {
                     try std.testing.expect(has_inbound and has_bind);
                     try std.testing.expectEqualStrings(
-                        "proxy route-forced (outbound TCP to ryk loopback proxy only; inbound/bind unrestricted)",
+                        "proxy route-forced (outbound TCP to ryk loopback proxy only; inbound/bind unrestricted; UDP/QUIC unrestricted)",
                         summary,
                     );
                 },
                 .strict => {
                     try std.testing.expect(!has_inbound and !has_bind);
                     try std.testing.expectEqualStrings(
-                        "proxy route-forced (outbound TCP to ryk loopback proxy only; inbound/bind denied)",
+                        "proxy route-forced (outbound TCP to ryk loopback proxy only; inbound/bind denied; UDP/QUIC unrestricted)",
                         summary,
                     );
                 },

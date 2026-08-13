@@ -48,6 +48,7 @@ pub fn detect() backend.ReportSet {
     return .{
         .os = .linux,
         .backend_name = "linux",
+        .landlock_abi = landlock.abi_version,
         .fallback_level = .partial,
         .fallback_note = "Linux backend is using honest partial mode with wrapper controls plus process supervision",
         .reports = reports,
@@ -65,6 +66,7 @@ pub fn killProcessGroup(pgid: i32) void {
 const Probe = struct {
     level: backend.Level,
     note: []const u8,
+    abi_version: ?u32 = null,
 };
 
 fn detectUserNamespace() Probe {
@@ -116,12 +118,14 @@ fn detectLandlock() Probe {
     if (info.version < landlock_mod.MIN_ABI) {
         return .{
             .level = .unavailable,
-            .note = "Landlock ABI is older than the minimum required version",
+            .note = "Landlock ABI 1/2 lacks truncation mediation; ABI 3+ is required for write integrity",
+            .abi_version = info.version,
         };
     }
     return .{
         .level = .partial,
-        .note = "Landlock ABI is available; session active only after child apply-before-exec",
+        .note = "Landlock ABI 3+ is available; session active only after child apply-before-exec",
+        .abi_version = info.version,
     };
 }
 
