@@ -80,7 +80,7 @@ Protected launches export **`RYK_SESSION_SANDBOX_GRADE`** and print `Session gra
 | `wrapper-only` | No OS attach |
 | `unrestricted-escape` | `--network open` or `RYK_AGENT_NETWORK_DEFAULT=legacy` |
 
-Doctor reports **capability** only; do not treat doctor “partial” strong-sandbox as a live session claim. See `docs/platform-macos.md` and `./scripts/sandbox-stress-regression.sh` for the P1–4 probe pack.
+Doctor reports **capability** only; do not treat doctor “partial” strong-sandbox as a live session claim. See `docs/platform-macos.md` and `./scripts/sandbox-stress-regression.sh` for the P1–4 probe pack. The pack keeps a workspace-planted `pi` as an explicit no-mediation anti-spoof check and uses a real, outside-workspace `$HOME/.local/bin/pi` fixture for route-forced deny probes.
 
 ## PATH honesty and tool packs (OS attach)
 

@@ -59,6 +59,7 @@ These use the run engine with default `--os-sandbox auto` and attach a custom Se
 - **`auto`** attaches when the running product major is in the advertised matrix and the sandbox apply symbol resolves; otherwise degrades loudly.
 - **`on`** fails closed when attach cannot complete.
 - **`off`** disables OS apply.
+- **Backend requirements:** `--require-backend strong-sandbox` is satisfied when this session has a Seatbelt attach plan. The check runs before spawn; any later attach failure still aborts the launch. `--require-backend landlock` remains unavailable on macOS.
 
 ## Seatbelt profile grades (advanced)
 
@@ -72,9 +73,9 @@ ryk run --seatbelt-profile compatible|hardened|strict -- ...
 
 | Grade | Default | Process | Bootstrap FS | Network without route-force | Network with route-force |
 |---|---|---|---|---|---|
-| `compatible` | no | `(allow process*)` | broad `/private/var` read | `(allow network*)` | outbound proxy TCP + inbound/bind open |
-| `hardened` | **yes** | `process-fork` / `process-exec` / `process-info*` | dyld + `/private/var/select` + tmp (no broad `/private/var`) | `(allow network*)` | outbound proxy TCP + inbound/bind open (Landlock parity) |
-| `strict` | opt-in | same as hardened | same as hardened | no broad `network*` (deny default) | outbound proxy TCP only; **inbound/bind denied** |
+| `compatible` | no | `(allow process*)` | broad `/private/var` read | `(allow network*)` | outbound proxy TCP + inbound/bind open; UDP/QUIC unrestricted |
+| `hardened` | **yes** | `process-fork` / `process-exec` / `process-info*` | dyld + `/private/var/select` + tmp (no broad `/private/var`) | `(allow network*)` | outbound proxy TCP + inbound/bind open; UDP/QUIC unrestricted (Landlock parity) |
+| `strict` | opt-in | same as hardened | same as hardened | no broad `network*` (deny default) | outbound proxy TCP only; **inbound/bind denied**; UDP/QUIC unrestricted |
 
 All grades still allow unfiltered `(allow mach-lookup)` (dyld/system services residual — not an XPC allowlist) and do **not** provide process isolation. Use `compatible` if a tool regresses under `hardened`.
 
@@ -113,7 +114,7 @@ Under **`hardened` / `compatible`**, inbound TCP and bind remain allowed so agen
 
 Under **`strict`**, inbound/bind are omitted (listener lockdown — intentional Landlock parity break). Without route force, `strict` also omits broad `network*` so deny-default blocks network.
 
-The runtime banner reports `network: proxy route-forced...`, and the child env exports `RYK_PROXY_ROUTE_FORCED=true` plus `RYK_TRANSPARENT_NETWORK_ENFORCEMENT=tcp-port-route-forced` (TCP route-force honesty label; Seatbelt still does not claim full XPC/mach isolation).
+The runtime banner and `sandbox_posture` audit reason explicitly report `UDP/QUIC unrestricted` alongside `network: proxy route-forced...`. The child env exports `RYK_PROXY_ROUTE_FORCED=true` plus `RYK_TRANSPARENT_NETWORK_ENFORCEMENT=tcp-port-route-forced` (TCP route-force honesty label; Seatbelt still does not claim full XPC/mach isolation).
 
 Proxy startup alone is not enough: without a route-forced OS sandbox session, the child env reports `RYK_PROXY_ROUTE_FORCED=false`, and `--require-backend network_enforce` fails closed.
 
@@ -130,6 +131,8 @@ ryk does not install an Endpoint Security extension, kernel extension, or admin-
 ## Seatbelt residual (intentional non-goals)
 
 Seatbelt session attach enforces filesystem path scope for the agent child and, when proxy route forcing is requested, child outbound TCP scope to the ryk proxy port. It does **not** provide general process isolation or IPC isolation.
+
+Inherited stdin/stdout/stderr are user-directed, pre-opened capabilities outside the Seatbelt path boundary. Redirect targets remain accessible through FDs 0/1/2 even when their paths are not granted.
 
 Baseline SBPL residuals (not a claim of full confinement). **Default grade is `hardened`:**
 

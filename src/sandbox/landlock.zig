@@ -81,8 +81,12 @@ pub const ACCESS_FS_IOCTL_DEV: u64 = 1 << 15;
 pub const ACCESS_NET_BIND_TCP: u64 = 1 << 0;
 pub const ACCESS_NET_CONNECT_TCP: u64 = 1 << 1;
 
-/// Minimum ABI we require (kernel 5.13+).
-pub const MIN_ABI: u32 = 1;
+/// Minimum ABI we require for complete write-integrity mediation.
+///
+/// ABI 1/2 do not mediate truncation, including `truncate(2)` and
+/// `open(O_RDONLY|O_TRUNC)`, so they cannot uphold control-root or outside-file
+/// integrity. ABI 3 (Linux 6.2+) adds `LANDLOCK_ACCESS_FS_TRUNCATE`.
+pub const MIN_ABI: u32 = 3;
 pub const MIN_TCP_ROUTE_FORCE_ABI: u32 = 4;
 
 /// FS rights present in ABI 1.
@@ -168,7 +172,12 @@ pub fn probeAbi() ?AbiInfo {
 
 pub fn isAbiAvailable() bool {
     const info = probeAbi() orelse return false;
-    return info.version >= MIN_ABI;
+    return abiSupportsWriteIntegrity(info.version);
+}
+
+/// Pure floor predicate shared by attach, doctor, and regression tests.
+pub fn abiSupportsWriteIntegrity(abi: u32) bool {
+    return abi >= MIN_ABI;
 }
 
 /// Parent-side surfaces for one RW grant that needs control expand.
@@ -777,6 +786,13 @@ test "pure ABI rights masks are filesystem-only and grow with ABI" {
     try std.testing.expect((a5 & ACCESS_FS_IOCTL_DEV) != 0);
 }
 
+test "write-integrity floor rejects Landlock ABI 1 and 2" {
+    try std.testing.expect(!abiSupportsWriteIntegrity(1));
+    try std.testing.expect(!abiSupportsWriteIntegrity(2));
+    try std.testing.expect(abiSupportsWriteIntegrity(3));
+    try std.testing.expect(abiSupportsWriteIntegrity(5));
+}
+
 test "pure TCP route forcing rights start at Landlock ABI 4" {
     try std.testing.expectEqual(@as(u64, 0), handledNetRights(1));
     try std.testing.expectEqual(@as(u64, 0), handledNetRights(3));
@@ -798,6 +814,7 @@ test "pure allowedAccessForMode RO is subset of RW and of handled mask" {
         try std.testing.expect((rw & handled) == rw);
         try std.testing.expect((ex & handled) == ex);
         try std.testing.expect((ro & ACCESS_FS_WRITE_FILE) == 0);
+        try std.testing.expect((ro & ACCESS_FS_TRUNCATE) == 0);
         try std.testing.expect((rw & ACCESS_FS_WRITE_FILE) != 0);
         try std.testing.expect((ro & ACCESS_FS_READ_FILE) != 0);
         try std.testing.expect((ex & ACCESS_FS_EXECUTE) != 0);
@@ -979,7 +996,7 @@ test "buildControlExpandSurfaces recurses when child covers nested control root"
 test "verifyApplyInChild and applySelf skip or run on Linux only" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
 
-    if (probeAbi() == null) return error.SkipZigTest;
+    if (!isAbiAvailable()) return error.SkipZigTest;
 
     // Real workspace under tmp so O_PATH succeeds. Need a non-control child so
     // control-root expand can install an RW PATH_BENEATH.
@@ -1007,7 +1024,7 @@ test "verifyApplyInChild and applySelf skip or run on Linux only" {
 // before buildChildLandlockPlan; this test asserts the expand contract.
 test "empty workspace only control root gains RW after session tmp precreate" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
-    if (probeAbi() == null) return error.SkipZigTest;
+    if (!isAbiAvailable()) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
     const io = std.testing.io;

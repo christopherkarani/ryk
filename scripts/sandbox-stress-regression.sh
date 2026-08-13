@@ -26,6 +26,7 @@ cd "$REPO_ROOT"
 BINARY="${RYK_STRESS_BINARY:-}"
 SKIP_OPEN_ESCAPE=false
 WORK_DIR=""
+STRESS_HOME=""
 PASS=0
 FAIL=0
 SKIP=0
@@ -50,6 +51,9 @@ skip() { SKIP=$((SKIP + 1)); log "SKIP: $*"; }
 cleanup() {
   if [[ -n "${WORK_DIR}" && -d "${WORK_DIR}" ]]; then
     rm -rf "${WORK_DIR}"
+  fi
+  if [[ -n "${STRESS_HOME}" && -d "${STRESS_HOME}" ]]; then
+    rm -rf "${STRESS_HOME}"
   fi
 }
 trap cleanup EXIT
@@ -89,8 +93,23 @@ run_os_sh() {
   )
 }
 
-# Host-alias-like mediation (basename pi → proxy + route-force).
+# Trusted host-shaped mediation (real $HOME/.local/bin/pi → proxy + route-force).
 run_mediated_pi() {
+  local cmd="$1"
+  local out_file="$2"
+  (
+    cd "${WORK_DIR}"
+    env HOME="${STRESS_HOME}" \
+      "${RYK}" run \
+        --workspace "${WORK_DIR}" \
+        --mode observe \
+        --os-sandbox on \
+        -- "${STRESS_HOME}/.local/bin/pi" -c "${cmd}" >"${out_file}" 2>&1
+  )
+}
+
+# Workspace-planted basename spoof must remain untrusted and unmediated.
+run_workspace_pi() {
   local cmd="$1"
   local out_file="$2"
   (
@@ -149,6 +168,12 @@ main() {
   log "version=$("${RYK}" version 2>/dev/null | head -1 || echo unknown)"
 
   WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ryk-stress.XXXXXX")"
+  # Trusted fixture HOME must be outside the workspace but NOT under a tmp tree:
+  # host_identity never trusts realpaths under TMPDIR (anti-spoof fence), so a
+  # TMPDIR fixture would silently lose mediation. zig-cache is repo-local and
+  # gitignored; the cleanup trap removes the fixture on exit.
+  mkdir -p "${REPO_ROOT}/zig-cache"
+  STRESS_HOME="$(mktemp -d "${REPO_ROOT}/zig-cache/ryk-stress-home.XXXXXX")"
   mkdir -p "${WORK_DIR}/.ryk" "${WORK_DIR}/tmp"
   mkdir -p "${WORK_DIR}/.git/objects" "${WORK_DIR}/.git/refs"
   printf 'ref: refs/heads/main\n' >"${WORK_DIR}/.git/HEAD"
@@ -175,8 +200,9 @@ fi
 exec /bin/sh "$@"
 SH
   chmod 755 "${WORK_DIR}/pi"
-  STRESS_HOME="${WORK_DIR}/fake-home"
-  mkdir -p "${STRESS_HOME}/.pi"
+  mkdir -p "${STRESS_HOME}/.pi" "${STRESS_HOME}/.local/bin"
+  cp "${WORK_DIR}/pi" "${STRESS_HOME}/.local/bin/pi"
+  chmod 755 "${STRESS_HOME}/.local/bin/pi"
 
   # Attach probe (non-host-alias): FS sandbox only.
   local attach_out="${WORK_DIR}/attach-probe.txt"
@@ -207,6 +233,21 @@ SH
     exit 1
   fi
   pass "os-sandbox attach probe"
+
+  # F-02 anti-spoof: a workspace-planted `pi` must not gain host mediation.
+  local spoof_out="${WORK_DIR}/out-workspace-pi-spoof.txt"
+  set +e
+  run_workspace_pi 'echo GRADE=$RYK_SESSION_SANDBOX_GRADE; echo ROUTE=${RYK_PROXY_ROUTE_FORCED:-false}' "${spoof_out}"
+  local spoof_code=$?
+  set -e
+  if [[ ${spoof_code} -eq 0 ]] &&
+     grep -q 'GRADE=fs-attached' "${spoof_out}" &&
+     grep -q 'ROUTE=false' "${spoof_out}"; then
+    pass "workspace-pi remains untrusted (fs-attached, no route force)"
+  else
+    fail "workspace-pi anti-spoof posture mismatch (see ${spoof_out})"
+    sed 's/^/[stress:detail] /' "${spoof_out}" | head -30 || true
+  fi
 
   # --- P2 control roots (OS attach; network open only to avoid mediation fail-closed) ---
   expect_fs_deny "write-git-control" \
@@ -271,8 +312,8 @@ SH
       pass "curl-example.com denied under mediation"
       if grep -q 'GRADE=strong-mediated' "${net_out}"; then
         pass "session-grade strong-mediated under host-alias mediation"
-      elif grep -qE 'GRADE=' "${net_out}"; then
-        skip "mediated grade not strong-mediated (see ${net_out})"
+      else
+        fail "mediated grade must be strong-mediated (see ${net_out})"
       fi
     else
       fail "network mediate probe inconclusive (see ${net_out})"
@@ -285,7 +326,7 @@ SH
   else
     set +e
     # Python socket connect: timeout/refuse → deny success under mediation.
-    run_mediated_pi 'python3 -c "import socket,sys
+    run_mediated_pi 'echo GRADE=$RYK_SESSION_SANDBOX_GRADE; python3 -c "import socket,sys
 try:
  s=socket.create_connection((\"1.1.1.1\",80),2); s.close(); print(\"TCP_OK\"); sys.exit(0)
 except Exception as e:
@@ -299,7 +340,11 @@ except Exception as e:
       fail "raw TCP to 1.1.1.1:80 allowed under mediation (see ${tcp_out})"
       sed 's/^/[stress:tcp] /' "${tcp_out}" | head -20 || true
     elif [[ ${tcp_code} -ne 0 ]] || grep -q 'STRESS_DENY_OK' "${tcp_out}"; then
-      pass "raw-tcp-1.1.1.1 denied under mediation"
+      if grep -q 'GRADE=strong-mediated' "${tcp_out}"; then
+        pass "raw-tcp-1.1.1.1 denied under strong mediation"
+      else
+        fail "raw-tcp deny lacked strong-mediated grade (see ${tcp_out})"
+      fi
     else
       fail "raw-tcp probe inconclusive (see ${tcp_out})"
     fi

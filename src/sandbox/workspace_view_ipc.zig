@@ -9,11 +9,14 @@ const std = @import("std");
 
 pub const cookie_len = 32;
 pub const profile_hash_len = 32;
-pub const protocol_version: u16 = 2;
+/// v3 (2026-08-13): fixed payload grew 28 → 36 bytes with ro_path_count +
+/// host_rw_path_count (2 × u32) and two new string lists (ro_paths,
+/// host_rw_paths). v2 bootstrap children reject v3 parents as UnsupportedVersion.
+pub const protocol_version: u16 = 3;
 
 const magic = [4]u8{ 'R', 'Y', 'K', 'W' };
 const header_len = 12;
-const request_fixed_payload_len = cookie_len + profile_hash_len + 28;
+const request_fixed_payload_len = cookie_len + profile_hash_len + 36;
 const request_variable_offset = header_len + request_fixed_payload_len;
 const request_options_offset = header_len + cookie_len + profile_hash_len;
 const request_stdio_offset = request_options_offset + 1;
@@ -21,7 +24,10 @@ const response_status_offset = header_len + cookie_len + profile_hash_len;
 const response_proof_offset = response_status_offset + 1;
 const response_reason_offset = response_proof_offset + 1;
 pub const response_frame_len = header_len + cookie_len + profile_hash_len + 8;
-const decode_allocation_count = 5;
+/// Allocations in `decodeRequestAlloc`: 1 frame storage copy + 6 slice tables
+/// (control_roots, exec_paths, ro_paths, host_rw_paths, argv, environ). The
+/// allocation-failure injection test walks every index below this count.
+const decode_allocation_count = 7;
 
 const option_include_tmp: u8 = 1 << 0;
 const option_has_proxy: u8 = 1 << 1;
@@ -39,6 +45,8 @@ pub const Limits = struct {
     max_item_bytes: usize = 128 * 1024,
     max_control_roots: usize = 256,
     max_exec_paths: usize = 64,
+    max_ro_paths: usize = 256,
+    max_host_rw_paths: usize = 256,
     max_arguments: usize = 4096,
     max_environment_entries: usize = 8192,
 };
@@ -59,6 +67,9 @@ pub const ProfileOptions = struct {
     /// Narrow absolute launch-binary paths (parent `.exec` grants). Required for
     /// bootstrap profile hash parity with `compileProfile(..., .exec_paths)`.
     exec_paths: []const []const u8 = &.{},
+    /// Original parent compile inputs required for profile-hash parity.
+    ro_paths: []const []const u8 = &.{},
+    host_rw_paths: []const []const u8 = &.{},
     network_proxy_port: ?u16 = null,
     require_network_route_forcing: bool = false,
     protect_workspace_secrets: bool,
@@ -79,12 +90,14 @@ pub const OwnedProfileOptions = struct {
     include_tmp: bool,
     control_roots: [][]const u8,
     exec_paths: [][]const u8,
+    ro_paths: [][]const u8,
+    host_rw_paths: [][]const u8,
     network_proxy_port: ?u16,
     require_network_route_forcing: bool,
     protect_workspace_secrets: bool,
 };
 
-/// Owns `storage` plus the three outer slice tables. All string fields are
+/// Owns `storage` plus the six outer slice tables. All string fields are
 /// views into `storage` and become invalid after `deinit`.
 pub const OwnedBootstrapRequest = struct {
     allocator: std.mem.Allocator,
@@ -103,6 +116,8 @@ pub const OwnedBootstrapRequest = struct {
     pub fn deinit(self: *OwnedBootstrapRequest) void {
         self.allocator.free(self.profile.control_roots);
         self.allocator.free(self.profile.exec_paths);
+        self.allocator.free(self.profile.ro_paths);
+        self.allocator.free(self.profile.host_rw_paths);
         self.allocator.free(self.argv);
         self.allocator.free(self.environ);
         wipeAndFree(self.allocator, self.storage);
@@ -115,6 +130,8 @@ pub const OwnedBootstrapRequest = struct {
         self.environ = &.{};
         self.profile.control_roots = &.{};
         self.profile.exec_paths = &.{};
+        self.profile.ro_paths = &.{};
+        self.profile.host_rw_paths = &.{};
     }
 
     pub fn borrowed(self: *const OwnedBootstrapRequest) BootstrapRequest {
@@ -129,6 +146,8 @@ pub const OwnedBootstrapRequest = struct {
                 .include_tmp = self.profile.include_tmp,
                 .control_roots = self.profile.control_roots,
                 .exec_paths = self.profile.exec_paths,
+                .ro_paths = self.profile.ro_paths,
+                .host_rw_paths = self.profile.host_rw_paths,
                 .network_proxy_port = self.profile.network_proxy_port,
                 .require_network_route_forcing = self.profile.require_network_route_forcing,
                 .protect_workspace_secrets = self.profile.protect_workspace_secrets,
@@ -264,6 +283,8 @@ pub const CodecError = error{
     LengthOutOfRange,
     TooManyControlRoots,
     TooManyExecPaths,
+    TooManyRoPaths,
+    TooManyHostRwPaths,
     TooManyArguments,
     TooManyEnvironmentEntries,
     PathTooLong,
@@ -290,6 +311,8 @@ pub fn encodedRequestSize(request: BootstrapRequest, limits: Limits) CodecError!
     size = try checkedAdd(size, request.agent_cwd.len);
     size = try addStringListSize(size, request.profile.control_roots);
     size = try addStringListSize(size, request.profile.exec_paths);
+    size = try addStringListSize(size, request.profile.ro_paths);
+    size = try addStringListSize(size, request.profile.host_rw_paths);
     size = try addStringListSize(size, request.argv);
     size = try addStringListSize(size, request.environ);
     if (size > limits.max_frame_bytes) return error.FrameTooLarge;
@@ -327,6 +350,8 @@ pub fn encodeRequest(
     try writer.putU16(request.profile.network_proxy_port orelse 0);
     try writer.putU32(try usizeToU32(request.profile.control_roots.len));
     try writer.putU32(try usizeToU32(request.profile.exec_paths.len));
+    try writer.putU32(try usizeToU32(request.profile.ro_paths.len));
+    try writer.putU32(try usizeToU32(request.profile.host_rw_paths.len));
     try writer.putU32(try usizeToU32(request.argv.len));
     try writer.putU32(try usizeToU32(request.environ.len));
     try writer.putU32(try usizeToU32(request.workspace_root.len));
@@ -335,6 +360,8 @@ pub fn encodeRequest(
     try writer.putBytes(request.agent_cwd);
     try writeStringList(&writer, request.profile.control_roots);
     try writeStringList(&writer, request.profile.exec_paths);
+    try writeStringList(&writer, request.profile.ro_paths);
+    try writeStringList(&writer, request.profile.host_rw_paths);
     try writeStringList(&writer, request.argv);
     try writeStringList(&writer, request.environ);
     if (writer.pos != size) return error.InvalidResponseState;
@@ -354,6 +381,10 @@ pub fn decodeRequestAlloc(
     errdefer allocator.free(control_roots);
     const exec_paths = try allocator.alloc([]const u8, meta.exec_path_count);
     errdefer allocator.free(exec_paths);
+    const ro_paths = try allocator.alloc([]const u8, meta.ro_path_count);
+    errdefer allocator.free(ro_paths);
+    const host_rw_paths = try allocator.alloc([]const u8, meta.host_rw_path_count);
+    errdefer allocator.free(host_rw_paths);
     const argv = try allocator.alloc([]const u8, meta.argument_count);
     errdefer allocator.free(argv);
     const environ = try allocator.alloc([]const u8, meta.environment_count);
@@ -371,6 +402,8 @@ pub fn decodeRequestAlloc(
     const proxy_port_raw = try reader.readU16();
     _ = try reader.readU32(); // control_root_count
     _ = try reader.readU32(); // exec_path_count
+    _ = try reader.readU32(); // ro_path_count
+    _ = try reader.readU32(); // host_rw_path_count
     _ = try reader.readU32(); // argument_count
     _ = try reader.readU32(); // environment_count
     const workspace_len: usize = try reader.readU32();
@@ -379,6 +412,8 @@ pub fn decodeRequestAlloc(
     const agent_cwd = try reader.take(cwd_len);
     try readStringListViews(&reader, control_roots);
     try readStringListViews(&reader, exec_paths);
+    try readStringListViews(&reader, ro_paths);
+    try readStringListViews(&reader, host_rw_paths);
     try readStringListViews(&reader, argv);
     try readStringListViews(&reader, environ);
     if (reader.pos != storage.len) return error.TrailingBytes;
@@ -396,6 +431,8 @@ pub fn decodeRequestAlloc(
             .include_tmp = option_flags & option_include_tmp != 0,
             .control_roots = control_roots,
             .exec_paths = exec_paths,
+            .ro_paths = ro_paths,
+            .host_rw_paths = host_rw_paths,
             .network_proxy_port = if (option_flags & option_has_proxy != 0) proxy_port_raw else null,
             .require_network_route_forcing = option_flags & option_require_route != 0,
             .protect_workspace_secrets = option_flags & option_protect_secrets != 0,
@@ -493,6 +530,8 @@ pub fn reasonAsError(reason: ReasonCode) ?BootstrapFailure {
 const RequestMeta = struct {
     control_root_count: usize,
     exec_path_count: usize,
+    ro_path_count: usize,
+    host_rw_path_count: usize,
     argument_count: usize,
     environment_count: usize,
 };
@@ -503,6 +542,8 @@ fn validateBorrowedRequest(request: BootstrapRequest, limits: Limits) CodecError
     if (!request.profile.protect_workspace_secrets) return error.SecretProtectionRequired;
     if (request.profile.control_roots.len > limits.max_control_roots) return error.TooManyControlRoots;
     if (request.profile.exec_paths.len > limits.max_exec_paths) return error.TooManyExecPaths;
+    if (request.profile.ro_paths.len > limits.max_ro_paths) return error.TooManyRoPaths;
+    if (request.profile.host_rw_paths.len > limits.max_host_rw_paths) return error.TooManyHostRwPaths;
     if (request.argv.len == 0) return error.EmptyArguments;
     if (request.argv.len > limits.max_arguments) return error.TooManyArguments;
     if (request.environ.len > limits.max_environment_entries) return error.TooManyEnvironmentEntries;
@@ -510,6 +551,8 @@ fn validateBorrowedRequest(request: BootstrapRequest, limits: Limits) CodecError
     try validatePath(request.agent_cwd, limits.max_path_bytes, true);
     for (request.profile.control_roots) |root| try validatePath(root, limits.max_path_bytes, false);
     for (request.profile.exec_paths) |exec_path| try validatePath(exec_path, limits.max_path_bytes, true);
+    for (request.profile.ro_paths) |ro_path| try validatePath(ro_path, limits.max_path_bytes, true);
+    for (request.profile.host_rw_paths) |host_rw_path| try validatePath(host_rw_path, limits.max_path_bytes, true);
     for (request.argv, 0..) |arg, index| {
         try validateItem(arg, limits.max_item_bytes);
         if (index == 0 and arg.len == 0) return error.EmptyExecutable;
@@ -522,6 +565,8 @@ fn validateBorrowedRequest(request: BootstrapRequest, limits: Limits) CodecError
 
     _ = try usizeToU32(request.profile.control_roots.len);
     _ = try usizeToU32(request.profile.exec_paths.len);
+    _ = try usizeToU32(request.profile.ro_paths.len);
+    _ = try usizeToU32(request.profile.host_rw_paths.len);
     _ = try usizeToU32(request.argv.len);
     _ = try usizeToU32(request.environ.len);
 }
@@ -540,6 +585,8 @@ fn validateRequestFrame(frame: []const u8, limits: Limits) CodecError!RequestMet
     const proxy_port_raw = try reader.readU16();
     const control_root_count: usize = try reader.readU32();
     const exec_path_count: usize = try reader.readU32();
+    const ro_path_count: usize = try reader.readU32();
+    const host_rw_path_count: usize = try reader.readU32();
     const argument_count: usize = try reader.readU32();
     const environment_count: usize = try reader.readU32();
     const workspace_len: usize = try reader.readU32();
@@ -547,6 +594,8 @@ fn validateRequestFrame(frame: []const u8, limits: Limits) CodecError!RequestMet
 
     if (control_root_count > limits.max_control_roots) return error.TooManyControlRoots;
     if (exec_path_count > limits.max_exec_paths) return error.TooManyExecPaths;
+    if (ro_path_count > limits.max_ro_paths) return error.TooManyRoPaths;
+    if (host_rw_path_count > limits.max_host_rw_paths) return error.TooManyHostRwPaths;
     if (argument_count == 0) return error.EmptyArguments;
     if (argument_count > limits.max_arguments) return error.TooManyArguments;
     if (environment_count > limits.max_environment_entries) return error.TooManyEnvironmentEntries;
@@ -557,7 +606,9 @@ fn validateRequestFrame(frame: []const u8, limits: Limits) CodecError!RequestMet
     try validatePath(agent_cwd, limits.max_path_bytes, true);
 
     try scanStringList(&reader, control_root_count, limits.max_path_bytes, .path);
-    try scanStringList(&reader, exec_path_count, limits.max_path_bytes, .path);
+    try scanStringList(&reader, exec_path_count, limits.max_path_bytes, .absolute_path);
+    try scanStringList(&reader, ro_path_count, limits.max_path_bytes, .absolute_path);
+    try scanStringList(&reader, host_rw_path_count, limits.max_path_bytes, .absolute_path);
     try scanStringList(&reader, argument_count, limits.max_item_bytes, .argument);
     try scanStringList(&reader, environment_count, limits.max_item_bytes, .environment);
     if (reader.pos != frame.len) return error.TrailingBytes;
@@ -569,6 +620,8 @@ fn validateRequestFrame(frame: []const u8, limits: Limits) CodecError!RequestMet
     return .{
         .control_root_count = control_root_count,
         .exec_path_count = exec_path_count,
+        .ro_path_count = ro_path_count,
+        .host_rw_path_count = host_rw_path_count,
         .argument_count = argument_count,
         .environment_count = environment_count,
     };
@@ -576,6 +629,7 @@ fn validateRequestFrame(frame: []const u8, limits: Limits) CodecError!RequestMet
 
 const StringClass = enum {
     path,
+    absolute_path,
     argument,
     environment,
 };
@@ -587,6 +641,7 @@ fn scanStringList(reader: *Reader, count: usize, max_len: usize, class: StringCl
         const item = try reader.take(len);
         switch (class) {
             .path => try validatePath(item, max_len, false),
+            .absolute_path => try validatePath(item, max_len, true),
             .argument => {
                 try validateItem(item, max_len);
                 if (index == 0 and item.len == 0) return error.EmptyExecutable;
@@ -795,6 +850,8 @@ const Reader = struct {
 test "request frame round trips every bootstrap field" {
     const control_roots = [_][]const u8{ "/work/.ryk", "/run/ryk-control" };
     const exec_paths = [_][]const u8{ "/home/user/.local/bin/agent", "/home/user/.local/bin/agent-real" };
+    const ro_paths = [_][]const u8{ "/home/user/.local/share/agent", "/etc/agent/config" };
+    const host_rw_paths = [_][]const u8{"/home/user/.config/agent"};
     const argv = [_][]const u8{ "/usr/bin/agent", "--mode", "safe" };
     const environ = [_][]const u8{ "PATH=/usr/bin:/bin", "RYK_SESSION_ID=session-test" };
     const request: BootstrapRequest = .{
@@ -808,6 +865,8 @@ test "request frame round trips every bootstrap field" {
             .include_tmp = true,
             .control_roots = &control_roots,
             .exec_paths = &exec_paths,
+            .ro_paths = &ro_paths,
+            .host_rw_paths = &host_rw_paths,
             .network_proxy_port = 43123,
             .require_network_route_forcing = true,
             .protect_workspace_secrets = true,
@@ -828,6 +887,8 @@ test "request frame round trips every bootstrap field" {
     try expectStringListsEqual(request.environ, decoded.environ);
     try expectStringListsEqual(request.profile.control_roots, decoded.profile.control_roots);
     try expectStringListsEqual(request.profile.exec_paths, decoded.profile.exec_paths);
+    try expectStringListsEqual(request.profile.ro_paths, decoded.profile.ro_paths);
+    try expectStringListsEqual(request.profile.host_rw_paths, decoded.profile.host_rw_paths);
     try std.testing.expectEqual(request.profile.include_tmp, decoded.profile.include_tmp);
     try std.testing.expectEqual(request.profile.network_proxy_port, decoded.profile.network_proxy_port);
     try std.testing.expectEqual(
@@ -882,6 +943,8 @@ test "request codec rejects cap violations before allocation" {
         .environ = &environ,
         .profile = .{
             .control_roots = &roots,
+            .ro_paths = &roots,
+            .host_rw_paths = &roots,
             .protect_workspace_secrets = true,
         },
         .stdio = .inherit,
@@ -890,6 +953,11 @@ test "request codec rejects cap violations before allocation" {
     try std.testing.expectError(
         error.TooManyControlRoots,
         encodedRequestSize(request, .{ .max_control_roots = 1 }),
+    );
+    try std.testing.expectError(error.TooManyRoPaths, encodedRequestSize(request, .{ .max_ro_paths = 1 }));
+    try std.testing.expectError(
+        error.TooManyHostRwPaths,
+        encodedRequestSize(request, .{ .max_host_rw_paths = 1 }),
     );
     try std.testing.expectError(error.TooManyArguments, encodedRequestSize(request, .{ .max_arguments = 1 }));
     try std.testing.expectError(error.TooManyEnvironmentEntries, encodedRequestSize(
@@ -976,8 +1044,8 @@ test "request decoder rejects malformed framing and wire fields" {
     copy[0] ^= 0xff;
     try std.testing.expectError(error.BadMagic, decodeRequestAlloc(std.testing.allocator, copy, .{}));
     @memcpy(copy, encoded.bytes);
-    // protocol_version is little-endian u16 at offset 4; set to unsupported (not current v2).
-    copy[4] = 3;
+    // protocol_version is little-endian u16 at offset 4; set to unsupported (not current v3).
+    copy[4] = 2;
     copy[5] = 0;
     try std.testing.expectError(error.UnsupportedVersion, decodeRequestAlloc(std.testing.allocator, copy, .{}));
     @memcpy(copy, encoded.bytes);
@@ -1040,6 +1108,8 @@ test "request decoder applies local limits to otherwise valid frame" {
 test "request allocation failures propagate and clean up partial decode" {
     const roots = [_][]const u8{"/work/.ryk"};
     const exec_paths = [_][]const u8{"/usr/bin/agent"};
+    const ro_paths = [_][]const u8{"/usr/share/agent"};
+    const host_rw_paths = [_][]const u8{"/home/user/.agent"};
     const argv = [_][]const u8{"/usr/bin/agent"};
     const environ = [_][]const u8{"PATH=/usr/bin"};
     const request: BootstrapRequest = .{
@@ -1052,6 +1122,8 @@ test "request allocation failures propagate and clean up partial decode" {
         .profile = .{
             .control_roots = &roots,
             .exec_paths = &exec_paths,
+            .ro_paths = &ro_paths,
+            .host_rw_paths = &host_rw_paths,
             .protect_workspace_secrets = true,
         },
         .stdio = .inherit,

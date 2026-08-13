@@ -182,6 +182,8 @@ pub fn forkApplyLandlockAndExec(
     compiled: *const profile.CompiledProfile,
     route_forcing: ?landlock.RouteForcing,
     include_tmp: bool,
+    ro_paths: []const []const u8,
+    host_rw_paths: []const []const u8,
     argv: []const []const u8,
     env_map: ?*const std.process.Environ.Map,
     cwd: ?[]const u8,
@@ -190,7 +192,18 @@ pub fn forkApplyLandlockAndExec(
     if (builtin.os.tag != .linux) return error.Unsupported;
     if (argv.len == 0) return error.ExecFailed;
     if (compiled.protect_workspace_secrets) {
-        return forkApplyWorkspaceViewAndExec(io, compiled, route_forcing, include_tmp, argv, env_map, cwd, stdio);
+        return forkApplyWorkspaceViewAndExec(
+            io,
+            compiled,
+            route_forcing,
+            include_tmp,
+            ro_paths,
+            host_rw_paths,
+            argv,
+            env_map,
+            cwd,
+            stdio,
+        );
     }
     return forkApplyAndExecLandlock(compiled, route_forcing, argv, env_map, cwd, stdio);
 }
@@ -201,6 +214,8 @@ fn forkApplyWorkspaceViewAndExec(
     compiled: *const profile.CompiledProfile,
     route_forcing: ?landlock.RouteForcing,
     include_tmp: bool,
+    ro_paths: []const []const u8,
+    host_rw_paths: []const []const u8,
     argv: []const []const u8,
     env_map: ?*const std.process.Environ.Map,
     cwd: ?[]const u8,
@@ -215,6 +230,8 @@ fn forkApplyWorkspaceViewAndExec(
         .profile = .{
             // Use the original compile option, not grant inference (workspace=/tmp trap).
             .include_tmp = include_tmp,
+            .ro_paths = ro_paths,
+            .host_rw_paths = host_rw_paths,
             .network_proxy_port = if (route_forcing) |route| route.proxy_port else null,
             .require_network_route_forcing = route_forcing != null,
         },
@@ -435,8 +452,7 @@ fn runChildAfterFork(
     if (!preflightExecTarget(path)) failExit(status_w);
 
     const keep_fds = [_]i32{ 0, 1, 2, status_w };
-    fd_scrub.closeInheritedFds(&keep_fds);
-
+    if (!fd_scrub.closeInheritedFdsAndVerify(&keep_fds)) failExit(status_w);
     if (!writeStatusOk(status_w)) failExit(status_w);
     closeFd(status_w);
 
@@ -812,6 +828,8 @@ test "forkApplyLandlockAndExec is unsupported off Linux" {
         },
         null,
         false,
+        &.{},
+        &.{},
         &[_][]const u8{"/bin/true"},
         null,
         null,
@@ -821,7 +839,7 @@ test "forkApplyLandlockAndExec is unsupported off Linux" {
 
 test "forkApplyLandlockAndExec applies then execs on Linux with handshake" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
-    if (landlock.probeAbi() == null) return error.SkipZigTest;
+    if (!landlock.isAbiAvailable()) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -855,6 +873,8 @@ test "forkApplyLandlockAndExec applies then execs on Linux with handshake" {
         &compiled,
         null,
         false,
+        &.{},
+        &.{},
         &[_][]const u8{true_path},
         null,
         ws_root,
@@ -867,7 +887,7 @@ test "forkApplyLandlockAndExec applies then execs on Linux with handshake" {
 
 test "forkApplyLandlockAndExec fails handshake on bad chdir" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
-    if (landlock.probeAbi() == null) return error.SkipZigTest;
+    if (!landlock.isAbiAvailable()) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -899,6 +919,8 @@ test "forkApplyLandlockAndExec fails handshake on bad chdir" {
         &compiled,
         null,
         false,
+        &.{},
+        &.{},
         &[_][]const u8{true_path},
         null,
         "/no/such/ryk/cwd/for/handshake/test",
@@ -1128,7 +1150,7 @@ test "preflight fail does not write status_ok (missing exec target)" {
         return;
     }
     if (builtin.os.tag != .linux) return error.SkipZigTest;
-    if (landlock.probeAbi() == null) return error.SkipZigTest;
+    if (!landlock.isAbiAvailable()) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -1150,6 +1172,8 @@ test "preflight fail does not write status_ok (missing exec target)" {
         &compiled,
         null,
         false,
+        &.{},
+        &.{},
         &[_][]const u8{"/no/such/ryk/exec/target/for/preflight"},
         null,
         ws_root,
@@ -1204,7 +1228,7 @@ test "planted non-kept FD is closed after successful handshake" {
     }
 
     // Linux Landlock path.
-    if (landlock.probeAbi() == null) return error.SkipZigTest;
+    if (!landlock.isAbiAvailable()) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var ws_tmp = std.testing.tmpDir(.{});
@@ -1233,6 +1257,8 @@ test "planted non-kept FD is closed after successful handshake" {
         &compiled,
         null,
         false,
+        &.{},
+        &.{},
         &[_][]const u8{ sh_path, "-c", check_closed },
         null,
         ws_root,
@@ -1305,6 +1331,8 @@ test "protect-on landlock spawn fails closed without env map (no unprotected fal
         &compiled,
         null,
         false,
+        &.{},
+        &.{},
         &[_][]const u8{"/bin/true"},
         null,
         root,

@@ -21,6 +21,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const profile = @import("profile.zig");
 
 /// Env-relative authority write-deny path template.
 ///
@@ -263,6 +264,21 @@ pub fn isForbiddenHostConfigPath(path: []const u8, home: []const u8) bool {
     return false;
 }
 
+fn canonicalExistingPath(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+) error{OutOfMemory}!?[]u8 {
+    const canonical_z = std.Io.Dir.cwd().realPathFileAlloc(io, path, allocator) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    // realPathFileAlloc returns a sentinel slice ([:0]u8 over a len+1 allocation);
+    // dupe to shed the sentinel so callers free with the exact visible length.
+    defer allocator.free(canonical_z);
+    return try allocator.dupe(u8, canonical_z);
+}
+
 /// Collect owned absolute host-config grant paths for a **trusted** table host key.
 ///
 /// - `host` must already be a trusted `host_config_table` key (from
@@ -288,6 +304,9 @@ pub fn collectHostConfigPaths(
     }
     // Note: do not call isForbiddenHostConfigPath(home, home) — bare HOME is always
     // "forbidden as a grant", which would empty the list before any subpath is considered.
+    const canonical_home = (try canonicalExistingPath(io, allocator, home)) orelse
+        return try allocator.alloc([]const u8, 0);
+    defer allocator.free(canonical_home);
 
     var list: std.ArrayList([]const u8) = .empty;
     errdefer {
@@ -308,26 +327,35 @@ pub fn collectHostConfigPaths(
         // fall back to follow-open for plain files/dirs that pathExists already covers.
         if (!pathExists(io, joined)) continue;
 
+        // Landlock installs PATH_BENEATH rules against resolved targets. Seal the
+        // same canonical path here and revalidate it against the canonical HOME
+        // boundary so a host-side `.claude -> ~/.ssh` (or outside-HOME) symlink
+        // cannot retarget a narrow grant.
+        const canonical = (try canonicalExistingPath(io, allocator, joined)) orelse continue;
+        if (!profile.isPathWithin(canonical, canonical_home) or
+            isForbiddenHostConfigPath(canonical, canonical_home))
+        {
+            allocator.free(canonical);
+            continue;
+        }
+
         // Dedup exact strings.
         var exists = false;
         for (list.items) |existing| {
-            if (std.mem.eql(u8, existing, joined)) {
+            if (std.mem.eql(u8, existing, canonical)) {
                 exists = true;
                 break;
             }
         }
-        if (exists) continue;
+        if (exists) {
+            allocator.free(canonical);
+            continue;
+        }
 
-        const owned = try allocator.dupe(u8, joined);
-        list.append(allocator, owned) catch |err| {
-            allocator.free(owned);
+        list.append(allocator, canonical) catch |err| {
+            allocator.free(canonical);
             return err;
         };
-        // macOS firmlink dual-form residual: lexical HOME+rel is not dual-emitted with
-        // realpath Data-form here (system_ro /etc dual is separate). Seatbelt grants
-        // match the open path used at collect time; open-follow existence check already
-        // validated the node. Full dual emission is follow-up if live /var vs /private
-        // host-config open residual is observed under firmlinks.
     }
 
     return try list.toOwnedSlice(allocator);
@@ -562,8 +590,8 @@ pub const max_ancestor_instruction_paths: usize = 32;
 ///   and an ancestor of the workspace; otherwise stops at FS root / depth cap.
 /// - Grants **regular files only** for `ancestor_instruction_basenames`.
 /// - Never returns bare `$HOME`, parent directories, or secret trees.
-/// - Missing files are skipped (no invent). Symlinks to regular files are OK
-///   when open+stat succeeds as `.file`.
+/// - Missing files are skipped (no invent). Symlinks that retarget outside the
+///   approved ancestor directory are skipped.
 ///
 /// Caller frees with `freeHostSystemRoPaths` (same ownership as other RO lists).
 pub fn collectAncestorInstructionRoPaths(
@@ -593,6 +621,12 @@ pub fn collectAncestorInstructionRoPaths(
         break :blk cleaned;
     };
     defer if (home_abs.len > 0) allocator.free(home_abs);
+    const canonical_home: ?[]u8 = if (home_abs.len > 0)
+        (try canonicalExistingPath(io, allocator, home_abs)) orelse
+            return try list.toOwnedSlice(allocator)
+    else
+        null;
+    defer if (canonical_home) |path| allocator.free(path);
 
     var current = std.fs.path.dirname(ws) orelse return try list.toOwnedSlice(allocator);
     var depth: usize = 0;
@@ -604,26 +638,56 @@ pub fn collectAncestorInstructionRoPaths(
             current = std.fs.path.dirname(current) orelse break;
             continue;
         }
+        const canonical_current = (try canonicalExistingPath(io, allocator, current)) orelse {
+            // Ancestor dir not canonically resolvable: no candidate inside it can
+            // be verified against its canonical parent, so nothing here grants.
+            if (shouldStopAncestorWalk(current, home_abs)) break;
+            current = std.fs.path.dirname(current) orelse break;
+            continue;
+        };
+        defer allocator.free(canonical_current);
 
         for (ancestor_instruction_basenames) |base| {
             if (list.items.len >= max_ancestor_instruction_paths) break;
             const candidate = try std.fs.path.join(allocator, &.{ current, base });
             defer allocator.free(candidate);
+            // Fast lexical rejection only. The canonical target check below is
+            // the security boundary and handles symlinks and macOS path aliases.
             if (home_abs.len > 0 and isForbiddenHostConfigPath(candidate, home_abs)) continue;
             if (!regularFileExists(io, candidate)) continue;
 
+            const canonical = (try canonicalExistingPath(io, allocator, candidate)) orelse continue;
+            const canonical_parent = std.fs.path.dirname(canonical) orelse {
+                allocator.free(canonical);
+                continue;
+            };
+            if (!std.mem.eql(u8, canonical_parent, canonical_current)) {
+                allocator.free(canonical);
+                continue;
+            }
+            if (canonical_home) |approved_home| {
+                if (profile.isPathWithin(canonical, approved_home) and
+                    isForbiddenHostConfigPath(canonical, approved_home))
+                {
+                    allocator.free(canonical);
+                    continue;
+                }
+            }
+
             var exists = false;
             for (list.items) |existing| {
-                if (std.mem.eql(u8, existing, candidate)) {
+                if (std.mem.eql(u8, existing, canonical)) {
                     exists = true;
                     break;
                 }
             }
-            if (exists) continue;
+            if (exists) {
+                allocator.free(canonical);
+                continue;
+            }
 
-            const owned = try allocator.dupe(u8, candidate);
-            list.append(allocator, owned) catch |err| {
-                allocator.free(owned);
+            list.append(allocator, canonical) catch |err| {
+                allocator.free(canonical);
                 return err;
             };
         }
@@ -1333,6 +1397,42 @@ test "collectHostConfigPaths grants existing claude roots and skips missing" {
     }
 }
 
+test "collectHostConfigPaths canonicalizes safe links and drops secret retargets" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    {
+        var home_tmp = std.testing.tmpDir(.{});
+        defer home_tmp.cleanup();
+        const home = try home_tmp.dir.realPathFileAlloc(io, ".", allocator);
+        defer allocator.free(home);
+        try home_tmp.dir.createDirPath(io, "safe-claude");
+        home_tmp.dir.symLink(io, "safe-claude", ".claude", .{ .is_directory = true }) catch
+            return error.SkipZigTest;
+
+        const safe_target = try home_tmp.dir.realPathFileAlloc(io, "safe-claude", allocator);
+        defer allocator.free(safe_target);
+        const paths = try collectHostConfigPaths(io, allocator, "claude", home);
+        defer freeHostConfigPaths(allocator, paths);
+        try std.testing.expectEqual(@as(usize, 1), paths.len);
+        try std.testing.expectEqualStrings(safe_target, paths[0]);
+    }
+
+    {
+        var home_tmp = std.testing.tmpDir(.{});
+        defer home_tmp.cleanup();
+        const home = try home_tmp.dir.realPathFileAlloc(io, ".", allocator);
+        defer allocator.free(home);
+        try home_tmp.dir.createDirPath(io, ".ssh");
+        home_tmp.dir.symLink(io, ".ssh", ".claude", .{ .is_directory = true }) catch
+            return error.SkipZigTest;
+
+        const paths = try collectHostConfigPaths(io, allocator, "claude", home);
+        defer freeHostConfigPaths(allocator, paths);
+        try std.testing.expectEqual(@as(usize, 0), paths.len);
+    }
+}
+
 test "collectHostConfigPaths empty for non-host and missing config" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -1775,6 +1875,39 @@ test "collectAncestorInstructionRoPaths grants parent AGENTS.md not parent dir o
     const rel = try collectAncestorInstructionRoPaths(io, allocator, "relative/ws", home);
     defer freeHostSystemRoPaths(allocator, rel);
     try std.testing.expectEqual(@as(usize, 0), rel.len);
+}
+
+test "collectAncestorInstructionRoPaths drops symlink retarget outside ancestor" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var home_tmp = std.testing.tmpDir(.{});
+    defer home_tmp.cleanup();
+    const home = try home_tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(home);
+
+    try home_tmp.dir.createDirPath(io, "CodingProjects/ryk");
+    try home_tmp.dir.createDirPath(io, ".ssh");
+    try home_tmp.dir.writeFile(io, .{ .sub_path = ".ssh/id", .data = "synthetic-canary\n" });
+    try home_tmp.dir.writeFile(io, .{
+        .sub_path = "CodingProjects/CLAUDE.md",
+        .data = "# plain parent instructions\n",
+    });
+    home_tmp.dir.symLink(io, "../.ssh/id", "CodingProjects/AGENTS.md", .{}) catch
+        return error.SkipZigTest;
+
+    const workspace = try std.fs.path.join(allocator, &.{ home, "CodingProjects", "ryk" });
+    defer allocator.free(workspace);
+    const plain = try std.fs.path.join(allocator, &.{ home, "CodingProjects", "CLAUDE.md" });
+    defer allocator.free(plain);
+    const secret = try std.fs.path.join(allocator, &.{ home, ".ssh", "id" });
+    defer allocator.free(secret);
+
+    const paths = try collectAncestorInstructionRoPaths(io, allocator, workspace, home);
+    defer freeHostSystemRoPaths(allocator, paths);
+    try std.testing.expectEqual(@as(usize, 1), paths.len);
+    try std.testing.expectEqualStrings(plain, paths[0]);
+    try std.testing.expect(!std.mem.eql(u8, secret, paths[0]));
 }
 
 test "collectAncestorInstructionRoPaths skips workspace itself and missing parents" {

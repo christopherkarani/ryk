@@ -140,6 +140,8 @@ pub const feature_order = [_]Feature{
 pub const ReportSet = struct {
     os: platform.Os,
     backend_name: []const u8,
+    /// Highest probed Landlock ABI, when the Linux syscall probe succeeded.
+    landlock_abi: ?u32 = null,
     fallback_level: Level,
     fallback_note: []const u8,
     reports: [feature_order.len]FeatureReport,

