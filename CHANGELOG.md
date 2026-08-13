@@ -5,11 +5,13 @@
 ### Added
 
 * **Release signing is wired but not yet active.** `keys/ryk-release-minisign.pub` ships the sentinel `RYK_RELEASE_PUBKEY_UNPROVISIONED`. Until a real key is provisioned, `scripts/install.sh` reports signing is not yet active and continues on SHA-256 only (checksum-only / fail-open). `scripts/install.ps1` is checksum-only (Windows unsigned) and does not verify `checksums.txt.minisig`. After provisioning, the POSIX installer will verify a detached minisign signature over `checksums.txt` and refuse unverifiable releases. `cut-release.sh` has a `sign` phase before `publish-git`; after a dry-run, resume from `sign`, not `publish-git`. CI backup (`release.yml`) still does not attach `checksums.txt.minisig`. See `docs/release-signing.md`.
-
+* **Homebrew formula is ready; the public tap is not published yet.** `packaging/homebrew/Formula/ryk.rb` is a real formula (release URLs, per-platform SHA-256 digests, caveats that point at `ryk doctor --fix`, `brew test`). `christopherkarani/homebrew-ryk` is 404 — do not `brew tap christopherkarani/ryk` until that repo exists. The checksum-verified curl installer remains the working public path on macOS and Linux. See `docs/install.md`.
 
 ### Changed
 
 * **Windows positioning:** public docs and `ryk doctor` now match backend truth. Windows sessions have no OS sandbox and run at wrapper/hook grade (MCP stdio is proxy). Doctor reports cmd/PowerShell wrappers as wrapper-only, and transparent filesystem plus proxy-mediated HTTP as unavailable (no loopback proxy). WinGet and Scoop stay deferred pending a Windows story (decision 2026-08-13).
+* **Homebrew formula is real, not a template.** `packaging/homebrew/Formula/ryk.rb` carries published release URLs and per-platform SHA-256 digests, caveats that point at `ryk doctor`, and a `brew test` block. `scripts/cut-release.sh` gained a `publish-brew` phase that regenerates the formula from the release's `checksums.txt`. A missing tap is a preflight warning and skips `--live` tap push rather than surprising after publish-git. The bump phase does not write a version-only formula (old digests). `brew upgrade` replaces the binary only; `ryk doctor --fix` wires hosts. `scripts/update-homebrew-tap.sh` fails closed (writes nothing) on a missing or malformed digest, a missing marker, missing ruby, or a `--live` tap clone failure.
+* **Packaging channel decisions recorded** in `packaging/README.md`: Homebrew ready / tap not published yet (blocked), npm deferred until a demand trigger fires, WinGet and Scoop deferred pending a Windows story. Nothing new is published.
 
 ### Security (OS sandbox audit 2026-08-13)
 

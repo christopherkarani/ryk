@@ -1,9 +1,38 @@
 # Install
 
-ryk is macOS/Linux-first. The supported install path is the checksum-verified
-curl installer on those platforms. Windows can run the CLI, but sessions there
-have no OS sandbox and stay at wrapper/hook grade — see [Windows Notes](#windows-notes)
+## Recommended: curl installer
+
+```sh
+curl -fsSL https://rykanv.com/install | sh
+```
+
+This is the working public install path on macOS and Linux. ryk is
+macOS/Linux-first. Windows can run the CLI, but sessions there have no OS
+sandbox and stay at wrapper/hook grade — see [Windows Notes](#windows-notes)
 and the [compatibility matrix](compatibility.md).
+
+npm, WinGet, and Scoop are not published — see
+[`packaging/README.md`](../packaging/README.md).
+
+## Homebrew (ready, tap not published yet)
+
+The formula in [`packaging/homebrew/`](../packaging/homebrew/) is real and
+release-ready, but the public tap (`christopherkarani/homebrew-ryk`) is **not
+published yet**. `brew tap christopherkarani/ryk` will 404 until that repo
+exists. Until then, use the curl installer above.
+
+When the tap is published:
+
+```sh
+brew tap christopherkarani/ryk
+brew install ryk
+ryk doctor --fix    # wire host hooks; nothing is gated until you run this
+ryk doctor
+```
+
+`brew upgrade ryk` replaces the binary only. Run `ryk doctor --fix` afterwards
+to refresh managed host plugins. Unlike the curl installer, `brew install` does
+**not** wire host hooks — Homebrew's post-install `HOME` is temporary.
 
 ## Build From Source
 
@@ -46,6 +75,13 @@ Do not use an install-only path without verification. Download the archive, veri
 4. Paste the activation command printed by the installer (the highlighted `eval "$(… env …)"` block on Unix). It invokes the absolute installed binary, so it also works in the shell that launched a first-time install before `ryk` is on `PATH`. The installer runs `ryk doctor --fix --from-install` to configure protection.
 
 ### Updating
+
+If you installed with Homebrew:
+
+```sh
+brew update && brew upgrade ryk
+ryk doctor --fix    # refresh managed host plugins after the upgrade
+```
 
 If you installed via the curl installer (`~/.local/bin/ryk`):
 
@@ -99,7 +135,9 @@ trusts whoever served the script — is spelled out in
 
 ## Release channel
 
-The supported install path is the checksum-verified curl installer:
+The working public path is the checksum-verified curl installer. Homebrew is
+ready but the tap is not published yet — see
+[Homebrew](#homebrew-ready-tap-not-published-yet). The curl installer:
 
 ```sh
 curl -fsSL https://rykanv.com/install | sh
