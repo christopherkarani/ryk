@@ -8,3 +8,8 @@ pub const resources = @import("resources.zig");
 pub const prompts = @import("prompts.zig");
 pub const sampling = @import("sampling.zig");
 pub const manifests = @import("manifests.zig");
+
+test {
+    _ = transport;
+    _ = manifests;
+}

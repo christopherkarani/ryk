@@ -25,7 +25,7 @@ Effect output never includes raw argument values. For interactive classification
 python3 fixtures/mcp/fake_client.py | ./zig-out/bin/ryk mcp proxy --name demo --policy policies/presets/mcp-dev.yaml --command python3 -- fixtures/mcp/fake_server.py
 ```
 
-The proxy reads client JSON-RPC from stdin and writes protocol responses to stdout. Server stderr and ryk human logs are logs, not protocol. Running `ryk mcp proxy` without a client input stream waits for JSON-RPC on stdin.
+The proxy reads client JSON-RPC from stdin and writes protocol responses to stdout. Ryk human diagnostics use stderr, but child-server stderr is discarded because it is attacker-controlled and may contain credentials; this does not affect the separate stdout JSON-RPC channel. Running `ryk mcp proxy` without a client input stream waits for JSON-RPC on stdin.
 
 ## Manifest Support
 
@@ -47,9 +47,20 @@ ryk policy-gates:
 
 ryk also observes and audits `tools/list`, `resources/list`, and `prompts/list` metadata so later calls can be evaluated with the discovered risk context.
 
+## Unmediated Methods: deny by default
+
+The proxy forwards only an explicit allowlist of known-safe, side-effect-free methods without policy gating:
+
+- `initialize` — protocol handshake
+- `ping` — keepalive (no params, no side effects; forwarded unaudited)
+- `notifications/*` — spec notification channel (forwarded, audited)
+- `tools/list`, `resources/list`, `prompts/list` — read-only discovery (responses inspected/audited)
+
+Every other method is denied with a JSON-RPC error and an audited `mcp_unknown_method` deny event. This includes `completion/complete` (argument content would leave the client unmediated), `logging/setLevel` (server side effect), vendor/extension namespaces such as `vendor/private`, and any future spec method until it is reviewed and allowlisted. A request-shaped message without an `id` that is not a `notifications/*` method is likewise denied rather than forwarded.
+
 ## Protocol Warning
 
-Stdio MCP stdout must contain only newline-delimited JSON-RPC protocol messages. Human logs belong on stderr.
+Stdio MCP stdout must contain only newline-delimited JSON-RPC protocol messages. Do not send child-server logs to stderr: `ryk mcp proxy` discards the server's stderr. ryk's own diagnostics stay on ryk's stderr.
 
 ## Remote/HTTP Status
 

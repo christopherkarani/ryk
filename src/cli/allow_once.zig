@@ -11,7 +11,9 @@
 //!
 //! Subcommands: `<code> [-y] [--json] [--scope cwd|project]`, `list`, `clear`, `revoke`.
 //! Default redeem scope_path is the pending record cwd (grant matches deny site).
-//! Redeem is operator-bound (M-1): TTY confirmation or RYK_OPERATOR=1.
+//! Redeem is operator-bound (M-1): interactive TTY confirmation only. There is no
+//! env-var break-glass — `RYK_OPERATOR` was removed because env vars are
+//! child-controlled and authenticate nobody.
 
 const std = @import("std");
 const core = @import("ryk_core").core;
@@ -35,14 +37,18 @@ const usage_text =
     \\Redeem a pending short code into a single-use allow-once grant for the exact
     \\command and scope. Management: list, clear, revoke.
     \\
-    \\Redeem is operator-bound: interactive TTY confirmation, or set
-    \\RYK_OPERATOR=1 for non-interactive operator redeem.
-    \\-y/--yes skips TTY confirmation only (does not authorize non-TTY redeem).
+    \\Redeem is operator-bound: interactive TTY confirmation required.
+    \\-y/--yes skips the confirmation prompt but never authorizes a non-TTY redeem.
     \\
     \\Paths: $XDG_DATA_HOME/ryk/ (or ~/.local/share/ryk/)
     \\  pending_exceptions.jsonl · allow_once.jsonl
     \\
 ;
+
+/// Test seam: when non-null, overrides the real TTY probe for the redeem gate.
+/// Production code leaves this null; tests set it to simulate operator presence
+/// (or absence) without a real terminal. Never set by shipped code paths.
+pub var test_operator_tty_override: ?bool = null;
 
 /// Top-level `ryk allow-once …` (argv after the verb).
 pub fn command(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: anytype) !u8 {
@@ -108,21 +114,14 @@ fn resolveRykDataDir(gpa: std.mem.Allocator) !?[]u8 {
     return null;
 }
 
-/// True when the process is explicitly operator-bound for non-interactive redeem.
-/// Agents must not be able to set this ambiently from ordinary host shells without
-/// the human operator configuring the environment (M-1).
-fn operatorRedeemAuthorized() bool {
-    return envTruthy("RYK_OPERATOR");
-}
-
-fn envTruthy(name: [*:0]const u8) bool {
-    const raw = std.c.getenv(name) orelse return false;
-    const v = std.mem.span(raw);
-    return std.mem.eql(u8, v, "1") or
-        std.mem.eql(u8, v, "true") or
-        std.mem.eql(u8, v, "TRUE") or
-        std.mem.eql(u8, v, "yes") or
-        std.mem.eql(u8, v, "YES");
+/// Operator presence for redeem (M-1). The only trustworthy signal is an
+/// interactive controlling terminal: environment variables are per-invocation
+/// and fully child-controlled, so an agent subprocess can set any var on itself.
+/// A TTY is the boundary an agent cannot fabricate for a human. Non-TTY → false
+/// (fail closed). `RYK_OPERATOR` was removed — it authenticated nobody.
+fn operatorRedeemAuthorized(io: std.Io) bool {
+    if (test_operator_tty_override) |v| return v;
+    return std.Io.File.stdin().isTty(io) catch false;
 }
 
 fn cmdRedeem(
@@ -178,33 +177,31 @@ fn cmdRedeem(
             return exit_codes.usage;
         }
     }
-    // M-1 redeem gate: fail closed unless operator-bound.
-    // - RYK_OPERATOR=1 → non-interactive operator redeem
+    // M-1 redeem gate: fail closed unless on an interactive TTY.
     // - stdin TTY → interactive confirmation (unless -y)
-    // - else → refuse (-y alone is not enough for agents/scripts)
-    if (!operatorRedeemAuthorized()) {
-        const is_tty = std.Io.File.stdin().isTty(io) catch false;
-        if (!is_tty) {
-            try stderr.writeAll(
-                \\ryk allow-once: redeem requires interactive TTY confirmation, or RYK_OPERATOR=1 for non-interactive operator redeem
-                \\
-            );
-            return exit_codes.usage;
-        }
-        if (!yes) {
-            const accepted = interactive.askConfirmInteractive(
-                io,
-                stdout,
-                "Redeem allow-once short code and grant a single-use shell exception?",
-                false,
-            ) catch |err| {
-                try stderr.print("ryk allow-once: confirmation failed: {s}\n", .{@errorName(err)});
-                return exit_codes.general;
-            };
-            if (!accepted) {
-                try stdout.writeAll("canceled\n");
-                return exit_codes.success;
-            }
+    // - non-TTY → refuse (-y alone is not enough for agents/scripts; there is no
+    //   env-var break-glass — RYK_OPERATOR was removed)
+    if (!operatorRedeemAuthorized(io)) {
+        try stderr.writeAll(
+            \\ryk allow-once: redeem requires an interactive TTY (operator presence).
+            \\Non-interactive / agent-driven redeem is refused; re-run in a terminal.
+            \\
+        );
+        return exit_codes.usage;
+    }
+    if (!yes) {
+        const accepted = interactive.askConfirmInteractive(
+            io,
+            stdout,
+            "Redeem allow-once short code and grant a single-use shell exception?",
+            false,
+        ) catch |err| {
+            try stderr.print("ryk allow-once: confirmation failed: {s}\n", .{@errorName(err)});
+            return exit_codes.general;
+        };
+        if (!accepted) {
+            try stdout.writeAll("canceled\n");
+            return exit_codes.success;
         }
     }
 
@@ -234,12 +231,12 @@ fn cmdRedeem(
         const path_j = try jsonStringAlloc(gpa, entry.scope_path);
         defer gpa.free(path_j);
         try stdout.print(
-            \\{{"schema_version":{d},"short_code":"{s}","command":{s},"scope_kind":"{s}","scope_path":{s},"expires_at":"{s}","single_use":{s}}}
+            \\{{"schema_version":{d},"code_hash":"{s}","command":{s},"scope_kind":"{s}","scope_path":{s},"expires_at":"{s}","single_use":{s}}}
             \\
         ,
             .{
                 allow_once_store.schema_version,
-                entry.source_short_code,
+                entry.source_code_hash,
                 cmd_j,
                 @tagName(entry.scope_kind),
                 path_j,
@@ -327,10 +324,10 @@ fn cmdList(
             const reason_j = try jsonStringAlloc(gpa, e.reason);
             defer gpa.free(reason_j);
             try stdout.print(
-                \\{{"short_code":"{s}","command":{s},"scope_kind":"{s}","scope_path":{s},"expires_at":"{s}","single_use":{s},"reason":{s}}}
+                \\{{"code_hash":"{s}","command":{s},"scope_kind":"{s}","scope_path":{s},"expires_at":"{s}","single_use":{s},"reason":{s}}}
             ,
                 .{
-                    e.source_short_code,
+                    e.source_code_hash,
                     cmd_j,
                     @tagName(e.scope_kind),
                     path_j,
@@ -352,7 +349,7 @@ fn cmdList(
     for (loaded.list.entries) |e| {
         try stdout.print(
             "  {s}  scope={s}  expires={s}\n    {s}\n",
-            .{ e.source_short_code, @tagName(e.scope_kind), e.expires_at, e.command_raw },
+            .{ e.source_code_hash, @tagName(e.scope_kind), e.expires_at, e.command_raw },
         );
     }
     return exit_codes.success;
@@ -558,21 +555,20 @@ const SOnceCliEnv = struct {
     data_root: []u8,
     prev_data: ?[:0]u8,
     prev_home: ?[:0]u8,
-    prev_operator: ?[:0]u8,
-    prev_ryk_operator: ?[:0]u8,
 
     fn deinit(self: *@This()) void {
         sOnceCliRestoreEnv("XDG_DATA_HOME", self.prev_data);
         sOnceCliRestoreEnv("HOME", self.prev_home);
-        sOnceCliRestoreEnv("RYK_OPERATOR", self.prev_operator);
-        sOnceCliRestoreEnv("RYK_OPERATOR", self.prev_ryk_operator);
+        // Always clear the TTY test seam so tests cannot leak operator presence.
+        test_operator_tty_override = null;
         std.testing.allocator.free(self.data_root);
         self.data_tmp.cleanup();
     }
 };
 
 /// Isolate allow-once JSONL under a temp `$XDG_DATA_HOME` (and pin HOME away from host).
-/// Also sets RYK_OPERATOR=1 so redeem tests exercise the operator non-interactive path.
+/// Redeem authorization is TTY-only; tests opt into operator presence explicitly via
+/// `sOnceCliSimulateOperatorTty` (the RYK_OPERATOR env break-glass was removed).
 fn sOnceCliIsolateXdg() !SOnceCliEnv {
     var data_tmp = std.testing.tmpDir(.{});
     errdefer data_tmp.cleanup();
@@ -586,27 +582,24 @@ fn sOnceCliIsolateXdg() !SOnceCliEnv {
     errdefer if (prev_data) |p| std.testing.allocator.free(p);
     const prev_home = try sOnceCliDupEnvZ("HOME");
     errdefer if (prev_home) |p| std.testing.allocator.free(p);
-    const prev_operator = try sOnceCliDupEnvZ("RYK_OPERATOR");
-    errdefer if (prev_operator) |p| std.testing.allocator.free(p);
-    const prev_ryk_operator = try sOnceCliDupEnvZ("RYK_OPERATOR");
-    errdefer if (prev_ryk_operator) |p| std.testing.allocator.free(p);
 
     const data_z0 = try std.testing.allocator.dupeZ(u8, data_root);
     defer std.testing.allocator.free(data_z0);
     try std.testing.expectEqual(@as(c_int, 0), setenv("XDG_DATA_HOME", data_z0.ptr, 1));
     // Pin HOME so fallback `~/.local/share/ryk` never touches the host home.
     try std.testing.expectEqual(@as(c_int, 0), setenv("HOME", data_z0.ptr, 1));
-    // Operator gate for non-TTY redeem tests (M-1).
-    try std.testing.expectEqual(@as(c_int, 0), setenv("RYK_OPERATOR", "1", 1));
 
     return .{
         .data_tmp = data_tmp,
         .data_root = data_root,
         .prev_data = prev_data,
         .prev_home = prev_home,
-        .prev_operator = prev_operator,
-        .prev_ryk_operator = prev_ryk_operator,
     };
+}
+
+/// Simulate an interactive operator TTY for the redeem gate (test seam).
+fn sOnceCliSimulateOperatorTty() void {
+    test_operator_tty_override = true;
 }
 
 const SOnceCliWorkspace = struct {
@@ -756,8 +749,8 @@ test "s-once-cli: help and missing args are usage-safe without daemon" {
         try std.testing.expect(std.mem.indexOf(u8, run.stdout, "allow-once") != null or
             std.mem.indexOf(u8, run.stdout, "Usage") != null or
             std.mem.indexOf(u8, run.stdout, "usage") != null);
-        // Operator-bound redeem documented on help.
-        try std.testing.expect(std.mem.indexOf(u8, run.stdout, "RYK_OPERATOR") != null or
+        // Operator-bound redeem documented on help (TTY-only; no env break-glass).
+        try std.testing.expect(std.mem.indexOf(u8, run.stdout, "TTY") != null or
             std.mem.indexOf(u8, run.stdout, "operator") != null);
     }
     {
@@ -770,28 +763,31 @@ test "s-once-cli: help and missing args are usage-safe without daemon" {
     }
 }
 
-test "s-once-cli: non-TTY redeem without RYK_OPERATOR fails closed" {
-    // M-1: -y alone must not authorize silent agent redeem on non-TTY.
+test "s-once-cli: non-TTY redeem fails closed even with RYK_OPERATOR set" {
+    // M-1 / P0-3: -y alone must not authorize silent agent redeem on non-TTY, and
+    // the removed RYK_OPERATOR env var must never authorize anything. Set it to
+    // prove it is ignored; the TTY seam stays unset (non-TTY).
     var xdg = try sOnceCliIsolateXdg();
     defer xdg.deinit();
     var ws = try sOnceCliWorkspace();
     defer ws.deinit();
 
-    // Isolate sets RYK_OPERATOR=1; clear it to exercise the fail-closed path.
-    _ = unsetenv("RYK_OPERATOR");
-    _ = unsetenv("RYK_OPERATOR");
+    // Explicitly set the removed var — it must have no effect.
+    try std.testing.expectEqual(@as(c_int, 0), setenv("RYK_OPERATOR", "1", 1));
+    defer _ = unsetenv("RYK_OPERATOR");
+    test_operator_tty_override = false; // explicit non-TTY
 
     const cmd_text = "git reset --hard";
     var issued = try sOnceCliIssuePending(xdg.data_root, cmd_text, ws.root, "m1 silent redeem gate");
     defer issued.deinit(std.testing.allocator);
-    const code = issued.record.short_code;
+    const code = issued.redeem_code;
 
     const run = try sOnceCliRun(&.{ code, "-y" });
     defer sOnceCliFreeRun(run);
     try std.testing.expect(run.code != exit_codes.success);
-    try std.testing.expect(std.mem.indexOf(u8, run.stderr, "RYK_OPERATOR") != null or
-        std.mem.indexOf(u8, run.stderr, "TTY") != null or
-        std.mem.indexOf(u8, run.stderr, "operator") != null);
+    try std.testing.expect(std.mem.indexOf(u8, run.stderr, "TTY") != null or
+        std.mem.indexOf(u8, run.stderr, "operator") != null or
+        std.mem.indexOf(u8, run.stderr, "terminal") != null);
 
     // Pending must remain unredeemed (gate is before store mutate).
     const pending_path = try sOnceCliPendingPath(xdg.data_root);
@@ -812,11 +808,12 @@ test "s-once-cli: redeem pending code writes allow_once.jsonl and burns pending"
     var ws = try sOnceCliWorkspace();
     defer ws.deinit();
 
+    sOnceCliSimulateOperatorTty();
     const cmd_text = "git reset --hard";
     const reason = "s-once-cli redeem burn-pending marker";
     var issued = try sOnceCliIssuePending(xdg.data_root, cmd_text, ws.root, reason);
     defer issued.deinit(std.testing.allocator);
-    const code = issued.record.short_code;
+    const code = issued.redeem_code;
 
     const run = try sOnceCliRun(&.{ code, "-y" });
     defer sOnceCliFreeRun(run);
@@ -863,6 +860,7 @@ test "s-once-cli: redeem then evaluate allows once; second evaluate denies" {
     var ws = try sOnceCliWorkspace();
     defer ws.deinit();
 
+    sOnceCliSimulateOperatorTty();
     const cmd_text = "git reset --hard";
     var issued = try sOnceCliIssuePending(
         xdg.data_root,
@@ -873,7 +871,7 @@ test "s-once-cli: redeem then evaluate allows once; second evaluate denies" {
     defer issued.deinit(std.testing.allocator);
 
     {
-        const run = try sOnceCliRun(&.{ issued.record.short_code, "-y" });
+        const run = try sOnceCliRun(&.{ issued.redeem_code, "-y" });
         defer sOnceCliFreeRun(run);
         try std.testing.expect(!sOnceCliIsStubNotImplemented(run.stdout, run.stderr));
         try std.testing.expectEqual(exit_codes.success, run.code);
@@ -917,13 +915,14 @@ test "s-once-cli: redeem then explain non-consume still allows once; third evalu
     var ws = try sOnceCliWorkspace();
     defer ws.deinit();
 
+    sOnceCliSimulateOperatorTty();
     const cmd_text = "git reset --hard";
     const reason = "s-once-cli explain non-consume attribution marker";
     var issued = try sOnceCliIssuePending(xdg.data_root, cmd_text, ws.root, reason);
     defer issued.deinit(std.testing.allocator);
 
     {
-        const run = try sOnceCliRun(&.{ issued.record.short_code, "-y" });
+        const run = try sOnceCliRun(&.{ issued.redeem_code, "-y" });
         defer sOnceCliFreeRun(run);
         try std.testing.expect(!sOnceCliIsStubNotImplemented(run.stdout, run.stderr));
         try std.testing.expectEqual(exit_codes.success, run.code);
@@ -985,11 +984,12 @@ test "s-once-cli: list shows redeemed grant; --json is parseable" {
     var ws = try sOnceCliWorkspace();
     defer ws.deinit();
 
+    sOnceCliSimulateOperatorTty();
     const cmd_text = "git reset --hard";
     const reason = "s-once-cli list surface marker";
     var issued = try sOnceCliIssuePending(xdg.data_root, cmd_text, ws.root, reason);
     defer issued.deinit(std.testing.allocator);
-    const code = issued.record.short_code;
+    const code = issued.redeem_code;
     {
         const run = try sOnceCliRun(&.{ code, "-y" });
         defer sOnceCliFreeRun(run);
@@ -1013,8 +1013,7 @@ test "s-once-cli: list shows redeemed grant; --json is parseable" {
         try sOnceCliExpectNoDaemonText(list_json.stdout);
         // Must encode the redeemed grant, not a hollow `{}` / empty array greening.
         try std.testing.expect(std.mem.indexOf(u8, list_json.stdout, cmd_text) != null);
-        try std.testing.expect(std.mem.indexOf(u8, list_json.stdout, code) != null or
-            std.mem.indexOf(u8, list_json.stdout, "short_code") != null or
+        try std.testing.expect(std.mem.indexOf(u8, list_json.stdout, "code_hash") != null or
             std.mem.indexOf(u8, list_json.stdout, "schema_version") != null);
         const trimmed = std.mem.trim(u8, list_json.stdout, " \t\r\n");
         try std.testing.expect(trimmed.len > 0);
@@ -1030,10 +1029,11 @@ test "s-once-cli: revoke by short code removes grant so evaluate denies" {
     var ws = try sOnceCliWorkspace();
     defer ws.deinit();
 
+    sOnceCliSimulateOperatorTty();
     const cmd_text = "git reset --hard";
     var issued = try sOnceCliIssuePending(xdg.data_root, cmd_text, ws.root, "revoke target");
     defer issued.deinit(std.testing.allocator);
-    const code = issued.record.short_code;
+    const code = issued.redeem_code;
     {
         const run = try sOnceCliRun(&.{ code, "-y" });
         defer sOnceCliFreeRun(run);
@@ -1068,11 +1068,12 @@ test "s-once-cli: clear empties active grants" {
     var ws = try sOnceCliWorkspace();
     defer ws.deinit();
 
+    sOnceCliSimulateOperatorTty();
     const cmd_text = "git reset --hard";
     var issued = try sOnceCliIssuePending(xdg.data_root, cmd_text, ws.root, "clear target");
     defer issued.deinit(std.testing.allocator);
     {
-        const run = try sOnceCliRun(&.{ issued.record.short_code, "-y" });
+        const run = try sOnceCliRun(&.{ issued.redeem_code, "-y" });
         defer sOnceCliFreeRun(run);
         try std.testing.expectEqual(exit_codes.success, run.code);
     }
@@ -1104,6 +1105,8 @@ test "s-once-cli: redeem unknown code is non-success with clear error" {
     var ws = try sOnceCliWorkspace();
     defer ws.deinit();
 
+    // Operator TTY so the redeem gate passes and we reach the store lookup.
+    sOnceCliSimulateOperatorTty();
     const run = try sOnceCliRun(&.{ "000000", "-y" });
     defer sOnceCliFreeRun(run);
     try std.testing.expect(!sOnceCliIsStubNotImplemented(run.stdout, run.stderr));
@@ -1122,6 +1125,7 @@ test "s-once-cli: redeem --json emits machine-readable success" {
     var ws = try sOnceCliWorkspace();
     defer ws.deinit();
 
+    sOnceCliSimulateOperatorTty();
     const cmd_text = "git reset --hard";
     var issued = try sOnceCliIssuePending(
         xdg.data_root,
@@ -1130,7 +1134,7 @@ test "s-once-cli: redeem --json emits machine-readable success" {
         "json redeem marker",
     );
     defer issued.deinit(std.testing.allocator);
-    const code = issued.record.short_code;
+    const code = issued.redeem_code;
 
     const run = try sOnceCliRun(&.{ code, "-y", "--json" });
     defer sOnceCliFreeRun(run);
@@ -1140,11 +1144,11 @@ test "s-once-cli: redeem --json emits machine-readable success" {
     try std.testing.expect(trimmed.len > 0 and trimmed[0] == '{');
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, trimmed, .{});
     defer parsed.deinit();
-    // Flat `{}` must not green: encode grant identity (command and/or short_code).
+    // Flat `{}` must not green: encode grant identity (command and/or code_hash).
     try std.testing.expect(std.mem.indexOf(u8, run.stdout, cmd_text) != null or
-        std.mem.indexOf(u8, run.stdout, code) != null);
+        std.mem.indexOf(u8, run.stdout, issued.record.code_hash) != null);
     try std.testing.expect(std.mem.indexOf(u8, run.stdout, "command") != null or
-        std.mem.indexOf(u8, run.stdout, "short_code") != null or
+        std.mem.indexOf(u8, run.stdout, "code_hash") != null or
         std.mem.indexOf(u8, run.stdout, "schema_version") != null);
 }
 
@@ -1155,11 +1159,12 @@ test "s-once-cli: clear pending leaves active grants intact" {
     var ws = try sOnceCliWorkspace();
     defer ws.deinit();
 
+    sOnceCliSimulateOperatorTty();
     const cmd_text = "git reset --hard";
     var issued = try sOnceCliIssuePending(xdg.data_root, cmd_text, ws.root, "clear pending only");
     defer issued.deinit(std.testing.allocator);
     {
-        const run = try sOnceCliRun(&.{ issued.record.short_code, "-y" });
+        const run = try sOnceCliRun(&.{ issued.redeem_code, "-y" });
         defer sOnceCliFreeRun(run);
         try std.testing.expectEqual(exit_codes.success, run.code);
     }
@@ -1207,13 +1212,14 @@ test "s-once-cli: revoke by full_hash removes grant" {
     var ws = try sOnceCliWorkspace();
     defer ws.deinit();
 
+    sOnceCliSimulateOperatorTty();
     const cmd_text = "git reset --hard";
     var issued = try sOnceCliIssuePending(xdg.data_root, cmd_text, ws.root, "revoke by hash");
     defer issued.deinit(std.testing.allocator);
     const full_hash = try std.testing.allocator.dupe(u8, issued.record.full_hash);
     defer std.testing.allocator.free(full_hash);
     {
-        const run = try sOnceCliRun(&.{ issued.record.short_code, "-y" });
+        const run = try sOnceCliRun(&.{ issued.redeem_code, "-y" });
         defer sOnceCliFreeRun(run);
         try std.testing.expectEqual(exit_codes.success, run.code);
     }
@@ -1256,12 +1262,13 @@ test "s-once-cli: redeem --scope project allows evaluate from subdirectory" {
     var ws = try sOnceCliWorkspace();
     defer ws.deinit();
 
+    sOnceCliSimulateOperatorTty();
     const cmd_text = "git reset --hard";
     var issued = try sOnceCliIssuePending(xdg.data_root, cmd_text, ws.root, "project scope redeem");
     defer issued.deinit(std.testing.allocator);
 
     {
-        const run = try sOnceCliRun(&.{ issued.record.short_code, "-y", "--scope", "project" });
+        const run = try sOnceCliRun(&.{ issued.redeem_code, "-y", "--scope", "project" });
         defer sOnceCliFreeRun(run);
         try std.testing.expect(!sOnceCliIsStubNotImplemented(run.stdout, run.stderr));
         try std.testing.expectEqual(exit_codes.success, run.code);

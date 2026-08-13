@@ -48,6 +48,8 @@ test "phase 19 package and workflow files are present" {
         "scripts/build-release.ps1",
         "scripts/generate-checksums.sh",
         "scripts/generate-sbom.sh",
+        "scripts/stage-release-payload.sh",
+        "scripts/check-release-payload-secrets.sh",
         "scripts/docker-install-layout-smoke-test.sh",
         "packaging/homebrew/Formula/ryk.rb",
         "packaging/scoop/ryk.json",
@@ -64,6 +66,14 @@ test "phase 19 package and workflow files are present" {
         var file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{});
         file.close(std.testing.io);
     }
+}
+
+test "release builder stages tracked files and scans every payload" {
+    const text = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "scripts/build-release.sh", std.testing.allocator, .limited(256 * 1024));
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "stage-release-payload.sh") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "check-release-payload-secrets.sh") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "cp -R docs policies") == null);
 }
 
 test "phase 19 release files include integrity checks without obvious credentials" {

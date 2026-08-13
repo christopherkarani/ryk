@@ -1302,6 +1302,7 @@ test "append rechecks opt-out state while holding the queue lock" {
     });
     defer std.testing.allocator.free(event);
 
+    try setEnabled(std.testing.io, &environ_map, std.testing.allocator, true);
     try appendEvent(std.testing.io, &environ_map, std.testing.allocator, event);
     try setEnabled(std.testing.io, &environ_map, std.testing.allocator, false);
     try std.testing.expectError(
@@ -1326,6 +1327,7 @@ test "activation is persisted and appended only once" {
     });
     defer std.testing.allocator.free(event);
 
+    try setEnabled(std.testing.io, &environ_map, std.testing.allocator, true);
     try std.testing.expect(try store.appendActivationEvent(std.testing.io, &environ_map, std.testing.allocator, event));
     try std.testing.expect(!(try store.appendActivationEvent(std.testing.io, &environ_map, std.testing.allocator, event)));
     try std.testing.expectEqual(@as(usize, 1), try queueCount(std.testing.allocator, std.testing.io, &environ_map));
@@ -1355,6 +1357,7 @@ test "activation queue identity repairs an unmarked state without duplicating" {
     });
     defer std.testing.allocator.free(event);
 
+    try setEnabled(std.testing.io, &environ_map, std.testing.allocator, true);
     try store.appendEvent(std.testing.io, &environ_map, std.testing.allocator, event);
     try std.testing.expect(!(try store.appendActivationEvent(std.testing.io, &environ_map, std.testing.allocator, event)));
     try std.testing.expectEqual(@as(usize, 1), try queueCount(std.testing.allocator, std.testing.io, &environ_map));
@@ -1587,7 +1590,28 @@ test "public telemetry command persists opt-out state" {
         exit_codes.success,
         try command(std.testing.io, &environ_map, std.testing.allocator, &.{ "status", "--json" }, &status_stdout, &status_stderr),
     );
-    try std.testing.expect(std.mem.indexOf(u8, status_stdout.buffered(), "\"enabled\":true") != null);
+    // Opt-in default: no consent state means disabled.
+    try std.testing.expect(std.mem.indexOf(u8, status_stdout.buffered(), "\"enabled\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_stdout.buffered(), "\"source\":\"default\"") != null);
+
+    var enable_first_stdout_buf: [256]u8 = undefined;
+    var enable_first_stderr_buf: [256]u8 = undefined;
+    var enable_first_stdout: std.Io.Writer = .fixed(&enable_first_stdout_buf);
+    var enable_first_stderr: std.Io.Writer = .fixed(&enable_first_stderr_buf);
+    try std.testing.expectEqual(
+        exit_codes.success,
+        try command(std.testing.io, &environ_map, std.testing.allocator, &.{"enable"}, &enable_first_stdout, &enable_first_stderr),
+    );
+
+    var enabled_stdout_buf: [512]u8 = undefined;
+    var enabled_stderr_buf: [512]u8 = undefined;
+    var enabled_stdout: std.Io.Writer = .fixed(&enabled_stdout_buf);
+    var enabled_stderr: std.Io.Writer = .fixed(&enabled_stderr_buf);
+    try std.testing.expectEqual(
+        exit_codes.success,
+        try command(std.testing.io, &environ_map, std.testing.allocator, &.{ "status", "--json" }, &enabled_stdout, &enabled_stderr),
+    );
+    try std.testing.expect(std.mem.indexOf(u8, enabled_stdout.buffered(), "\"enabled\":true") != null);
 
     var disable_stdout_buf: [256]u8 = undefined;
     var disable_stderr_buf: [256]u8 = undefined;
@@ -1623,6 +1647,65 @@ test "public telemetry command persists opt-out state" {
         exit_codes.success,
         try command(std.testing.io, &environ_map, std.testing.allocator, &.{"enable"}, &enable_stdout, &enable_stderr),
     );
+}
+
+test "missing telemetry state defaults to disabled with no queued events" {
+    // P1 opt-in default: a fresh install must not queue or send anything until
+    // the user runs `ryk telemetry enable`. No state file -> append is refused
+    // -> queue stays empty -> the sender returns before any POST attempt.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+
+    var environ_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ_map.deinit();
+    try environ_map.put("XDG_CONFIG_HOME", root);
+
+    const paths = (try store.resolvePaths(std.testing.allocator, &environ_map)).?;
+    defer {
+        var owned_paths = paths;
+        owned_paths.deinit(std.testing.allocator);
+    }
+    var loaded = try store.readState(std.testing.allocator, std.testing.io, &paths);
+    defer loaded.deinit(std.testing.allocator);
+    try std.testing.expect(!loaded.state.enabled);
+    try std.testing.expectEqual(store.StateSource.default, loaded.source);
+
+    const event = try renderEvent(std.testing.allocator, std.testing.io, "ryk_0123456789abcdef0123456789abcdef", .{
+        .command = "doctor",
+        .host = "none",
+        .outcome = "success",
+    });
+    defer std.testing.allocator.free(event);
+    try std.testing.expectError(
+        error.TelemetryDisabled,
+        store.appendEvent(std.testing.io, &environ_map, std.testing.allocator, event),
+    );
+    try std.testing.expectEqual(@as(usize, 0), try queueCount(std.testing.allocator, std.testing.io, &environ_map));
+
+    // Empty queue short-circuits before any transport attempt.
+    try @import("telemetry_transport.zig").sendQueued(std.testing.io, &environ_map, std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), try queueCount(std.testing.allocator, std.testing.io, &environ_map));
+}
+
+test "RYK_NO_TELEMETRY overrides an explicit opt-in" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+
+    var environ_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ_map.deinit();
+    try environ_map.put("XDG_CONFIG_HOME", root);
+
+    try setEnabled(std.testing.io, &environ_map, std.testing.allocator, true);
+    try environ_map.put("RYK_NO_TELEMETRY", "1");
+
+    var loaded = try loadEffectiveState(std.testing.allocator, std.testing.io, &environ_map);
+    defer loaded.deinit(std.testing.allocator);
+    try std.testing.expect(!loaded.state.enabled);
+    try std.testing.expectEqual(StateSource.environment, loaded.source);
 }
 
 test "hard telemetry disable blocks enabling" {

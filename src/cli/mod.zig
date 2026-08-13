@@ -818,7 +818,7 @@ test "env command appears in help and dispatches correctly" {
 }
 
 test "command-specific help works through help command and command flag" {
-    var stdout_buf: [4096]u8 = undefined;
+    var stdout_buf: [8192]u8 = undefined;
     var stderr_buf: [256]u8 = undefined;
     var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
     var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
@@ -842,7 +842,7 @@ test "command-specific help works through help command and command flag" {
 }
 
 test "help run includes examples section" {
-    var stdout_buf: [4096]u8 = undefined;
+    var stdout_buf: [8192]u8 = undefined;
     var stderr_buf: [256]u8 = undefined;
     var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
     var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
@@ -1993,7 +1993,7 @@ test "RYK_NO_RICH truthy variants suppress presentation without changing machine
 }
 
 test "banner suppressed on command-specific help (help run)" {
-    var stdout_buf: [4096]u8 = undefined;
+    var stdout_buf: [8192]u8 = undefined;
     var stderr_buf: [256]u8 = undefined;
     var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
     var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);

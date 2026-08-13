@@ -9,6 +9,7 @@ const builtin = @import("builtin");
 const core = @import("ryk_core").core;
 const core_api = @import("ryk_core").api;
 const sandbox = @import("../sandbox/mod.zig");
+const path_list = sandbox.path_list;
 const exit_codes = @import("exit_codes.zig");
 const tui = @import("../tui/mod.zig");
 
@@ -143,14 +144,9 @@ fn mergeOwnedPathLists(
 
     const out = try list.toOwnedSlice(allocator);
     // Success: consume inputs so callers must not free them again.
-    freeMergedPathList(allocator, a);
-    freeMergedPathList(allocator, b);
+    path_list.free(allocator, a);
+    path_list.free(allocator, b);
     return out;
-}
-
-fn freeMergedPathList(allocator: std.mem.Allocator, paths: []const []const u8) void {
-    for (paths) |p| allocator.free(p);
-    allocator.free(paths);
 }
 
 /// Same dedup semantics as `mergeOwnedPathLists`, but leaves both inputs owned
@@ -161,30 +157,11 @@ fn copyMergedPathLists(
     a: []const []const u8,
     b: []const []const u8,
 ) error{OutOfMemory}![]const []const u8 {
-    const a_copy = try clonePathList(allocator, a);
-    errdefer freeMergedPathList(allocator, a_copy);
-    const b_copy = try clonePathList(allocator, b);
-    errdefer freeMergedPathList(allocator, b_copy);
+    const a_copy = try path_list.clone(allocator, a);
+    errdefer path_list.free(allocator, a_copy);
+    const b_copy = try path_list.clone(allocator, b);
+    errdefer path_list.free(allocator, b_copy);
     return mergeOwnedPathLists(allocator, a_copy, b_copy);
-}
-
-fn clonePathList(
-    allocator: std.mem.Allocator,
-    paths: []const []const u8,
-) error{OutOfMemory}![]const []const u8 {
-    var list: std.ArrayList([]const u8) = .empty;
-    errdefer {
-        for (list.items) |path| allocator.free(path);
-        list.deinit(allocator);
-    }
-    for (paths) |path| {
-        const owned = try allocator.dupe(u8, path);
-        list.append(allocator, owned) catch |err| {
-            allocator.free(owned);
-            return err;
-        };
-    }
-    return try list.toOwnedSlice(allocator);
 }
 
 fn containsPath(paths: []const []const u8, candidate: []const u8) bool {
@@ -232,7 +209,7 @@ fn withoutDefaultCodexHome(
     custom_home_active: bool,
 ) error{OutOfMemory}![]const []const u8 {
     if (!custom_home_active or home.len == 0 or !std.fs.path.isAbsolute(home)) {
-        return clonePathList(allocator, paths);
+        return path_list.clone(allocator, paths);
     }
     const default_root = try std.fs.path.join(allocator, &.{ home, ".codex" });
     defer allocator.free(default_root);
@@ -466,13 +443,13 @@ pub fn applyForRun(
     // Honesty labels for the child (even when pack resolves empty).
     try env_map.put(sandbox.tool_pack.tool_pack_env, tool_pack.toString());
     const agent_and_pack = try copyMergedPathLists(allocator, agent_exec_paths, pack_exec_paths);
-    defer freeMergedPathList(allocator, agent_and_pack);
+    defer path_list.free(allocator, agent_and_pack);
     const launch_exec_paths = try copyMergedPathLists(
         allocator,
         agent_and_pack,
         extra_exec_paths,
     );
-    defer freeMergedPathList(allocator, launch_exec_paths);
+    defer path_list.free(allocator, launch_exec_paths);
 
     // Node/npm agents: RO package root so nested optional deps + vendor binaries
     // are readable after empty-backpack Seatbelt (file-only .exec is not enough).
@@ -491,7 +468,7 @@ pub fn applyForRun(
                 errdefer sandbox.host_config_grants.freeHostSystemRoPaths(allocator, system_ro);
                 break :inner try mergeOwnedPathLists(allocator, install_ro, system_ro);
             } else try allocator.alloc([]const u8, 0);
-            errdefer freeMergedPathList(allocator, install_system);
+            errdefer path_list.free(allocator, install_system);
 
             const toolchain_ro = try sandbox.host_config_grants.collectMacosDeveloperToolchainRoPaths(
                 launch_io,
@@ -502,7 +479,7 @@ pub fn applyForRun(
             // Consumes both inputs on success; errdefers above only run if this fails.
             break :merge_ist try mergeOwnedPathLists(allocator, install_system, toolchain_ro);
         };
-        errdefer freeMergedPathList(allocator, install_system_toolchain);
+        errdefer path_list.free(allocator, install_system_toolchain);
 
         // Parent-of-workspace AGENTS.md / CLAUDE.md (file RO only). Pi and peers
         // walk up from cwd; empty backpack previously denied these by design and
@@ -516,16 +493,16 @@ pub fn applyForRun(
         errdefer sandbox.host_config_grants.freeHostSystemRoPaths(allocator, ancestor_ro);
         break :blk try mergeOwnedPathLists(allocator, install_system_toolchain, ancestor_ro);
     };
-    defer freeMergedPathList(allocator, base_launch_ro_paths);
+    defer path_list.free(allocator, base_launch_ro_paths);
     // Pack dylib/formula RO (Homebrew linked libs) + MCP/extra RO.
     const base_and_pack_ro = try copyMergedPathLists(allocator, base_launch_ro_paths, pack_ro_paths);
-    defer freeMergedPathList(allocator, base_and_pack_ro);
+    defer path_list.free(allocator, base_and_pack_ro);
     const launch_ro_paths = try copyMergedPathLists(
         allocator,
         base_and_pack_ro,
         extra_ro_paths,
     );
-    defer freeMergedPathList(allocator, launch_ro_paths);
+    defer path_list.free(allocator, launch_ro_paths);
 
     // Pin DEVELOPER_DIR for the child (prefer CLT). Stops libxcselect from
     // requiring host select-link resolution when links are stale/broken, and
@@ -556,31 +533,31 @@ pub fn applyForRun(
         try collectCustomCodexHome(launch_io, allocator, trusted_host, home_for_config, env_map)
     else
         try allocator.alloc([]const u8, 0);
-    defer freeMergedPathList(allocator, custom_codex_home);
+    defer path_list.free(allocator, custom_codex_home);
     const base_host_rw_paths = try withoutDefaultCodexHome(
         allocator,
         base_host_rw_paths_unfiltered,
         home_for_config,
         custom_codex_home.len > 0,
     );
-    defer freeMergedPathList(allocator, base_host_rw_paths);
+    defer path_list.free(allocator, base_host_rw_paths);
     const base_and_codex_rw_paths = try copyMergedPathLists(
         allocator,
         base_host_rw_paths,
         custom_codex_home,
     );
-    defer freeMergedPathList(allocator, base_and_codex_rw_paths);
+    defer path_list.free(allocator, base_and_codex_rw_paths);
     const custom_host_config = if (trusted_host.len > 0)
         try collectCustomHostConfigPaths(launch_io, allocator, trusted_host, home_for_config, env_map)
     else
         try allocator.alloc([]const u8, 0);
-    defer freeMergedPathList(allocator, custom_host_config);
+    defer path_list.free(allocator, custom_host_config);
     const launch_host_rw_paths = try copyMergedPathLists(
         allocator,
         base_and_codex_rw_paths,
         custom_host_config,
     );
-    defer freeMergedPathList(allocator, launch_host_rw_paths);
+    defer path_list.free(allocator, launch_host_rw_paths);
 
     const result = sandbox.apply.applyBeforeExec(.{
         .allocator = allocator,
@@ -649,6 +626,7 @@ pub fn isSandboxSpawnFailure(err: anyerror) bool {
         error.LandlockAttachFailed,
         error.CapabilityLockdownFailed,
         error.MountVerificationFailed,
+        error.FdScrubFailed,
         error.TooManyExecPaths,
         => true,
         else => false,
@@ -674,6 +652,7 @@ pub fn sandboxSpawnFailReason(err: anyerror) []const u8 {
         error.LandlockAttachFailed => "landlock_attach_failed",
         error.CapabilityLockdownFailed => "capability_lockdown_failed",
         error.MountVerificationFailed => "mount_verification_failed",
+        error.FdScrubFailed => "fd_scrub_failed",
         error.TooManyExecPaths => "too_many_exec_paths",
         else => "sandbox_spawn_failed",
     };
@@ -803,7 +782,7 @@ test "mergeOwnedPathLists consumes inputs on success" {
     const b = try std.testing.allocator.alloc([]const u8, 1);
     b[0] = try std.testing.allocator.dupe(u8, "/toolchain");
     const merged = try mergeOwnedPathLists(std.testing.allocator, a, b);
-    defer freeMergedPathList(std.testing.allocator, merged);
+    defer path_list.free(std.testing.allocator, merged);
     try std.testing.expectEqual(@as(usize, 2), merged.len);
     try std.testing.expectEqualStrings("/install", merged[0]);
     try std.testing.expectEqualStrings("/toolchain", merged[1]);
@@ -886,14 +865,14 @@ test "custom CODEX_HOME removes default auth root but retains shared skills" {
     const input = try allocator.alloc([]const u8, 2);
     input[0] = try allocator.dupe(u8, "/Users/synthetic/.codex");
     input[1] = try allocator.dupe(u8, "/Users/synthetic/.agents");
-    defer freeMergedPathList(allocator, input);
+    defer path_list.free(allocator, input);
     const filtered = try withoutDefaultCodexHome(
         allocator,
         input,
         "/Users/synthetic",
         true,
     );
-    defer freeMergedPathList(allocator, filtered);
+    defer path_list.free(allocator, filtered);
     try std.testing.expectEqual(@as(usize, 1), filtered.len);
     try std.testing.expectEqualStrings("/Users/synthetic/.agents", filtered[0]);
 }
@@ -1024,7 +1003,7 @@ test "custom host config collector canonicalizes documented env paths" {
         home,
         &env_map,
     );
-    defer freeMergedPathList(std.testing.allocator, paths);
+    defer path_list.free(std.testing.allocator, paths);
     try std.testing.expectEqual(@as(usize, 1), paths.len);
     try std.testing.expectEqualStrings(hermes_home, paths[0]);
     try std.testing.expectEqualStrings(hermes_home, env_map.get("HERMES_HOME").?);
@@ -1042,7 +1021,7 @@ test "custom host config collector strips unsafe selectors" {
         "/Users/synthetic",
         &env_map,
     );
-    defer freeMergedPathList(std.testing.allocator, paths);
+    defer path_list.free(std.testing.allocator, paths);
     try std.testing.expectEqual(@as(usize, 0), paths.len);
     try std.testing.expect(env_map.get("OPENCODE_CONFIG") == null);
 }
@@ -1056,6 +1035,7 @@ test "isSandboxSpawnFailure classifies ApplyFailed ForkFailed Unsupported ExecFa
     try std.testing.expect(isSandboxSpawnFailure(error.HandshakeTimeout));
     try std.testing.expect(isSandboxSpawnFailure(error.FuseMountFailed));
     try std.testing.expect(isSandboxSpawnFailure(error.LandlockAttachFailed));
+    try std.testing.expect(isSandboxSpawnFailure(error.FdScrubFailed));
     try std.testing.expect(isSandboxSpawnFailure(error.TooManyExecPaths));
     try std.testing.expect(!isSandboxSpawnFailure(error.FileNotFound));
 }
@@ -1071,6 +1051,7 @@ test "sandboxSpawnFailReason maps classified spawn errors" {
     try std.testing.expectEqualStrings("profile_rebuild_failed", sandboxSpawnFailReason(error.ProfileRebuildFailed));
     try std.testing.expectEqualStrings("fuse_mount_failed", sandboxSpawnFailReason(error.FuseMountFailed));
     try std.testing.expectEqualStrings("landlock_attach_failed", sandboxSpawnFailReason(error.LandlockAttachFailed));
+    try std.testing.expectEqualStrings("fd_scrub_failed", sandboxSpawnFailReason(error.FdScrubFailed));
     try std.testing.expectEqualStrings("too_many_exec_paths", sandboxSpawnFailReason(error.TooManyExecPaths));
     // Unrelated errors fall through to a generic reason (not classified true above).
     try std.testing.expectEqualStrings("sandbox_spawn_failed", sandboxSpawnFailReason(error.FileNotFound));

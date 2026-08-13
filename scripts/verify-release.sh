@@ -91,6 +91,7 @@ require_archive_excludes() {
         fail "artifact $name contains a private path: $path"
       fi
     done
+    bash "$REPO_ROOT/scripts/check-release-payload-secrets.sh" "$artifact" >/dev/null
   done
   [ "$found" = "1" ] || fail "missing artifact pattern $pattern"
 }

@@ -18,7 +18,7 @@ Run:
 | Network decision engine | active |
 | Transparent network enforcement | per-session when proxy backend + Landlock ABI >= 4 route-forces TCP; otherwise observe-only |
 | Transparent filesystem enforcement | staged writes always; Landlock session-attach when available |
-| Strong sandbox | session-attach via Landlock when ABI ≥ 1 (kernel 5.13+); otherwise unavailable |
+| Strong sandbox | session-attach via Landlock when ABI ≥ 3 (kernel 6.2+); otherwise unavailable |
 
 ## OS filesystem sandbox
 
@@ -27,14 +27,14 @@ Protected agent launches (`ryk <agent>`) use the run engine and can attach a Lan
 - **Probe ≠ session-attach.** Doctor Landlock / strong-sandbox reports are capability evidence only. Doctor never reports a live session as `active` from a probe alone.
 - **Session-attach** is claimable only after apply-before-exec child attach succeeds for that run (with a profile hash). The pre-exec status handshake (`status_ok`) does not prove `execve`; an `active` session can still fail at exec (e.g. exit 127).
 - **FS scope (Landlock):** workspace child RW with workspace-root RO — create/write at the workspace root is denied; Seatbelt (macOS) allows full workspace subpath RW including create-at-root. Default control roots are `{workspace}/.ryk` and `{workspace}/.git` (RO under expand; siblings remain RW).
-- **Narrow host-agent config RW (trusted identity):** empty backpack keeps bare `$HOME` denied. Host-config grants require a **trusted resolved launch binary** (same rules as macOS — realpath allowlist + table host basename; not basename spoof). Trusted hosts get **existing** config trees only (same table as macOS). Missing roots are not invented. See `docs/platform-macos.md` residuals (`~/.local/bin` FP, allowlist FN). **Hardlink auth plant (F-03):** closed on macOS via Seatbelt `file-link` fence; **Linux has no Landlock `file-link` twin** — dual RW + REFER residual remains open here (do not claim parity).
+- **Narrow host-agent config RW (trusted identity):** empty backpack keeps bare `$HOME` denied. Host-config grants require a **trusted resolved launch binary** (same rules as macOS — realpath allowlist + table host basename; not basename spoof). Existing HOME-scoped grant paths are canonicalized and revalidated before compile, so symlinks into `~/.ssh`, other forbidden trees, or outside HOME are not granted. Missing roots are not invented. See `docs/platform-macos.md` residuals (`~/.local/bin` FP, allowlist FN). **Hardlink auth plant (F-03):** closed on macOS via Seatbelt `file-link` fence; **Linux has no Landlock `file-link` twin** — dual RW + REFER residual remains open here (do not claim parity).
 - **Host-config write authority (Linux parity):** authority files (`config.toml`, `settings.json`, `.mcp.json`, …) from the host-config table are extra **control roots**. Landlock control-expand keeps those paths RO under host RW trees (siblings stay RW). Landlock cannot express Seatbelt-style last-match literal write-deny; control-root RO is the equivalent. Hardlinked authority files fail closed at prepare.
 - **Launch binary grant:** the resolved agent executable (and realpath target when a symlink), plus the launch file’s shebang interpreter when present, are granted as narrow read+exec **files** so installs outside the workspace (e.g. `~/.local/bin`) can pass child preflight/exec after attach. This is **not** a broad `$HOME` grant. Landlock file `PATH_BENEATH` is enough for `execve` of that path — directory path-walk is not Landlock-mediated (kernel docs: `EXECUTE` applies to files only; `chdir`/`stat`/`access` are also outside FS rights). Apply refuses directory `.exec` targets (would tree-open). Residual: child preflight uses `access(2)`, which Landlock does not mediate, so preflight can false-pass while `execve` is the real gate.
-- **`auto`** attaches when the host supports Landlock ABI ≥ 1 and degrades loudly when it does not.
+- **`auto`** attaches when the host supports Landlock ABI ≥ 3 and degrades loudly with `landlock_abi_below_truncate_floor` on ABI 1/2.
 - **`on`** fails closed when attach cannot complete.
 - **`off`** disables OS apply.
 
-Requirements: Linux kernel **5.13+** with Landlock **ABI ≥ 1**. Containers and host policy can still make Landlock unavailable.
+Requirements: Linux kernel **6.2+** with Landlock **ABI ≥ 3**. ABI 1/2 cannot mediate `truncate(2)` or `open(O_TRUNC)` (including `O_RDONLY|O_TRUNC`), so ryk does not claim OS-enforced write integrity or attach on those kernels. `ryk doctor` reports the probed ABI and this gap. Containers and host policy can still make Landlock unavailable.
 
 ## Network route forcing
 
@@ -58,11 +58,13 @@ Doctor may report user namespaces, mount namespaces, seccomp, Landlock, cgroups,
 
 ## Fallback
 
-If kernel features are unavailable, ryk falls back to wrapper/proxy, staged-write, policy, and audit controls. Required backend features fail closed when requested with `--require-backend` or `--os-sandbox on`.
+If kernel features are unavailable, ryk falls back to wrapper/proxy, staged-write, policy, and audit controls. Required backend features fail closed when requested with `--require-backend` or `--os-sandbox on`. `--require-backend strong-sandbox` is satisfied when this session has an OS attach plan; `--require-backend landlock` additionally requires that plan to use Landlock. A later child-attach failure still aborts the launch.
 
 ## Limitations
 
 Linux capability varies by distro, kernel, container, and sysctl configuration. Do not treat doctor probes as transparent filesystem enforcement for an arbitrary process; trust OS-enforced FS isolation only for sessions that completed child attach.
+
+Inherited stdin/stdout/stderr are user-directed, pre-opened capabilities outside the Landlock path boundary. Redirect targets remain accessible through FDs 0/1/2 even when their paths are not granted.
 
 ## Hardlink residual
 

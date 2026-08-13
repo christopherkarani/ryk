@@ -500,6 +500,9 @@ pub fn build(b: *std.Build) void {
     const check_fixture_secrets_step = b.step("check-fixture-secrets", "Scan fixtures/tests for non-synthetic secret patterns");
     check_fixture_secrets_step.dependOn(&check_fixture_secrets.step);
 
+    const test_release_payload_boundary = b.addSystemCommand(&.{ "bash", "scripts/test-release-payload-boundary.sh" });
+    test_release_payload_boundary.setCwd(b.path("."));
+
     const check_step = b.step("check", "Compile ryk CLI only (fastest compile gate)");
     check_step.dependOn(&exe.step);
 
@@ -560,6 +563,7 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&check_fixture_secrets.step);
+    test_step.dependOn(&test_release_payload_boundary.step);
     test_step.dependOn(&run_shell_engine_tests.step);
     test_step.dependOn(&run_lib_tests.step);
     test_step.dependOn(&run_exe_tests.step);

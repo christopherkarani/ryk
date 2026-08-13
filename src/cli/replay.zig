@@ -175,6 +175,9 @@ fn writeReplayHuman(
         try stdout.writeByte('\n');
     }
 
+    // Evidence-plane degradation is prominent too (P1-1).
+    try writeAuditDegradedCallout(io, allocator, stdout, session.events);
+
     // Build grouped timeline rows (collapse runs of secret_redacted).
     const rows = try allocator.alloc(ReplayTimelineRow, session.events.len);
     defer allocator.free(rows);
@@ -255,8 +258,41 @@ fn replayEventIcon(event_type: []const u8) []const u8 {
     if (std.mem.endsWith(u8, event_type, "_allowed")) return "✓";
     if (std.mem.endsWith(u8, event_type, "_denied")) return "✗";
     if (std.mem.eql(u8, event_type, "secret_redacted")) return "⚠";
+    if (std.mem.eql(u8, event_type, "audit_degraded")) return "⚠";
     if (std.mem.startsWith(u8, event_type, "session_")) return "ℹ";
     return "•";
+}
+
+/// Evidence-plane degradation callout (P1-1): a session with audit_degraded
+/// events has shim execs with no in-shim audit record — surface it prominently.
+fn writeAuditDegradedCallout(io: std.Io, allocator: std.mem.Allocator, stdout: anytype, events: []const core_api.ReplayEvent) !void {
+    var degraded_count: usize = 0;
+    var first_degraded_reason: ?[]u8 = null;
+    defer if (first_degraded_reason) |reason| allocator.free(reason);
+    for (events) |event| {
+        if (!std.mem.eql(u8, event.event_type, "audit_degraded")) continue;
+        degraded_count += 1;
+        if (first_degraded_reason == null) first_degraded_reason = try degradedReasonFromRaw(allocator, event.raw);
+    }
+    if (degraded_count == 0) return;
+    var degraded_body: std.ArrayList(u8) = .empty;
+    defer degraded_body.deinit(allocator);
+    try degraded_body.print(allocator, "{d} audit_degraded event(s): session evidence is incomplete — some allowed shim execs have no in-shim audit record.", .{degraded_count});
+    if (first_degraded_reason) |reason| try degraded_body.print(allocator, " Reason: {s}", .{reason});
+    try tui.render.callout(io, stdout, .warn, "Audit degraded", degraded_body.items);
+    try stdout.writeByte('\n');
+}
+
+/// Pull `decision.reason` out of a raw event line for the degraded callout.
+fn degradedReasonFromRaw(allocator: std.mem.Allocator, raw: []const u8) !?[]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const decision = parsed.value.object.get("decision") orelse return null;
+    if (decision != .object) return null;
+    const reason = decision.object.get("reason") orelse return null;
+    if (reason != .string) return null;
+    return try allocator.dupe(u8, reason.string);
 }
 
 /// Build the flat, pre-rendered lines for the `--tui` alt-screen timeline view.
@@ -594,6 +630,86 @@ test "replay human timeline emphasizes network_connect_denied without command_de
     try std.testing.expect(std.mem.indexOf(u8, output, "Denied") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "[DENY]") != null or std.mem.indexOf(u8, output, "DENY") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "https://exfil.example/steal") != null);
+}
+
+test "replay surfaces audit_degraded sessions with a warn callout" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    try tmp.dir.createDirPath(std.testing.io, ".ryk");
+    {
+        const policy_file = try tmp.dir.createFile(std.testing.io, ".ryk/policy.yaml", .{});
+        defer policy_file.close(std.testing.io);
+        try policy_file.writeStreamingAll(std.testing.io, "version: 1\nmode: strict\n");
+    }
+    const session_id = try writeReplayDegradedFixture(std.testing.io, std.testing.allocator, root);
+    defer std.testing.allocator.free(session_id);
+
+    const previous_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(previous_cwd);
+    try std.process.setCurrentDir(std.testing.io, tmp.dir);
+    defer std.process.setCurrentPath(std.testing.io, previous_cwd) catch {};
+
+    var stdout_buf: [4096]u8 = undefined;
+    var stderr_buf: [512]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+
+    const code = try command(std.testing.io, &.{}, &stdout_writer, &stderr_writer);
+    try std.testing.expectEqual(exit_codes.success, code);
+    const output = stdout_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, output, "Audit degraded") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "audit_degraded") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "control write-deny residual") != null);
+}
+
+fn writeReplayDegradedFixture(io: std.Io, allocator: std.mem.Allocator, workspace_root: []const u8) ![]u8 {
+    const now = core.time.Timestamp.fromUnixSeconds(1_777_983_130);
+    var session_id: core.session.SessionId = .{ .value = undefined, .len = 0 };
+    const session_id_text = try std.fmt.bufPrint(&session_id.value, "replay-degraded-fixture", .{});
+    session_id.len = session_id_text.len;
+    const session = core.session.Session{
+        .id = session_id,
+        .started_at = now,
+        .ended_at = now,
+        .command = "ryk",
+        .args = &.{ "run", "--", "echo", "ok" },
+        .workspace_root = workspace_root,
+        .session_name = "replay-degraded-test",
+        .mode = .strict,
+        .platform = core.platform.detectOs(),
+    };
+    var audit_writer = try core_api.createAuditWriter(io, allocator, session);
+    defer audit_writer.deinit();
+
+    var degraded_id: core.event.EventId = .{ .value = undefined, .len = 0 };
+    const degraded_id_text = try std.fmt.bufPrint(&degraded_id.value, "degraded", .{});
+    degraded_id.len = degraded_id_text.len;
+    const degraded = try core_api.createAuditEvent(.{
+        .session_id = session.id,
+        .event_id = degraded_id,
+        .timestamp = now,
+        .event_type = .audit_degraded,
+        .actor = .{ .kind = .ryk, .display = "ryk" },
+        .target = .{ .kind = .session, .value = session.id.slice() },
+        .decision = core_api.makeDecision(.{
+            .result = .observe,
+            .reason = "shim audit open denied (control write-deny residual) without parent attestation; at least one allowed shim exec has no in-shim audit event",
+        }),
+    });
+    try core_api.appendAuditEvent(&audit_writer, degraded);
+
+    try audit_writer.writeLastPointer();
+    try core_api.writeAuditSummary(allocator, audit_writer.sessionDirPath(), .{
+        .session = session,
+        .status = .{ .exited = 0 },
+        .event_count = audit_writer.event_count,
+        .final_event_hash = audit_writer.finalHash() orelse "",
+        .policy = ".ryk/policy.yaml",
+        .product_label = brand.product_display,
+    });
+    return allocator.dupe(u8, session.id.slice());
 }
 
 test "isDeniedFields mirrors audit only_denied semantics" {

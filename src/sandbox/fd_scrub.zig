@@ -20,6 +20,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+extern "c" fn dirfd(dir: *std.c.DIR) std.c.fd_t;
+
 /// Default keep set: stdin, stdout, stderr.
 pub const default_keep_fds = [_]i32{ 0, 1, 2 };
 
@@ -369,21 +371,69 @@ fn tryCloseViaDevFd(keep: []const i32) bool {
     return !overflowed;
 }
 
-/// Close inherited FDs above the keep set (default: keep 0/1/2).
-/// Best-effort: ignores close errors (EBADF for already-closed slots).
-/// Call from the post-fork child before exec (see `apply_posix`).
-///
-/// Prefers platform range-close (`close_range` / `closefrom`) when available
-/// so scrub cost stays well under the parent handshake budget. On Darwin
-/// (no range-close), prefers `/dev/fd` live enumeration, then an O(open_max)
-/// walk bounded by `resolveOpenMax` (practical ceiling when hard is infinite).
-pub fn closeInheritedFds(keep: []const i32) void {
-    if (tryPlatformRangeClose(keep)) return;
-    if (tryPlatformClosefrom(keep)) return;
-    if (tryCloseViaDevFd(keep)) return;
+/// Perform the scrub and report whether Linux `close_range` completed every
+/// range. That kernel path is exhaustive; all fallback paths require a live-FD
+/// verification before the child may report attach success.
+fn scrubInheritedFds(keep: []const i32) bool {
+    if (tryPlatformRangeClose(keep)) return true;
+    if (tryPlatformClosefrom(keep)) return false;
+    if (tryCloseViaDevFd(keep)) return false;
+    // This bounded walk may miss descriptors above the practical ceiling.
+    // `verifyFallbackScrub` is the correctness gate for every fallback path.
     const open_max = platformOpenMax();
-    if (open_max <= 0) return;
-    _ = closeFdsWith(open_max, keep, bestEffortClose);
+    if (open_max > 0) _ = closeFdsWith(open_max, keep, bestEffortClose);
+    return false;
+}
+
+/// Pure survivor predicate used by verification and injected-survivor tests.
+pub fn noUnexpectedLiveFds(live_fds: []const i32, enumeration_fd: i32, keep: []const i32) bool {
+    for (live_fds) |fd| {
+        if (fd == enumeration_fd or isKeptFd(fd, keep)) continue;
+        return false;
+    }
+    return true;
+}
+
+/// Re-enumerate the live descriptor table after fallback scrubbing.
+///
+/// Opening the enumeration directory creates one temporary FD, which is
+/// explicitly ignored. Failure to open or an over-cap live set fails closed.
+fn verifyFallbackScrub(keep: []const i32) bool {
+    const path = switch (builtin.os.tag) {
+        .macos => "/dev/fd",
+        .linux => "/proc/self/fd",
+        else => return false,
+    };
+    // Missing procfs/devfs or a blocked open is not evidence of a complete
+    // scrub: handshake callers fail closed rather than attest an unknown set.
+    const dir = std.c.opendir(path) orelse return false;
+    defer _ = std.c.closedir(dir);
+    const enumeration_fd = dirfd(dir);
+    if (enumeration_fd < 0) return false;
+
+    var live: [dev_fd_collect_cap]i32 = undefined;
+    var count: usize = 0;
+    while (true) {
+        const entry = std.c.readdir(dir) orelse break;
+        const name = std.mem.sliceTo(entry.name[0..], 0);
+        if (name.len == 0 or name[0] == '.') continue;
+        const fd = std.fmt.parseInt(i32, name, 10) catch continue;
+        if (count >= live.len) return false;
+        live[count] = fd;
+        count += 1;
+    }
+    return noUnexpectedLiveFds(live[0..count], enumeration_fd, keep);
+}
+
+/// Close inherited FDs and verify fallback paths before a success handshake.
+pub fn closeInheritedFdsAndVerify(keep: []const i32) bool {
+    if (scrubInheritedFds(keep)) return true;
+    return verifyFallbackScrub(keep);
+}
+
+/// Best-effort close for non-handshake child paths.
+pub fn closeInheritedFds(keep: []const i32) void {
+    _ = scrubInheritedFds(keep);
 }
 
 /// Like `closeInheritedFds` but uses `default_keep_fds` (0, 1, 2).
@@ -418,6 +468,12 @@ test "shouldCloseFd with custom keep" {
     try std.testing.expect(!shouldCloseFd(7, &keep));
     try std.testing.expect(shouldCloseFd(8, &keep));
     try std.testing.expect(shouldCloseFd(3, &keep));
+}
+
+test "fallback verification rejects injected non-kept survivor" {
+    const keep = [_]i32{ 0, 1, 2, 9 };
+    try std.testing.expect(noUnexpectedLiveFds(&.{ 0, 1, 2, 9, 17 }, 17, &keep));
+    try std.testing.expect(!noUnexpectedLiveFds(&.{ 0, 1, 2, 9, 17, 42 }, 17, &keep));
 }
 
 test "listFdsToClose returns non-kept fds in range" {

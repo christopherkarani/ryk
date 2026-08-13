@@ -40,17 +40,55 @@ $targets = @(
 )
 
 function Copy-ReleasePayload($Root) {
-    New-Item -ItemType Directory -Force -Path $Root | Out-Null
-    Copy-Item README.md, LICENSE, SECURITY.md, CONTRIBUTING.md -Destination $Root
-    foreach ($path in @("docs", "policies", "schemas", "fixtures", "examples", "packages", "packaging", "scripts", "integrations", "ryk-pi")) {
-        Copy-Item $path -Destination $Root -Recurse
+    $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+    $payloadRoots = @(
+        "README.md", "LICENSE", "SECURITY.md", "CONTRIBUTING.md",
+        "docs", "policies", "schemas", "fixtures", "examples",
+        "packages", "packaging", "scripts", "integrations", "ryk-pi"
+    )
+    if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+        throw "Release payload staging requires git to copy only tracked files."
     }
-    Get-ChildItem -LiteralPath $Root -Recurse -Force -Directory |
+    $tracked = @(& git -C $repoRoot ls-files -- @payloadRoots)
+    if ($LASTEXITCODE -ne 0) {
+        throw "Release payload staging failed: git ls-files exited $LASTEXITCODE."
+    }
+    if (-not $tracked) {
+        throw "Release payload staging listed no tracked files."
+    }
+
+    New-Item -ItemType Directory -Force -Path $Root | Out-Null
+    foreach ($rel in $tracked) {
+        if ([string]::IsNullOrWhiteSpace($rel)) { continue }
+        $src = Join-Path $repoRoot $rel
+        if (-not (Test-Path -LiteralPath $src -PathType Leaf)) {
+            continue
+        }
+        $dest = Join-Path $Root $rel
+        $destDir = Split-Path -Parent $dest
+        if (-not (Test-Path -LiteralPath $destDir)) {
+            New-Item -ItemType Directory -Force -Path $destDir | Out-Null
+        }
+        Copy-Item -LiteralPath $src -Destination $dest
+    }
+    Get-ChildItem -LiteralPath $Root -Recurse -Force -Directory -ErrorAction SilentlyContinue |
         Where-Object { $_.Name -in @("__pycache__", ".pytest_cache") } |
         Remove-Item -Recurse -Force
-    Get-ChildItem -LiteralPath $Root -Recurse -Force -File |
+    Get-ChildItem -LiteralPath $Root -Recurse -Force -File -ErrorAction SilentlyContinue |
         Where-Object { $_.Extension -in @(".pyc", ".pyo") } |
         Remove-Item -Force
+
+    $scanner = Join-Path $PSScriptRoot "check-release-payload-secrets.sh"
+    if (-not (Get-Command bash -ErrorAction SilentlyContinue)) {
+        throw "Release payload secret scanner requires bash; refusing to continue without a scan."
+    }
+    if (-not (Test-Path -LiteralPath $scanner)) {
+        throw "Release payload secret scanner is missing: $scanner"
+    }
+    & bash $scanner $Root
+    if ($LASTEXITCODE -ne 0) {
+        throw "Release payload secret scan failed."
+    }
 }
 
 function Assert-ReleaseTelemetry($Path) {

@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const env_util = @import("../env_util.zig");
 const core = @import("ryk_core").core;
+const redact_bridge = @import("ryk_core").audit.redact_bridge;
 const supervisor = core.supervisor;
 const mcp_mod = @import("../mcp/mod.zig");
 const policy_mod = @import("ryk_core").policy;
@@ -201,6 +202,7 @@ pub fn command(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: an
         const policy_path = try std.fs.path.join(allocator, &.{ context.workspace_root, ".ryk", "policy.yaml" });
         defer allocator.free(policy_path);
         try readiness.writeJsonEnvelope(stdout, .{
+            .allocator = allocator,
             .assessment = core_ready,
             .check = options.check,
             .daemon_status = readiness.daemonWireLabel(context.daemon_health),
@@ -250,6 +252,8 @@ fn runDoctorTui(
     backend_report: sandbox.backend.ReportSet,
     context: IntegrationContext,
 ) !u8 {
+    const redacted_daemon_detail = try redact_bridge.redactAlloc(allocator, context.daemon_detail);
+    defer allocator.free(redacted_daemon_detail);
     const counts = countCapabilitySummary(os, backend_report);
     const policy_status = if (!context.policy_present)
         "no policy"
@@ -316,7 +320,7 @@ fn runDoctorTui(
 
     const next: doctor_tui.NextStepFacts = .{
         .daemon_health_compatible = context.daemon_health == .compatible,
-        .daemon_detail = context.daemon_detail,
+        .daemon_detail = redacted_daemon_detail,
         .daemon_binary_untrusted = context.daemon_binary_untrusted,
         .daemon_binary_exists = context.daemon_binary_exists,
         .daemon_binary_executable = context.daemon_binary_executable,
@@ -437,6 +441,24 @@ fn doctorDisplayNote(feature: sandbox.backend.Feature, level: sandbox.backend.Le
     return note;
 }
 
+/// Optional probe detail appended to a feature line (e.g. the probed Landlock
+/// ABI). Single source for the report and panel renderers so the ABI-floor
+/// warning cannot drift between views. Returns null when the feature carries
+/// no probe detail.
+fn featureProbeDetail(
+    backend_report: sandbox.backend.ReportSet,
+    feature: sandbox.backend.Feature,
+    buf: []u8,
+) ?[]const u8 {
+    if (feature != .landlock) return null;
+    const abi = backend_report.landlock_abi orelse return null;
+    const suffix = if (abi < sandbox.landlock.MIN_ABI)
+        "; ABI 3+ required for truncation mediation"
+    else
+        "";
+    return std.fmt.bufPrint(buf, "ABI {d}{s}", .{ abi, suffix }) catch null;
+}
+
 fn countCapabilitySummary(os: core.platform.Os, backend_report: sandbox.backend.ReportSet) struct { active: usize, limited: usize, unavailable: usize } {
     var active_count: usize = 0;
     var limited_count: usize = 0;
@@ -485,7 +507,91 @@ fn daemonDetailFromError(allocator: std.mem.Allocator, err: anyerror) !DaemonHea
     };
 }
 
+fn redactDisplayAlloc(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
+    return redact_bridge.redactAlloc(allocator, value);
+}
+
+fn freeHostDoctorRow(allocator: std.mem.Allocator, row: HostDoctorRow) void {
+    allocator.free(row.host);
+    allocator.free(row.wired);
+    allocator.free(row.shell_gate);
+    allocator.free(row.fail_stance);
+    allocator.free(row.smoke_allow);
+    allocator.free(row.smoke_deny);
+    allocator.free(row.fix);
+}
+
+fn redactHostRow(allocator: std.mem.Allocator, row: HostDoctorRow) !HostDoctorRow {
+    const host = try redactDisplayAlloc(allocator, row.host);
+    errdefer allocator.free(host);
+    const wired = try redactDisplayAlloc(allocator, row.wired);
+    errdefer allocator.free(wired);
+    const shell_gate = try redactDisplayAlloc(allocator, row.shell_gate);
+    errdefer allocator.free(shell_gate);
+    const fail_stance = try redactDisplayAlloc(allocator, row.fail_stance);
+    errdefer allocator.free(fail_stance);
+    const smoke_allow = try redactDisplayAlloc(allocator, row.smoke_allow);
+    errdefer allocator.free(smoke_allow);
+    const smoke_deny = try redactDisplayAlloc(allocator, row.smoke_deny);
+    errdefer allocator.free(smoke_deny);
+    const fix = try redactDisplayAlloc(allocator, row.fix);
+    errdefer allocator.free(fix);
+    return .{
+        .host = host,
+        .wired = wired,
+        .shell_gate = shell_gate,
+        .fail_stance = fail_stance,
+        .smoke_allow = smoke_allow,
+        .smoke_deny = smoke_deny,
+        .fix = fix,
+    };
+}
+
+fn redactHostRows(allocator: std.mem.Allocator, rows: []const HostDoctorRow) ![]HostDoctorRow {
+    const out = try allocator.alloc(HostDoctorRow, rows.len);
+    var done: usize = 0;
+    errdefer {
+        for (out[0..done]) |row| freeHostDoctorRow(allocator, row);
+        allocator.free(out);
+    }
+    for (rows) |row| {
+        out[done] = try redactHostRow(allocator, row);
+        done += 1;
+    }
+    return out;
+}
+
 fn writeReport(io: std.Io, stdout: anytype, os: core.platform.Os, backend_report: sandbox.backend.ReportSet, context: IntegrationContext, verbose: bool) !void {
+    // Redact dynamic fields only. Whole-document redactAlloc collapses the
+    // report to [REDACTED] on encoded secrets or input >64KiB.
+    const allocator = context.allocator;
+    const daemon_detail = try redactDisplayAlloc(allocator, context.daemon_detail);
+    defer allocator.free(daemon_detail);
+    const daemon_binary_path = if (context.daemon_binary_path) |path| try redactDisplayAlloc(allocator, path) else null;
+    defer if (daemon_binary_path) |path| allocator.free(path);
+    const daemon_socket_path = if (context.daemon_socket_path) |path| try redactDisplayAlloc(allocator, path) else null;
+    defer if (daemon_socket_path) |path| allocator.free(path);
+    const daemon_pid_path = if (context.daemon_pid_path) |path| try redactDisplayAlloc(allocator, path) else null;
+    defer if (daemon_pid_path) |path| allocator.free(path);
+    const policy_error = if (context.policy_error) |err_name| try redactDisplayAlloc(allocator, err_name) else null;
+    defer if (policy_error) |err_name| allocator.free(err_name);
+    const host_rows = try redactHostRows(allocator, context.host_rows);
+    defer {
+        for (host_rows) |row| freeHostDoctorRow(allocator, row);
+        allocator.free(host_rows);
+    }
+
+    var safe = context;
+    safe.daemon_detail = daemon_detail;
+    safe.daemon_binary_path = daemon_binary_path;
+    safe.daemon_socket_path = daemon_socket_path;
+    safe.daemon_pid_path = daemon_pid_path;
+    safe.policy_error = policy_error;
+    safe.host_rows = host_rows;
+    try writeReportRaw(io, stdout, os, backend_report, safe, verbose);
+}
+
+fn writeReportRaw(io: std.Io, stdout: anytype, os: core.platform.Os, backend_report: sandbox.backend.ReportSet, context: IntegrationContext, verbose: bool) !void {
     try stdout.writeAll("ryk Doctor\n\n");
 
     const counts = countCapabilitySummary(os, backend_report);
@@ -593,6 +699,10 @@ fn writeReport(io: std.Io, stdout: anytype, os: core.platform.Os, backend_report
             try writeBackendLine(io, stdout, backend_report, .mount_namespaces);
             try writeBackendLine(io, stdout, backend_report, .seccomp);
             try writeBackendLine(io, stdout, backend_report, .landlock);
+            var abi_detail_buf: [96]u8 = undefined;
+            if (featureProbeDetail(backend_report, .landlock, &abi_detail_buf)) |detail| {
+                try stdout.print("  Landlock probed {s}\n", .{detail});
+            }
             try writeBackendLine(io, stdout, backend_report, .cgroups);
         }
         try writeBackendLine(io, stdout, backend_report, .network_enforce);
@@ -625,16 +735,25 @@ fn writeDefaultPanels(
     try stdout.writeByte('\n');
 
     var capability_storage: [doctor_capabilities.len][160]u8 = undefined;
+    var detail_storage: [doctor_capabilities.len][96]u8 = undefined;
     var capability_lines: [doctor_capabilities.len][]const u8 = undefined;
     for (doctor_capabilities, 0..) |item, index| {
         if (item.feature) |feature| {
             const report = backend_report.get(feature);
             const display_level = doctorDisplayLevel(feature, report.level);
-            capability_lines[index] = try std.fmt.bufPrint(&capability_storage[index], "{s}  {s}: {s}", .{
-                levelColorAndGlyph(display_level).glyph,
-                item.label,
-                display_level.toString(),
-            });
+            capability_lines[index] = if (featureProbeDetail(backend_report, feature, &detail_storage[index])) |detail|
+                try std.fmt.bufPrint(&capability_storage[index], "{s}  {s}: {s} ({s})", .{
+                    levelColorAndGlyph(display_level).glyph,
+                    item.label,
+                    display_level.toString(),
+                    detail,
+                })
+            else
+                try std.fmt.bufPrint(&capability_storage[index], "{s}  {s}: {s}", .{
+                    levelColorAndGlyph(display_level).glyph,
+                    item.label,
+                    display_level.toString(),
+                });
         } else if (item.capability) |capability| {
             const report = core.platform.reportCapability(os, capability);
             capability_lines[index] = try std.fmt.bufPrint(&capability_storage[index], "{s}  {s}: {s}", .{
@@ -694,16 +813,32 @@ fn writeMcpSetupReport(io: std.Io, stdout: anytype, context: IntegrationContext)
     try stdout.writeByte('\n');
 }
 
+/// P1-1: true when the most recent session recorded an `audit_degraded` event
+/// (shim execs ran without in-shim audit evidence). Best-effort: any read
+/// failure reports as not degraded — doctor must not fail on missing evidence.
+fn lastSessionAuditDegraded(io: std.Io, allocator: std.mem.Allocator, workspace_root: []const u8) bool {
+    const last_path = std.fs.path.join(allocator, &.{ workspace_root, ".ryk", "last" }) catch return false;
+    defer allocator.free(last_path);
+    const id_text = std.Io.Dir.cwd().readFileAlloc(io, last_path, allocator, .limited(256)) catch return false;
+    defer allocator.free(id_text);
+    const session_id = std.mem.trim(u8, id_text, " \t\r\n");
+    if (session_id.len == 0) return false;
+    const events_path = std.fs.path.join(allocator, &.{ workspace_root, ".ryk", "sessions", session_id, "events.jsonl" }) catch return false;
+    defer allocator.free(events_path);
+    const events = std.Io.Dir.cwd().readFileAlloc(io, events_path, allocator, .limited(core.limits.max_audit_log_len)) catch return false;
+    defer allocator.free(events);
+    return std.mem.indexOf(u8, events, "\"type\":\"audit_degraded\"") != null;
+}
+
 fn writeIntegrationReport(io: std.Io, stdout: anytype, context: IntegrationContext) !void {
-    _ = io;
     try stdout.writeAll("Integration checks:\n");
-    try writeDynamicLine(stdout, "  workspace root: ", context.workspace_root, "\n");
+    try writeDynamicLine(context.allocator, stdout, "  workspace root: ", context.workspace_root, "\n");
     try stdout.print("  git repository: {s}\n", .{if (context.git_present) "detected" else "not detected"});
     if (context.policy_present) {
         if (context.policy_valid) {
             try stdout.writeAll("  .ryk/policy.yaml: present and valid\n");
         } else {
-            try writeDynamicLine(stdout, "  .ryk/policy.yaml: invalid (", context.policy_error orelse "validation failed", ")\n");
+            try writeDynamicLine(context.allocator, stdout, "  .ryk/policy.yaml: invalid (", context.policy_error orelse "validation failed", ")\n");
         }
     } else {
         try stdout.writeAll("  .ryk/policy.yaml: missing\n");
@@ -730,8 +865,11 @@ fn writeIntegrationReport(io: std.Io, stdout: anytype, context: IntegrationConte
         try stdout.writeByte(')');
     }
     try stdout.writeByte('\n');
-    try writeDynamicLine(stdout, "  shell: ", context.shell_name, "\n");
+    try writeDynamicLine(context.allocator, stdout, "  shell: ", context.shell_name, "\n");
     try stdout.print("  audit/replay: {s}\n", .{if (context.audit_sessions_present) "session artifacts present; replay available" else "replay available; no local sessions detected"});
+    if (context.audit_sessions_present and lastSessionAuditDegraded(io, context.allocator, context.workspace_root)) {
+        try stdout.writeAll("  last session audit: degraded — some allowed shim execs have no in-shim audit record (see `ryk replay`)\n");
+    }
     try stdout.print("  red-team fixtures: {s}\n", .{if (context.redteam_fixtures_present) "available" else "not found"});
     if (context.daemon_binary_path) |path| {
         try stdout.writeAll("  daemon binary: ");
@@ -763,9 +901,11 @@ fn writeIntegrationReport(io: std.Io, stdout: anytype, context: IntegrationConte
     try stdout.writeAll(")\n\n");
 }
 
-fn writeDynamicLine(stdout: anytype, prefix: []const u8, value: []const u8, suffix: []const u8) !void {
+fn writeDynamicLine(allocator: std.mem.Allocator, stdout: anytype, prefix: []const u8, value: []const u8, suffix: []const u8) !void {
+    const redacted = try redactDisplayAlloc(allocator, value);
+    defer allocator.free(redacted);
     try stdout.writeAll(prefix);
-    try tui.terminal_text.write(stdout, value, .single_line);
+    try tui.terminal_text.write(stdout, redacted, .single_line);
     try stdout.writeAll(suffix);
 }
 
@@ -907,7 +1047,7 @@ fn hermesFailOpenFromEnv() bool {
 fn writeRecommendations(stdout: anytype, context: IntegrationContext) !void {
     try stdout.writeAll("\nRecommended next step:\n");
     if (context.daemon_health != .compatible) {
-        try writeDynamicLine(stdout, "  Daemon health issue: ", context.daemon_detail, "\n");
+        try writeDynamicLine(context.allocator, stdout, "  Daemon health issue: ", context.daemon_detail, "\n");
         if (context.daemon_binary_untrusted) {
             try stdout.writeAll("  Remove the untrusted legacy companion override, then re-run `ryk doctor`.\n");
         } else if (context.daemon_binary_exists and !context.daemon_binary_executable) {
@@ -1527,6 +1667,41 @@ test "doctor sanitizes hostile dynamic diagnostic text" {
     try std.testing.expect(std.mem.indexOfScalar(u8, written, 0x1b) == null);
     try std.testing.expect(std.mem.indexOf(u8, written, "pwn") == null);
     try std.testing.expect(std.mem.indexOf(u8, written, "\nforged") == null);
+}
+
+test "doctor verbose output redacts secret-bearing dynamic paths and details" {
+    const synthetic_secret = "ghp_syntheticDoctorHumanSecret123456";
+    var stdout_buf: [32768]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var context = try testContext(std.testing.allocator, .{ .daemon_detail = "password=ghp_syntheticDoctorHumanSecret123456" });
+    defer context.deinit();
+    context.allocator.free(context.workspace_root);
+    context.workspace_root = try context.allocator.dupe(u8, "/tmp/ghp_syntheticDoctorHumanSecret123456/workspace");
+    context.allocator.free(context.daemon_binary_path.?);
+    context.daemon_binary_path = try context.allocator.dupe(u8, "/tmp/ghp_syntheticDoctorHumanSecret123456/ryk-daemon");
+
+    try writeReport(std.testing.io, &stdout_writer, .linux, sandbox.backend.detect(.linux), context, true);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), synthetic_secret) == null);
+}
+
+test "doctor writeReport keeps capabilities when workspace path has encoded secret" {
+    // Encoded `token=…` must redact the path field only. Whole-document
+    // redactAlloc collapses the report to [REDACTED] and wipes grades.
+    const encoded_secret = "token%3Dcorrect-horse-battery-staple";
+    var stdout_buf: [32768]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var context = try testContext(std.testing.allocator, .{});
+    defer context.deinit();
+    context.allocator.free(context.workspace_root);
+    context.workspace_root = try context.allocator.dupe(u8, "/tmp/" ++ encoded_secret ++ "/workspace");
+
+    try writeReport(std.testing.io, &stdout_writer, .linux, sandbox.backend.detect(.linux), context, true);
+    const written = stdout_writer.buffered();
+    try std.testing.expect(!std.mem.eql(u8, written, "[REDACTED]"));
+    try std.testing.expect(std.mem.indexOf(u8, written, "Capabilities") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "strong sandbox") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "correct-horse-battery-staple") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, encoded_secret) == null);
 }
 
 test "doctor summary includes daemon availability" {
@@ -2709,4 +2884,33 @@ fn testHostRows(allocator: std.mem.Allocator) ![]HostDoctorRow {
         });
     }
     return try list.toOwnedSlice(allocator);
+}
+
+test "lastSessionAuditDegraded detects audit_degraded in the pointed-at session" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+
+    // No session artifacts at all -> not degraded (and no error).
+    try std.testing.expect(!lastSessionAuditDegraded(io, allocator, root));
+
+    try tmp.dir.createDirPath(io, ".ryk/sessions/sess-degraded");
+    try tmp.dir.writeFile(io, .{ .sub_path = ".ryk/last", .data = "sess-degraded\n" });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = ".ryk/sessions/sess-degraded/events.jsonl",
+        .data = "{\"type\":\"session_start\"}\n{\"type\":\"audit_degraded\",\"decision\":{\"result\":\"observe\",\"reason\":\"shim audit open denied\"}}\n",
+    });
+    try std.testing.expect(lastSessionAuditDegraded(io, allocator, root));
+
+    // A clean session rewrites the pointer -> not degraded.
+    try tmp.dir.createDirPath(io, ".ryk/sessions/sess-clean");
+    try tmp.dir.writeFile(io, .{ .sub_path = ".ryk/last", .data = "sess-clean\n" });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = ".ryk/sessions/sess-clean/events.jsonl",
+        .data = "{\"type\":\"session_start\"}\n{\"type\":\"command_allowed\"}\n",
+    });
+    try std.testing.expect(!lastSessionAuditDegraded(io, allocator, root));
 }

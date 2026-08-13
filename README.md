@@ -172,6 +172,8 @@ ryk dashboard --once
 
 ryk is graded mediation, not a universal OS sandbox. Absolute-path binaries, non-shimmed tools, non-proxy traffic, and host hooks that do not fire can sit outside a particular enforcement surface. `ryk doctor` reports platform capability; it does not prove that a child session attached to an OS sandbox. Read the [compatibility matrix](docs/compatibility.md) and [threat model](docs/threat-model.md) before making a stronger claim.
 
+Release builds include opt-in product telemetry: nothing is collected or sent unless you run `ryk telemetry enable`. See [docs/telemetry.md](docs/telemetry.md) for the exact payload contract.
+
 ## Documentation
 
 Start with the [documentation index](docs/README.md). The most useful guides are:

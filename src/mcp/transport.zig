@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 const core = @import("ryk_core").core;
 const jsonrpc = @import("jsonrpc.zig");
@@ -58,7 +59,10 @@ pub const ProcessServer = struct {
             .environ_map = env_map,
             .stdin = .pipe,
             .stdout = .pipe,
-            .stderr = .inherit,
+            // Child diagnostics are attacker-controlled and may contain credentials.
+            // MCP protocol traffic uses stdout, so discarding stderr cannot corrupt
+            // JSON-RPC and cannot backpressure or deadlock on an unread pipe.
+            .stderr = .ignore,
         });
         errdefer child.kill(io);
 
@@ -127,4 +131,28 @@ test "process transport cleans up child after post-spawn allocation failures" {
     const source = try std.Io.Dir.cwd().readFileAlloc(io, "src/mcp/transport.zig", std.testing.allocator, .limited(64 * 1024));
     defer std.testing.allocator.free(source);
     try std.testing.expect(std.mem.count(u8, source, "errdefer child.kill(io);") >= 1);
+}
+
+test "process transport never inherits child stderr" {
+    const source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/mcp/transport.zig", std.testing.allocator, .limited(64 * 1024));
+    defer std.testing.allocator.free(source);
+    try std.testing.expect(std.mem.indexOf(u8, source, ".stderr = .ignore") != null);
+}
+
+test "ignored child stderr cannot block json-rpc response" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var server = try ProcessServer.spawn(io, std.testing.allocator, &.{
+        "/bin/sh",
+        "-c",
+        "i=0; while [ $i -lt 10000 ]; do printf synthetic-stderr-canary >&2; i=$((i+1)); done; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}'; sleep 1",
+    });
+    defer server.deinit(io);
+
+    const response = try ProcessServer.request(&server, std.testing.allocator, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}");
+    defer std.testing.allocator.free(response);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"result\":{}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "synthetic-stderr-canary") == null);
 }

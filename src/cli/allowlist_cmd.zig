@@ -333,30 +333,25 @@ pub fn isValidExpiresIsoZ(value: []const u8) bool {
     return true;
 }
 
-/// Operator break-glass for permanent exception mutations (M-2 partial).
-fn isOperatorBreakGlass() bool {
-    return envFlagTruthy("RYK_OPERATOR");
-}
+/// Test seam: when non-null, overrides the real TTY probe for the mutate gate.
+/// Production leaves this null; tests set it to simulate operator presence.
+pub var test_operator_tty_override: ?bool = null;
 
-fn envFlagTruthy(name: [*:0]const u8) bool {
-    const raw = std.c.getenv(name) orelse return false;
-    const value = std.mem.span(raw);
-    return std.mem.eql(u8, value, "1") or
-        std.mem.eql(u8, value, "true") or
-        std.mem.eql(u8, value, "yes") or
-        std.mem.eql(u8, value, "TRUE") or
-        std.mem.eql(u8, value, "YES");
-}
-
-/// Refuse agent-reachable allowlist mutations unless operator env or interactive TTY.
+/// Refuse agent-reachable allowlist mutations unless on an interactive TTY.
+/// Permanent FULL ALLOW / rule exceptions are operator-only (M-2). The only
+/// trustworthy operator signal is an interactive controlling terminal — env vars
+/// are child-controlled (RYK_OPERATOR was removed: it authenticated nobody).
+/// Non-TTY → fail closed.
 fn requireAllowlistMutateGate(io: std.Io, stderr: anytype) !bool {
-    if (isOperatorBreakGlass()) return true;
-    const is_tty = (std.Io.File.stdin().isTty(io) catch false) and
-        (std.Io.File.stdout().isTty(io) catch false);
+    const is_tty = if (test_operator_tty_override) |v|
+        v
+    else
+        (std.Io.File.stdin().isTty(io) catch false) and
+            (std.Io.File.stdout().isTty(io) catch false);
     if (is_tty) return true;
     try stderr.writeAll(
-        \\ryk allowlist: permanent exception mutations require RYK_OPERATOR=1 or an interactive TTY
-        \\(agent-reachable FULL ALLOW path). Re-run as an operator, or set RYK_OPERATOR=1.
+        \\ryk allowlist: permanent exception mutations require an interactive TTY
+        \\(agent-reachable FULL ALLOW path). Re-run as an operator in a terminal.
         \\
     );
     return false;
@@ -1015,12 +1010,12 @@ const SAllowlistCliEnv = struct {
     config_root: []u8,
     prev_config: ?[:0]u8,
     prev_home: ?[:0]u8,
-    prev_operator: ?[:0]u8,
 
     fn deinit(self: *@This()) void {
         sAllowlistCliRestoreEnv("XDG_CONFIG_HOME", self.prev_config);
         sAllowlistCliRestoreEnv("HOME", self.prev_home);
-        sAllowlistCliRestoreEnv("RYK_OPERATOR", self.prev_operator);
+        // Always clear the TTY test seam so tests cannot leak operator presence.
+        test_operator_tty_override = null;
         std.testing.allocator.free(self.config_root);
         self.config_tmp.cleanup();
     }
@@ -1039,23 +1034,21 @@ fn sAllowlistCliIsolateXdg() !SAllowlistCliEnv {
     errdefer if (prev_config) |p| std.testing.allocator.free(p);
     const prev_home = try sAllowlistCliDupEnvZ("HOME");
     errdefer if (prev_home) |p| std.testing.allocator.free(p);
-    const prev_operator = try sAllowlistCliDupEnvZ("RYK_OPERATOR");
-    errdefer if (prev_operator) |p| std.testing.allocator.free(p);
 
     const config_z0 = try std.testing.allocator.dupeZ(u8, config_root);
     defer std.testing.allocator.free(config_z0);
     try std.testing.expectEqual(@as(c_int, 0), setenv("XDG_CONFIG_HOME", config_z0.ptr, 1));
     // Pin HOME away from the real home so user-path fallback never touches the host.
     try std.testing.expectEqual(@as(c_int, 0), setenv("HOME", config_z0.ptr, 1));
-    // Operator break-glass so non-TTY unit tests can exercise permanent mutations.
-    try std.testing.expectEqual(@as(c_int, 0), setenv("RYK_OPERATOR", "1", 1));
+    // Mutations are TTY-only; simulate operator presence via the test seam
+    // (the RYK_OPERATOR env break-glass was removed).
+    test_operator_tty_override = true;
 
     return .{
         .config_tmp = config_tmp,
         .config_root = config_root,
         .prev_config = prev_config,
         .prev_home = prev_home,
-        .prev_operator = prev_operator,
     };
 }
 

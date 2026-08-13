@@ -20,6 +20,8 @@ const empty_bootstrap_environment = [_:null]?[*:0]const u8{};
 
 pub const ProfileInputs = struct {
     include_tmp: bool = false,
+    ro_paths: []const []const u8 = &.{},
+    host_rw_paths: []const []const u8 = &.{},
     network_proxy_port: ?u16 = null,
     require_network_route_forcing: bool = false,
 };
@@ -132,6 +134,8 @@ fn spawnWithOperations(request: LaunchRequest, operations: Operations) !SpawnedW
             .include_tmp = request.profile.include_tmp,
             .control_roots = request.compiled.control_roots,
             .exec_paths = exec_paths,
+            .ro_paths = request.profile.ro_paths,
+            .host_rw_paths = request.profile.host_rw_paths,
             .network_proxy_port = request.profile.network_proxy_port,
             .require_network_route_forcing = request.profile.require_network_route_forcing,
             .protect_workspace_secrets = request.compiled.protect_workspace_secrets,
@@ -737,16 +741,20 @@ test {
     std.testing.refAllDecls(@This());
 }
 
-test "bootstrap profile rebuild matches parent hash with launch exec grants" {
-    // M11 / B1: parent compile with non-empty exec_paths + protect-on must equal
+test "bootstrap profile rebuild matches all parent launch grant inputs" {
+    // Parent compile with non-empty exec/RO/host-RW paths + protect-on must equal
     // bootstrap-style recompile that receives those same paths over the wire.
     const allocator = std.testing.allocator;
     const exec_paths = [_][]const u8{ "/home/user/.local/bin/agent", "/home/user/.local/bin/agent-real" };
+    const ro_paths = [_][]const u8{"/home/user/.local/share/agent"};
+    const host_rw_paths = [_][]const u8{"/home/user/.config/agent"};
     var parent = try profile_mod.compileProfile(allocator, .{
         .workspace_root = "/work/project",
         .control_roots = &[_][]const u8{"/work/project/.ryk"},
         .include_tmp = false,
         .exec_paths = &exec_paths,
+        .ro_paths = &ro_paths,
+        .host_rw_paths = &host_rw_paths,
         .protect_workspace_secrets = true,
         .system_ro_prefixes = &[_][]const u8{"/usr"},
     });
@@ -757,6 +765,8 @@ test "bootstrap profile rebuild matches parent hash with launch exec grants" {
         .control_roots = &[_][]const u8{"/work/project/.ryk"},
         .include_tmp = false,
         .exec_paths = &exec_paths,
+        .ro_paths = &ro_paths,
+        .host_rw_paths = &host_rw_paths,
         .protect_workspace_secrets = true,
         .system_ro_prefixes = &[_][]const u8{"/usr"},
     });
@@ -766,17 +776,19 @@ test "bootstrap profile rebuild matches parent hash with launch exec grants" {
     try std.testing.expectEqualSlices(u8, parent.hash(), rebuilt.hash());
     try std.testing.expect(parent.hasGrant("/home/user/.local/bin/agent", .exec));
     try std.testing.expect(rebuilt.hasGrant("/home/user/.local/bin/agent", .exec));
+    try std.testing.expect(parent.hasGrant("/home/user/.local/share/agent", .ro));
+    try std.testing.expect(rebuilt.hasGrant("/home/user/.config/agent", .rw));
 
-    // Omitting exec_paths must change the digest (detects the B1 regression).
-    var without_exec = try profile_mod.compileProfile(allocator, .{
+    // Omitting any launch grant class must change the digest.
+    var without_launch_grants = try profile_mod.compileProfile(allocator, .{
         .workspace_root = "/work/project",
         .control_roots = &[_][]const u8{"/work/project/.ryk"},
         .include_tmp = false,
         .protect_workspace_secrets = true,
         .system_ro_prefixes = &[_][]const u8{"/usr"},
     });
-    defer without_exec.deinit();
-    try std.testing.expect(!std.mem.eql(u8, parent.hash(), without_exec.hash()));
+    defer without_launch_grants.deinit();
+    try std.testing.expect(!std.mem.eql(u8, parent.hash(), without_launch_grants.hash()));
 }
 
 test "execPathsFromCompiled collects only .exec grants" {

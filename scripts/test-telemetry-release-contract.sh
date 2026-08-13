@@ -66,6 +66,19 @@ assert_queue_payloads() {
   done < "$queue"
 }
 
+# P1-5 opt-in default: fresh state is disabled and nothing is queued or sent
+# until an explicit `ryk telemetry enable`.
+fresh_status="$(ryk telemetry status --json)"
+printf '%s\n' "$fresh_status" | grep -q '"enabled":false' || fail "fresh release did not default to telemetry disabled"
+ryk doctor --help >/dev/null 2>/dev/null || true
+if [[ -e "$CONFIG/ryk/telemetry.queue.jsonl" ]]; then
+  fail "command queued telemetry before explicit opt-in"
+fi
+
+ryk telemetry enable >/dev/null || fail "telemetry enable failed"
+enabled_status="$(ryk telemetry status --json)"
+printf '%s\n' "$enabled_status" | grep -q '"enabled":true' || fail "explicit opt-in did not enable telemetry"
+
 ryk doctor --help >/dev/null 2>/dev/null || true
 wait_for_queue || fail "human command did not create a queued telemetry event"
 wait_for_event "ryk_feature_summary" || fail "feature summary was not queued"

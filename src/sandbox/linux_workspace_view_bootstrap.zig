@@ -134,6 +134,8 @@ fn runLinux(allocator: std.mem.Allocator, fds: BootstrapFds) !void {
         .control_roots = request.profile.control_roots,
         .include_tmp = request.profile.include_tmp,
         .exec_paths = request.profile.exec_paths,
+        .ro_paths = request.profile.ro_paths,
+        .host_rw_paths = request.profile.host_rw_paths,
         .protect_workspace_secrets = request.profile.protect_workspace_secrets,
     }) catch return response.fail(.profile_rebuild_failed);
     defer compiled.deinit();
@@ -258,12 +260,12 @@ fn runLinux(allocator: std.mem.Allocator, fds: BootstrapFds) !void {
     closeLinux(cwd_fd);
     cwd_fd = -1;
     const keep_fds = [_]i32{ 0, 1, 2, response.fd };
-    fd_scrub.closeInheritedFds(&keep_fds);
+    if (!fd_scrub.closeInheritedFdsAndVerify(&keep_fds)) {
+        return response.fail(.fd_scrub_failed);
+    }
     if (!descriptorIsClosed(fds.request) or
         !descriptorIsClosed(fuse_fd) or
-        !descriptorIsClosed(backing_fd) or
-        !descriptorIsClosed(view_root_fd) or
-        !descriptorIsClosed(cwd_fd))
+        !descriptorIsClosed(backing_fd))
     {
         return response.fail(.fd_scrub_failed);
     }

@@ -27,27 +27,28 @@ The core engine detects and classifies sensitive values using pattern matching a
 
 ### Environment Variable Name Patterns
 
-The following env var name patterns are automatically flagged as secret-like:
+Names are matched as **underscore-anchored tokens** or **exact aliases**, not as
+substring globs (`*PASSWORD*` / `*KEY*`). `AWS_REGION`, `KEYBOARD_LAYOUT`, and
+`MONKEY_MODE` are not secret names.
 
 | Pattern | Examples |
 |---------|----------|
-| `*TOKEN*` | `GITHUB_TOKEN`, `API_TOKEN`, `NPM_TOKEN` |
-| `*SECRET*` | `AWS_SECRET`, `APP_SECRET` |
-| `*PASSWORD*` | `DB_PASSWORD`, `ADMIN_PASSWORD` |
-| `*PASSWD*` | `ROOT_PASSWD` |
-| `*PRIVATE*` | `PRIVATE_KEY` |
-| `*KEY*` | `API_KEY`, `ENCRYPTION_KEY` |
-| `AWS_*` | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` |
-| `AZURE_*` | `AZURE_CLIENT_SECRET` |
-| `GITHUB_TOKEN` | Exact match |
-| `GH_TOKEN` | Exact match |
-| `OPENAI_API_KEY` | Exact match |
-| `ANTHROPIC_API_KEY` | Exact match |
-| `GOOGLE_API_KEY` | Exact match |
-| `GOOGLE_APPLICATION_CREDENTIALS` | Exact match |
-| `NPM_TOKEN` | Exact match |
-| `PYPI_TOKEN` | Exact match |
-| `SSH_AUTH_SOCK` | Exact match |
+| `TOKEN`, `*_TOKEN`, `*_TOKEN_*` | `TOKEN`, `GITHUB_TOKEN`, `API_TOKEN`, `NPM_TOKEN` |
+| `SECRET`, `*_SECRET`, `*_SECRET_*` | `SECRET`, `AWS_SECRET`, `APP_SECRET`, `AZURE_CLIENT_SECRET` |
+| `PASSWORD`, `*_PASSWORD`, `*_PASSWORD_*` | `PASSWORD`, `DB_PASSWORD`, `ADMIN_PASSWORD` |
+| Exact `PGPASSWORD` | `PGPASSWORD` |
+| `PASSWD`, `*_PASSWD`, `*_PASSWD_*` | `PASSWD`, `ROOT_PASSWD` |
+| Exact `MYSQL_PWD` | `MYSQL_PWD` |
+| `SECRET_KEY`, `*_SECRET_KEY` | `SECRET_KEY`, `DJANGO_SECRET_KEY` |
+| `PRIVATE_KEY`, `*_PRIVATE_KEY` | `PRIVATE_KEY` |
+| `API_KEY`, `*_API_KEY` | `API_KEY`, `OPENAI_API_KEY` |
+| `*_ACCESS_KEY`, `*_ACCESS_KEY_*` | `AWS_ACCESS_KEY_ID` |
+| `*_SIGNING_KEY` | `CUSTOM_SIGNING_KEY` |
+| `*_ENCRYPTION_KEY` | `APP_ENCRYPTION_KEY` |
+| `*_CLIENT_KEY` | `APP_CLIENT_KEY` |
+| Exact `KEY` | `KEY` (not `KEYBOARD_LAYOUT`) |
+| `*_CREDENTIALS` | `GOOGLE_APPLICATION_CREDENTIALS` |
+| Exact `SSH_AUTH_SOCK` | `SSH_AUTH_SOCK` |
 
 ### Value Classification
 
@@ -67,14 +68,14 @@ ryk inspects values and classifies them into specific secret types:
 
 ### Redaction Format
 
-When a secret is detected, it is replaced with a redaction label that includes a SHA-256 fingerprint prefix:
+When a secret is detected, it is replaced with a classification label:
 
 ```
-[REDACTED:env:GITHUB_TOKEN:sha256:a1b2c3d4]
-[REDACTED:secret:github_token:sha256:e5f6g7h8]
+[REDACTED:env:GITHUB_TOKEN]
+[REDACTED:secret:github_token]
 ```
 
-The fingerprint is the first 8 hex characters of the SHA-256 hash of the raw value. This allows you to verify whether two redactions refer to the same secret without exposing the secret itself.
+Redaction output intentionally omits stable fingerprints. Even a truncated unsalted digest can act as an offline verifier for low-entropy passwords and can correlate the same credential across otherwise unrelated sessions.
 
 ### Embedded Secret Detection
 
@@ -131,6 +132,8 @@ In this mode:
 | FS scope honesty | When host-config grants are active, receipts say `narrow host-config RW, no bare home` (not bare `no home`) |
 | Redirected stdio residual | Seatbelt does **not** grant host `/var/folders` or classic `/tmp` content under production defaults. Redirecting agent stdout/stderr into those paths can trigger Bun `EPERM fstat` / `process.stderr.fd` crashes (exit **1** after attach). Prefer TTY, pipes, or capture files under the workspace (session tmp is `{workspace}/.ryk-tmp`). Ryk detects parent stdio paths under classic tmp and prints a **stdio/fstat** tip (not a re-login lead). |
 
+Inherited stdin/stdout/stderr (FDs 0/1/2) are user-directed, pre-opened capabilities. A redirect such as `ryk claude < ~/.aws/credentials` or `ryk claude > ~/out.log` gives the child access through that already-open descriptor even when the redirect target is outside the filesystem grant boundary; path mediation does not revoke existing FDs. Choose redirects with the same care as explicit file grants.
+
 **Empty-backpack help redirect matrix (macOS, production Seatbelt):**
 
 | Capture | Example | Expected exit | Notes |
@@ -166,7 +169,7 @@ When env vars are filtered, ryk creates redaction records for the audit trail:
 
 ```
 Name: GITHUB_TOKEN
-Label: [REDACTED:env:GITHUB_TOKEN:sha256:a1b2c3d4]
+Label: [REDACTED:env:GITHUB_TOKEN]
 Reason: environment variable name matches secret pattern
 ```
 
@@ -313,7 +316,7 @@ ryk scans **visible** network surfaces for secret-like values and flags potentia
 When secrets are detected in URLs, they are redacted before audit persistence:
 
 ```
-https://example.com/path?token=[REDACTED:secret:openai_api_key:sha256:a1b2c3d4]&ok=1
+https://example.com/path?token=[REDACTED:secret:openai_api_key]&ok=1
 ```
 
 ryk also handles percent-encoded secrets:

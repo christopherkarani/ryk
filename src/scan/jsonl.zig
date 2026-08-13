@@ -72,14 +72,17 @@ pub fn parseJsonlFile(
         if (line_no > 5000) break; // bound lines per file
         const line = std.mem.trim(u8, raw_line, " \t\r");
         if (line.len == 0) continue;
-        if (line.len > types.max_line_bytes) continue;
+        if (line.len > types.max_file_bytes) continue;
 
         // Timestamp opportunistic scan without full parse.
         if (result.timestamp_secs == fallback_ts) {
             if (findTimestampInLine(line)) |ts| result.timestamp_secs = ts;
         }
 
-        var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch continue;
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => continue,
+        };
         defer parsed.deinit();
         try extract.walkValueForCommands(allocator, parsed.value, &result.commands, 0);
         try extract.walkValueForTextBlobs(allocator, parsed.value, &result.text_blobs, 0);
@@ -125,4 +128,58 @@ test "malformed JSON lines are skipped" {
     defer parsed.deinit(std.testing.allocator);
     try std.testing.expect(parsed.commands.items.len >= 1);
     try std.testing.expectEqualStrings("rm -rf /tmp/x", parsed.commands.items[0]);
+}
+
+test "oversized JSONL strings still reach secret material scanning" {
+    const io = std.testing.io;
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try std.fmt.bufPrint(&root_buf, "zig-cache/tmp-scan-jsonl-large-{d}", .{std.Io.Timestamp.now(io, .real).toSeconds()});
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root, "sess.jsonl" });
+    defer std.testing.allocator.free(path);
+
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(std.testing.allocator);
+    try body.appendSlice(std.testing.allocator, "{\"message\":{\"content\":\"");
+    try body.appendNTimes(std.testing.allocator, 'a', types.max_line_bytes + 1024);
+    try body.appendSlice(std.testing.allocator, " ghp_fakeSyntheticBeyondFirstWindow1234567890\"}}\n");
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = body.items });
+
+    var parsed = try parseJsonlFile(io, std.testing.allocator, path, 0);
+    defer parsed.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), parsed.text_blobs.items.len);
+    try std.testing.expect(parsed.text_blobs.items[0].len > types.max_line_bytes);
+}
+
+test "JSONL parse OutOfMemory is not swallowed as a skipped line" {
+    const io = std.testing.io;
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try std.fmt.bufPrint(&root_buf, "zig-cache/tmp-scan-jsonl-oom-{d}", .{std.Io.Timestamp.now(io, .real).toSeconds()});
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root, "sess.jsonl" });
+    defer std.testing.allocator.free(path);
+
+    const body =
+        \\{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"rm -rf /tmp/x"}}]}}
+        \\
+    ;
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = body });
+
+    // First successful parse under a failing allocator must still extract the command.
+    // If parseFromSlice OOM is `catch continue`, the first "success" is an empty session.
+    var first_success_had_command = false;
+    var fail_index: usize = 0;
+    while (fail_index < 64) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        var parsed = parseJsonlFile(io, failing.allocator(), path, 0) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            continue;
+        };
+        defer parsed.deinit(failing.allocator());
+        first_success_had_command = parsed.commands.items.len >= 1;
+        break;
+    }
+    try std.testing.expect(first_success_had_command);
 }

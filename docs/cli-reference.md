@@ -145,7 +145,7 @@ The security-sensitive choices are explicit:
 - --inherit-env is accepted only when the selected policy allows environment inheritance.
 - --os-sandbox on fails closed when the platform backend cannot attach. --os-sandbox off disables the OS apply step and should be treated as a lower protection posture.
 - --network open is an unrestricted-egress escape. --network-backend proxy adds a local proxy path; it does not mean that every network protocol is transparently intercepted.
-- --require-backend turns a named capability into a launch requirement. Use it when a degraded session is not acceptable.
+- --require-backend turns a named capability into a launch requirement. `strong-sandbox` is satisfied when an OS-sandbox attach is planned for this session; `landlock` additionally requires a Landlock plan. These checks run before spawn, and a later attach failure still aborts the launch fail closed. Use the flag when a degraded session is not acceptable.
 
 Host aliases are exact, case-sensitive rewrites to ryk run -- <host> ...:
 
@@ -218,7 +218,9 @@ ryk allow-once <short-code>
 ryk allow-once clear
 ~~~
 
-The add, remove, enable, disable, and redeem paths are state-changing operations. Non-interactive callers may need the explicit operator setting required by the local command contract.
+Allow-once is an operator break-glass, not an agent self-service path. When a command is denied, the redeemable short code is shown only on the operator's controlling terminal; it is never written to the agent-visible block message and is never stored on disk (`pending_exceptions.jsonl` keeps only a keyed hash of the code, not the code itself). `ryk allow-once *` is not in the default allow list, so an agent cannot invoke it as an ordinary allowed command.
+
+The add, remove, enable, disable, and redeem paths are state-changing, operator-only operations. They require an interactive terminal (a controlling TTY) as the operator-presence signal and fail closed on a non-TTY (agent, script, or CI). There is no environment-variable break-glass: `RYK_OPERATOR` was removed because an environment variable is per-invocation and fully child-controlled, so an agent subprocess could set it on itself and authenticate nobody.
 
 ## Policy commands
 
