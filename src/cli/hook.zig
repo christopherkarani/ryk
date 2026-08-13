@@ -602,33 +602,24 @@ fn hookCommand(io: std.Io, host: Host, event: Event, original_event_name: []cons
 
     if (host == .hermes) recordHermesHookActivity(io, allocator, root, request_event, hook_payload, result);
 
-    if (usesExitTwoDenyOutput(host, result.decision)) {
+    switch (agentEmitShape(host, event, result.decision)) {
         // Codex: exit 2 + thin agent stderr (ignores stdout JSON on deny).
+        // Dynamic policy text is redacted before any agent-visible emit.
+        .exit_two_guard => try writeExitTwoGuardBlock(allocator, stderr, result.message, result.reason),
         // Grok: exit 2 + native stdout {"decision":"deny","reason":…} so the TUI/model
         // surface the pack/rule reason (empty stdout used to yield a generic exit-2 string).
-        // Dynamic policy text is redacted before any agent-visible emit.
-        if (host == .grok) {
-            try writeGrokDenyOutput(allocator, stdout, stderr, result);
-        } else {
-            try writeExitTwoGuardBlock(allocator, stderr, result.message, result.reason);
-        }
-    } else if (usesClaudeHostShapedPermission(host, event)) {
+        .grok_deny_json => try writeGrokDenyOutput(allocator, stdout, stderr, result),
         // Claude PreToolUse / PermissionRequest: native permissionDecision JSON (exit 0).
         // Operator Recourse/Next stay on stderr; reason is short (no Recourse walls).
-        try writeClaudePermissionDecision(allocator, stdout, event, result);
-        if (result.decision == .block) {
-            try writeHumanShellExplain(io, allocator, stderr, result);
-        } else if (result.rule) |rule| {
-            try stderr.print("[hook] matched rule: {s}\n", .{rule});
-        }
-    } else {
-        try writeHookResponse(stdout, result);
-        // Human-facing hosts: rich explain on stderr; agent protocol stays on stdout JSON.
-        if (result.decision == .block) {
-            try writeHumanShellExplain(io, allocator, stderr, result);
-        } else if (result.rule) |rule| {
-            try stderr.print("[hook] matched rule: {s}\n", .{rule});
-        }
+        .claude_permission => {
+            try writeClaudePermissionDecision(allocator, stdout, event, result);
+            try writeBlockExplainOrRule(io, allocator, stderr, result);
+        },
+        .generic_json => {
+            try writeHookResponse(stdout, result);
+            // Human-facing hosts: rich explain on stderr; agent protocol stays on stdout JSON.
+            try writeBlockExplainOrRule(io, allocator, stderr, result);
+        },
     }
 
     return hookExitCode(host, result.decision, ci_mode);
@@ -736,6 +727,16 @@ fn writeHumanShellExplain(io: std.Io, allocator: std.mem.Allocator, stderr: anyt
     try stderr.writeAll("  Next: ryk explain \"<command>\" for the full decision tree\n");
 }
 
+/// Operator stderr companion for JSON-emitting hosts: full explain on block,
+/// otherwise the matched rule line.
+fn writeBlockExplainOrRule(io: std.Io, allocator: std.mem.Allocator, stderr: anytype, result: HookResponse) !void {
+    if (result.decision == .block) {
+        try writeHumanShellExplain(io, allocator, stderr, result);
+    } else if (result.rule) |rule| {
+        try stderr.print("[hook] matched rule: {s}\n", .{rule});
+    }
+}
+
 fn isCodexDenyOutput(host: Host, decision: PluginDecision) bool {
     return host == .codex and decision == .block;
 }
@@ -749,6 +750,28 @@ fn usesExitTwoDenyOutput(host: Host, decision: PluginDecision) bool {
         return decision == .block or decision == .ask or decision == .err;
     }
     return false;
+}
+
+/// Which agent-visible wire shape a host+event+decision emits. Single source of
+/// truth for deny routing so the cross-host block-message parity test exercises
+/// the same selection the hook command does.
+const AgentEmitShape = enum {
+    /// Codex: exit 2 + guard sentinel on stderr (host ignores stdout on deny).
+    exit_two_guard,
+    /// Grok: native stdout deny JSON + sentinel, exit 2.
+    grok_deny_json,
+    /// Claude PreToolUse/PermissionRequest: native permissionDecision JSON.
+    claude_permission,
+    /// OpenCode / OpenClaw / Hermes / Claude other events: hook-response JSON.
+    generic_json,
+};
+
+fn agentEmitShape(host: Host, event: Event, decision: PluginDecision) AgentEmitShape {
+    if (usesExitTwoDenyOutput(host, decision)) {
+        return if (host == .grok) .grok_deny_json else .exit_two_guard;
+    }
+    if (usesClaudeHostShapedPermission(host, event)) return .claude_permission;
+    return .generic_json;
 }
 
 /// Host-aware hook process exit code after evaluation completes.
@@ -789,19 +812,18 @@ fn emitPreEvalFailClosed(
     var result = try makeFailClosedHookResponse(allocator, category, reason, message, &redactions, &limitations);
     defer result.deinit(allocator);
 
-    if (usesExitTwoDenyOutput(host, result.decision)) {
-        if (host == .grok) {
-            try writeGrokDenyOutput(allocator, stdout, stderr, result);
-        } else {
+    switch (agentEmitShape(host, event, result.decision)) {
+        .exit_two_guard => {
             try writeExitTwoGuardBlock(allocator, stderr, result.message, result.reason);
-        }
-        return codex_deny_exit_code;
+            return codex_deny_exit_code;
+        },
+        .grok_deny_json => {
+            try writeGrokDenyOutput(allocator, stdout, stderr, result);
+            return codex_deny_exit_code;
+        },
+        .claude_permission => try writeClaudePermissionDecision(allocator, stdout, event, result),
+        .generic_json => try writeHookResponse(stdout, result),
     }
-    if (usesClaudeHostShapedPermission(host, event)) {
-        try writeClaudePermissionDecision(allocator, stdout, event, result);
-        return hookExitCode(host, result.decision, false);
-    }
-    try writeHookResponse(stdout, result);
     return hookExitCode(host, result.decision, false);
 }
 
@@ -5578,6 +5600,144 @@ test "hook agent-facing message is short: no Recourse or Next when pending short
 
     // Claude JSON hosts: exit-success-with-JSON (do not invent exit-2 for Claude).
     try std.testing.expectEqual(exit_codes.success, hookExitCode(.claude, .block, false));
+}
+
+/// Raw (still JSON-escaped) value of a top-level `"key": "value"` string field.
+/// Deliberately does not unescape: the parity assertions below must be able to
+/// see an escaped `\n` as evidence of a multi-line agent message.
+fn testJsonStringFieldRaw(haystack: []const u8, key: []const u8) ?[]const u8 {
+    var needle_buf: [64]u8 = undefined;
+    const needle = std.fmt.bufPrint(&needle_buf, "\"{s}\":", .{key}) catch return null;
+    const key_at = std.mem.indexOf(u8, haystack, needle) orelse return null;
+    var i = key_at + needle.len;
+    while (i < haystack.len and (haystack[i] == ' ' or haystack[i] == '\n' or haystack[i] == '\t')) i += 1;
+    if (i >= haystack.len or haystack[i] != '"') return null;
+    i += 1;
+    const start = i;
+    while (i < haystack.len) {
+        if (haystack[i] == '\\') {
+            i += 2;
+            continue;
+        }
+        if (haystack[i] == '"') return haystack[start..i];
+        i += 1;
+    }
+    return null;
+}
+
+// P2-1c: short block message parity across every hook host.
+//
+// One real pack deny (`git reset --hard` through the real Zig evaluator) is
+// emitted through each host's production wire shape, and the agent-visible
+// field is held to the shared contract from
+// docs/handoffs/shared-short-agent-message-2026-08-11.md: one line, no operator
+// Recourse/Next walls, still names ryk, never a redeemable allow-once code.
+// Operator detail stays on stderr / structured fields.
+//
+// Codex and Grok are documented exceptions on *channel*, not on shape. They have
+// no separate operator surface the model can read (exit-2 hosts), so both fold a
+// fixed placeholder recourse into that one string by design — the Codex guard
+// sentinel and `grok_deny_reason`'s footer. The code is truth here: the handoff
+// says "no Recourse in message", which holds for every host that does have a
+// second channel. For the exit-2 pair the enforced rule is narrower and still
+// meaningful: recourse may appear only in placeholder form (`<code>`), never as a
+// redeemable code, and never as a multi-line wall.
+test "hook short block message parity across all hosts" {
+    var xdg = try sOnceCliHookIsolateXdg();
+    defer xdg.deinit();
+
+    var ws_tmp = std.testing.tmpDir(.{});
+    defer ws_tmp.cleanup();
+    try ws_tmp.dir.createDirPath(std.testing.io, ".git");
+    const ws_root = try ws_tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(ws_root);
+
+    const allocator = std.testing.allocator;
+
+    var sink: TestRedeemSink = .{};
+    test_operator_redeem_sink = &sink;
+    defer test_operator_redeem_sink = null;
+
+    var result = try sOnceCliHookRealZigDeny(allocator, "git reset --hard", ws_root, ws_root);
+    defer result.deinit(allocator);
+    try std.testing.expectEqual(PluginDecision.block, result.decision);
+
+    var covered: usize = 0;
+    inline for (@typeInfo(Host).@"enum".fields) |field| {
+        const host: Host = @enumFromInt(field.value);
+        covered += 1;
+
+        var stdout_buf: [8192]u8 = undefined;
+        var stderr_buf: [8192]u8 = undefined;
+        var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+        var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+
+        const shape = agentEmitShape(host, .PreToolUse, result.decision);
+        const agent_text: []const u8 = switch (shape) {
+            .exit_two_guard => blk: {
+                try writeExitTwoGuardBlock(allocator, &stderr_writer, result.message, result.reason);
+                const err_out = stderr_writer.buffered();
+                try std.testing.expect(containsGuardSentinel(err_out));
+                // Everything after the fixed sentinel line is the agent message.
+                const nl = std.mem.indexOfScalar(u8, err_out, '\n') orelse return error.TestMissingSentinelLine;
+                break :blk std.mem.trim(u8, err_out[nl + 1 ..], " \r\n");
+            },
+            .grok_deny_json => blk: {
+                try writeGrokDenyOutput(allocator, &stdout_writer, &stderr_writer, result);
+                const out = stdout_writer.buffered();
+                break :blk testJsonStringFieldRaw(out, "reason") orelse return error.TestMissingGrokReason;
+            },
+            .claude_permission => blk: {
+                try writeClaudePermissionDecision(allocator, &stdout_writer, .PreToolUse, result);
+                const out = stdout_writer.buffered();
+                break :blk testJsonStringFieldRaw(out, "permissionDecisionReason") orelse
+                    return error.TestMissingClaudeReason;
+            },
+            .generic_json => blk: {
+                try writeHookResponse(&stdout_writer, result);
+                const out = stdout_writer.buffered();
+                break :blk testJsonStringFieldRaw(out, "message") orelse return error.TestMissingMessage;
+            },
+        };
+
+        // Short: one line. Raw newline and escaped `\n` both count as a wall.
+        try std.testing.expect(std.mem.indexOfScalar(u8, agent_text, '\n') == null);
+        try std.testing.expect(std.mem.indexOf(u8, agent_text, "\\n") == null);
+        // Useful: non-empty and identifiably ryk.
+        try std.testing.expect(agent_text.len > 0);
+        try std.testing.expect(std.mem.indexOf(u8, agent_text, "ryk") != null or
+            std.mem.indexOf(u8, agent_text, "RYKAN") != null or
+            std.mem.indexOf(u8, agent_text, "blocked") != null);
+        // No multi-line operator wall on any host.
+        try std.testing.expect(std.mem.indexOf(u8, agent_text, "Next:") == null);
+        switch (shape) {
+            // Hosts with a separate operator channel keep recourse out entirely.
+            .claude_permission, .generic_json => {
+                try std.testing.expect(std.mem.indexOf(u8, agent_text, "Recourse") == null);
+            },
+            // Exit-2 hosts may carry recourse, but only as a placeholder.
+            .exit_two_guard, .grok_deny_json => {
+                if (std.mem.indexOf(u8, agent_text, "Recourse") != null) {
+                    try std.testing.expect(std.mem.indexOf(u8, agent_text, "<code>") != null);
+                }
+            },
+        }
+        // M-1: never a redeemable allow-once code on an agent surface.
+        try std.testing.expect(sOnceCliHookExtractShortCode(agent_text) == null);
+        try std.testing.expect(sOnceCliHookExtractShortCode(stdout_writer.buffered()) == null);
+        try std.testing.expect(sOnceCliHookExtractShortCode(stderr_writer.buffered()) == null);
+    }
+    // Every host in the enum was asserted (a new host cannot skip the contract).
+    try std.testing.expectEqual(@typeInfo(Host).@"enum".fields.len, covered);
+
+    // Structured next steps survive for the hosts that read them.
+    try std.testing.expect(result.remediation_commands.len >= 2);
+    // Operator channel still carries the full wall.
+    var human: std.Io.Writer.Allocating = .init(allocator);
+    defer human.deinit();
+    try writeHumanShellExplain(std.testing.io, allocator, &human.writer, result);
+    try std.testing.expect(std.mem.indexOf(u8, human.written(), "Recourse") != null);
+    try std.testing.expect(std.mem.indexOf(u8, human.written(), "Next:") != null);
 }
 
 test "hook agent-facing message uses first line only from multi-line explanation" {
