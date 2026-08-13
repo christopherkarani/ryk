@@ -1285,17 +1285,33 @@ test "generic agent preset allows common inspection and verification commands" {
     }
 }
 
-test "generic agent preset keeps installs remote writes and dangerous commands gated" {
+test "generic agent preset keeps dangerous commands gated while package and push flows run" {
     var selected = try policy.load.parseFromSlice(std.testing.allocator, policy.presets.agentPresetText(.generic_agent), "generic-agent.yaml");
     defer selected.deinit();
 
+    // Door A (P2-1): the coding DCG body declares `commands.default: allow` with
+    // no ask rule for installs or plain push, so package and push flows run
+    // unattended. They previously hit the command risk heuristic, which resolves
+    // to deny under this preset's `mode: strict` — a hard deadlock that
+    // contradicted the preset's own YAML. Presets that do want approval
+    // (common_strict_rules) keep explicit commands.ask rules; that contract is
+    // locked by "command policy evaluation covers phase 10 requested command
+    // decisions" above. Force-push and the rest of the fence stay denied below.
     var npm_install = try evaluate(std.testing.allocator, &selected, .ask, &.{ "npm", "install" });
     defer npm_install.deinit(std.testing.allocator);
-    try std.testing.expectEqual(core.decision.DecisionResult.ask, npm_install.decision.result);
+    try std.testing.expectEqual(core.decision.DecisionResult.allow, npm_install.decision.result);
+
+    var pip_install = try evaluate(std.testing.allocator, &selected, .ask, &.{ "pip", "install", "requests" });
+    defer pip_install.deinit(std.testing.allocator);
+    try std.testing.expectEqual(core.decision.DecisionResult.allow, pip_install.decision.result);
 
     var git_push = try evaluate(std.testing.allocator, &selected, .ask, &.{ "git", "push" });
     defer git_push.deinit(std.testing.allocator);
-    try std.testing.expectEqual(core.decision.DecisionResult.ask, git_push.decision.result);
+    try std.testing.expectEqual(core.decision.DecisionResult.allow, git_push.decision.result);
+
+    var git_force = try evaluate(std.testing.allocator, &selected, .ask, &.{ "git", "push", "--force" });
+    defer git_force.deinit(std.testing.allocator);
+    try std.testing.expectEqual(core.decision.DecisionResult.deny, git_force.decision.result);
 
     var rm_rf = try evaluate(std.testing.allocator, &selected, .ask, &.{ "rm", "-rf", "/" });
     defer rm_rf.deinit(std.testing.allocator);
