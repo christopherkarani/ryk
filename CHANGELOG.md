@@ -12,6 +12,17 @@
 
 **User-visible behavior changes:** `RYK_OPERATOR` no longer authorizes anything (use an interactive terminal); `ryk allow-once *` is no longer auto-allowed by the default policy; the allow-once redeem code is shown only on the operator terminal.
 
+### Security (P1 audit 2026-08-12)
+
+* **Shim unaudited-exec gap closed (P1-1):** when the session audit open fails, the PATH shim now probes the control root to distinguish the by-design Seatbelt/Landlock write-deny residual from audit-file tamper. Tamper-shaped failures (e.g. `chmod 000 events.jsonl` with a writable control root) now **fail closed** — the allowed exec is denied rather than run with no audit record. Genuine residuals drop a workspace gap marker; the parent appends an `audit_degraded` event at session end (also for parent-attested degraded sessions), and `ryk replay` / `ryk doctor` surface degraded sessions.
+* **Cursor/agent hook fails closed (P1-2):** the bare-`ryk` stdin hook (`beforeShellExecution` / Claude-compatible entries) no longer fails open on malformed JSON, oversized payloads, unknown formats, or command-less shell payloads — they emit dual-contract deny JSON and exit 2 (the host block code). Recognized non-shell tool hooks still pass through.
+* **MCP proxy deny-default (P1-3):** unknown, vendor-namespaced, or side-effecting MCP methods (`completion/complete`, `logging/setLevel`, `vendor/*`, future spec methods) are denied and audited instead of forwarded unmediated. Only `initialize`, `ping`, `notifications/*`, `tools/list`, `resources/list`, and `prompts/list` pass ungated; see `docs/mcp.md`.
+* **Honest setup completion copy (P1-4):** `ryk start` no longer prints "You're now protected by ryk" after hook-only verification. The end card states what was verified (protection grade: hook), that setup attaches no OS sandbox, and points at the session banner (`RYK_SESSION_SANDBOX_GRADE`) and `docs/compatibility.md`.
+* **Telemetry is opt-in (P1-5):** missing consent state now means disabled — nothing is queued or sent until `ryk telemetry enable`. `RYK_NO_TELEMETRY=1` remains a hard off that overrides even explicit opt-in. The payload contract (fixed allowlist, `$ip:0`, no person profile) is unchanged.
+* **Intercept proxy DNS-rebinding fence (P1-6):** after a hostname passes policy, the proxy re-checks every resolved address and pins the validated one (no re-resolution). Loopback, private, link-local, and cloud-metadata answers are refused unless `network.allow` explicitly lists the class (`localhost`, `private`, `metadata`) or exact IP; the attempt is denied with a `network_connect_denied` audit event and a 403 to the client.
+
+**User-visible behavior changes:** telemetry is now opt-in (`ryk telemetry enable`); `ryk start` completion copy states the verified grade instead of an absolute protection claim; the MCP proxy denies unknown methods (previously forwarded); the Cursor/agent hook denies malformed payloads (previously silent permit); shim execs with a tamper-shaped audit log are denied; degraded-audit sessions are visible in `ryk replay` and `ryk doctor`.
+
 ## [1.2.17] - 2026-08-12
 
 ## What's Changed

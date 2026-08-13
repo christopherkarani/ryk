@@ -1609,10 +1609,34 @@ test "EnsureCore host fix_hint never teaches ryk start as required repair" {
     // Quiet path: no D06 full-protection claim when we did not prove hosts (zero hosts).
     const out = stdout_writer.buffered();
     const err = stderr_writer.buffered();
-    try std.testing.expect(!containsIgnoreCase(out, "fully protected"));
-    try std.testing.expect(!containsIgnoreCase(out, "all hosts wired"));
-    try std.testing.expect(!containsIgnoreCase(out, "protection complete"));
-    try std.testing.expect(!containsIgnoreCase(err, "fully protected"));
+    try std.testing.expect(!claimsUnqualifiedProtection(out));
+    try std.testing.expect(!claimsUnqualifiedProtection(err));
+}
+
+/// Unqualified "protected" claims are banned from start/ensure output (P1-4):
+/// setup verifies hook/wrapper integration; only a live session banner may
+/// state a sandbox grade. Qualified statements ("protection grade: hook",
+/// "no OS sandbox attached") do not match these phrases.
+fn claimsUnqualifiedProtection(text: []const u8) bool {
+    if (containsIgnoreCase(text, "fully protected")) return true;
+    if (containsIgnoreCase(text, "all hosts wired")) return true;
+    if (containsIgnoreCase(text, "protection complete")) return true;
+    if (containsIgnoreCase(text, "you're now protected")) return true;
+    if (containsIgnoreCase(text, "now protected by")) return true;
+    if (containsIgnoreCase(text, "protected by ryk")) return true;
+    return false;
+}
+
+test "start success end card source carries no unqualified protection claim" {
+    // Source-level guard so the absolute claim cannot regress without failing
+    // the named-run gate even where runtime output tests miss a branch.
+    const start_src = @embedFile("start.zig");
+    try std.testing.expect(std.mem.indexOf(u8, start_src, "You're now protected") == null);
+    try std.testing.expect(std.mem.indexOf(u8, start_src, "now protected by") == null);
+    // The verified-completion card must state the hook grade and point at the
+    // compatibility matrix instead of claiming blanket protection.
+    try std.testing.expect(std.mem.indexOf(u8, start_src, "protection grade: hook") != null);
+    try std.testing.expect(std.mem.indexOf(u8, start_src, "docs/compatibility.md") != null);
 }
 
 // ---------------------------------------------------------------------------

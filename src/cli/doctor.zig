@@ -694,8 +694,24 @@ fn writeMcpSetupReport(io: std.Io, stdout: anytype, context: IntegrationContext)
     try stdout.writeByte('\n');
 }
 
+/// P1-1: true when the most recent session recorded an `audit_degraded` event
+/// (shim execs ran without in-shim audit evidence). Best-effort: any read
+/// failure reports as not degraded — doctor must not fail on missing evidence.
+fn lastSessionAuditDegraded(io: std.Io, allocator: std.mem.Allocator, workspace_root: []const u8) bool {
+    const last_path = std.fs.path.join(allocator, &.{ workspace_root, ".ryk", "last" }) catch return false;
+    defer allocator.free(last_path);
+    const id_text = std.Io.Dir.cwd().readFileAlloc(io, last_path, allocator, .limited(256)) catch return false;
+    defer allocator.free(id_text);
+    const session_id = std.mem.trim(u8, id_text, " \t\r\n");
+    if (session_id.len == 0) return false;
+    const events_path = std.fs.path.join(allocator, &.{ workspace_root, ".ryk", "sessions", session_id, "events.jsonl" }) catch return false;
+    defer allocator.free(events_path);
+    const events = std.Io.Dir.cwd().readFileAlloc(io, events_path, allocator, .limited(core.limits.max_audit_log_len)) catch return false;
+    defer allocator.free(events);
+    return std.mem.indexOf(u8, events, "\"type\":\"audit_degraded\"") != null;
+}
+
 fn writeIntegrationReport(io: std.Io, stdout: anytype, context: IntegrationContext) !void {
-    _ = io;
     try stdout.writeAll("Integration checks:\n");
     try writeDynamicLine(stdout, "  workspace root: ", context.workspace_root, "\n");
     try stdout.print("  git repository: {s}\n", .{if (context.git_present) "detected" else "not detected"});
@@ -732,6 +748,9 @@ fn writeIntegrationReport(io: std.Io, stdout: anytype, context: IntegrationConte
     try stdout.writeByte('\n');
     try writeDynamicLine(stdout, "  shell: ", context.shell_name, "\n");
     try stdout.print("  audit/replay: {s}\n", .{if (context.audit_sessions_present) "session artifacts present; replay available" else "replay available; no local sessions detected"});
+    if (context.audit_sessions_present and lastSessionAuditDegraded(io, context.allocator, context.workspace_root)) {
+        try stdout.writeAll("  last session audit: degraded — some allowed shim execs have no in-shim audit record (see `ryk replay`)\n");
+    }
     try stdout.print("  red-team fixtures: {s}\n", .{if (context.redteam_fixtures_present) "available" else "not found"});
     if (context.daemon_binary_path) |path| {
         try stdout.writeAll("  daemon binary: ");
@@ -2709,4 +2728,33 @@ fn testHostRows(allocator: std.mem.Allocator) ![]HostDoctorRow {
         });
     }
     return try list.toOwnedSlice(allocator);
+}
+
+test "lastSessionAuditDegraded detects audit_degraded in the pointed-at session" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+
+    // No session artifacts at all -> not degraded (and no error).
+    try std.testing.expect(!lastSessionAuditDegraded(io, allocator, root));
+
+    try tmp.dir.createDirPath(io, ".ryk/sessions/sess-degraded");
+    try tmp.dir.writeFile(io, .{ .sub_path = ".ryk/last", .data = "sess-degraded\n" });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = ".ryk/sessions/sess-degraded/events.jsonl",
+        .data = "{\"type\":\"session_start\"}\n{\"type\":\"audit_degraded\",\"decision\":{\"result\":\"observe\",\"reason\":\"shim audit open denied\"}}\n",
+    });
+    try std.testing.expect(lastSessionAuditDegraded(io, allocator, root));
+
+    // A clean session rewrites the pointer -> not degraded.
+    try tmp.dir.createDirPath(io, ".ryk/sessions/sess-clean");
+    try tmp.dir.writeFile(io, .{ .sub_path = ".ryk/last", .data = "sess-clean\n" });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = ".ryk/sessions/sess-clean/events.jsonl",
+        .data = "{\"type\":\"session_start\"}\n{\"type\":\"command_allowed\"}\n",
+    });
+    try std.testing.expect(!lastSessionAuditDegraded(io, allocator, root));
 }

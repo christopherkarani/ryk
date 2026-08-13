@@ -814,6 +814,102 @@ pub fn isExfilSinkHostname(host: []const u8) bool {
     return isPasteSite(host) or isWebhookOrRequestBin(host) or isTunnelingService(host);
 }
 
+// ---------------------------------------------------------------------------
+// Post-DNS-resolution fence (P1-6)
+// ---------------------------------------------------------------------------
+
+/// Classify a resolved IP into the same HostClass fences `classifyHost` applies
+/// to destination text, plus IPv6 cases the text path only approximates
+/// (v4-mapped ::ffff:a.b.c.d, fc00::/7 ULA). Byte-based so OS resolver output
+/// needs no re-parse.
+pub fn classifyResolvedIp(ip: std.Io.net.IpAddress) HostClass {
+    return switch (ip) {
+        .ip4 => |a| classifyIpv4Bytes(a.bytes),
+        .ip6 => |a| classifyIpv6Bytes(a.bytes),
+    };
+}
+
+fn classifyIpv4Bytes(ip: [4]u8) HostClass {
+    if (isCloudMetadataIp(ip)) return .cloud_metadata;
+    if (isLocalhostIp(ip)) return .localhost;
+    // 0/8 is "this network" (RFC 1122): connect() to 0.0.0.0 routes to loopback
+    // on Linux/macOS, so unspecified answers are loopback-class, not direct_ip.
+    if (ip[0] == 0) return .localhost;
+    if (isPrivateIpv4(ip)) return .private_network;
+    return .direct_ip;
+}
+
+fn classifyIpv6Bytes(bytes: [16]u8) HostClass {
+    // v4-mapped (::ffff:a.b.c.d) inherits the embedded IPv4 class.
+    if (std.mem.allEqual(u8, bytes[0..10], 0) and bytes[10] == 0xff and bytes[11] == 0xff) {
+        return classifyIpv4Bytes(bytes[12..16].*);
+    }
+    if (std.mem.allEqual(u8, bytes[0..15], 0) and bytes[15] == 1) return .localhost; // ::1
+    // Deprecated v4-compatible (::a.b.c.d, RFC 4291) and the v6 unspecified
+    // address (::) embed IPv4 in the low 32 bits — inherit that class so ::
+    // fences as loopback (0.0.0.0) and ::127.0.0.1 cannot slip loopback through.
+    if (std.mem.allEqual(u8, bytes[0..12], 0)) {
+        return classifyIpv4Bytes(bytes[12..16].*);
+    }
+    if (bytes[0] == 0xfe and (bytes[1] & 0xc0) == 0x80) return .private_network; // fe80::/10 link-local
+    if ((bytes[0] & 0xfe) == 0xfc) return .private_network; // fc00::/7 unique-local
+    return .direct_ip;
+}
+
+pub const ResolvedAddressFence = struct {
+    allowed: bool,
+    host_class: HostClass,
+    /// Static reason text when `allowed` is false.
+    reason: []const u8 = "",
+};
+
+/// Post-resolution fence for the intercept proxy: a hostname allow covers
+/// public-unicast DNS answers only. Loopback, private/link-local, and
+/// cloud-metadata answers require an explicit class-token (`localhost`,
+/// `private`, `metadata`) or exact-IP rule in `network.allow`; otherwise the
+/// resolved address is denied (DNS-rebinding fence). `direct_ip` answers pass:
+/// public unicast is the expected resolution of an allowlisted hostname.
+pub fn resolvedAddressFence(policy: *const schema.Policy, ip: std.Io.net.IpAddress, port: ?u16) ResolvedAddressFence {
+    const host_class = classifyResolvedIp(ip);
+    switch (host_class) {
+        .domain, .direct_ip => return .{ .allowed = true, .host_class = host_class },
+        else => {},
+    }
+    var text_buf: [48]u8 = undefined;
+    const ip_text = formatResolvedIpText(&text_buf, ip) catch return .{
+        .allowed = false,
+        .host_class = host_class,
+        .reason = "resolved address could not be classified",
+    };
+    const destination: Destination = .{
+        .raw = ip_text,
+        .host = ip_text,
+        .port = port,
+        .host_class = host_class,
+    };
+    if (findMatch("network.allow", destination, policy.network.allow) != null) {
+        return .{ .allowed = true, .host_class = host_class };
+    }
+    return .{
+        .allowed = false,
+        .host_class = host_class,
+        .reason = strictDefaultDenyReason(destination) orelse "resolved address class denied by default",
+    };
+}
+
+/// IP text without port for rule matching (exact-IP allow rules compare strings).
+fn formatResolvedIpText(buf: []u8, ip: std.Io.net.IpAddress) ![]u8 {
+    var writer: std.Io.Writer = .fixed(buf);
+    switch (ip) {
+        .ip4 => |a| try writer.print("{d}.{d}.{d}.{d}", .{ a.bytes[0], a.bytes[1], a.bytes[2], a.bytes[3] }),
+        .ip6 => |a| {
+            const unresolved: std.Io.net.Ip6Address.Unresolved = .{ .bytes = a.bytes, .interface_name = null };
+            try writer.print("{f}", .{unresolved});
+        },
+    }
+    return writer.buffered();
+}
+
 fn hostMatchesAny(host: []const u8, patterns: []const []const u8) bool {
     for (patterns) |pattern| {
         if (matchers.matchesDomain(pattern, host)) return true;
@@ -1019,6 +1115,100 @@ test "strict defaults deny direct localhost private and metadata destinations" {
         defer result.deinit(std.testing.allocator);
         try std.testing.expectEqual(core.decision.DecisionResult.deny, result.decision.result);
     }
+}
+
+test "resolved address fence denies loopback private and metadata answers by default" {
+    const load = @import("load.zig");
+    var policy = try load.parseFromSlice(std.testing.allocator,
+        \\version: 1
+        \\mode: strict
+        \\network:
+        \\  mode: allowlist
+        \\  allow:
+        \\    - "api.example.com"
+    , "network.yaml");
+    defer policy.deinit();
+
+    // DNS-rebinding shapes: an allowlisted hostname answering with fenced classes.
+    const denied_cases = [_]struct { text: []const u8, class: HostClass }{
+        .{ .text = "169.254.169.254", .class = .cloud_metadata },
+        .{ .text = "127.0.0.1", .class = .localhost },
+        .{ .text = "127.55.66.77", .class = .localhost },
+        .{ .text = "10.0.0.9", .class = .private_network },
+        .{ .text = "172.16.0.1", .class = .private_network },
+        .{ .text = "192.168.1.7", .class = .private_network },
+        .{ .text = "169.254.1.1", .class = .private_network }, // link-local
+        .{ .text = "::1", .class = .localhost },
+        .{ .text = "::ffff:127.0.0.1", .class = .localhost }, // v4-mapped
+        .{ .text = "::ffff:169.254.169.254", .class = .cloud_metadata },
+        .{ .text = "fc00::1", .class = .private_network }, // ULA
+        .{ .text = "fe80::1", .class = .private_network }, // v6 link-local
+        // Loopback aliases (review 2026-08-13): connect() to the unspecified
+        // address routes to loopback on Linux/macOS, so 0/8 and :: must not
+        // pass the fence as direct_ip.
+        .{ .text = "0.0.0.0", .class = .localhost },
+        .{ .text = "0.1.2.3", .class = .localhost }, // 0/8 "this network" (RFC 1122)
+        .{ .text = "::", .class = .localhost }, // v6 unspecified
+        .{ .text = "::ffff:0.0.0.0", .class = .localhost }, // v4-mapped unspecified
+    };
+    for (denied_cases) |case| {
+        const ip = try std.Io.net.IpAddress.parse(case.text, 443);
+        const fence = resolvedAddressFence(&policy, ip, 443);
+        try std.testing.expect(!fence.allowed);
+        try std.testing.expectEqual(case.class, fence.host_class);
+        try std.testing.expect(fence.reason.len > 0);
+    }
+
+    // Deprecated v4-compatible form (::a.b.c.d, RFC 4291): Zig's parser rejects
+    // the text, but a hostile AAAA answer can still carry these bytes — the
+    // embedded IPv4 class must apply (here: loopback).
+    const v4_compatible_loopback = std.Io.net.IpAddress{ .ip6 = .{
+        .bytes = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 127, 0, 0, 1 },
+        .port = 443,
+        .interface = .none,
+    } };
+    const v4_compat_fence = resolvedAddressFence(&policy, v4_compatible_loopback, 443);
+    try std.testing.expect(!v4_compat_fence.allowed);
+    try std.testing.expectEqual(HostClass.localhost, v4_compat_fence.host_class);
+
+    // Public unicast answers pass: the expected resolution of an allowlisted host.
+    const public_ip = try std.Io.net.IpAddress.parse("93.184.216.34", 443);
+    const public_fence = resolvedAddressFence(&policy, public_ip, 443);
+    try std.testing.expect(public_fence.allowed);
+    try std.testing.expectEqual(HostClass.direct_ip, public_fence.host_class);
+}
+
+test "resolved address fence lifts only on explicit class or exact-IP allow" {
+    const load = @import("load.zig");
+    var class_policy = try load.parseFromSlice(std.testing.allocator,
+        \\version: 1
+        \\mode: strict
+        \\network:
+        \\  mode: allowlist
+        \\  allow:
+        \\    - "localhost"
+    , "network.yaml");
+    defer class_policy.deinit();
+
+    const loopback = try std.Io.net.IpAddress.parse("127.0.0.1", 443);
+    try std.testing.expect(resolvedAddressFence(&class_policy, loopback, 443).allowed);
+    // A class allow does not lift other fenced classes.
+    const metadata = try std.Io.net.IpAddress.parse("169.254.169.254", 443);
+    try std.testing.expect(!resolvedAddressFence(&class_policy, metadata, 443).allowed);
+    const private_ip = try std.Io.net.IpAddress.parse("10.0.0.9", 443);
+    try std.testing.expect(!resolvedAddressFence(&class_policy, private_ip, 443).allowed);
+
+    var exact_policy = try load.parseFromSlice(std.testing.allocator,
+        \\version: 1
+        \\mode: strict
+        \\network:
+        \\  mode: allowlist
+        \\  allow:
+        \\    - "10.0.0.9"
+    , "network.yaml");
+    defer exact_policy.deinit();
+    try std.testing.expect(resolvedAddressFence(&exact_policy, private_ip, 443).allowed);
+    try std.testing.expect(!resolvedAddressFence(&exact_policy, loopback, 443).allowed);
 }
 
 test "unknown domain denies in allowlist mode" {

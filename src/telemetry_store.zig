@@ -364,7 +364,9 @@ pub fn readState(allocator: std.mem.Allocator, io: std.Io, paths: *const Paths) 
         allocator,
         .limited(max_state_bytes),
     ) catch |err| switch (err) {
-        error.FileNotFound => return .{ .state = .{ .enabled = true }, .source = .default },
+        // Opt-in default (2026-08 P1): no consent state means disabled. Telemetry
+        // activates only through an explicit `ryk telemetry enable`.
+        error.FileNotFound => return .{ .state = .{ .enabled = false }, .source = .default },
         else => return err,
     };
     defer allocator.free(text);

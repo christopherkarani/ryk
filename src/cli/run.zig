@@ -160,6 +160,41 @@ pub fn commandWithEnv(
     return commandWithStdioAndEnv(io, argv, stdout, stderr, .inherit, true, current_env, null);
 }
 
+/// P1-1 session-end reconciliation: degraded in-shim audit becomes durable
+/// `audit_degraded` evidence. (a) Parent-attested at setup (OS attach
+/// write-denies the control root to the child): in-shim audit was dark by
+/// design this session. (b) Unattested residual: a shim hit the control
+/// write-deny path and dropped a workspace gap marker — allowed execs lack
+/// in-shim events. Reason codes are static; no command payloads.
+fn reconcileShimAuditGap(
+    writer: *core_api.AuditWriter,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    session: core.session.Session,
+    parent_marked_degraded: bool,
+) !void {
+    const shim_mod = @import("shim.zig");
+    const degraded_reason: ?[]const u8 = if (parent_marked_degraded)
+        "in-shim audit dark by design this session: OS attach write-denies the control root to the child (parent-attested degraded mode)"
+    else if (shim_mod.consumeShimAuditGapMarker(io, allocator, session.workspace_root, session.id.slice()) catch false)
+        "shim audit open denied (control write-deny residual) without parent attestation; at least one allowed shim exec has no in-shim audit event"
+    else
+        null;
+    if (degraded_reason) |reason| {
+        const ts = core.time.Timestamp.now(io);
+        const ev: core.event.Event = .{
+            .session_id = session.id,
+            .event_id = try core.event.generateEventId(ts),
+            .timestamp = ts,
+            .event_type = .audit_degraded,
+            .actor = .{ .kind = .ryk, .display = "ryk" },
+            .target = .{ .kind = .session, .value = session.id.slice() },
+            .decision = .{ .result = .observe, .reason = reason, .ci_may_proceed = true },
+        };
+        try core_api.appendAuditEvent(writer, ev);
+    }
+}
+
 fn commandWithStdio(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: anytype, stdio: supervisor.StdioBehavior, audit_enabled: bool) !u8 {
     return commandWithStdioAndEnv(io, argv, stdout, stderr, stdio, audit_enabled, null, null);
 }
@@ -1464,6 +1499,10 @@ fn commandWithStdioAndEnv(io: std.Io, argv: []const []const u8, stdout: anytype,
                     try core_api.appendAuditEvent(writer, ev);
                 }
             }
+        }
+        // P1-1 reconciliation: make degraded in-shim audit durable evidence.
+        if (audit_context.session) |session| {
+            try reconcileShimAuditGap(writer, io, allocator, session, shim_audit_degraded);
         }
         const final_hash = writer.finalHash() orelse "";
         try core_api.writeAuditSummary(allocator, writer.session_dir_path, .{
@@ -6349,4 +6388,62 @@ test "computeSessionSandboxGrade: mediated attach vs open escape" {
     );
     try std.testing.expectEqualStrings("strong-mediated", SessionSandboxGrade.strong_mediated.toString());
     try std.testing.expectEqualStrings("unrestricted-escape", SessionSandboxGrade.unrestricted_escape.toString());
+}
+
+test "reconcileShimAuditGap appends audit_degraded for attested and marker paths only" {
+    const shim_mod = @import("shim.zig");
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const Case = struct {
+        parent_marked: bool,
+        plant_marker: bool,
+        expect_degraded: bool,
+    };
+    for ([_]Case{
+        .{ .parent_marked = true, .plant_marker = false, .expect_degraded = true },
+        .{ .parent_marked = false, .plant_marker = true, .expect_degraded = true },
+        .{ .parent_marked = false, .plant_marker = false, .expect_degraded = false },
+    }) |case| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+        defer allocator.free(root);
+
+        const ts = core.time.Timestamp.fromUnixSeconds(1_777_983_130);
+        const session: core.session.Session = .{
+            .id = try core.session.generateSessionId(ts),
+            .started_at = ts,
+            .command = "true",
+            .args = &.{},
+            .workspace_root = root,
+            .mode = .strict,
+            .platform = core.platform.detectOs(),
+        };
+        var writer = try core_api.createAuditWriter(io, allocator, session);
+        defer writer.deinit();
+
+        if (case.plant_marker) {
+            const marker_name = try std.fmt.allocPrint(allocator, "{s}{s}", .{ shim_mod.shim_audit_gap_marker_prefix, session.id.slice() });
+            defer allocator.free(marker_name);
+            try tmp.dir.writeFile(io, .{ .sub_path = marker_name, .data = "audit_degraded reason=shim_audit_open_control_write_deny_residual\n" });
+        }
+
+        try reconcileShimAuditGap(&writer, io, allocator, session, case.parent_marked);
+
+        const events_path = try std.fs.path.join(allocator, &.{ root, ".ryk", "sessions", session.id.slice(), "events.jsonl" });
+        defer allocator.free(events_path);
+        const events = try std.Io.Dir.cwd().readFileAlloc(io, events_path, allocator, .limited(64 * 1024));
+        defer allocator.free(events);
+        const found = std.mem.indexOf(u8, events, "\"type\":\"audit_degraded\"") != null;
+        try std.testing.expectEqual(case.expect_degraded, found);
+        if (case.expect_degraded) {
+            // Reason codes only — static text, no command payload.
+            try std.testing.expect(std.mem.indexOf(u8, events, "in-shim audit") != null);
+        }
+        if (case.plant_marker) {
+            // Marker consumed (idempotent reconciliation).
+            try std.testing.expect(!(try shim_mod.consumeShimAuditGapMarker(io, allocator, root, session.id.slice())));
+        }
+    }
 }
