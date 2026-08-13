@@ -34,7 +34,7 @@ CLI_BINS_DIR="${RYK_CLI_ARTIFACT_DIR:-${REPO_ROOT}/.release-cli-bins}"
 ALLOWED_BRANCHES="${RYK_RELEASE_BRANCHES:-main master}"
 LOG_FILE=""
 
-PHASES=(preflight version notes gate bump build verify sign publish-git "done")
+PHASES=(preflight version notes gate bump build verify sign publish-git publish-brew "done")
 COMPLETED_PHASES=()
 
 # ---------------------------------------------------------------------------
@@ -805,6 +805,47 @@ Resume: ./scripts/cut-release.sh --version ${VERSION} --live --resume-from sign"
 }
 
 # ---------------------------------------------------------------------------
+# publish-brew
+# ---------------------------------------------------------------------------
+# Homebrew is the recommended macOS channel and the update mechanism that
+# refreshes managed host plugins, so the formula cannot lag the release: a stale
+# formula means `brew upgrade` silently keeps old protection. Runs after
+# publish-git because it digests the assets that phase uploaded.
+phase_publish_brew() {
+  local -a args=(--version "$VERSION")
+  if [[ -s "${DIST_DIR}/checksums.txt" ]]; then
+    args+=(--checksums "${DIST_DIR}/checksums.txt")
+  fi
+
+  if [[ "$LIVE" -ne 1 ]]; then
+    # --print writes nothing: a dry-run must not leave a formula pinned to an
+    # unpublished version (the bump phase is skipped too), but it should still
+    # fail loudly if the markers or digests are out of shape.
+    log "dry-run: validating formula render (no file or tap written)"
+    ./scripts/update-homebrew-tap.sh "${args[@]}" --print >/dev/null || fail "formula render failed"
+    return 0
+  fi
+
+  args+=(--live)
+  if ! ./scripts/update-homebrew-tap.sh "${args[@]}"; then
+    # The GitHub Release is already published at this point; a tap failure must
+    # not read as a failed release, but it must not pass silently either.
+    warn "Homebrew formula/tap update failed. The release is published; the brew channel is STALE."
+    warn "Fix and re-run: ./scripts/update-homebrew-tap.sh --version ${VERSION} --live"
+    fail "publish-brew failed after a successful publish-git"
+  fi
+
+  # The formula rewrite lands in the working tree; commit it so the repo copy and
+  # the tap never disagree about which release brew installs.
+  if ! git diff --quiet -- packaging/homebrew/Formula/ryk.rb; then
+    git add packaging/homebrew/Formula/ryk.rb
+    git commit -q -m "chore(homebrew): ryk ${VERSION} formula checksums"
+    git push origin "$(git rev-parse --abbrev-ref HEAD)"
+    log "committed formula checksums for v${VERSION}"
+  fi
+}
+
+# ---------------------------------------------------------------------------
 # done
 # ---------------------------------------------------------------------------
 phase_done() {
@@ -863,15 +904,17 @@ main() {
           printf '\n=== DRY-RUN COMPLETE ===\n'
           printf 'Version %s built, verified, and sign-phase checked under %s/\n' "$VERSION" "$DIST_DIR"
           printf 'No push or tag was performed.\n'
-          printf 'To publish (re-runs sign, then publish-git):\n'
+          printf 'To publish (re-runs sign, then publish-git, then publish-brew):\n'
           printf '  ./scripts/cut-release.sh --version %s --live --resume-from sign\n' "$VERSION"
           printf '  (or re-run full --live after resetting if you need a clean bump path)\n'
           printf '========================\n\n'
           log "dry-run: skipping publish-git and later phases"
+          phase_publish_brew
           exit 0
         fi
         phase_publish_git
         ;;
+      publish-brew) phase_publish_brew ;;
       done) phase_done ;;
       *) fail "unknown phase $name" ;;
     esac

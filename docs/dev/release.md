@@ -14,10 +14,10 @@ RYK_POSTHOG_PROJECT_TOKEN="<release-project-token>" ./scripts/cut-release.sh --v
 
 Release builds require the public PostHog project token in
 `RYK_POSTHOG_PROJECT_TOKEN`. A live build also needs Docker for the Linux
-artifacts and `gh` access to publish the GitHub Release. npm is used only to
-build the dashboard when its local `dist/` directory is absent; no npm package
-is published. Homebrew and other package-manager channels are not part of the
-release.
+artifacts and `gh` access to publish the GitHub Release and update the Homebrew
+tap. npm is used only to build the dashboard when its local `dist/` directory is
+absent; no npm package is published. WinGet and Scoop are not part of the release
+(see [`packaging/README.md`](../../packaging/README.md)).
 
 What it does:
 
@@ -31,6 +31,15 @@ What it does:
    for installers (sentinel key; checksum-only until provisioned).
 7. Creates the GitHub Release with the assets required by `curl | sh`, including
    `checksums.txt.minisig` when the Mac cutter produced one.
+8. `publish-brew`: regenerates `packaging/homebrew/Formula/ryk.rb` from the
+   release `checksums.txt`. The public tap is not published yet; `--live` tap
+   push is skipped until `christopherkarani/homebrew-ryk` exists. A dry-run
+   validates the formula render and writes nothing.
+
+`publish-brew` runs after the release exists because it digests the published
+assets. If it fails after a live GitHub release, the brew channel is stale —
+the script says so and prints the re-run command
+(`./scripts/update-homebrew-tap.sh --version X.Y.Z --live`).
 
 CI `release.yml` is a backup path. It skips when the complete curl installer
 asset set is already attached to the tag's GitHub Release. The backup still does

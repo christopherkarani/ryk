@@ -23,6 +23,7 @@ Use `./scripts/agent-gate.sh` when you are unsure which check fits the change. I
 - `release-dry-run.sh` builds and verifies a host archive without publishing it.
 - `cut-release.sh` is the maintainer release orchestrator. Read [the release guide](../docs/dev/release.md) before using its live mode.
 - `test-release-signing.sh` always asserts `cut-release.sh` dispatches `sign)`. When a verifier is present it also proves the provisioned-key installer path refuses a release it cannot authenticate (tampered, forged, wrong-key, or missing signature). Uses a throwaway keypair, never the release key. Current shipping is sentinel / checksum-only. Runs inside `verify-pre-merge.sh`; see [release signing](../docs/release-signing.md).
+- `update-homebrew-tap.sh` regenerates the Homebrew formula from a release's `checksums.txt` and, with `--live`, pushes the tap once it exists. `cut-release.sh` calls it in the `publish-brew` phase; run it by hand only to repair a stale channel. The public tap is not published yet.
 
 The release scripts write archives and generated metadata under ignored `dist/` or `dist-dry-run/` directories. Do not commit those outputs.
 
@@ -33,3 +34,4 @@ The release scripts write archives and generated metadata under ignored `dist/` 
 - `os-sandbox-adversarial-e2e.sh` runs the OS sandbox fixture probes when the platform can attach the backend.
 - `quick-install-dx-verify.sh` exercises the first-run CLI setup matrix.
 - `test-openclaw-release-assets.sh` proves committed OpenClaw `dist/` matches TypeScript. `agent-gate` runs it when `integrations/openclaw-plugin/**` is dirty (plugin gate); release packaging also runs it.
+- `test-homebrew-formula.sh` checks the Homebrew formula offline (pins `VERSION`, digest markers intact, automation fails closed without mutating the formula). Runs inside `verify-pre-merge.sh`.
