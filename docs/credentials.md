@@ -131,6 +131,8 @@ In this mode:
 | FS scope honesty | When host-config grants are active, receipts say `narrow host-config RW, no bare home` (not bare `no home`) |
 | Redirected stdio residual | Seatbelt does **not** grant host `/var/folders` or classic `/tmp` content under production defaults. Redirecting agent stdout/stderr into those paths can trigger Bun `EPERM fstat` / `process.stderr.fd` crashes (exit **1** after attach). Prefer TTY, pipes, or capture files under the workspace (session tmp is `{workspace}/.ryk-tmp`). Ryk detects parent stdio paths under classic tmp and prints a **stdio/fstat** tip (not a re-login lead). |
 
+Inherited stdin/stdout/stderr (FDs 0/1/2) are user-directed, pre-opened capabilities. A redirect such as `ryk claude < ~/.aws/credentials` or `ryk claude > ~/out.log` gives the child access through that already-open descriptor even when the redirect target is outside the filesystem grant boundary; path mediation does not revoke existing FDs. Choose redirects with the same care as explicit file grants.
+
 **Empty-backpack help redirect matrix (macOS, production Seatbelt):**
 
 | Capture | Example | Expected exit | Notes |

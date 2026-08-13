@@ -26,7 +26,7 @@ Doctor / platform reports are **not** a second taxonomy. Map them to grades:
 | doctor `wrapper-only` (command guard / PATH shims) | `wrapper` | Not transparent OS enforcement |
 | doctor sandbox / strong sandbox `partial` (API present) | probe only | Capability evidence; **not** a live session claim |
 | doctor sandbox / transparent FS or network `active` | `OS-enforced` | Rare; doctor never marks session active from probe alone |
-| Protected agent launch + successful child attach | `OS-enforced` (FS, that session) | `ryk <agent>` uses the run engine; advanced `ryk run --os-sandbox` exposes explicit attach flags. Landlock ABI ≥ 1 (kernel 5.13+) or Seatbelt majors 14–26 (capability gate; CI attach evidence: linux amd64 + macos-14) |
+| Protected agent launch + successful child attach | `OS-enforced` (FS, that session) | `ryk <agent>` uses the run engine; advanced `ryk run --os-sandbox` exposes explicit attach flags. Landlock ABI ≥ 3 (kernel 6.2+; ABI 1/2 lack truncation mediation) or Seatbelt majors 14–26 (capability gate; CI attach evidence: linux amd64 + macos-14) |
 | doctor `observe-only` / `limited` / `unavailable` | no enforcement claim | Decision or partial path only |
 | MCP stdio proxy `active` | `proxy` (MCP path) | Only for mediated MCP traffic |
 | `ryk start` default (**Ask on risk**) | multi-grade aspirational (`hook` + `wrapper` when available) | Public path has no `--protection` flag; wires host hooks + policy; not `OS-enforced` from doctor probes alone |
@@ -55,7 +55,7 @@ Reserve marketing “firewall” / “maximum protection” for a **verified** m
 | Proxy-mediated network enforcement | limited; explicit loopback proxy when requested; route forcing when OS sandbox supports it | limited; explicit loopback proxy when requested; route forcing when OS sandbox supports it | limited; explicit loopback proxy when requested, routes not forced |
 | Transparent network enforcement | per-session Landlock TCP route forcing with ABI >= 4; otherwise observe-only | per-session Seatbelt TCP route forcing with proxy backend + OS sandbox; otherwise unavailable | unavailable; wrapper/proxy-mediated only, routes not forced |
 | Transparent filesystem enforcement | staged writes; Landlock attach when available | limited; Seatbelt attach when available | limited |
-| Strong sandbox (session-attach) | Landlock when ABI ≥ 1 (kernel 5.13+); else unavailable | Seatbelt capability majors 14–26; else unavailable | unavailable |
+| Strong sandbox (session-attach) | Landlock when ABI ≥ 3 (kernel 6.2+); else unavailable | Seatbelt capability majors 14–26; else unavailable | unavailable |
 | Advanced `--os-sandbox` flag | auto \| on \| off (default auto) | auto \| on \| off (default auto) | off / unavailable |
 | Advanced `--seatbelt-profile` / `RYK_SEATBELT_PROFILE` | n/a (Landlock) | compatible \| hardened \| strict (default **hardened**) | n/a |
 | Process cleanup | active or partial | active | partial |

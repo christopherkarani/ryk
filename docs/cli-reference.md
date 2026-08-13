@@ -145,7 +145,7 @@ The security-sensitive choices are explicit:
 - --inherit-env is accepted only when the selected policy allows environment inheritance.
 - --os-sandbox on fails closed when the platform backend cannot attach. --os-sandbox off disables the OS apply step and should be treated as a lower protection posture.
 - --network open is an unrestricted-egress escape. --network-backend proxy adds a local proxy path; it does not mean that every network protocol is transparently intercepted.
-- --require-backend turns a named capability into a launch requirement. Use it when a degraded session is not acceptable.
+- --require-backend turns a named capability into a launch requirement. `strong-sandbox` is satisfied when an OS-sandbox attach is planned for this session; `landlock` additionally requires a Landlock plan. These checks run before spawn, and a later attach failure still aborts the launch fail closed. Use the flag when a degraded session is not acceptable.
 
 Host aliases are exact, case-sensitive rewrites to ryk run -- <host> ...:
 
