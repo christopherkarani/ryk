@@ -21,6 +21,7 @@ const host_status = @import("host_status.zig");
 const pack_state = @import("pack_state.zig");
 const readiness = @import("readiness.zig");
 const ensure = @import("ensure.zig");
+const policy_migrate = @import("policy_migrate.zig");
 const doctor_tui = @import("doctor_tui.zig");
 const doctor_mcp = @import("doctor_mcp.zig");
 
@@ -91,6 +92,9 @@ const IntegrationContext = struct {
     host_rows: []const HostDoctorRow = &.{},
     hermes_fail_open: bool = true,
     hermes_installed: bool = false,
+    /// Stale-default notices (workspace + user-global policies). Informational
+    /// only — never flips --check. Owned slices.
+    policy_notices: []const policy_migrate.StaleNotice = &.{},
 
     fn deinit(self: *IntegrationContext) void {
         self.allocator.free(self.workspace_root);
@@ -113,6 +117,10 @@ const IntegrationContext = struct {
                 self.allocator.free(row.fix);
             }
             self.allocator.free(self.host_rows);
+        }
+        if (self.policy_notices.len > 0) {
+            for (self.policy_notices) |notice| self.allocator.free(notice.path);
+            self.allocator.free(self.policy_notices);
         }
         self.* = undefined;
     }
@@ -580,6 +588,17 @@ fn writeReport(io: std.Io, stdout: anytype, os: core.platform.Os, backend_report
         for (host_rows) |row| freeHostDoctorRow(allocator, row);
         allocator.free(host_rows);
     }
+    const policy_notices = try allocator.alloc(policy_migrate.StaleNotice, context.policy_notices.len);
+    defer {
+        for (policy_notices) |notice| allocator.free(notice.path);
+        allocator.free(policy_notices);
+    }
+    for (context.policy_notices, 0..) |notice, index| {
+        policy_notices[index] = .{
+            .path = try redactDisplayAlloc(allocator, notice.path),
+            .kind = notice.kind,
+        };
+    }
 
     var safe = context;
     safe.daemon_detail = daemon_detail;
@@ -588,6 +607,7 @@ fn writeReport(io: std.Io, stdout: anytype, os: core.platform.Os, backend_report
     safe.daemon_pid_path = daemon_pid_path;
     safe.policy_error = policy_error;
     safe.host_rows = host_rows;
+    safe.policy_notices = policy_notices;
     try writeReportRaw(io, stdout, os, backend_report, safe, verbose);
 }
 
@@ -635,6 +655,7 @@ fn writeReportRaw(io: std.Io, stdout: anytype, os: core.platform.Os, backend_rep
         try writePacksSection(io, stdout, context);
         try writeHermesFailOpenWarning(io, stdout, context);
         try writePiNote(stdout);
+        try writePolicyFreshnessNotices(stdout, context);
         try writeRecommendations(stdout, context);
         return;
     }
@@ -710,7 +731,28 @@ fn writeReportRaw(io: std.Io, stdout: anytype, os: core.platform.Os, backend_rep
         try writeBackendLine(io, stdout, backend_report, .strong_sandbox);
         try writeBackendLine(io, stdout, backend_report, .audit);
     }
+    try writePolicyFreshnessNotices(stdout, context);
     try writeRecommendations(stdout, context);
+}
+
+/// Stale-default notices (P2 Door A): one line per policy that is not the
+/// current shipped default. Informational; never affects --check exit codes.
+fn writePolicyFreshnessNotices(stdout: anytype, context: IntegrationContext) !void {
+    if (context.policy_notices.len == 0) return;
+    try stdout.writeAll("Policy freshness:\n");
+    for (context.policy_notices) |notice| {
+        switch (notice.kind) {
+            .legacy_default => try stdout.print(
+                "  {s}: old ryk default policy — run `ryk doctor --fix` to upgrade to the current default (a backup is written alongside).\n",
+                .{notice.path},
+            ),
+            .customized => try stdout.print(
+                "  {s}: customized policy — ryk ships a newer default; compare with the generic-agent preset and merge manually (customized policies are never auto-rewritten).\n",
+                .{notice.path},
+            ),
+        }
+    }
+    try stdout.writeByte('\n');
 }
 
 fn writeDefaultPanels(
@@ -1150,6 +1192,11 @@ fn collectIntegrationContextAt(io: std.Io, allocator: std.mem.Allocator, workspa
         allocator.free(host_snapshot.rows);
     }
 
+    // Stale-default scan (diagnose-only, soft): flags policies that are not the
+    // current shipped default so users learn a newer default exists.
+    var stale_scan = policy_migrate.scanStalePolicies(io, allocator, workspace_root) catch policy_migrate.ScanReport{ .notices = &.{} };
+    errdefer stale_scan.deinit(allocator);
+
     return .{
         .allocator = allocator,
         .workspace_root = workspace_root,
@@ -1181,6 +1228,7 @@ fn collectIntegrationContextAt(io: std.Io, allocator: std.mem.Allocator, workspa
         .host_rows = host_snapshot.rows,
         .hermes_fail_open = host_snapshot.hermes_fail_open,
         .hermes_installed = host_snapshot.hermes_installed,
+        .policy_notices = stale_scan.notices,
     };
 }
 

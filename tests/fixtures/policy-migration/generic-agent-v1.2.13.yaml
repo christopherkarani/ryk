@@ -1,0 +1,275 @@
+# ryk preset: generic-agent
+# Conservative starting point for local coding agents with no proprietary assumptions.
+# Edit allowlists for your repository before switching broad actions from ask to allow.
+version: 1
+mode: ask
+workspace:
+  root: "."
+  write_mode: staged
+
+env:
+  inherit: false
+  allow:
+    - PATH
+    - HOME
+    - LANG
+    - TERM
+    - RYK_UNATTENDED
+    - RYK_OPENCLAW_UNATTENDED
+  deny_patterns:
+    - "*TOKEN*"
+    - "*SECRET*"
+    - "*PASSWORD*"
+    - "*PASSWD*"
+    - "*PRIVATE*"
+    - "*KEY*"
+    - "AWS_*"
+    - "AZURE_*"
+    - "GITHUB_TOKEN"
+    - "GH_TOKEN"
+    - "OPENAI_API_KEY"
+    - "ANTHROPIC_API_KEY"
+    - "GOOGLE_API_KEY"
+    - "GOOGLE_APPLICATION_CREDENTIALS"
+    - "NPM_TOKEN"
+    - "PYPI_TOKEN"
+    - "SSH_AUTH_SOCK"
+
+files:
+  read:
+    allow:
+      - "./**"
+    deny:
+      - "./.env"
+      - "./.env.*"
+      - "~/.ssh/**"
+      - "~/.aws/**"
+      - "~/.gcloud/**"
+      - "~/.azure/**"
+      - "~/.config/gh/**"
+      - "~/Library/Keychains/**"
+      - "./Library/Keychains/**"
+      - "~/Library/Application Support/**/Cookies*"
+      - "./Library/Application Support/**/Cookies*"
+      - "~/Library/Application Support/**/Login Data*"
+      - "./Library/Application Support/**/Login Data*"
+      - "~/Library/Application Support/Google/Chrome/**"
+      - "./Library/Application Support/Google/Chrome/**"
+      - "~/Library/Application Support/BraveSoftware/**"
+      - "./Library/Application Support/BraveSoftware/**"
+      - "~/Library/Application Support/Firefox/**"
+      - "./Library/Application Support/Firefox/**"
+      - "~/Library/Mobile Documents/**"
+      - "./Library/Mobile Documents/**"
+      - "~/.zsh_history"
+      - "~/.bash_history"
+      - "~/.zshrc"
+      - "~/.bashrc"
+      - "~/.profile"
+      - "**/id_rsa"
+      - "**/id_ed25519"
+      - "**/*credentials*"
+      - "**/*credential*"
+      - "**/*secret*"
+      - "**/*token*"
+  write:
+    allow:
+      - "./**"
+    deny:
+      # Dual patterns for robustness across hook/plugin path normalizations.
+      - "./.git/**"
+      - ".git/**"
+      - "./.ryk/**"
+      - ".ryk/**"
+    mode: staged
+
+commands:
+  default: ask
+  # Agents default permit (strict list; packs + hard fence still apply).
+  # Unquoted && chains are on-list only when every segment matches.
+  # Not a free pass: high/medium pack hits still matrix-block under strict.
+  allow:
+    # Workspace / inspect
+    - "cd *"
+    - "mkdir *"
+    - "touch *"
+    - "cp *"
+    - "mv *"
+    - "rmdir *"
+    - "cat *"
+    - "head *"
+    - "tail *"
+    - "file *"
+    - "stat *"
+    - "which *"
+    - "whoami"
+    - "id"
+    - "uname *"
+    - "date"
+    - "umask"
+    - "umask *"
+    - "ls"
+    - "ls *"
+    - "pwd"
+    - "echo *"
+    - "/usr/bin/env"
+    - "true"
+    - "false"
+    - "rg *"
+    - "grep *"
+    - "find *"
+    - "wc *"
+    - "sort *"
+    - "uniq *"
+    - "sed -n *"
+    - "curl *"
+    - "wget *"
+    # Git (local read/write; no bare git *; push stays ask)
+    - "git status"
+    - "git status*"
+    - "git diff"
+    - "git diff *"
+    - "git log"
+    - "git log *"
+    - "git branch"
+    - "git branch *"
+    - "git ls-files"
+    - "git ls-files *"
+    - "git add *"
+    - "git commit *"
+    - "git show *"
+    - "git stash *"
+    - "git fetch *"
+    - "git pull *"
+    - "git merge *"
+    - "git remote *"
+    - "git tag *"
+    - "git cherry-pick *"
+    - "git init"
+    - "git clone *"
+    - "git rev-parse *"
+    - "git merge-base *"
+    - "git checkout *"
+    - "git switch *"
+    - "git restore *"
+    # GitHub CLI (narrow; no blanket gh api *)
+    - "gh auth status"
+    - "gh pr *"
+    - "gh issue *"
+    # Language / test / build
+    - "zig version"
+    - "zig build"
+    - "zig build *"
+    - "zig fmt"
+    - "zig fmt *"
+    - "npm test*"
+    - "npm run *"
+    - "pnpm test*"
+    - "pnpm run *"
+    - "yarn test*"
+    - "yarn run *"
+    - "go test"
+    - "go test *"
+    - "go build"
+    - "go build *"
+    - "go run"
+    - "go run *"
+    - "go fmt"
+    - "go fmt *"
+    - "cargo test"
+    - "cargo test *"
+    - "cargo build"
+    - "cargo build *"
+    - "cargo run"
+    - "cargo run *"
+    - "cargo fmt"
+    - "cargo check"
+    - "cargo clippy"
+    - "swift test*"
+    - "swift build"
+    - "swift build *"
+    - "tsc"
+    - "tsc *"
+    - "python --version"
+    - "python3 --version"
+    - "python -m pytest*"
+    - "python3 -m pytest*"
+    - "pytest"
+    - "pytest *"
+    - "node --version"
+    - "make test*"
+    - "make build*"
+    - "make check*"
+    - "./scripts/zig *"
+    # Ryk recovery / inspect (never deadlock allow-once / explain)
+    - "ryk version"
+    - "ryk help *"
+    - "ryk doctor *"
+    - "ryk explain *"
+    - "ryk allow-once *"
+    - "ryk allowlist *"
+    - "ryk packs *"
+  deny:
+    - "rm -rf *"
+    - "find * -delete"
+    - "shred *"
+    - "curl * | sh"
+    - "wget * | bash"
+    - "sudo *"
+    - "su *"
+    - "doas *"
+    - "powershell *EncodedCommand*"
+    - "powershell *-enc*"
+    - "cat .env"
+    - "cat ~/.ssh/*"
+  ask:
+    - "npm install*"
+    - "pnpm install*"
+    - "yarn install*"
+    - "pip install*"
+    - "git push*"
+
+network:
+  mode: allowlist
+  default: deny
+  allow:
+    - "api.github.com"
+    - "*.github.com"
+    - "registry.npmjs.org"
+    - "pypi.org"
+  ask:
+    - "*.githubusercontent.com"
+  deny:
+    - "pastebin.com"
+    - "*.ngrok.io"
+    - "*.requestbin.net"
+  detect_exfiltration:
+    dns: true
+    long_query_strings: true
+    secret_patterns: true
+
+mcp:
+  default: ask
+  allow:
+    - "*.search_*"
+    - "*.list_*"
+    - "*.get_*"
+    - "glob"
+    - "grep"
+    - "list"
+    - "read"
+    - "todowrite"
+    - "todoread"
+    - "skill"
+    - "task"
+    - "question"
+    - "lsp"
+  deny:
+    - "*.delete_*"
+    - "*.shell"
+    - "*.run_command"
+
+audit:
+  level: full
+  redact_secrets: true
+  tamper_evident: true
