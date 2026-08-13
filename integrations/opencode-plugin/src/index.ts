@@ -22,14 +22,27 @@ type PluginContext = {
   worktree: string;
   client?: {
     tui?: {
-      showToast?: (input: {
-        body: {
-          title?: string;
-          message: string;
-          variant?: 'info' | 'success' | 'warning' | 'error';
-          duration?: number;
-        };
-      }) => Promise<unknown>;
+      /**
+       * OpenCode 1.18+ SDK: flat fields mapped into POST /tui/show-toast body.
+       * Older SDK Options shape: `{ body: { title, message, variant, duration } }`.
+       */
+      showToast?: (
+        input:
+          | {
+              title?: string;
+              message: string;
+              variant?: 'info' | 'success' | 'warning' | 'error';
+              duration?: number;
+            }
+          | {
+              body: {
+                title?: string;
+                message: string;
+                variant?: 'info' | 'success' | 'warning' | 'error';
+                duration?: number;
+              };
+            }
+      ) => Promise<unknown>;
     };
   };
 };
@@ -562,7 +575,7 @@ async function maybeToast(
     }
     return;
   }
-  const body = {
+  const payload = {
     title,
     message: message.slice(0, 280),
     variant,
@@ -570,7 +583,24 @@ async function maybeToast(
   };
   try {
     await Promise.race([
-      Promise.resolve(showToast({ body })).then(() => undefined),
+      (async () => {
+        // Prefer flat args (OpenCode 1.18+ / current SDK client).
+        // Fall back to nested `{ body }` for older plugin clients.
+        try {
+          await showToast(payload);
+        } catch (flatErr: unknown) {
+          try {
+            await showToast({ body: payload });
+          } catch (bodyErr: unknown) {
+            if (process.env.RYK_OPENCODE_TOAST_DEBUG === '1') {
+              const flatMsg = flatErr instanceof Error ? flatErr.message : String(flatErr);
+              const bodyMsg = bodyErr instanceof Error ? bodyErr.message : String(bodyErr);
+              console.error(`[ryk] toast failed (flat): ${flatMsg}`);
+              console.error(`[ryk] toast failed (body): ${bodyMsg}`);
+            }
+          }
+        }
+      })(),
       new Promise<void>((resolve) => {
         setTimeout(resolve, TOAST_TIMEOUT_MS);
       }),
@@ -586,7 +616,10 @@ async function maybeToast(
 
 /**
  * Best-effort error toast then throw a short single-line Error.
- * Default stderr matches toast copy; set RYK_OPENCODE_VERBOSE=1 for operator Next/Recourse.
+ *
+ * Do NOT console.error on the default path: OpenCode surfaces console.error as a
+ * red TUI status line, which duplicates toast + tool error and looks broken.
+ * Operator detail stays on stderr only when RYK_OPENCODE_VERBOSE=1.
  */
 async function hardBlockWithToast(
   ctx: PluginContext,
@@ -594,13 +627,11 @@ async function hardBlockWithToast(
   operatorDetail?: string
 ): Promise<never> {
   await maybeToast(ctx, 'error', 'ryk blocked', shortMsg);
-  console.error(`[ryk] ${shortMsg}`);
-  if (
-    operatorDetail &&
-    operatorDetail !== shortMsg &&
-    process.env.RYK_OPENCODE_VERBOSE === '1'
-  ) {
-    console.error(`[ryk] ${operatorDetail}`);
+  if (process.env.RYK_OPENCODE_VERBOSE === '1') {
+    console.error(`[ryk] ${shortMsg}`);
+    if (operatorDetail && operatorDetail !== shortMsg) {
+      console.error(`[ryk] ${operatorDetail}`);
+    }
   }
   throw new Error(shortMsg);
 }
@@ -643,11 +674,13 @@ function applyPermissionDecision(response: RykResponse, output: PermissionAskOut
   const status = PERMISSION_STATUS[response.decision];
   if (!status) {
     const msg = response.message || response.reason || 'ryk returned an invalid permission decision';
-    console.error(`[ryk] Blocked permission (fail-closed): ${msg}`);
+    if (process.env.RYK_OPENCODE_VERBOSE === '1') {
+      console.error(`[ryk] Blocked permission (fail-closed): ${msg}`);
+    }
     output.status = 'deny';
     return;
   }
-  if (status === 'deny') {
+  if (status === 'deny' && process.env.RYK_OPENCODE_VERBOSE === '1') {
     const msg = response.message || response.reason || 'ryk blocked this command.';
     console.error(`[ryk] Blocked permission: ${msg}`);
   }
@@ -755,7 +788,9 @@ export default async function rykPlugin(ctx: PluginContext): Promise<PluginHooks
         );
       },
       'permission.ask': async (_input, output) => {
-        console.error(`[ryk] Blocked permission: ${MISSING_BINARY_MSG}`);
+        if (process.env.RYK_OPENCODE_VERBOSE === '1') {
+          console.error(`[ryk] Blocked permission: ${MISSING_BINARY_MSG}`);
+        }
         output.status = 'deny';
         await maybeToast(
           ctx,
@@ -840,7 +875,7 @@ export default async function rykPlugin(ctx: PluginContext): Promise<PluginHooks
       // Host already presents permission UI: map via table (ask stays ask for resume).
       applyPermissionDecision(response, output);
       if (output.status === 'deny') {
-        // Best-effort error toast; full operator detail already on console.error.
+        // Best-effort error toast; operator detail only when RYK_OPENCODE_VERBOSE=1.
         // Toast failure must never change deny outcome.
         await maybeToast(
           ctx,

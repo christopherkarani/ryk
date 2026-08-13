@@ -8,6 +8,12 @@ import test from 'node:test';
 
 import rykPlugin, { findRyk, parseHookResponse } from '../dist/index.js';
 
+
+function toastPayload(input) {
+  // OpenCode 1.18+ uses flat fields; older clients wrap under body.
+  return input?.body ?? input;
+}
+
 const pluginRoot = join(dirname(fileURLToPath(import.meta.url)), '..');
 
 async function withFakeRyk(run, scriptBody, pluginExtras = {}) {
@@ -139,8 +145,8 @@ test('permission.ask block toasts error with short message', async () => {
       await permissionAsk({ sessionID: 'session-1', command: 'rm -rf build' }, output);
       assert.equal(output.status, 'deny');
       assert.equal(toasts.length, 1, 'exactly one error toast on permission deny');
-      const body = toasts[0]?.body;
-      assert.ok(body, 'toast body present');
+      const body = toastPayload(toasts[0]);
+      assert.ok(body, 'toast payload present');
       assert.equal(body.variant, 'error');
       assert.match(body.title, /ryk/i);
       assert.ok(typeof body.message === 'string' && body.message.length > 0);
@@ -175,7 +181,7 @@ test('permission.ask error decision toasts error and denies', async () => {
       await permissionAsk({ sessionID: 'session-1', command: 'echo hi' }, output);
       assert.equal(output.status, 'deny');
       assert.equal(toasts.length, 1);
-      assert.equal(toasts[0]?.body?.variant, 'error');
+      assert.equal(toastPayload(toasts[0])?.variant, 'error');
     },
     `#!/bin/sh
 printf '%s\\n' '{"decision":"error","message":"evaluator failed"}'
@@ -242,7 +248,7 @@ test('permission.ask warn maps to host ask and may toast warning', async () => {
       await permissionAsk({ sessionID: 'session-1', command: 'echo warn-me' }, output);
       assert.equal(output.status, 'ask', 'warn must not silent-allow or hard-deny');
       assert.equal(toasts.length, 1);
-      assert.equal(toasts[0]?.body?.variant, 'warning');
+      assert.equal(toastPayload(toasts[0])?.variant, 'warning');
     },
     `#!/bin/sh
 printf '%s\\n' '{"decision":"warn","message":"soft policy note"}'
@@ -269,7 +275,7 @@ test('permission.ask ryk ask toasts warning not error', async () => {
       await permissionAsk({ sessionID: 'session-1', command: 'rm file.txt' }, output);
       assert.equal(output.status, 'ask');
       assert.equal(toasts.length, 1);
-      assert.equal(toasts[0]?.body?.variant, 'warning');
+      assert.equal(toastPayload(toasts[0])?.variant, 'warning');
     },
     undefined,
     {
@@ -311,9 +317,9 @@ test('missing binary permission.ask toasts error and denies', async () => {
     await permissionAsk({ sessionID: 'session-1', command: 'echo hi' }, output);
     assert.equal(output.status, 'deny');
     assert.equal(toasts.length, 1);
-    assert.equal(toasts[0]?.body?.variant, 'error');
+    assert.equal(toastPayload(toasts[0])?.variant, 'error');
     assert.match(
-      toasts[0]?.body?.message ?? '',
+      toastPayload(toasts[0])?.message ?? '',
       /^ryk blocked permission:/,
       'missing-binary toast should use formatShortBlock shape'
     );
@@ -469,8 +475,8 @@ test('hard block shows toast error before throw when client present', async () =
         }
       );
       assert.equal(toasts.length, 1, 'exactly one error toast on block');
-      const body = toasts[0]?.body;
-      assert.ok(body, 'toast body present');
+      const body = toastPayload(toasts[0]);
+      assert.ok(body, 'toast payload present');
       assert.equal(body.variant, 'error');
       assert.ok(body.title && body.title.length <= 40, 'toast title short');
       assert.match(body.title, /ryk/i);
@@ -549,7 +555,7 @@ printf '%s\\n' '{"decision":"block","message":"command blocked"}'
   );
 });
 
-test('hard block logs short message to console.error by default', async () => {
+test('hard block does not console.error by default (OpenCode status-line noise)', async () => {
   const errors = [];
   const originalError = console.error;
   console.error = (...args) => {
@@ -567,9 +573,13 @@ test('hard block logs short message to console.error by default', async () => {
           )
         );
         const joined = errors.join('\n');
-        assert.match(joined, /\[ryk\] ryk blocked tool execution:/);
-        assert.ok(!joined.includes('Next:'), `default stderr must stay short, got: ${JSON.stringify(joined)}`);
-        assert.ok(!joined.includes('Recourse:'), `default stderr must stay short, got: ${JSON.stringify(joined)}`);
+        // OpenCode paints console.error as a red TUI status line — keep it quiet by default.
+        assert.ok(
+          !/\[ryk\] ryk blocked tool execution:/.test(joined),
+          `default hard-block must not console.error, got: ${JSON.stringify(joined)}`
+        );
+        assert.ok(!joined.includes('Next:'), `default stderr must stay quiet, got: ${JSON.stringify(joined)}`);
+        assert.ok(!joined.includes('Recourse:'), `default stderr must stay quiet, got: ${JSON.stringify(joined)}`);
       },
       `#!/bin/sh
 printf '%s\n' '{"decision":"block","message":"command blocked by ryk policy\nRecourse: operator can run ryk allow-once ABC","remediation_commands":["ryk allow-once ABC"]}'
@@ -631,7 +641,7 @@ test('warn path does not throw and may toast warning', async () => {
         { args: { command: 'echo warn-me' } }
       );
       assert.equal(toasts.length, 1);
-      assert.equal(toasts[0]?.body?.variant, 'warning');
+      assert.equal(toastPayload(toasts[0])?.variant, 'warning');
     },
     `#!/bin/sh
 printf '%s\\n' '{"decision":"warn","message":"soft policy note"}'
@@ -665,7 +675,7 @@ test('command.execute.before block uses short throw + error toast', async () => 
         }
       );
       assert.equal(toasts.length, 1);
-      assert.equal(toasts[0]?.body?.variant, 'error');
+      assert.equal(toastPayload(toasts[0])?.variant, 'error');
     },
     `#!/bin/sh
 printf '%s\\n' '{"decision":"block","message":"command blocked\\nRecourse: hide","remediation_commands":["ryk explain x"]}'
@@ -699,7 +709,7 @@ test('.env local block uses short throw and error toast', async () => {
         }
       );
       assert.equal(toasts.length, 1);
-      assert.equal(toasts[0]?.body?.variant, 'error');
+      assert.equal(toastPayload(toasts[0])?.variant, 'error');
     },
     undefined,
     {
@@ -750,7 +760,7 @@ test('missing binary hard-block toasts error and throws short message', async ()
       }
     );
     assert.equal(toasts.length, 1);
-    assert.equal(toasts[0]?.body?.variant, 'error');
+    assert.equal(toastPayload(toasts[0])?.variant, 'error');
   } finally {
     process.env.PATH = originalPath;
     process.env.HOME = originalHome;
