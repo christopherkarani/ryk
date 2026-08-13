@@ -13,5 +13,3 @@ test {
     _ = transport;
     _ = manifests;
 }
-
-pub const phase = "17-advanced-mcp-and-manifests";

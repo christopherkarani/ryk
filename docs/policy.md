@@ -466,7 +466,7 @@ CI never prompts. `ask` decisions become `deny`.
 
 ## Secretless Runtime
 
-Agent-primary aliases such as `ryk claude` and `ryk codex` enable the **empty backpack** secret boundary by default. Generic commands use `ryk run --secretless -- <command>` explicitly. The boundary provides public host env plus exact session phantoms for granted Anthropic/OpenAI keys, requires an OS sandbox, and denies workspace `.env` / `.env.*` forms at the OS layer. Raw values remain in the parent store; a provider-specific loopback gateway swaps exact mints only for fixed upstream hosts. Use `ryk run --with-host-secrets -- <agent-command>` as the loud escape. See [credentials.md](credentials.md) and [agent-recipes.md](agent-recipes.md).
+Agent-primary aliases such as `ryk claude` and `ryk codex` enable the **empty backpack** secret boundary by default. Generic commands use `ryk run --secretless -- <command>` explicitly. The boundary provides public host env plus exact session phantoms for granted Anthropic/OpenAI keys, requires an OS sandbox, and denies workspace `.env` / `.env.*` forms at the OS layer. Raw values remain in the parent store; a provider-specific loopback gateway swaps exact mints only for fixed upstream hosts. Use `ryk run --with-host-secrets -- <agent-command>` as the loud escape. See [credentials.md](credentials.md) and [quickstart.md](quickstart.md).
 
 ```yaml
 credentials:

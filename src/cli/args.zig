@@ -1,1 +1,1 @@
-pub const phase = "04-cli-skeleton";
+//! Argument parsing lives in command modules under src/cli/.

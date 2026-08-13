@@ -139,3 +139,15 @@ test "phase25 active contracts use canonical ryk identity" {
     try std.testing.expect(std.mem.indexOf(u8, evidence, "ryk_run_os_sandbox_on_active") != null);
     try std.testing.expect(std.mem.indexOf(u8, evidence, "orca_run_os_sandbox_on_active") == null);
 }
+
+test "tests tree has no phase-sprint filenames" {
+    var dir = try std.Io.Dir.cwd().openDir(std.testing.io, "tests", .{ .iterate = true });
+    defer dir.close(std.testing.io);
+    var it = dir.iterate();
+    while (try it.next(std.testing.io)) |entry| {
+        if (std.mem.startsWith(u8, entry.name, "phase") and std.mem.endsWith(u8, entry.name, ".zig")) {
+            std.debug.print("phase-sprint filename still present: {s}\n", .{entry.name});
+            return error.PhaseSprintFilenameFound;
+        }
+    }
+}

@@ -22,11 +22,11 @@ For a release install, use the checksum-verified curl installer in [install.md](
 ./zig-out/bin/ryk start
 ```
 
-`ryk start` is the **only** onboarding door:
+`ryk start` onboards a workspace:
 
 - creates `.ryk/policy.yaml` when missing (Ask on risk / `generic-agent` preset)
 - wires host integrations
-- verifies core readiness (daemon + policy)
+- verifies core readiness
 - prints next steps: run an agent, then `doctor` / `scan` / `replay`
 
 Non-interactive / CI-friendly:

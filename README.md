@@ -44,7 +44,7 @@ ryk <agent>
 ```
 
 
-Run scan on your repo to check for when agent has run destructive commands, you would be surprised!:
+Scan past agent sessions for risky commands and secret-like exposure:
 
 ```sh
 ryk scan

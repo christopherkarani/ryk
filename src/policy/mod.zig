@@ -16,8 +16,6 @@ pub const inference_discover = @import("inference_discover.zig");
 // Surgical monopath attach for AINA P3 managed store (p3-managed).
 pub const network_discovered = @import("network_discovered.zig");
 
-pub const phase = "07-policy-engine";
-
 test {
     // Re-export policy submodules so monopath / package gates discover their tests
     // (mirrors sandbox/mod.zig discovery pattern).

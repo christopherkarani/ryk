@@ -1,4 +1,4 @@
-# fm-steward (Phase 3)
+# fm-steward
 
 Mac-only **on-device Apple Foundation Models steward** for ryk (`SystemLanguageModel`).
 
@@ -13,7 +13,7 @@ Classifies **risk-card-v1** JSON into:
 | `ask` | Soft interrupt; human-readable `explain` required |
 | `ask_sticky_candidate` | Ask and suggest a sticky allow scope |
 
-Phase 3 ships:
+This package ships:
 
 - Normative schemas under `Schemas/`
 - Shell fixture corpus under `Fixtures/`
@@ -22,6 +22,7 @@ Phase 3 ships:
 - Warm `StewardSession` with timeout race for residual FM work
 - **Residual Wax few-shot assist** (text mode): YAML packs → compiled seed → `.wax` → k≤3 neighbors
 - Demo CLI: `fm-steward classify --card <path.json> [--live] [--few-shot auto|off|wax]`
+- Zig product hooks call this binary (see [Product Zig wiring](#product-zig-wiring))
 
 ## Platform
 
@@ -30,7 +31,7 @@ Phase 3 ships:
 | **macOS 26+** | Supported — requires Apple Intelligence / Foundation Models assets |
 | **Linux** | **Skipped** — product path does not use FM |
 
-This package is **not** wired into production Zig hooks in Phase 3 (see [Scope / W4](#scope--not-done-w4)).
+On macOS, product shell paths (`ryk hook`, `ryk evaluate`, `ryk run` / shim) call this steward after the Zig hard fence and policy matrix. Linux / non-macOS skip the call (continue stub; no steward binary required).
 
 ## Security honesty
 
@@ -140,17 +141,38 @@ swift run fm-steward eval-danger
 ./scripts/demo.sh
 ```
 
-## Scope / not done (W4)
+## Product Zig wiring
 
-**W4 production hook wiring is NOT done.** Phase 3 does not call FM from `hook.zig` / `shell_eval.zig`.
+Zig product hooks **do** call this steward. The choke is `applyFmSoftSeatbelt` in `src/cli/shell_eval.zig`. Live callers (do not treat as unattached):
 
-### G5 negative-scope check
+| Surface | Role |
+|---------|------|
+| `src/cli/fm_steward_client.zig` | Subprocess client: `fm-steward classify --card <temp> --timeout-ms N --json`. Fail-open. |
+| `src/cli/shell_eval.zig` | Soft-seatbelt choke after hard fence + policy matrix |
+| `src/cli/hook.zig` | PreToolUse / PermissionRequest shell → that choke (`telemetry_source=hook`) |
+
+`ryk evaluate` and `ryk run` / shim use the same `shell_eval` choke (evaluate injects `fm_client` into `decisionFromDaemonResultWithPolicy`).
+
+**Order (see `docs/policy.md`):** critical hard fence deny → sticky match → strict refuse → mode × severity matrix → **then** FM on remaining soft outcomes (`allow` \| `warn` \| `ask`).
+
+**Assist only — never unlocks hard deny.**
+
+- `.block` / critical deny never reach the client
+- Sticky session trust is a terminal soft allow (no FM re-ask)
+- FM may **upgrade** soft continue → `ask` only (`ask_sticky_candidate` → ask + optional sticky hints)
+- Timeout / missing binary / parse error / `RYK_FM_STEWARD=0` / non-macOS → **continue** (keep the soft matrix outcome; never invent ask)
+
+Binary resolve: `RYK_FM_STEWARD_BIN` if set, else `fm-steward` on PATH. Transport is subprocess only (no UDS). Zig does not call Swift `Classifier` for residual RAG.
 
 ```bash
-rg -n 'fm_steward|FmVerdict|classifyRiskCard' src/cli/hook.zig src/cli/shell_eval.zig || true
+# Live callers (expect hits; this is not a negative-scope check)
+rg -n 'fm_steward_client|applyFmSoftSeatbelt' src/cli/hook.zig src/cli/shell_eval.zig src/cli/fm_steward_client.zig
 ```
 
-Host sticky UI / always-allow storage / employee email·pay·social seed bodies → later phases (architecture documented under `residual-knowledge/`).
+### Remaining scope (not product)
+
+- Host sticky UI / always-allow storage for hosts that approve **outside** ryk (Claude, Codex, Pi) — `docs/policy.md` A5
+- Employee **email / pay / social** seed bodies — architecture **stubs** only under `residual-knowledge/`
 
 ## Library surface
 
@@ -300,12 +322,14 @@ let response = await session.classify(card)
 // Hosts that open Wax should close when done: await (retriever as? WaxFewShotStore)?.close()
 ```
 
-### Honesty (Phase 3 attach)
+### Honesty (Zig + Swift attach)
 
-- **Not production Zig hooks yet.** Phase 3 does not call FM from `hook.zig` /
-  `shell_eval.zig` (see [Scope / W4](#scope--not-done-w4)). Host attach here means
-  Mac demo / embed of the Swift library only.
+- **Zig product hooks call this steward.** `hook.zig` / `shell_eval.zig` (and
+  evaluate / run through that choke) invoke `fm_steward_client` as a subprocess.
+  The Swift sketch above is for Mac demo / in-process embed of `StewardSession`.
+  Both paths are residual assist — not a second policy engine.
 - **Assist only.** Wax neighbors + on-device FM are residual soft-seatbelt assist —
-  not sole security. Zig hard fence still owns catastrophe deny. Fail-open on
-  store/search errors → empty few-shots → normal FM / unavailable path.
+  not sole security. Zig hard fence still owns catastrophe deny. FM never unlocks
+  hard deny. Fail-open on store/search errors → empty few-shots → normal FM /
+  unavailable path.
 - Prefer sequential `StewardSession.classify` from one owner (actor single-flight).

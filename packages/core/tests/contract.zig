@@ -2,7 +2,7 @@ const std = @import("std");
 const ryk_core = @import("ryk_core");
 
 test "core package root exposes curated boundary only" {
-    try std.testing.expectEqualStrings("core-boundary-isolation", ryk_core.phase);
+    try expectNoDecl(ryk_core, "phase");
     try std.testing.expect(@hasDecl(ryk_core, "api"));
     try std.testing.expect(@hasDecl(ryk_core, "abi"));
 

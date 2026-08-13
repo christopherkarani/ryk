@@ -102,6 +102,10 @@
 
 **Full Changelog**: https://github.com/christopherkarani/ryk/compare/v1.2.9...v1.2.10
 
+## Formerly Orca
+
+The product was previously named Orca.
+
 ## [1.2.9] - 2026-07-25
 
 ## What's Changed
