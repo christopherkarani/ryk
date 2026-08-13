@@ -123,10 +123,6 @@ pub fn updateFinalHash(allocator: std.mem.Allocator, session_dir_path: []const u
     }
 }
 
-pub fn writeJson(writer: anytype, input: SummaryInput) !void {
-    try writeJsonAlloc(std.heap.page_allocator, writer, input);
-}
-
 pub fn writeJsonAlloc(allocator: std.mem.Allocator, writer: anytype, input: SummaryInput) !void {
     var canonical_aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer canonical_aw.deinit();
@@ -288,10 +284,6 @@ fn writeRedactedCanonicalSummaryFromJson(
         try writeRedactedJsonString(allocator, writer, try expectString(try requiredField(object, "final_event_hash")));
     }
     try writer.writeByte('}');
-}
-
-pub fn writeMarkdown(writer: anytype, input: SummaryInput) !void {
-    try writeMarkdownAlloc(std.heap.page_allocator, writer, input);
 }
 
 pub fn writeMarkdownAlloc(allocator: std.mem.Allocator, writer: anytype, input: SummaryInput) !void {

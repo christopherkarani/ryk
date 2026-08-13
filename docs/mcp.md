@@ -60,7 +60,7 @@ Every other method is denied with a JSON-RPC error and an audited `mcp_unknown_m
 
 ## Protocol Warning
 
-Stdio MCP stdout must contain only newline-delimited JSON-RPC protocol messages. Human logs belong on stderr.
+Stdio MCP stdout must contain only newline-delimited JSON-RPC protocol messages. Do not send child-server logs to stderr: `ryk mcp proxy` discards the server's stderr. ryk's own diagnostics stay on ryk's stderr.
 
 ## Remote/HTTP Status
 

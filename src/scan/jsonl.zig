@@ -79,7 +79,10 @@ pub fn parseJsonlFile(
             if (findTimestampInLine(line)) |ts| result.timestamp_secs = ts;
         }
 
-        var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch continue;
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => continue,
+        };
         defer parsed.deinit();
         try extract.walkValueForCommands(allocator, parsed.value, &result.commands, 0);
         try extract.walkValueForTextBlobs(allocator, parsed.value, &result.text_blobs, 0);
@@ -147,4 +150,36 @@ test "oversized JSONL strings still reach secret material scanning" {
     defer parsed.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), parsed.text_blobs.items.len);
     try std.testing.expect(parsed.text_blobs.items[0].len > types.max_line_bytes);
+}
+
+test "JSONL parse OutOfMemory is not swallowed as a skipped line" {
+    const io = std.testing.io;
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try std.fmt.bufPrint(&root_buf, "zig-cache/tmp-scan-jsonl-oom-{d}", .{std.Io.Timestamp.now(io, .real).toSeconds()});
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root, "sess.jsonl" });
+    defer std.testing.allocator.free(path);
+
+    const body =
+        \\{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"rm -rf /tmp/x"}}]}}
+        \\
+    ;
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = body });
+
+    // First successful parse under a failing allocator must still extract the command.
+    // If parseFromSlice OOM is `catch continue`, the first "success" is an empty session.
+    var first_success_had_command = false;
+    var fail_index: usize = 0;
+    while (fail_index < 64) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        var parsed = parseJsonlFile(io, failing.allocator(), path, 0) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            continue;
+        };
+        defer parsed.deinit(failing.allocator());
+        first_success_had_command = parsed.commands.items.len >= 1;
+        break;
+    }
+    try std.testing.expect(first_success_had_command);
 }

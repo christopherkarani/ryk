@@ -127,7 +127,8 @@ pub fn walkValueForTextBlobs(
             for (text_keys) |key| {
                 if (obj.get(key)) |v| {
                     if (v == .string and v.string.len >= 12) {
-                        try appendOwned(allocator, out, v.string);
+                        const take = @min(v.string.len, types.max_file_bytes);
+                        try appendOwned(allocator, out, v.string[0..take]);
                     } else {
                         try walkValueForTextBlobs(allocator, v, out, depth + 1);
                     }
@@ -187,9 +188,12 @@ fn extractCommandFromArguments(allocator: std.mem.Allocator, args: std.json.Valu
         .string => |s| {
             // JSON-encoded arguments string (Grok style).
             if (s.len > 0 and s[0] == '{') {
-                var parsed = std.json.parseFromSlice(std.json.Value, allocator, s, .{}) catch {
-                    try extractCmdFromCodexInput(allocator, s, out);
-                    return;
+                var parsed = std.json.parseFromSlice(std.json.Value, allocator, s, .{}) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => {
+                        try extractCmdFromCodexInput(allocator, s, out);
+                        return;
+                    },
                 };
                 defer parsed.deinit();
                 try extractCommandFromArguments(allocator, parsed.value, out);
@@ -285,4 +289,32 @@ test "extract Claude Bash tool_use" {
     try walkValueForCommands(std.testing.allocator, parsed.value, &list, 0);
     try std.testing.expect(list.items.len >= 1);
     try std.testing.expectEqualStrings("git status", list.items[0]);
+}
+
+test "named content fields cap at max_file_bytes" {
+    const huge = try std.testing.allocator.alloc(u8, types.max_file_bytes + 64);
+    defer std.testing.allocator.free(huge);
+    @memset(huge, 'a');
+
+    var obj: std.json.ObjectMap = .empty;
+    defer obj.deinit(std.testing.allocator);
+    try obj.put(std.testing.allocator, "content", .{ .string = huge });
+
+    var list: std.ArrayList([]const u8) = .empty;
+    defer freeStringList(std.testing.allocator, &list);
+    try walkValueForTextBlobs(std.testing.allocator, .{ .object = obj }, &list, 0);
+    try std.testing.expectEqual(@as(usize, 1), list.items.len);
+    try std.testing.expectEqual(types.max_file_bytes, list.items[0].len);
+}
+
+test "JSON-encoded arguments OutOfMemory is not swallowed" {
+    const line =
+        \\{"type":"tool_use","name":"Bash","arguments":"{\"command\":\"hello\"}"}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, line, .{});
+    defer parsed.deinit();
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var list: std.ArrayList([]const u8) = .empty;
+    defer freeStringList(failing.allocator(), &list);
+    try std.testing.expectError(error.OutOfMemory, walkValueForCommands(failing.allocator(), parsed.value, &list, 0));
 }

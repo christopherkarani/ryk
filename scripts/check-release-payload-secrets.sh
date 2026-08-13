@@ -74,9 +74,11 @@ patterns=(
 )
 
 # Secret identifiers make even short, low-entropy values sensitive. Keep this
-# intentionally structural rather than entropy-based so `PASSWORD=hunter2`
-# and URI credentials cannot pass merely because their values look ordinary.
-credential_name='PASSWORD|PASSWD|PASSPHRASE|PWD|TOKEN|SECRET|API_KEY|APIKEY|ACCESS_KEY|PRIVATE_KEY|CLIENT_SECRET|CREDENTIALS?|AUTHORIZATION|COOKIE'
+# intentionally structural rather than entropy-based so a low-entropy PASSWORD
+# value and URI credentials cannot pass merely because they look ordinary.
+# PGPASSWORD has no underscore; SECRET_KEY / ENCRYPTION_KEY do not end in a
+# listed term (SECRET_KEY is SECRET + _KEY, not *_SECRET). Name them first.
+credential_name='PGPASSWORD|SECRET_KEY|ENCRYPTION_KEY|PASSWORD|PASSWD|PASSPHRASE|PWD|TOKEN|SECRET|API_KEY|APIKEY|ACCESS_KEY|PRIVATE_KEY|CLIENT_SECRET|CREDENTIALS?|AUTHORIZATION|COOKIE'
 env_assignment_pattern="(^|[^A-Za-z0-9_])(([A-Z][A-Z0-9_]*)_)?(${credential_name})[[:space:]]*=[[:space:]]*[^[:space:],;}{]+"
 lowercase_credential_assignment_pattern="(^|[^A-Za-z0-9_])[a-z][a-z0-9_]+_(password|passwd|passphrase|pwd|token|secret|api_?key|access_?key|private_?key|client_?secret|credential(s)?|authorization|cookie)[[:space:]]*=[[:space:]]*[^[:space:],;}{]+"
 structured_assignment_pattern="^[[:space:]]*[\"']?(password|passwd|passphrase|pwd|token|secret|api[_-]?key|apikey|access[_-]?key|private[_-]?key|client[_-]?secret|credential(s)?|authorization|proxy-authorization|cookie|set-cookie)[\"']?[[:space:]]*:[[:space:]]*[^[:space:],;}{]+"

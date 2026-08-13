@@ -406,10 +406,6 @@ fn countIndent(line: []const u8) usize {
     return count;
 }
 
-pub fn writeStarterManifest(writer: anytype, server_name: []const u8, command: []const u8, args: []const []const u8) !void {
-    try writeStarterManifestAlloc(std.heap.page_allocator, writer, server_name, command, args);
-}
-
 pub fn writeStarterManifestAlloc(allocator: std.mem.Allocator, writer: anytype, server_name: []const u8, command: []const u8, args: []const []const u8) !void {
     try writer.writeAll("version: 1\nserver:\n");
     try writer.writeAll("  name: ");

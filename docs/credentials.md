@@ -27,27 +27,28 @@ The core engine detects and classifies sensitive values using pattern matching a
 
 ### Environment Variable Name Patterns
 
-The following env var name patterns are automatically flagged as secret-like:
+Names are matched as **underscore-anchored tokens** or **exact aliases**, not as
+substring globs (`*PASSWORD*` / `*KEY*`). `AWS_REGION`, `KEYBOARD_LAYOUT`, and
+`MONKEY_MODE` are not secret names.
 
 | Pattern | Examples |
 |---------|----------|
-| `*TOKEN*` | `GITHUB_TOKEN`, `API_TOKEN`, `NPM_TOKEN` |
-| `*SECRET*` | `AWS_SECRET`, `APP_SECRET` |
-| `*PASSWORD*` | `DB_PASSWORD`, `ADMIN_PASSWORD` |
-| `*PASSWD*` | `ROOT_PASSWD` |
-| `*PRIVATE*` | `PRIVATE_KEY` |
-| `*KEY*` | `API_KEY`, `ENCRYPTION_KEY` |
-| `AWS_*` | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` |
-| `AZURE_*` | `AZURE_CLIENT_SECRET` |
-| `GITHUB_TOKEN` | Exact match |
-| `GH_TOKEN` | Exact match |
-| `OPENAI_API_KEY` | Exact match |
-| `ANTHROPIC_API_KEY` | Exact match |
-| `GOOGLE_API_KEY` | Exact match |
-| `GOOGLE_APPLICATION_CREDENTIALS` | Exact match |
-| `NPM_TOKEN` | Exact match |
-| `PYPI_TOKEN` | Exact match |
-| `SSH_AUTH_SOCK` | Exact match |
+| `TOKEN`, `*_TOKEN`, `*_TOKEN_*` | `TOKEN`, `GITHUB_TOKEN`, `API_TOKEN`, `NPM_TOKEN` |
+| `SECRET`, `*_SECRET`, `*_SECRET_*` | `SECRET`, `AWS_SECRET`, `APP_SECRET`, `AZURE_CLIENT_SECRET` |
+| `PASSWORD`, `*_PASSWORD`, `*_PASSWORD_*` | `PASSWORD`, `DB_PASSWORD`, `ADMIN_PASSWORD` |
+| Exact `PGPASSWORD` | `PGPASSWORD` |
+| `PASSWD`, `*_PASSWD`, `*_PASSWD_*` | `PASSWD`, `ROOT_PASSWD` |
+| Exact `MYSQL_PWD` | `MYSQL_PWD` |
+| `SECRET_KEY`, `*_SECRET_KEY` | `SECRET_KEY`, `DJANGO_SECRET_KEY` |
+| `PRIVATE_KEY`, `*_PRIVATE_KEY` | `PRIVATE_KEY` |
+| `API_KEY`, `*_API_KEY` | `API_KEY`, `OPENAI_API_KEY` |
+| `*_ACCESS_KEY`, `*_ACCESS_KEY_*` | `AWS_ACCESS_KEY_ID` |
+| `*_SIGNING_KEY` | `CUSTOM_SIGNING_KEY` |
+| `*_ENCRYPTION_KEY` | `APP_ENCRYPTION_KEY` |
+| `*_CLIENT_KEY` | `APP_CLIENT_KEY` |
+| Exact `KEY` | `KEY` (not `KEYBOARD_LAYOUT`) |
+| `*_CREDENTIALS` | `GOOGLE_APPLICATION_CREDENTIALS` |
+| Exact `SSH_AUTH_SOCK` | `SSH_AUTH_SOCK` |
 
 ### Value Classification
 

@@ -557,23 +557,6 @@ fn decisionResultFromValue(allocator: std.mem.Allocator, value: std.json.Value) 
         try allocator.dupe(u8, redact_bridge.redacted_value);
 }
 
-fn eventJsonLineFromValue(allocator: std.mem.Allocator, value: std.json.Value) ![]u8 {
-    const object = try expectObject(value);
-    const event_hash = try expectString(try requiredField(object, "event_hash"));
-    const canonical = try canonicalFromJsonValue(allocator, value);
-    defer allocator.free(canonical);
-
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    errdefer out.deinit();
-    const writer = &out.writer;
-    if (canonical.len == 0 or canonical[canonical.len - 1] != '}') return error.InvalidEventSchema;
-    try writer.writeAll(canonical[0 .. canonical.len - 1]);
-    try writer.writeAll(",\"event_hash\":");
-    try core.util.writeJsonString(writer, event_hash);
-    try writer.writeByte('}');
-    return try out.toOwnedSlice();
-}
-
 const SummaryFields = struct {
     command_display: []u8,
     policy: []u8,

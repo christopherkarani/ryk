@@ -254,6 +254,29 @@ test "no-secrets removes authorization aliases when inheriting" {
     try std.testing.expect(filtered.env_map.get("HTTP_AUTHORIZATION") == null);
 }
 
+test "no-secrets omits encryption keys when inheriting" {
+    var current = std.process.Environ.Map.init(std.testing.allocator);
+    defer current.deinit();
+    try current.put("AWS_REGION", "us-test-1");
+    try current.put("KEYBOARD_LAYOUT", "us");
+    try current.put("APP_ENCRYPTION_KEY", "0123456789abcdef0123456789abcdef");
+
+    var selected = policy.schema.Policy{ .allocator = std.testing.allocator };
+    selected.env.inherit = true;
+    var filtered = try filterMap(
+        std.testing.allocator,
+        &current,
+        &selected,
+        .observe,
+        .{ .no_secrets = true },
+    );
+    defer filtered.deinit();
+
+    try std.testing.expect(filtered.env_map.get("APP_ENCRYPTION_KEY") == null);
+    try std.testing.expectEqualStrings("us-test-1", filtered.env_map.get("AWS_REGION").?);
+    try std.testing.expectEqualStrings("us", filtered.env_map.get("KEYBOARD_LAYOUT").?);
+}
+
 fn isBoundaryPublicHostEnv(name: []const u8) bool {
     if (sandbox_env.isProxyEnvKey(name)) return false;
     if (std.mem.eql(u8, name, "ANTHROPIC_BASE_URL") or
@@ -310,6 +333,7 @@ fn isCredentialEnvName(name: []const u8) bool {
         "CLIENT_KEY",
         "SIGNING_KEY",
         "SECRET_KEY",
+        "ENCRYPTION_KEY",
         "APIKEY",
     };
     for (compound_suffixes) |suffix| {

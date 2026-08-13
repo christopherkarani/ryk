@@ -216,11 +216,57 @@ fn isTokenChar(char: u8) bool {
     return std.ascii.isAlphanumeric(char) or char == '_' or char == '-';
 }
 
+const percent_decode_depth_cap: u8 = 4;
+const max_encoded_decoded = 1024;
+
+fn containsSecretPlain(value: []const u8) bool {
+    return findStructuredSecret(value, 0) != null or classifyString(value) != null;
+}
+
+fn percentUnfoldContainsSecret(value: []const u8, buffer: []u8) bool {
+    var current = value;
+    var depth: u8 = 0;
+    while (depth < percent_decode_depth_cap) : (depth += 1) {
+        const decoded = percentDecodeBounded(current, buffer) orelse return false;
+        if (std.mem.eql(u8, decoded, current)) return false;
+        if (containsSecretPlain(decoded)) return true;
+        current = decoded;
+    }
+    return false;
+}
+
+fn encodedDecodedContainsSecret(decoded: []const u8) bool {
+    if (!std.unicode.utf8ValidateSlice(decoded)) return false;
+    if (containsSecretPlain(decoded)) return true;
+    var unfold: [max_encoded_decoded]u8 = undefined;
+    if (decoded.len > unfold.len) return false;
+    return percentUnfoldContainsSecret(decoded, &unfold);
+}
+
+fn encodedDecodedContainsSecretAlloc(allocator: std.mem.Allocator, decoded: []const u8) !bool {
+    if (!std.unicode.utf8ValidateSlice(decoded)) return false;
+    if (containsSecretPlain(decoded)) return true;
+    var current = try allocator.dupe(u8, decoded);
+    defer allocator.free(current);
+    var depth: u8 = 0;
+    while (depth < percent_decode_depth_cap) : (depth += 1) {
+        const next = try percentDecodeAlloc(allocator, current);
+        if (std.mem.eql(u8, next, current)) {
+            allocator.free(next);
+            return false;
+        }
+        allocator.free(current);
+        current = next;
+        if (containsSecretPlain(current)) return true;
+    }
+    return false;
+}
+
 fn encodedContainsSecret(allocator: std.mem.Allocator, value: []const u8) !bool {
     var current = try allocator.dupe(u8, value);
     defer allocator.free(current);
     var depth: u8 = 0;
-    while (depth < 2) : (depth += 1) {
+    while (depth < percent_decode_depth_cap) : (depth += 1) {
         const decoded = try percentDecodeAlloc(allocator, current);
         if (std.mem.eql(u8, decoded, current)) {
             allocator.free(decoded);
@@ -228,7 +274,7 @@ fn encodedContainsSecret(allocator: std.mem.Allocator, value: []const u8) !bool 
         }
         allocator.free(current);
         current = decoded;
-        if (findStructuredSecret(current, 0) != null or classifyString(current) != null) return true;
+        if (containsSecretPlain(current)) return true;
     }
     if (try encodedCandidateContainsSecret(allocator, value)) return true;
     var tokens = std.mem.tokenizeAny(u8, value, " \t\r\n\"'(),;:{}[]<>");
@@ -263,14 +309,14 @@ fn encodedCandidateContainsSecret(allocator: std.mem.Allocator, value: []const u
             const decoded = try allocator.alloc(u8, size);
             defer allocator.free(decoded);
             decoder.decode(decoded, value) catch continue;
-            if (std.unicode.utf8ValidateSlice(decoded) and (findStructuredSecret(decoded, 0) != null or classifyString(decoded) != null)) return true;
+            if (try encodedDecodedContainsSecretAlloc(allocator, decoded)) return true;
         }
     }
     if (value.len >= 40 and value.len <= 2048 and value.len % 2 == 0) {
         const decoded = try allocator.alloc(u8, value.len / 2);
         defer allocator.free(decoded);
         _ = std.fmt.hexToBytes(decoded, value) catch return false;
-        if (std.unicode.utf8ValidateSlice(decoded) and (findStructuredSecret(decoded, 0) != null or classifyString(decoded) != null)) return true;
+        if (try encodedDecodedContainsSecretAlloc(allocator, decoded)) return true;
     }
     return false;
 }
@@ -319,8 +365,12 @@ const secret_env_patterns = [_][]const u8{
     "*_ENCRYPTION_KEY",
     "*_CLIENT_KEY",
     "KEY",
+    "SECRET_KEY",
+    "*_SECRET_KEY",
     "*_CREDENTIALS",
     "SSH_AUTH_SOCK",
+    "PGPASSWORD",
+    "MYSQL_PWD",
 };
 
 pub fn redactString(value: []const u8) []const u8 {
@@ -334,7 +384,7 @@ pub fn redactStringBounded(value: []const u8, buffer: []u8) []const u8 {
     if (value.len > max_structured_input) return redacted_value;
     if (encodedContainsSecretBounded(value)) return redacted_value;
     if (classifyString(value)) |match| {
-        return formatReplacement(buffer, match.label, &match.fingerprint) catch redacted_value;
+        return formatReplacement(buffer, match.label) catch redacted_value;
     }
     // `classifyString` does not model sensitive-key assignments
     // (`{"password":"…"}`), header credentials (`Authorization: Bearer …`),
@@ -351,19 +401,8 @@ pub fn redactStringBounded(value: []const u8, buffer: []u8) []const u8 {
 fn encodedContainsSecretBounded(value: []const u8) bool {
     // Match the owned path's complete percent-decoding coverage without heap
     // allocation. The public input is already capped at max_structured_input.
-    var percent_first: [max_structured_input]u8 = undefined;
-    if (percentDecodeBounded(value, &percent_first)) |first| {
-        if (!std.mem.eql(u8, first, value)) {
-            if (findStructuredSecret(first, 0) != null or classifyString(first) != null) return true;
-            const first_len = first.len;
-            // Percent decoding cannot grow its input, so the second pass can
-            // safely decode in place and keep this boundary to one fixed buffer.
-            if (percentDecodeBounded(first, &percent_first)) |second| {
-                if (second.len != first_len and
-                    (findStructuredSecret(second, 0) != null or classifyString(second) != null)) return true;
-            }
-        }
-    }
+    var percent_buf: [max_structured_input]u8 = undefined;
+    if (percentUnfoldContainsSecret(value, &percent_buf)) return true;
 
     if (encodedCandidateContainsSecretBounded(value)) return true;
     var tokens = std.mem.tokenizeAny(u8, value, " \t\r\n\"'(),;:{}[]<>");
@@ -392,18 +431,14 @@ fn encodedCandidateContainsSecretBounded(value: []const u8) bool {
             const size = decoder.calcSizeForSlice(value) catch continue;
             if (size == 0 or size > decoded.len) continue;
             decoder.decode(decoded[0..size], value) catch continue;
-            const candidate = decoded[0..size];
-            if (std.unicode.utf8ValidateSlice(candidate) and
-                (findStructuredSecret(candidate, 0) != null or classifyString(candidate) != null)) return true;
+            if (encodedDecodedContainsSecret(decoded[0..size])) return true;
         }
     }
     if (value.len >= 40 and value.len <= 2048 and value.len % 2 == 0) {
         var decoded: [1024]u8 = undefined;
         const size = value.len / 2;
         _ = std.fmt.hexToBytes(decoded[0..size], value) catch return false;
-        const candidate = decoded[0..size];
-        if (std.unicode.utf8ValidateSlice(candidate) and
-            (findStructuredSecret(candidate, 0) != null or classifyString(candidate) != null)) return true;
+        if (encodedDecodedContainsSecret(decoded[0..size])) return true;
     }
     return false;
 }
@@ -461,7 +496,7 @@ fn redactStructuredBounded(value: []const u8, buffer: []u8) []const u8 {
 pub fn redactTargetValueBounded(kind_name: []const u8, value: []const u8, buffer: []u8) []const u8 {
     if (std.mem.eql(u8, kind_name, "env_var")) {
         if (classifySecretValue(value)) |match| {
-            return formatReplacement(buffer, match.label, &match.fingerprint) catch redacted_value;
+            return formatReplacement(buffer, match.label) catch redacted_value;
         }
         return value;
     }
@@ -474,7 +509,7 @@ pub fn redactTargetValueAlloc(allocator: std.mem.Allocator, kind_name: []const u
     if (std.mem.eql(u8, kind_name, "env_var")) {
         if (classifySecretValue(value)) |match| {
             var buffer: [256]u8 = undefined;
-            const replacement = formatReplacement(&buffer, match.label, &match.fingerprint) catch redacted_value;
+            const replacement = formatReplacement(&buffer, match.label) catch redacted_value;
             return allocator.dupe(u8, replacement);
         }
     }
@@ -488,10 +523,14 @@ pub fn isSecretEnvName(name: []const u8) bool {
     return false;
 }
 
+fn labeledMatch(label: []const u8) RedactionMatch {
+    return .{ .label = label, .fingerprint = .{0} ** 8 };
+}
+
 pub fn classifyString(value: []const u8) ?RedactionMatch {
     if (parseEnvAssignment(value)) |assignment| {
         if (isSecretEnvName(assignment.name)) {
-            return .{ .label = assignment.name, .fingerprint = fingerprint8(assignment.value) };
+            return labeledMatch(assignment.name);
         }
         if (classifySecretValue(assignment.value)) |match| return match;
     }
@@ -505,34 +544,34 @@ pub fn classifySecretValue(value: []const u8) ?RedactionMatch {
     if (trimmed.len == 0) return null;
 
     if (containsIgnoreCase(trimmed, "fake_secret") or containsIgnoreCase(trimmed, "fake-secret") or containsIgnoreCase(trimmed, "secret_value") or containsIgnoreCase(trimmed, "secret-value")) {
-        return .{ .label = "secret:synthetic_secret", .fingerprint = fingerprint8(trimmed) };
+        return labeledMatch("secret:synthetic_secret");
     }
     if (containsIgnoreCase(trimmed, "-----BEGIN ") and containsIgnoreCase(trimmed, "PRIVATE KEY-----")) {
-        return .{ .label = "secret:pem_private_key", .fingerprint = fingerprint8(trimmed) };
+        return labeledMatch("secret:pem_private_key");
     }
     if (containsIgnoreCase(trimmed, "-----BEGIN OPENSSH PRIVATE KEY-----")) {
-        return .{ .label = "secret:ssh_private_key", .fingerprint = fingerprint8(trimmed) };
+        return labeledMatch("secret:ssh_private_key");
     }
     if (containsCloudCredentialJson(trimmed)) {
-        return .{ .label = "secret:cloud_credentials_json", .fingerprint = fingerprint8(trimmed) };
+        return labeledMatch("secret:cloud_credentials_json");
     }
     if (looksLikeAwsAccessKey(trimmed)) {
-        return .{ .label = "secret:aws_access_key", .fingerprint = fingerprint8(trimmed) };
+        return labeledMatch("secret:aws_access_key");
     }
     if (looksLikeGithubToken(trimmed)) {
-        return .{ .label = "secret:github_token", .fingerprint = fingerprint8(trimmed) };
+        return labeledMatch("secret:github_token");
     }
     if (looksLikeOpenAiKey(trimmed)) {
-        return .{ .label = "secret:openai_api_key", .fingerprint = fingerprint8(trimmed) };
+        return labeledMatch("secret:openai_api_key");
     }
     if (looksLikeAnthropicKey(trimmed)) {
-        return .{ .label = "secret:anthropic_api_key", .fingerprint = fingerprint8(trimmed) };
+        return labeledMatch("secret:anthropic_api_key");
     }
     if (looksLikeJwt(trimmed)) {
-        return .{ .label = "secret:jwt", .fingerprint = fingerprint8(trimmed) };
+        return labeledMatch("secret:jwt");
     }
     if (looksHighEntropy(trimmed)) {
-        return .{ .label = "secret:high_entropy", .fingerprint = fingerprint8(trimmed) };
+        return labeledMatch("secret:high_entropy");
     }
     return null;
 }
@@ -542,21 +581,11 @@ pub fn formatEnvReplacement(buffer: []u8, name: []const u8, value: []const u8) !
     return try std.fmt.bufPrint(buffer, "[REDACTED:env:{s}]", .{name});
 }
 
-fn formatReplacement(buffer: []u8, label: []const u8, digest: *const [8]u8) ![]const u8 {
-    _ = digest;
+fn formatReplacement(buffer: []u8, label: []const u8) ![]const u8 {
     if (std.mem.startsWith(u8, label, "secret:")) {
         return try std.fmt.bufPrint(buffer, "[REDACTED:{s}]", .{label});
     }
     return try std.fmt.bufPrint(buffer, "[REDACTED:env:{s}]", .{label});
-}
-
-pub fn fingerprint8(value: []const u8) [8]u8 {
-    var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(value, &digest, .{});
-    const hex = std.fmt.bytesToHex(digest, .lower);
-    var out: [8]u8 = undefined;
-    @memcpy(&out, hex[0..8]);
-    return out;
 }
 
 fn parseEnvAssignment(value: []const u8) ?EnvAssignment {
@@ -575,7 +604,7 @@ fn classifyEmbeddedAssignment(value: []const u8) ?RedactionMatch {
         const token = trimCommandToken(raw_token);
         if (parseEnvAssignment(token)) |assignment| {
             if (isSecretEnvName(assignment.name)) {
-                return .{ .label = assignment.name, .fingerprint = fingerprint8(assignment.value) };
+                return labeledMatch(assignment.name);
             }
             if (classifySecretValue(assignment.value)) |match| return match;
         }
@@ -1123,4 +1152,43 @@ test "benign environment names are not credentials" {
     try std.testing.expect(isSecretEnvName("AWS_SECRET_ACCESS_KEY"));
     try std.testing.expect(isSecretEnvName("AZURE_CLIENT_SECRET"));
     try std.testing.expect(isSecretEnvName("CUSTOM_SIGNING_KEY"));
+}
+
+test "secret env name detection covers PGPASSWORD MYSQL_PWD and SECRET_KEY" {
+    try std.testing.expect(isSecretEnvName("PGPASSWORD"));
+    try std.testing.expect(isSecretEnvName("MYSQL_PWD"));
+    try std.testing.expect(isSecretEnvName("SECRET_KEY"));
+    try std.testing.expect(isSecretEnvName("DJANGO_SECRET_KEY"));
+    try std.testing.expect(!isSecretEnvName("AWS_REGION"));
+    try std.testing.expect(!isSecretEnvName("KEYBOARD_LAYOUT"));
+    try std.testing.expect(!isSecretEnvName("MONKEY_MODE"));
+
+    const redacted = try redactAlloc(std.testing.allocator, "PGPASSWORD=hunter2 psql");
+    defer std.testing.allocator.free(redacted);
+    try std.testing.expect(std.mem.indexOf(u8, redacted, "hunter2") == null);
+    try std.testing.expect(std.mem.indexOf(u8, redacted, redacted_value) != null);
+}
+
+test "triple percent and base64-of-percent secrets redact on alloc and bounded paths" {
+    const triple_percent = "token%25253Dcorrect-horse-battery-staple";
+    // base64("token%3Dcorrect-horse-battery-staple")
+    const base64_of_percent = "dG9rZW4lM0Rjb3JyZWN0LWhvcnNlLWJhdHRlcnktc3RhcGxl";
+    const cases = [_][]const u8{ triple_percent, base64_of_percent };
+    for (cases) |value| {
+        const owned = try redactAlloc(std.testing.allocator, value);
+        defer std.testing.allocator.free(owned);
+        try std.testing.expectEqualStrings(redacted_value, owned);
+        try std.testing.expect(std.mem.indexOf(u8, owned, "correct-horse") == null);
+
+        var buffer: [256]u8 = undefined;
+        const bounded = redactStringBounded(value, &buffer);
+        try std.testing.expectEqualStrings(redacted_value, bounded);
+        try std.testing.expect(std.mem.indexOf(u8, bounded, "correct-horse") == null);
+    }
+}
+
+test "classify does not hash raw secret fingerprints" {
+    const match = classifyString("GITHUB_TOKEN=hunter2") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual([_]u8{0} ** 8, match.fingerprint);
+    try std.testing.expectEqualStrings("GITHUB_TOKEN", match.label);
 }

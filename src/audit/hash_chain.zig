@@ -16,133 +16,13 @@ pub fn eventHash(previous_hash: ?[]const u8, canonical_event_without_hash: []con
     return std.fmt.bytesToHex(digest, .lower);
 }
 
-/// Compatibility wrapper for callers that rely on the allocation-free public
-/// serializer. Encoded-secret parity is provided by the bounded redactor.
-pub fn writeCanonicalEventWithoutHash(writer: anytype, ev: core.event.Event, previous_hash: ?[]const u8) !void {
-    try writeEventFieldsBounded(writer, ev, previous_hash, null);
-}
-
 pub fn writeCanonicalEventWithoutHashAlloc(allocator: std.mem.Allocator, writer: anytype, ev: core.event.Event, previous_hash: ?[]const u8) !void {
     try writeEventFields(allocator, writer, ev, previous_hash, null);
-}
-
-/// Compatibility wrapper retaining the established no-allocator API.
-pub fn writeEventJsonLine(writer: anytype, ev: core.event.Event, previous_hash: ?[]const u8, event_hash_value: []const u8) !void {
-    try writeEventFieldsBounded(writer, ev, previous_hash, event_hash_value);
-    try writer.writeByte('\n');
 }
 
 pub fn writeEventJsonLineAlloc(allocator: std.mem.Allocator, writer: anytype, ev: core.event.Event, previous_hash: ?[]const u8, event_hash_value: []const u8) !void {
     try writeEventFields(allocator, writer, ev, previous_hash, event_hash_value);
     try writer.writeByte('\n');
-}
-
-fn writeEventFieldsBounded(writer: anytype, ev: core.event.Event, previous_hash: ?[]const u8, event_hash_value: ?[]const u8) !void {
-    var timestamp_buf: [32]u8 = undefined;
-    const timestamp = try ev.timestamp.formatIso(&timestamp_buf);
-
-    try writer.writeByte('{');
-    try writer.print("\"version\":{d}", .{ev.schema_version});
-    try writer.writeAll(",\"session_id\":");
-    try core.util.writeJsonString(writer, ev.session_id.slice());
-    try writer.writeAll(",\"event_id\":");
-    try core.util.writeJsonString(writer, ev.event_id.slice());
-    try writer.writeAll(",\"timestamp\":");
-    try core.util.writeJsonString(writer, timestamp);
-    try writer.writeAll(",\"type\":");
-    try core.util.writeJsonString(writer, ev.event_type.toString());
-    try writer.writeAll(",\"actor\":");
-    try writeActorBounded(writer, ev.actor);
-    try writer.writeAll(",\"target\":");
-    try writeTargetBounded(writer, ev.target);
-    try writer.writeAll(",\"decision\":");
-    try writeDecisionBounded(writer, ev.decision);
-    try writer.writeAll(",\"redactions\":");
-    try writeRedactionsBounded(writer, ev.redactions);
-    if (!ev.metadata.isEmpty()) {
-        try writer.writeAll(",\"metadata\":");
-        try writeMetadataBounded(writer, ev.metadata);
-    }
-    try writer.writeAll(",\"previous_hash\":");
-    try writeNullableRawString(writer, previous_hash);
-    if (event_hash_value) |hash| {
-        try writer.writeAll(",\"event_hash\":");
-        try core.util.writeJsonString(writer, hash);
-    }
-    try writer.writeByte('}');
-}
-
-fn writeActorBounded(writer: anytype, actor: core.types.Actor) !void {
-    try writer.writeByte('{');
-    try writer.writeAll("\"kind\":");
-    try core.util.writeJsonString(writer, @tagName(actor.kind));
-    try writer.writeAll(",\"id\":");
-    try writeNullableStringBounded(writer, actor.id);
-    try writer.writeAll(",\"display\":");
-    try writeNullableStringBounded(writer, actor.display);
-    try writer.writeByte('}');
-}
-
-fn writeTargetBounded(writer: anytype, target: core.types.Target) !void {
-    try writer.writeByte('{');
-    try writer.writeAll("\"kind\":");
-    try core.util.writeJsonString(writer, @tagName(target.kind));
-    try writer.writeAll(",\"value\":");
-    var buffer: [512]u8 = undefined;
-    try core.util.writeJsonString(writer, redact_bridge.redactTargetValueBounded(@tagName(target.kind), target.value, &buffer));
-    try writer.writeByte('}');
-}
-
-fn writeDecisionBounded(writer: anytype, maybe_decision: ?core.decision.Decision) !void {
-    const decision = maybe_decision orelse return writer.writeAll("null");
-    try writer.writeByte('{');
-    try writer.writeAll("\"result\":");
-    try core.util.writeJsonString(writer, decision.result.toString());
-    try writer.writeAll(",\"rule_id\":");
-    try writeNullableStringBounded(writer, decision.rule_id);
-    try writer.writeAll(",\"reason\":");
-    var reason_buf: [512]u8 = undefined;
-    try core.util.writeJsonString(writer, redact_bridge.redactStringBounded(decision.reason, &reason_buf));
-    try writer.writeAll(",\"risk_score\":");
-    if (decision.risk_score) |score| try writer.print("{d}", .{score}) else try writer.writeAll("null");
-    try writer.print(",\"requires_user\":{},\"ci_may_proceed\":{}", .{ decision.requires_user, decision.ci_may_proceed });
-    try writer.writeByte('}');
-}
-
-fn writeRedactionsBounded(writer: anytype, redactions: core.event.RedactionSummary) !void {
-    try writer.print("{{\"count\":{d},\"labels\":[", .{redactions.count});
-    for (redactions.labels, 0..) |label, index| {
-        if (index > 0) try writer.writeByte(',');
-        var buffer: [512]u8 = undefined;
-        try core.util.writeJsonString(writer, redact_bridge.redactStringBounded(label, &buffer));
-    }
-    try writer.writeAll("]}");
-}
-
-fn writeMetadataBounded(writer: anytype, metadata: core.event.EventMetadata) !void {
-    try writer.writeByte('{');
-    var wrote = false;
-    inline for (.{
-        .{ "decision_source", metadata.decision_source }, .{ "event_source", metadata.event_source },
-        .{ "host", metadata.host },                       .{ "daemon_status", metadata.daemon_status },
-        .{ "pack_id", metadata.pack_id },                 .{ "severity", metadata.severity },
-        .{ "remediation", metadata.remediation },
-    }) |field| if (field[1]) |value| {
-        if (wrote) try writer.writeByte(',');
-        try core.util.writeJsonString(writer, field[0]);
-        try writer.writeByte(':');
-        var buffer: [512]u8 = undefined;
-        try core.util.writeJsonString(writer, redact_bridge.redactStringBounded(value, &buffer));
-        wrote = true;
-    };
-    try writer.writeByte('}');
-}
-
-fn writeNullableStringBounded(writer: anytype, value: ?[]const u8) !void {
-    if (value) |string| {
-        var buffer: [512]u8 = undefined;
-        try core.util.writeJsonString(writer, redact_bridge.redactStringBounded(string, &buffer));
-    } else try writer.writeAll("null");
 }
 
 fn writeEventFields(allocator: std.mem.Allocator, writer: anytype, ev: core.event.Event, previous_hash: ?[]const u8, event_hash_value: ?[]const u8) !void {
