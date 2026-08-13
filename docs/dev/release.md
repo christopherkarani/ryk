@@ -38,6 +38,8 @@ asset set is already attached to the tag's GitHub Release.
 | `scripts/build-release.sh` | Build CLI archives, checksums, SBOM, and release manifest |
 | `scripts/build-linux-release-docker.sh` | Stage Linux `ryk` bins for Mac hosts |
 | `scripts/verify-release.sh` | Verify the curl installer artifact contract |
+| `scripts/stage-release-payload.sh` | Stage only Git-tracked runtime files |
+| `scripts/check-release-payload-secrets.sh` | Reject credential-shaped content from staged and archived payloads |
 | `scripts/release-dry-run.sh` | Host-only dry-run build and verify |
 
 ## Product notes

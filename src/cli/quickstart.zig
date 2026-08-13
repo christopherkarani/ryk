@@ -72,6 +72,7 @@ fn commandWithDaemonChecker(
 
         if (json_mode) {
             try readiness.writeJsonEnvelope(stdout, .{
+                .allocator = allocator,
                 .assessment = assessment,
                 .check = check_mode,
                 .daemon_status = readiness.daemonWireLabel(daemon_check.status),

@@ -87,8 +87,8 @@ pub fn filterMap(
     while (it.next()) |entry| {
         const name = entry.key_ptr.*;
         const value = entry.value_ptr.*;
-        const name_secret = audit.redact_bridge.isSecretEnvName(name);
-        const value_match = audit.redact_bridge.classifySecretValue(value);
+        const name_secret = isCredentialEnvName(name);
+        const value_match = classifyCredentialEnvValue(value);
         if (name_secret) {
             try appendRedaction(
                 allocator,
@@ -197,6 +197,63 @@ test "empty backpack env schema passes declared public and omits unknown and sen
     try std.testing.expectEqualStrings("/usr/bin", filtered.env_map.get("PATH").?);
 }
 
+test "no-secrets retains benign AWS and key configuration but removes unknown credential aliases" {
+    var current = std.process.Environ.Map.init(std.testing.allocator);
+    defer current.deinit();
+    try current.put("AWS_REGION", "us-test-1");
+    try current.put("KEYBOARD_LAYOUT", "us");
+    try current.put("CUSTOM_SERVICE_CREDENTIAL", "ordinary-looking-value");
+    try current.put("CUSTOM_API_KEY", "ordinary-looking-value");
+    try current.put("STRIPE_APIKEY", "ordinary-looking-value");
+    try current.put("SERVICE_AUTH", "ordinary-looking-value");
+    try current.put("SESSION_ID", "ordinary-looking-value");
+    try current.put("APP_COOKIE", "ordinary-looking-value");
+    try current.put("DATABASE_PWD", "ordinary-looking-value");
+    try current.put("DATABASE_URL", "postgres://admin:hunter2@db.invalid/app");
+    try current.put("APP_CONFIG", "{\"password\":\"hunter2\"}");
+    try current.put("PUBLIC_URL", "https://service.invalid/api");
+
+    var selected = policy.schema.Policy{ .allocator = std.testing.allocator };
+    selected.env.inherit = true;
+    var filtered = try filterMap(
+        std.testing.allocator,
+        &current,
+        &selected,
+        .observe,
+        .{ .no_secrets = true },
+    );
+    defer filtered.deinit();
+
+    try std.testing.expectEqualStrings("us-test-1", filtered.env_map.get("AWS_REGION").?);
+    try std.testing.expectEqualStrings("us", filtered.env_map.get("KEYBOARD_LAYOUT").?);
+    try std.testing.expect(filtered.env_map.get("CUSTOM_SERVICE_CREDENTIAL") == null);
+    try std.testing.expect(filtered.env_map.get("CUSTOM_API_KEY") == null);
+    try std.testing.expect(filtered.env_map.get("STRIPE_APIKEY") == null);
+    try std.testing.expect(filtered.env_map.get("SERVICE_AUTH") == null);
+    try std.testing.expect(filtered.env_map.get("SESSION_ID") == null);
+    try std.testing.expect(filtered.env_map.get("APP_COOKIE") == null);
+    try std.testing.expect(filtered.env_map.get("DATABASE_PWD") == null);
+    try std.testing.expect(filtered.env_map.get("DATABASE_URL") == null);
+    try std.testing.expect(filtered.env_map.get("APP_CONFIG") == null);
+    try std.testing.expectEqualStrings("https://service.invalid/api", filtered.env_map.get("PUBLIC_URL").?);
+}
+
+test "no-secrets removes authorization aliases when inheriting" {
+    var current = std.process.Environ.Map.init(std.testing.allocator);
+    defer current.deinit();
+    try current.put("AUTHORIZATION", "Basic ordinary-value");
+    try current.put("PROXY_AUTHORIZATION", "Basic ordinary-value");
+    try current.put("HTTP_AUTHORIZATION", "Basic ordinary-value");
+
+    var selected = policy.schema.Policy{ .allocator = std.testing.allocator };
+    selected.env.inherit = true;
+    var filtered = try filterMap(std.testing.allocator, &current, &selected, .observe, .{ .no_secrets = true });
+    defer filtered.deinit();
+    try std.testing.expect(filtered.env_map.get("AUTHORIZATION") == null);
+    try std.testing.expect(filtered.env_map.get("PROXY_AUTHORIZATION") == null);
+    try std.testing.expect(filtered.env_map.get("HTTP_AUTHORIZATION") == null);
+}
+
 fn isBoundaryPublicHostEnv(name: []const u8) bool {
     if (sandbox_env.isProxyEnvKey(name)) return false;
     if (std.mem.eql(u8, name, "ANTHROPIC_BASE_URL") or
@@ -208,6 +265,72 @@ fn isBoundaryPublicHostEnv(name: []const u8) bool {
         if (std.mem.eql(u8, name, allowed)) return true;
     }
     return false;
+}
+
+/// Classifies credential-bearing environment names without treating broad
+/// configuration namespaces (for example AWS_REGION) or ordinary words that
+/// contain "KEY" (for example KEYBOARD_LAYOUT) as secrets.
+fn isCredentialEnvName(name: []const u8) bool {
+    const exact_names = [_][]const u8{
+        "SSH_AUTH_SOCK",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "MYSQL_PWD",
+        "PGPASSWORD",
+        "AWS_ACCESS_KEY_ID",
+    };
+    for (exact_names) |candidate| {
+        if (std.ascii.eqlIgnoreCase(name, candidate)) return true;
+    }
+
+    const credential_terms = [_][]const u8{
+        "TOKEN",
+        "SECRET",
+        "PASSWORD",
+        "PASSWD",
+        "PASSPHRASE",
+        "CREDENTIAL",
+        "CREDENTIALS",
+        "AUTH",
+        "AUTHORIZATION",
+        "SESSION",
+        "COOKIE",
+        "PWD",
+    };
+    var terms = std.mem.tokenizeAny(u8, name, "_-.");
+    while (terms.next()) |term| {
+        for (credential_terms) |credential_term| {
+            if (std.ascii.eqlIgnoreCase(term, credential_term)) return true;
+        }
+    }
+
+    const compound_suffixes = [_][]const u8{
+        "API_KEY",
+        "ACCESS_KEY",
+        "PRIVATE_KEY",
+        "CLIENT_KEY",
+        "SIGNING_KEY",
+        "SECRET_KEY",
+        "APIKEY",
+    };
+    for (compound_suffixes) |suffix| {
+        if (std.ascii.eqlIgnoreCase(name, suffix)) return true;
+        if (name.len > suffix.len and name[name.len - suffix.len - 1] == '_' and
+            std.ascii.eqlIgnoreCase(name[name.len - suffix.len ..], suffix)) return true;
+    }
+    return false;
+}
+
+fn classifyCredentialEnvValue(value: []const u8) ?audit.redact_bridge.RedactionMatch {
+    if (audit.redact_bridge.classifySecretValue(value)) |match| return match;
+    var buffer: [256]u8 = undefined;
+    const redacted = audit.redact_bridge.redactStringBounded(value, &buffer);
+    if (!(redacted.ptr == value.ptr and redacted.len == value.len)) {
+        return .{
+            .label = "secret:structured_credential",
+            .fingerprint = .{0} ** 8,
+        };
+    }
+    return null;
 }
 
 fn matchesAnyPattern(patterns: []const []const u8, name: []const u8) bool {
@@ -279,9 +402,9 @@ fn appendValueRedaction(
     errdefer allocator.free(safe_name);
     var label_buf: [256]u8 = undefined;
     const label = if (std.mem.startsWith(u8, match.label, "secret:"))
-        try std.fmt.bufPrint(&label_buf, "[REDACTED:{s}:sha256:{s}]", .{ match.label, &match.fingerprint })
+        try std.fmt.bufPrint(&label_buf, "[REDACTED:{s}]", .{match.label})
     else
-        try std.fmt.bufPrint(&label_buf, "[REDACTED:env:{s}:sha256:{s}]", .{ match.label, &match.fingerprint });
+        try std.fmt.bufPrint(&label_buf, "[REDACTED:env:{s}]", .{match.label});
     const labels = try allocator.alloc([]const u8, 1);
     errdefer allocator.free(labels);
     labels[0] = try allocator.dupe(u8, label);

@@ -43,18 +43,16 @@ const SecretSpan = struct { start: usize, end: usize };
 fn findStructuredSecret(value: []const u8, from: usize) ?SecretSpan {
     var i = from;
     while (i < value.len) : (i += 1) {
-        // Already-redacted placeholders are opaque: skip the whole `[REDACTED…]`
-        // token so redaction is idempotent. Values flow through this scan more
-        // than once (e.g. intercept redacts a URL, then the audit write boundary
-        // redacts again); without this, `token=[REDACTED:env:token:sha256:…]`
-        // and the marker's inner `token:sha256` would be re-scanned and the label
-        // clobbered. P0-4.
+        // Only syntactically valid markers are opaque. Attacker-controlled text
+        // beginning with `[REDACTED` must not suppress scanning of its contents
+        // or the remainder of the value.
         if (std.mem.startsWith(u8, value[i..], redacted_value[0 .. redacted_value.len - 1])) {
             if (std.mem.indexOfScalarPos(u8, value, i, ']')) |close| {
-                i = close; // loop's `i += 1` advances past ']'
-                continue;
+                if (isValidRedactionMarker(value[i .. close + 1])) {
+                    i = close; // loop's `i += 1` advances past ']'
+                    continue;
+                }
             }
-            return null;
         }
 
         // URL userinfo credentials: `scheme://user:password@host`. The userinfo
@@ -93,11 +91,28 @@ fn findStructuredSecret(value: []const u8, from: usize) ?SecretSpan {
         var cursor = key_end;
         while (cursor < value.len and (value[cursor] == ' ' or value[cursor] == '\t' or value[cursor] == '"' or value[cursor] == '\'')) : (cursor += 1) {}
         if (cursor < value.len and value[cursor] == ':') cursor += 1 else if (cursor < value.len and value[cursor] == '=') cursor += 1 else continue;
-        while (cursor < value.len and (value[cursor] == ' ' or value[cursor] == '\t')) : (cursor += 1) {}
+        var continued_value = false;
+        while (cursor < value.len and std.ascii.isWhitespace(value[cursor])) : (cursor += 1) {
+            if (value[cursor] == '\r' or value[cursor] == '\n') continued_value = true;
+        }
         var quote: ?u8 = null;
         if (cursor < value.len and (value[cursor] == '"' or value[cursor] == '\'')) {
             quote = value[cursor];
             cursor += 1;
+        }
+        // YAML block scalar indicators introduce an indented multi-line value.
+        // Redact the complete block, not only the `|` / `>` indicator.
+        if (quote == null and cursor < value.len and (value[cursor] == '|' or value[cursor] == '>')) {
+            while (cursor < value.len and value[cursor] != '\r' and value[cursor] != '\n') : (cursor += 1) {}
+            while (cursor < value.len) {
+                var next = cursor;
+                if (value[next] == '\r') next += 1;
+                if (next < value.len and value[next] == '\n') next += 1;
+                if (next >= value.len or (value[next] != ' ' and value[next] != '\t')) break;
+                cursor = next;
+                while (cursor < value.len and value[cursor] != '\r' and value[cursor] != '\n') : (cursor += 1) {}
+            }
+            return .{ .start = key_end, .end = cursor };
         }
         const secret_start = cursor;
         const header_value = std.ascii.eqlIgnoreCase(value[key_start..key_end], "authorization") or std.ascii.eqlIgnoreCase(value[key_start..key_end], "proxy-authorization");
@@ -108,7 +123,16 @@ fn findStructuredSecret(value: []const u8, from: usize) ?SecretSpan {
                     continue;
                 }
                 if (value[cursor] == q) break;
-            } else if ((header_value and (value[cursor] == '\r' or value[cursor] == '\n')) or (!header_value and (std.ascii.isWhitespace(value[cursor]) or value[cursor] == ',' or value[cursor] == '&' or value[cursor] == ';' or value[cursor] == '}'))) break;
+            } else if (header_value and (value[cursor] == '\r' or value[cursor] == '\n')) {
+                var continuation = cursor;
+                if (value[continuation] == '\r') continuation += 1;
+                if (continuation < value.len and value[continuation] == '\n') continuation += 1;
+                if (continuation < value.len and (value[continuation] == ' ' or value[continuation] == '\t')) {
+                    cursor = continuation;
+                    continue;
+                }
+                break;
+            } else if (!header_value and ((continued_value and (value[cursor] == '\r' or value[cursor] == '\n')) or (!continued_value and std.ascii.isWhitespace(value[cursor])) or value[cursor] == ',' or value[cursor] == '&' or value[cursor] == ';' or value[cursor] == '}')) break;
         }
         // Do not re-wrap a value that is already a redaction placeholder
         // (`token=[REDACTED:env:token:sha256:…]`); fall through so the loop-top
@@ -120,9 +144,62 @@ fn findStructuredSecret(value: []const u8, from: usize) ?SecretSpan {
     return null;
 }
 
+fn isValidRedactionMarker(marker: []const u8) bool {
+    if (std.mem.eql(u8, marker, redacted_value)) return true;
+    if (marker.len < "[REDACTED::]".len or marker[marker.len - 1] != ']') return false;
+    const body = marker["[REDACTED:".len .. marker.len - 1];
+    const prefixes = [_][]const u8{ "env:", "secret:" };
+    var payload: ?[]const u8 = null;
+    for (prefixes) |prefix| {
+        if (std.mem.startsWith(u8, body, prefix)) payload = body[prefix.len..];
+    }
+    const label = payload orelse return false;
+    if (label.len == 0) return false;
+    var end = label.len;
+    if (std.mem.lastIndexOf(u8, label, ":sha256:")) |fingerprint_at| {
+        const digest = label[fingerprint_at + ":sha256:".len ..];
+        if (digest.len != 8) return false;
+        for (digest) |char| if (!std.ascii.isHex(char)) return false;
+        end = fingerprint_at;
+    }
+    if (end == 0) return false;
+    for (label[0..end]) |char| {
+        if (!(std.ascii.isAlphanumeric(char) or char == '_' or char == '-')) return false;
+    }
+    const clean_label = label[0..end];
+    if (std.mem.startsWith(u8, body, "env:")) return isSecretEnvName(clean_label) or isLegacyEnvMarkerLabel(clean_label);
+    return isKnownSecretMarkerLabel(clean_label);
+}
+
+fn isLegacyEnvMarkerLabel(label: []const u8) bool {
+    // Older intercept markers used the structured key name as the env label.
+    return std.ascii.eqlIgnoreCase(label, "token") or
+        std.ascii.eqlIgnoreCase(label, "password") or
+        std.ascii.eqlIgnoreCase(label, "api_key") or
+        std.ascii.eqlIgnoreCase(label, "secret_access_key");
+}
+
+fn isKnownSecretMarkerLabel(label: []const u8) bool {
+    const labels = [_][]const u8{
+        "synthetic_secret",
+        "pem_private_key",
+        "ssh_private_key",
+        "cloud_credentials_json",
+        "aws_access_key",
+        "github_token",
+        "github_pat",
+        "openai_api_key",
+        "anthropic_api_key",
+        "jwt",
+        "high_entropy",
+    };
+    for (labels) |known| if (std.ascii.eqlIgnoreCase(label, known)) return true;
+    return false;
+}
+
 pub fn isSensitiveKey(key: []const u8) bool {
     const trimmed = std.mem.trim(u8, key, "-/");
-    const keys = [_][]const u8{ "authorization", "proxy-authorization", "password", "passwd", "passphrase", "token", "access_token", "api_key", "apikey", "private_key", "client_secret" };
+    const keys = [_][]const u8{ "authorization", "proxy-authorization", "password", "passwd", "passphrase", "pwd", "token", "access_token", "refresh_token", "api_key", "apikey", "private_key", "client_secret", "clientSecret", "cookie", "set-cookie", "session", "secret_access_key" };
     for (keys) |candidate| if (std.ascii.eqlIgnoreCase(trimmed, candidate)) return true;
     return isSecretEnvName(trimmed);
 }
@@ -220,22 +297,29 @@ fn percentDecodeAlloc(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
 }
 
 const secret_env_patterns = [_][]const u8{
-    "*TOKEN*",
-    "*SECRET*",
-    "*PASSWORD*",
-    "*PASSWD*",
-    "*PRIVATE*",
-    "*KEY*",
-    "AWS_*",
-    "AZURE_*",
-    "GITHUB_TOKEN",
-    "GH_TOKEN",
-    "OPENAI_API_KEY",
-    "ANTHROPIC_API_KEY",
-    "GOOGLE_API_KEY",
-    "GOOGLE_APPLICATION_CREDENTIALS",
-    "NPM_TOKEN",
-    "PYPI_TOKEN",
+    "*_TOKEN",
+    "*_TOKEN_*",
+    "TOKEN",
+    "*_SECRET",
+    "*_SECRET_*",
+    "SECRET",
+    "*_PASSWORD",
+    "*_PASSWORD_*",
+    "PASSWORD",
+    "*_PASSWD",
+    "*_PASSWD_*",
+    "PASSWD",
+    "*_PRIVATE_KEY",
+    "PRIVATE_KEY",
+    "*_API_KEY",
+    "API_KEY",
+    "*_ACCESS_KEY",
+    "*_ACCESS_KEY_*",
+    "*_SIGNING_KEY",
+    "*_ENCRYPTION_KEY",
+    "*_CLIENT_KEY",
+    "KEY",
+    "*_CREDENTIALS",
     "SSH_AUTH_SOCK",
 };
 
@@ -247,6 +331,8 @@ pub fn redactString(value: []const u8) []const u8 {
 }
 
 pub fn redactStringBounded(value: []const u8, buffer: []u8) []const u8 {
+    if (value.len > max_structured_input) return redacted_value;
+    if (encodedContainsSecretBounded(value)) return redacted_value;
     if (classifyString(value)) |match| {
         return formatReplacement(buffer, match.label, &match.fingerprint) catch redacted_value;
     }
@@ -257,6 +343,93 @@ pub fn redactStringBounded(value: []const u8, buffer: []u8) []const u8 {
     // structured scan here — bounded and alloc-free (P0-4).
     if (findStructuredSecret(value, 0) == null) return value;
     return redactStructuredBounded(value, buffer);
+}
+
+/// Allocation-free encoded secret detection for public/core boundary callers.
+/// Encoded candidates are intentionally capped to fixed stack buffers. Inputs
+/// outside those bounds fall back to the regular plaintext/structured scan.
+fn encodedContainsSecretBounded(value: []const u8) bool {
+    // Match the owned path's complete percent-decoding coverage without heap
+    // allocation. The public input is already capped at max_structured_input.
+    var percent_first: [max_structured_input]u8 = undefined;
+    if (percentDecodeBounded(value, &percent_first)) |first| {
+        if (!std.mem.eql(u8, first, value)) {
+            if (findStructuredSecret(first, 0) != null or classifyString(first) != null) return true;
+            const first_len = first.len;
+            // Percent decoding cannot grow its input, so the second pass can
+            // safely decode in place and keep this boundary to one fixed buffer.
+            if (percentDecodeBounded(first, &percent_first)) |second| {
+                if (second.len != first_len and
+                    (findStructuredSecret(second, 0) != null or classifyString(second) != null)) return true;
+            }
+        }
+    }
+
+    if (encodedCandidateContainsSecretBounded(value)) return true;
+    var tokens = std.mem.tokenizeAny(u8, value, " \t\r\n\"'(),;:{}[]<>");
+    var count: usize = 0;
+    while (tokens.next()) |raw| {
+        count += 1;
+        if (count > 256) break;
+        if (encodedCandidateContainsSecretBounded(raw)) return true;
+        if (std.mem.indexOfScalar(u8, raw, '=')) |eq| {
+            if (eq + 1 < raw.len and encodedCandidateContainsSecretBounded(raw[eq + 1 ..])) return true;
+        }
+    }
+    return false;
+}
+
+fn encodedCandidateContainsSecretBounded(value: []const u8) bool {
+    if (value.len >= 24 and value.len <= 1024) {
+        const decoders = [_]std.base64.Base64Decoder{
+            std.base64.standard.Decoder,
+            std.base64.standard_no_pad.Decoder,
+            std.base64.url_safe.Decoder,
+            std.base64.url_safe_no_pad.Decoder,
+        };
+        var decoded: [768]u8 = undefined;
+        for (decoders) |decoder| {
+            const size = decoder.calcSizeForSlice(value) catch continue;
+            if (size == 0 or size > decoded.len) continue;
+            decoder.decode(decoded[0..size], value) catch continue;
+            const candidate = decoded[0..size];
+            if (std.unicode.utf8ValidateSlice(candidate) and
+                (findStructuredSecret(candidate, 0) != null or classifyString(candidate) != null)) return true;
+        }
+    }
+    if (value.len >= 40 and value.len <= 2048 and value.len % 2 == 0) {
+        var decoded: [1024]u8 = undefined;
+        const size = value.len / 2;
+        _ = std.fmt.hexToBytes(decoded[0..size], value) catch return false;
+        const candidate = decoded[0..size];
+        if (std.unicode.utf8ValidateSlice(candidate) and
+            (findStructuredSecret(candidate, 0) != null or classifyString(candidate) != null)) return true;
+    }
+    return false;
+}
+
+fn percentDecodeBounded(value: []const u8, buffer: []u8) ?[]const u8 {
+    if (value.len > buffer.len) return null;
+    var out_len: usize = 0;
+    var i: usize = 0;
+    while (i < value.len) {
+        if (value[i] == '%' and i + 2 < value.len) {
+            const byte = std.fmt.parseInt(u8, value[i + 1 .. i + 3], 16) catch {
+                buffer[out_len] = value[i];
+                out_len += 1;
+                i += 1;
+                continue;
+            };
+            buffer[out_len] = byte;
+            out_len += 1;
+            i += 3;
+        } else {
+            buffer[out_len] = value[i];
+            out_len += 1;
+            i += 1;
+        }
+    }
+    return buffer[0..out_len];
 }
 
 /// Bounded twin of `redactAlloc`'s span replacement: copy `value` into `buffer`,
@@ -293,6 +466,19 @@ pub fn redactTargetValueBounded(kind_name: []const u8, value: []const u8, buffer
         return value;
     }
     return redactStringBounded(value, buffer);
+}
+
+/// Canonical owned target redaction for persistence and presentation sinks.
+/// Allocation or decoding failure is fail-closed to a separately owned marker.
+pub fn redactTargetValueAlloc(allocator: std.mem.Allocator, kind_name: []const u8, value: []const u8) ![]u8 {
+    if (std.mem.eql(u8, kind_name, "env_var")) {
+        if (classifySecretValue(value)) |match| {
+            var buffer: [256]u8 = undefined;
+            const replacement = formatReplacement(&buffer, match.label, &match.fingerprint) catch redacted_value;
+            return allocator.dupe(u8, replacement);
+        }
+    }
+    return redactAlloc(allocator, value);
 }
 
 pub fn isSecretEnvName(name: []const u8) bool {
@@ -352,15 +538,16 @@ pub fn classifySecretValue(value: []const u8) ?RedactionMatch {
 }
 
 pub fn formatEnvReplacement(buffer: []u8, name: []const u8, value: []const u8) ![]const u8 {
-    const digest = fingerprint8(value);
-    return try std.fmt.bufPrint(buffer, "[REDACTED:env:{s}:sha256:{s}]", .{ name, &digest });
+    _ = value;
+    return try std.fmt.bufPrint(buffer, "[REDACTED:env:{s}]", .{name});
 }
 
 fn formatReplacement(buffer: []u8, label: []const u8, digest: *const [8]u8) ![]const u8 {
+    _ = digest;
     if (std.mem.startsWith(u8, label, "secret:")) {
-        return try std.fmt.bufPrint(buffer, "[REDACTED:{s}:sha256:{s}]", .{ label, digest });
+        return try std.fmt.bufPrint(buffer, "[REDACTED:{s}]", .{label});
     }
-    return try std.fmt.bufPrint(buffer, "[REDACTED:env:{s}:sha256:{s}]", .{ label, digest });
+    return try std.fmt.bufPrint(buffer, "[REDACTED:env:{s}]", .{label});
 }
 
 pub fn fingerprint8(value: []const u8) [8]u8 {
@@ -543,7 +730,7 @@ test "secret value detection covers synthetic examples" {
     try std.testing.expect(classifySecretValue("/Users/fake/ryk/path/with/mixed/Chars123") == null);
 }
 
-test "redaction fingerprints are stable and do not include raw value" {
+test "redaction labels are stable and do not include raw value" {
     var first: [256]u8 = undefined;
     var second: [256]u8 = undefined;
     const fake = "GITHUB_TOKEN=fake_secret_value";
@@ -551,7 +738,7 @@ test "redaction fingerprints are stable and do not include raw value" {
     const b = redactStringBounded(fake, &second);
     try std.testing.expectEqualStrings(a, b);
     try std.testing.expect(std.mem.indexOf(u8, a, "fake_secret_value") == null);
-    try std.testing.expect(std.mem.startsWith(u8, a, "[REDACTED:env:GITHUB_TOKEN:sha256:"));
+    try std.testing.expectEqualStrings("[REDACTED:env:GITHUB_TOKEN]", a);
 }
 
 test "redaction catches embedded synthetic secret assignments in command text" {
@@ -559,7 +746,7 @@ test "redaction catches embedded synthetic secret assignments in command text" {
     const command = "/bin/echo OPENAI_API_KEY=sk-fakeSyntheticOpenAIKey1234567890";
     const redacted = redactStringBounded(command, &buf);
     try std.testing.expect(std.mem.indexOf(u8, redacted, "sk-fakeSyntheticOpenAIKey") == null);
-    try std.testing.expect(std.mem.startsWith(u8, redacted, "[REDACTED:env:OPENAI_API_KEY:sha256:"));
+    try std.testing.expectEqualStrings("[REDACTED:env:OPENAI_API_KEY]", redacted);
 }
 
 test "redaction covers synthetic policy url mcp and command contexts" {
@@ -612,6 +799,40 @@ test "owned redaction detects bounded encodings" {
         defer std.testing.allocator.free(redacted);
         try std.testing.expectEqualStrings(redacted_value, redacted);
     }
+}
+
+test "bounded redaction matches owned encoded-secret coverage" {
+    const encoded = [_][]const u8{
+        "token%3Dcorrect-horse-battery-staple",
+        "token%253Dcorrect-horse-battery-staple",
+        "dG9rZW49Y29ycmVjdC1ob3JzZS1iYXR0ZXJ5LXN0YXBsZQ==",
+        "dG9rZW49YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWE/Pz8",
+        "S0VZPWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYT8_Pw",
+        "746f6b656e3d636f72726563742d686f7273652d626174746572792d737461706c65",
+    };
+    for (encoded) |value| {
+        var buffer: [256]u8 = undefined;
+        const redacted = redactStringBounded(value, &buffer);
+        try std.testing.expectEqualStrings(redacted_value, redacted);
+    }
+}
+
+test "bounded redaction finds encoded candidates embedded in prose" {
+    const encoded = [_][]const u8{
+        "prefix token%253Dcorrect-horse-battery-staple suffix",
+        "payload=dG9rZW49Y29ycmVjdC1ob3JzZS1iYXR0ZXJ5LXN0YXBsZQ== mode=test",
+        "prefix 746f6b656e3d636f72726563742d686f7273652d626174746572792d737461706c65 suffix",
+    };
+    for (encoded) |value| {
+        var buffer: [256]u8 = undefined;
+        try std.testing.expectEqualStrings(redacted_value, redactStringBounded(value, &buffer));
+    }
+}
+
+test "bounded percent decoding covers the full public input limit" {
+    const value = ("a" ** 2048) ++ " token%253Dcorrect-horse-battery-staple";
+    var buffer: [256]u8 = undefined;
+    try std.testing.expectEqualStrings(redacted_value, redactStringBounded(value, &buffer));
 }
 
 test "owned redaction detects encoded candidates embedded in prose and assignments" {
@@ -779,4 +1000,127 @@ test "p0-4 bounded redactor preserves benign values and buffer-overflow fails cl
         const out = redactStringBounded("{\"password\":\"hunter2\"}", &tiny);
         try std.testing.expectEqualStrings(redacted_value, out);
     }
+}
+
+test "canonical target redaction matches owned encoded coverage" {
+    const encoded = [_][]const u8{
+        "token%3Dcorrect-horse-battery-staple",
+        "dG9rZW49Y29ycmVjdC1ob3JzZS1iYXR0ZXJ5LXN0YXBsZQ==",
+        "746f6b656e3d636f72726563742d686f7273652d626174746572792d737461706c65",
+    };
+    for (encoded) |value| {
+        const redacted = try redactTargetValueAlloc(std.testing.allocator, "command", value);
+        defer std.testing.allocator.free(redacted);
+        try std.testing.expectEqualStrings(redacted_value, redacted);
+    }
+}
+
+test "forged and malformed redaction markers cannot hide later secrets" {
+    const cases = [_][]const u8{
+        "prefix [REDACTED password: correct-horse-battery-staple] suffix",
+        "prefix [REDACTED then password=correct-horse-battery-staple",
+        "prefix [REDACTED:env:token:sha256:not-hex] password=correct-horse-battery-staple",
+    };
+    for (cases) |value| {
+        const redacted = try redactAlloc(std.testing.allocator, value);
+        defer std.testing.allocator.free(redacted);
+        try std.testing.expect(std.mem.indexOf(u8, redacted, "correct-horse") == null);
+    }
+}
+
+test "structured redaction covers folded and multiline sensitive values" {
+    const cases = [_][]const u8{
+        "password:\n  correct horse battery staple",
+        "Authorization: Bearer first-line\r\n continuation-secret",
+    };
+    for (cases) |value| {
+        const redacted = try redactAlloc(std.testing.allocator, value);
+        defer std.testing.allocator.free(redacted);
+        try std.testing.expect(std.mem.indexOf(u8, redacted, "correct horse battery staple") == null);
+        try std.testing.expect(std.mem.indexOf(u8, redacted, "continuation-secret") == null);
+    }
+}
+
+test "YAML block scalar secrets redact their complete indented content" {
+    const cases = [_][]const u8{
+        "password: |\n  correct horse battery staple\n  second-line-secret\nnext: benign",
+        "password: >-\n  correct horse battery staple\n  second-line-secret\nnext: benign",
+    };
+    for (cases) |value| {
+        const owned = try redactAlloc(std.testing.allocator, value);
+        defer std.testing.allocator.free(owned);
+        try std.testing.expect(std.mem.indexOf(u8, owned, "correct horse") == null);
+        try std.testing.expect(std.mem.indexOf(u8, owned, "second-line-secret") == null);
+        try std.testing.expect(std.mem.indexOf(u8, owned, "next: benign") != null);
+
+        var buffer: [256]u8 = undefined;
+        const bounded = redactStringBounded(value, &buffer);
+        try std.testing.expect(std.mem.indexOf(u8, bounded, "correct horse") == null);
+        try std.testing.expect(std.mem.indexOf(u8, bounded, "second-line-secret") == null);
+        try std.testing.expect(std.mem.indexOf(u8, bounded, "next: benign") != null);
+    }
+}
+
+test "percent encoded URI userinfo is redacted" {
+    const value = "postgres://service:correct%2Dhorse%2Dbattery%2Dstaple@db.invalid/app";
+    const redacted = try redactAlloc(std.testing.allocator, value);
+    defer std.testing.allocator.free(redacted);
+    try std.testing.expect(std.mem.indexOf(u8, redacted, "correct%2Dhorse") == null);
+}
+
+test "common sensitive structured keys are recognized" {
+    const cases = [_][]const u8{
+        "cookie=session-value",
+        "Set-Cookie: session-value",
+        "session=low-entropy-value",
+        "refresh_token=low-entropy-value",
+        "secret_access_key=low-entropy-value",
+        "pwd=low-entropy-value",
+        "clientSecret=low-entropy-value",
+    };
+    for (cases) |value| {
+        const redacted = try redactAlloc(std.testing.allocator, value);
+        defer std.testing.allocator.free(redacted);
+        try std.testing.expect(std.mem.indexOf(u8, redacted, "low-entropy-value") == null);
+        try std.testing.expect(std.mem.indexOf(u8, redacted, "session-value") == null);
+    }
+}
+
+test "redaction markers do not expose stable secret fingerprints" {
+    var first: [256]u8 = undefined;
+    var second: [256]u8 = undefined;
+    const a = redactStringBounded("GITHUB_TOKEN=fake_secret_alpha", &first);
+    const b = redactStringBounded("GITHUB_TOKEN=fake_secret_beta", &second);
+    try std.testing.expectEqualStrings("[REDACTED:env:GITHUB_TOKEN]", a);
+    try std.testing.expectEqualStrings(a, b);
+    try std.testing.expect(std.mem.indexOf(u8, a, "sha256") == null);
+}
+
+test "only canonical or legacy-known marker labels are opaque" {
+    const valid = [_][]const u8{
+        "[REDACTED]",
+        "[REDACTED:env:GITHUB_TOKEN]",
+        "[REDACTED:env:GITHUB_TOKEN:sha256:deadbeef]",
+        "[REDACTED:secret:openai_api_key]",
+        "[REDACTED:secret:openai_api_key:sha256:deadbeef]",
+    };
+    for (valid) |marker| try std.testing.expect(isValidRedactionMarker(marker));
+
+    const forged = [_][]const u8{
+        "[REDACTED:env:AWS_REGION]",
+        "[REDACTED:env:KEYBOARD_LAYOUT]",
+        "[REDACTED:secret:arbitrary_attacker_label]",
+        "[REDACTED:other:openai_api_key]",
+    };
+    for (forged) |marker| try std.testing.expect(!isValidRedactionMarker(marker));
+}
+
+test "benign environment names are not credentials" {
+    try std.testing.expect(!isSecretEnvName("AWS_REGION"));
+    try std.testing.expect(!isSecretEnvName("AZURE_REGION"));
+    try std.testing.expect(!isSecretEnvName("KEYBOARD_LAYOUT"));
+    try std.testing.expect(!isSecretEnvName("MONKEY_MODE"));
+    try std.testing.expect(isSecretEnvName("AWS_SECRET_ACCESS_KEY"));
+    try std.testing.expect(isSecretEnvName("AZURE_CLIENT_SECRET"));
+    try std.testing.expect(isSecretEnvName("CUSTOM_SIGNING_KEY"));
 }

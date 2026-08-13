@@ -72,7 +72,7 @@ pub fn parseJsonlFile(
         if (line_no > 5000) break; // bound lines per file
         const line = std.mem.trim(u8, raw_line, " \t\r");
         if (line.len == 0) continue;
-        if (line.len > types.max_line_bytes) continue;
+        if (line.len > types.max_file_bytes) continue;
 
         // Timestamp opportunistic scan without full parse.
         if (result.timestamp_secs == fallback_ts) {
@@ -125,4 +125,26 @@ test "malformed JSON lines are skipped" {
     defer parsed.deinit(std.testing.allocator);
     try std.testing.expect(parsed.commands.items.len >= 1);
     try std.testing.expectEqualStrings("rm -rf /tmp/x", parsed.commands.items[0]);
+}
+
+test "oversized JSONL strings still reach secret material scanning" {
+    const io = std.testing.io;
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try std.fmt.bufPrint(&root_buf, "zig-cache/tmp-scan-jsonl-large-{d}", .{std.Io.Timestamp.now(io, .real).toSeconds()});
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root, "sess.jsonl" });
+    defer std.testing.allocator.free(path);
+
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(std.testing.allocator);
+    try body.appendSlice(std.testing.allocator, "{\"message\":{\"content\":\"");
+    try body.appendNTimes(std.testing.allocator, 'a', types.max_line_bytes + 1024);
+    try body.appendSlice(std.testing.allocator, " ghp_fakeSyntheticBeyondFirstWindow1234567890\"}}\n");
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = body.items });
+
+    var parsed = try parseJsonlFile(io, std.testing.allocator, path, 0);
+    defer parsed.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), parsed.text_blobs.items.len);
+    try std.testing.expect(parsed.text_blobs.items[0].len > types.max_line_bytes);
 }

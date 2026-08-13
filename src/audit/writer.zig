@@ -2,6 +2,7 @@ const std = @import("std");
 
 const core = @import("../core/public.zig");
 const hash_chain = @import("hash_chain.zig");
+const redact_bridge = @import("redact_bridge.zig");
 const replay = @import("replay.zig");
 const audit_summary = @import("summary.zig");
 
@@ -112,11 +113,7 @@ pub const SessionWriter = struct {
         const canonical = try hash_chain.canonicalEventAlloc(self.allocator, ev, previous);
         defer self.allocator.free(canonical);
         const hash = hash_chain.eventHash(previous, canonical);
-
-        var out: std.Io.Writer.Allocating = .init(self.allocator);
-        defer out.deinit();
-        try hash_chain.writeEventJsonLine(&out.writer, ev, previous, &hash);
-        const line = try out.toOwnedSlice();
+        const line = try hash_chain.eventJsonLineFromCanonicalAlloc(self.allocator, canonical, &hash);
         defer self.allocator.free(line);
 
         // Positional append at the true EOF. `writeStreamingAll` targets the OS
@@ -340,7 +337,50 @@ test "session writer persists redacted synthetic secrets before JSONL write" {
     defer std.testing.allocator.free(events);
 
     try std.testing.expect(std.mem.indexOf(u8, events, "fake_secret_value") == null);
-    try std.testing.expect(std.mem.indexOf(u8, events, "[REDACTED:secret:synthetic_secret:sha256:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, events, redact_bridge.redacted_value) != null);
+}
+
+test "session writer allocation failure leaves a valid complete chain" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const ts = core.time.Timestamp.fromUnixSeconds(1_777_983_130);
+    const session: core.session.Session = .{
+        .id = try core.session.generateSessionId(ts),
+        .started_at = ts,
+        .command = "echo",
+        .args = &.{"hello"},
+        .workspace_root = root,
+        .mode = .observe,
+        .platform = core.platform.detectOs(),
+    };
+    var event_id: core.event.EventId = .{ .value = undefined, .len = 0 };
+    event_id.len = (try std.fmt.bufPrint(&event_id.value, "evt_alloc_fail", .{})).len;
+    const ev: core.event.Event = .{
+        .session_id = session.id,
+        .event_id = event_id,
+        .timestamp = ts,
+        .event_type = .process_launch,
+        .actor = .{ .kind = .ryk, .display = "ryk" },
+        .target = .{ .kind = .command, .value = "token%253Dcorrect-horse-battery-staple" },
+    };
+
+    var session_writer = try SessionWriter.init(std.testing.io, std.testing.allocator, session);
+    defer session_writer.deinit();
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    session_writer.allocator = failing.allocator();
+    try std.testing.expectError(error.OutOfMemory, session_writer.appendEvent(ev));
+    session_writer.allocator = std.testing.allocator;
+
+    const rel_events_path = try std.fs.path.join(std.testing.allocator, &.{ ".ryk", "sessions", session.id.slice(), "events.jsonl" });
+    defer std.testing.allocator.free(rel_events_path);
+    const events = try tmp.dir.readFileAlloc(std.testing.io, rel_events_path, std.testing.allocator, .limited(4096));
+    defer std.testing.allocator.free(events);
+    try std.testing.expectEqual(@as(usize, 0), events.len);
+    try std.testing.expectEqual(@as(usize, 0), session_writer.event_count);
+    try std.testing.expect(session_writer.finalHash() == null);
 }
 
 test "session writer redacts embedded secret assignments in command targets" {
@@ -381,7 +421,7 @@ test "session writer redacts embedded secret assignments in command targets" {
     defer std.testing.allocator.free(events);
 
     try std.testing.expect(std.mem.indexOf(u8, events, "sk-fakeSyntheticOpenAIKey") == null);
-    try std.testing.expect(std.mem.indexOf(u8, events, "[REDACTED:env:OPENAI_API_KEY:sha256:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, events, redact_bridge.redacted_value) != null);
 }
 
 test "p0-4 write path redacts structured secrets classifyString missed in events.jsonl" {

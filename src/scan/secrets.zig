@@ -59,13 +59,10 @@ const secret_cmd_prefixes = [_][]const u8{
 
 pub const MaterialHit = struct {
     label: []const u8,
-    /// Owned printable fingerprint (typically 8 hex chars from redact_bridge).
-    fingerprint_hex: []u8,
     redacted: []const u8,
 
     pub fn deinit(self: *MaterialHit, allocator: std.mem.Allocator) void {
         allocator.free(self.label);
-        allocator.free(self.fingerprint_hex);
         allocator.free(self.redacted);
         self.* = undefined;
     }
@@ -74,44 +71,74 @@ pub const MaterialHit = struct {
 /// Classify secret material in a blob. Returns owned label + redacted form; never the raw value.
 pub fn classifyMaterial(allocator: std.mem.Allocator, blob: []const u8) !?MaterialHit {
     if (blob.len == 0) return null;
-    // Bound classification cost.
-    const slice = if (blob.len > types.max_line_bytes) blob[0..types.max_line_bytes] else blob;
+    // Scan fixed-size overlapping windows so classification cost stays bounded
+    // without silently ignoring material after the first 64 KiB. The overlap
+    // catches provider tokens and assignments split across a window boundary.
+    const overlap: usize = 512;
+    const stride = types.max_line_bytes - overlap;
+    var start: usize = 0;
+    while (start < blob.len) : (start += stride) {
+        const end = @min(start + types.max_line_bytes, blob.len);
+        const slice = blob[start..end];
 
-    if (redact_bridge.classifyString(slice)) |match| {
-        return try materialFromMatch(allocator, match, slice);
-    }
-    if (redact_bridge.classifySecretValue(slice)) |match| {
-        return try materialFromMatch(allocator, match, slice);
-    }
-    // Scan for embedded token-like secrets via redaction path.
-    var buf: [256]u8 = undefined;
-    const redacted = redact_bridge.redactStringBounded(slice, &buf);
-    if (redacted.ptr != slice.ptr or redacted.len != slice.len) {
-        // Redaction rewrote the value — treat as material with generic label.
-        const label = try allocator.dupe(u8, "secret:embedded");
-        errdefer allocator.free(label);
-        const owned = try allocator.dupe(u8, redacted);
-        errdefer allocator.free(owned);
-        var fp_owned: []u8 = undefined;
-        if (std.mem.indexOf(u8, redacted, "sha256:")) |idx| {
-            const hex = redacted[idx + 7 ..];
-            var end: usize = 0;
-            while (end < hex.len and end < 16 and std.ascii.isHex(hex[end])) : (end += 1) {}
-            if (end > 0) {
-                fp_owned = try allocator.dupe(u8, hex[0..end]);
-            } else {
-                fp_owned = try allocator.dupe(u8, "00000000");
-            }
-        } else {
-            fp_owned = try allocator.dupe(u8, "00000000");
+        if (redact_bridge.classifyString(slice)) |match| {
+            return try materialFromMatch(allocator, match, slice);
         }
-        return .{
-            .label = label,
-            .fingerprint_hex = fp_owned,
-            .redacted = owned,
-        };
+        if (redact_bridge.classifySecretValue(slice)) |match| {
+            return try materialFromMatch(allocator, match, slice);
+        }
+        if (try embeddedMaterial(allocator, slice)) |hit| return hit;
+        if (end == blob.len) break;
     }
     return null;
+}
+
+/// Count independently presented secret-bearing tokens without retaining a
+/// stable identifier derived from their contents.
+pub fn countMaterials(blob: []const u8) usize {
+    var count: usize = 0;
+    var seen: [256][]const u8 = undefined;
+    var seen_len: usize = 0;
+    var fields = std.mem.tokenizeAny(u8, blob, ",\r\n");
+    while (fields.next()) |field| {
+        var word_hits: usize = 0;
+        var words = std.mem.tokenizeAny(u8, field, " \t;(){}[]<>\"");
+        while (words.next()) |word| {
+            if (redact_bridge.classifySecretValue(word) == null) continue;
+            var duplicate = false;
+            for (seen[0..seen_len]) |prior| {
+                if (std.mem.eql(u8, prior, word)) duplicate = true;
+            }
+            if (duplicate) continue;
+            if (seen_len == seen.len) return seen.len;
+            seen[seen_len] = word;
+            seen_len += 1;
+            word_hits += 1;
+        }
+        if (word_hits > 0) {
+            count += word_hits;
+            continue;
+        }
+        var buffer: [256]u8 = undefined;
+        const redacted = redact_bridge.redactStringBounded(field, &buffer);
+        if (!(redacted.ptr == field.ptr and redacted.len == field.len)) count += 1;
+    }
+    return count;
+}
+
+fn embeddedMaterial(allocator: std.mem.Allocator, slice: []const u8) !?MaterialHit {
+    var buf: [256]u8 = undefined;
+    const redacted = redact_bridge.redactStringBounded(slice, &buf);
+    if (redacted.ptr == slice.ptr and redacted.len == slice.len) return null;
+
+    const label = try allocator.dupe(u8, "secret:embedded");
+    errdefer allocator.free(label);
+    const owned = try allocator.dupe(u8, redacted);
+    errdefer allocator.free(owned);
+    return .{
+        .label = label,
+        .redacted = owned,
+    };
 }
 
 fn materialFromMatch(allocator: std.mem.Allocator, match: redact_bridge.RedactionMatch, slice: []const u8) !MaterialHit {
@@ -121,11 +148,8 @@ fn materialFromMatch(allocator: std.mem.Allocator, match: redact_bridge.Redactio
     const redacted_view = redact_bridge.redactStringBounded(slice, &buf);
     const redacted = try allocator.dupe(u8, redacted_view);
     errdefer allocator.free(redacted);
-    // redact_bridge fingerprints are 8 printable hex chars (first 8 of sha256 hex).
-    const fp = try allocator.dupe(u8, &match.fingerprint);
     return .{
         .label = label,
-        .fingerprint_hex = fp,
         .redacted = redacted,
     };
 }
@@ -189,8 +213,8 @@ pub fn safeDetail(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
     const redacted = try redact_bridge.redactAlloc(allocator, text);
     // Fail closed if residual provider-shaped prefixes remain after redaction.
     const residual_prefixes = [_][]const u8{
-        "ghp_", "gho_", "ghs_", "ghu_", "ghr_", "github_pat_",
-        "sk-", "sk-ant-", "AKIA", "ASIA", "BEGIN PRIVATE", "BEGIN OPENSSH",
+        "ghp_", "gho_",    "ghs_", "ghu_", "ghr_",          "github_pat_",
+        "sk-",  "sk-ant-", "AKIA", "ASIA", "BEGIN PRIVATE", "BEGIN OPENSSH",
     };
     for (residual_prefixes) |p| {
         if (containsAsciiIgnoreCase(redacted, p)) {
@@ -238,6 +262,33 @@ test "secret_material never returns raw ghp_ or sk- tokens" {
 test "benign text is not secret material" {
     const hit = try classifyMaterial(std.testing.allocator, "hello world ls -la");
     try std.testing.expect(hit == null);
+}
+
+test "secret material classification scans beyond 64 KiB" {
+    const prefix_len = types.max_line_bytes + 1024;
+    const token = "ghp_fakeSyntheticBeyondFirstWindow1234567890";
+    const blob = try std.testing.allocator.alloc(u8, prefix_len + token.len);
+    defer std.testing.allocator.free(blob);
+    @memset(blob[0..prefix_len], 'a');
+    @memcpy(blob[prefix_len..], token);
+
+    const hit = try classifyMaterial(std.testing.allocator, blob);
+    try std.testing.expect(hit != null);
+    var material = hit.?;
+    defer material.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, material.redacted, token) == null);
+}
+
+test "distinct secret tokens in one blob remain separately counted" {
+    try std.testing.expectEqual(@as(usize, 2), countMaterials(
+        "ghp_fakeSyntheticTokenValue1234567890 ghp_anotherSyntheticTokenValue1234567890",
+    ));
+    try std.testing.expectEqual(@as(usize, 2), countMaterials(
+        "{\"password\":\"hunter2\",\"token\":\"ordinary-value\"}",
+    ));
+    try std.testing.expectEqual(@as(usize, 1), countMaterials(
+        "ghp_fakeSyntheticTokenValue1234567890 ghp_fakeSyntheticTokenValue1234567890",
+    ));
 }
 
 test "Get-Content case-insensitive secret access" {

@@ -3876,7 +3876,8 @@ test "plugin manifest hermes reports expected paths" {
 }
 
 test "plugin manifest all reports all five" {
-    var stdout_buf: [1024]u8 = undefined;
+    // Worktree paths can be substantially longer than the primary checkout.
+    var stdout_buf: [4096]u8 = undefined;
     var stderr_buf: [256]u8 = undefined;
     var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
     var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);

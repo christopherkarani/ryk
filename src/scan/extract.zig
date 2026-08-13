@@ -140,7 +140,7 @@ pub fn walkValueForTextBlobs(
             for (arr.items) |item| try walkValueForTextBlobs(allocator, item, out, depth + 1);
         },
         .string => |s| {
-            if (s.len >= 20 and s.len <= types.max_line_bytes) {
+            if (s.len >= 20 and s.len <= types.max_file_bytes) {
                 // Only keep if it looks secret-ish to avoid memory blowup.
                 if (std.mem.indexOf(u8, s, "ghp_") != null or
                     std.mem.indexOf(u8, s, "sk-") != null or

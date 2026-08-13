@@ -67,14 +67,14 @@ ryk inspects values and classifies them into specific secret types:
 
 ### Redaction Format
 
-When a secret is detected, it is replaced with a redaction label that includes a SHA-256 fingerprint prefix:
+When a secret is detected, it is replaced with a classification label:
 
 ```
-[REDACTED:env:GITHUB_TOKEN:sha256:a1b2c3d4]
-[REDACTED:secret:github_token:sha256:e5f6g7h8]
+[REDACTED:env:GITHUB_TOKEN]
+[REDACTED:secret:github_token]
 ```
 
-The fingerprint is the first 8 hex characters of the SHA-256 hash of the raw value. This allows you to verify whether two redactions refer to the same secret without exposing the secret itself.
+Redaction output intentionally omits stable fingerprints. Even a truncated unsalted digest can act as an offline verifier for low-entropy passwords and can correlate the same credential across otherwise unrelated sessions.
 
 ### Embedded Secret Detection
 
@@ -166,7 +166,7 @@ When env vars are filtered, ryk creates redaction records for the audit trail:
 
 ```
 Name: GITHUB_TOKEN
-Label: [REDACTED:env:GITHUB_TOKEN:sha256:a1b2c3d4]
+Label: [REDACTED:env:GITHUB_TOKEN]
 Reason: environment variable name matches secret pattern
 ```
 
@@ -313,7 +313,7 @@ ryk scans **visible** network surfaces for secret-like values and flags potentia
 When secrets are detected in URLs, they are redacted before audit persistence:
 
 ```
-https://example.com/path?token=[REDACTED:secret:openai_api_key:sha256:a1b2c3d4]&ok=1
+https://example.com/path?token=[REDACTED:secret:openai_api_key]&ok=1
 ```
 
 ryk also handles percent-encoded secrets:

@@ -216,7 +216,7 @@ test "core API writes redacted audit events and verifies replay hash chain" {
     const events = try tmp.dir.readFileAlloc(std.testing.io, events_path, std.testing.allocator, .limited(16 * 1024));
     defer std.testing.allocator.free(events);
     try std.testing.expect(std.mem.indexOf(u8, events, "fake_secret_value_phase24") == null);
-    try std.testing.expect(std.mem.indexOf(u8, events, "[REDACTED:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, events, "[REDACTED") != null);
 
     var replay = try ryk_core.api.loadReplay(std.testing.io, std.testing.allocator, root, .{ .session = session.id.slice(), .verify = true });
     defer replay.deinit();

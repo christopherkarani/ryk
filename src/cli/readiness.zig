@@ -112,6 +112,7 @@ pub fn assessWorkspacePolicy(io: std.Io, allocator: std.mem.Allocator, workspace
 
 /// Fields for the shared readiness JSON envelope (additive schema_version 1 fields).
 pub const JsonEnvelope = struct {
+    allocator: std.mem.Allocator,
     assessment: Assessment,
     check: bool,
     daemon_status: []const u8,
@@ -135,29 +136,29 @@ pub fn writeJsonEnvelope(stdout: anytype, env: JsonEnvelope) !void {
     try stdout.print("  \"check\": {},\n", .{env.check});
 
     try stdout.writeAll("  \"daemon\": {\"status\":");
-    try core.util.writeJsonString(stdout, env.daemon_status);
+    try writeRedactedJsonString(stdout, env.allocator, env.daemon_status);
     try stdout.writeAll(",\"detail\":");
-    try core.util.writeJsonString(stdout, env.daemon_detail);
+    try writeRedactedJsonString(stdout, env.allocator, env.daemon_detail);
     try stdout.writeAll("},\n");
 
     try stdout.writeAll("  \"policy\": {\"path\":");
-    try core.util.writeJsonString(stdout, env.policy_path);
+    try writeRedactedJsonString(stdout, env.allocator, env.policy_path);
     try stdout.print(",\"present\":{},\"valid\":{}", .{ env.assessment.policy_present, env.assessment.policy_valid });
     if (env.policy_mode) |mode| {
         try stdout.writeAll(",\"mode\":");
-        try core.util.writeJsonString(stdout, mode);
+        try writeRedactedJsonString(stdout, env.allocator, mode);
     } else {
         try stdout.writeAll(",\"mode\":null");
     }
     if (env.policy_preset) |preset| {
         try stdout.writeAll(",\"preset\":");
-        try core.util.writeJsonString(stdout, preset);
+        try writeRedactedJsonString(stdout, env.allocator, preset);
     } else {
         try stdout.writeAll(",\"preset\":null");
     }
     if (env.policy_error) |err_name| {
         try stdout.writeAll(",\"error\":");
-        try core.util.writeJsonString(stdout, err_name);
+        try writeRedactedJsonString(stdout, env.allocator, err_name);
     } else {
         try stdout.writeAll(",\"error\":null");
     }
@@ -166,6 +167,12 @@ pub fn writeJsonEnvelope(stdout: anytype, env: JsonEnvelope) !void {
     } else {
         try stdout.writeAll("},\n");
     }
+}
+
+fn writeRedactedJsonString(writer: anytype, allocator: std.mem.Allocator, value: []const u8) !void {
+    const redacted = try @import("ryk_core").audit.redact_bridge.redactAlloc(allocator, value);
+    defer allocator.free(redacted);
+    try core.util.writeJsonString(writer, redacted);
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -242,6 +249,7 @@ test "writeJsonEnvelope close and open forms" {
     var w: std.Io.Writer = .fixed(&buf);
     const a = assess(.compatible, true, true);
     try writeJsonEnvelope(&w, .{
+        .allocator = std.testing.allocator,
         .assessment = a,
         .check = true,
         .daemon_status = "compatible",
@@ -256,6 +264,7 @@ test "writeJsonEnvelope close and open forms" {
 
     w = .fixed(&buf);
     try writeJsonEnvelope(&w, .{
+        .allocator = std.testing.allocator,
         .assessment = a,
         .check = false,
         .daemon_status = "compatible",
@@ -276,6 +285,7 @@ test "writeJsonEnvelope preserves long and heavily escaped values" {
     var buf: [16384]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buf);
     try writeJsonEnvelope(&writer, .{
+        .allocator = std.testing.allocator,
         .assessment = assess(.compatible, true, true),
         .check = true,
         .daemon_status = "compatible",
@@ -289,6 +299,24 @@ test "writeJsonEnvelope preserves long and heavily escaped values" {
     const policy_value = parsed.value.object.get("policy").?.object;
     try std.testing.expectEqualStrings(&detail, daemon.get("detail").?.string);
     try std.testing.expectEqualStrings(&path, policy_value.get("path").?.string);
+}
+
+test "writeJsonEnvelope redacts secret-bearing daemon details and policy paths" {
+    const synthetic_secret = "ghp_syntheticDoctorJsonSecret123456";
+    var buf: [4096]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try writeJsonEnvelope(&writer, .{
+        .allocator = std.testing.allocator,
+        .assessment = assess(.unavailable, true, false),
+        .check = true,
+        .daemon_status = "unavailable",
+        .daemon_detail = "daemon path /tmp/ghp_syntheticDoctorJsonSecret123456/bin",
+        .policy_path = "/tmp/ghp_syntheticDoctorJsonSecret123456/.ryk/policy.yaml",
+        .policy_error = "password=ghp_syntheticDoctorJsonSecret123456",
+    });
+    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), synthetic_secret) == null);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, writer.buffered(), .{});
+    defer parsed.deinit();
 }
 
 test "daemonWireLabel is stable machine vocabulary" {

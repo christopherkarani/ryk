@@ -201,6 +201,7 @@ pub fn command(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: an
         const policy_path = try std.fs.path.join(allocator, &.{ context.workspace_root, ".ryk", "policy.yaml" });
         defer allocator.free(policy_path);
         try readiness.writeJsonEnvelope(stdout, .{
+            .allocator = allocator,
             .assessment = core_ready,
             .check = options.check,
             .daemon_status = readiness.daemonWireLabel(context.daemon_health),
@@ -250,6 +251,8 @@ fn runDoctorTui(
     backend_report: sandbox.backend.ReportSet,
     context: IntegrationContext,
 ) !u8 {
+    const redacted_daemon_detail = try @import("ryk_core").audit.redact_bridge.redactAlloc(allocator, context.daemon_detail);
+    defer allocator.free(redacted_daemon_detail);
     const counts = countCapabilitySummary(os, backend_report);
     const policy_status = if (!context.policy_present)
         "no policy"
@@ -316,7 +319,7 @@ fn runDoctorTui(
 
     const next: doctor_tui.NextStepFacts = .{
         .daemon_health_compatible = context.daemon_health == .compatible,
-        .daemon_detail = context.daemon_detail,
+        .daemon_detail = redacted_daemon_detail,
         .daemon_binary_untrusted = context.daemon_binary_untrusted,
         .daemon_binary_exists = context.daemon_binary_exists,
         .daemon_binary_executable = context.daemon_binary_executable,
@@ -486,6 +489,17 @@ fn daemonDetailFromError(allocator: std.mem.Allocator, err: anyerror) !DaemonHea
 }
 
 fn writeReport(io: std.Io, stdout: anytype, os: core.platform.Os, backend_report: sandbox.backend.ReportSet, context: IntegrationContext, verbose: bool) !void {
+    var staged: std.Io.Writer.Allocating = .init(context.allocator);
+    defer staged.deinit();
+    try writeReportRaw(io, &staged.writer, os, backend_report, context, verbose);
+    const raw = try staged.toOwnedSlice();
+    defer context.allocator.free(raw);
+    const redacted = try @import("ryk_core").audit.redact_bridge.redactAlloc(context.allocator, raw);
+    defer context.allocator.free(redacted);
+    try stdout.writeAll(redacted);
+}
+
+fn writeReportRaw(io: std.Io, stdout: anytype, os: core.platform.Os, backend_report: sandbox.backend.ReportSet, context: IntegrationContext, verbose: bool) !void {
     try stdout.writeAll("ryk Doctor\n\n");
 
     const counts = countCapabilitySummary(os, backend_report);
@@ -1546,6 +1560,21 @@ test "doctor sanitizes hostile dynamic diagnostic text" {
     try std.testing.expect(std.mem.indexOfScalar(u8, written, 0x1b) == null);
     try std.testing.expect(std.mem.indexOf(u8, written, "pwn") == null);
     try std.testing.expect(std.mem.indexOf(u8, written, "\nforged") == null);
+}
+
+test "doctor verbose output redacts secret-bearing dynamic paths and details" {
+    const synthetic_secret = "ghp_syntheticDoctorHumanSecret123456";
+    var stdout_buf: [32768]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var context = try testContext(std.testing.allocator, .{ .daemon_detail = "password=ghp_syntheticDoctorHumanSecret123456" });
+    defer context.deinit();
+    context.allocator.free(context.workspace_root);
+    context.workspace_root = try context.allocator.dupe(u8, "/tmp/ghp_syntheticDoctorHumanSecret123456/workspace");
+    context.allocator.free(context.daemon_binary_path.?);
+    context.daemon_binary_path = try context.allocator.dupe(u8, "/tmp/ghp_syntheticDoctorHumanSecret123456/ryk-daemon");
+
+    try writeReport(std.testing.io, &stdout_writer, .linux, sandbox.backend.detect(.linux), context, true);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), synthetic_secret) == null);
 }
 
 test "doctor summary includes daemon availability" {

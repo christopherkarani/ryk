@@ -111,11 +111,7 @@ copy_cli_payload() {
     exit 1
   }
   mkdir -p "$root"
-  cp README.md LICENSE SECURITY.md CONTRIBUTING.md "$root/"
-  cp -R docs policies schemas fixtures examples packages packaging scripts integrations "$root/"
-  # Runtime onboarding copies these TypeScript files directly into Pi. Keep the
-  # package source in the archive so curl installs never need npm.
-  cp -R ryk-pi "$root/"
+  bash ./scripts/stage-release-payload.sh "$(pwd)" "$root"
   if [ -d "ryk-dashboard-ui/dist" ]; then
     mkdir -p "$root/ryk-dashboard-ui"
     cp -R ryk-dashboard-ui/dist "$root/ryk-dashboard-ui/dist"
@@ -257,6 +253,7 @@ build_cli_target() {
   install_cli "$os" "$prefix" "$root" "$bin_name"
   # ryk-daemon removed: Zig shell_engine evaluates in-process.
   find "$root" -name .DS_Store -delete
+  bash ./scripts/check-release-payload-secrets.sh "$root"
 
   if [ "$ext" = "zip" ]; then
     (cd "$work" && zip -qr "../../$artifact" "ryk-v${VERSION}-${os}-${arch}")
