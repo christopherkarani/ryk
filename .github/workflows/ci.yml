@@ -124,3 +124,46 @@ jobs:
             exit 1
           fi
           grep -q 'test-release-signing: passed' /tmp/signing.log
+
+  # Prove the formula in this checkout. Always install from a local tap built
+  # here — do not `brew tap "$TAP" 2>/dev/null` (that hides a 404 and fail-opens
+  # onto a stale published formula). brew installs the binary only;
+  # `ryk doctor --fix` wires host plugins.
+  homebrew-tap:
+    runs-on: macos-14
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: 1
+      HOMEBREW_NO_INSTALL_CLEANUP: 1
+      HOMEBREW_NO_ANALYTICS: 1
+      TAP: christopherkarani/ryk
+    steps:
+      - uses: actions/checkout@v4
+      - name: Formula contract (offline)
+        run: ./scripts/test-homebrew-formula.sh
+      - name: Tap the formula from this checkout
+        run: |
+          set -euo pipefail
+          echo "tap_source=local" >> "$GITHUB_ENV"
+          brew tap-new "$TAP"
+          tap_dir="$(brew --repository "$TAP")"
+          mkdir -p "${tap_dir}/Formula"
+          cp packaging/homebrew/Formula/ryk.rb "${tap_dir}/Formula/ryk.rb"
+      - name: brew install from the tap
+        run: brew install --verbose "${TAP}/ryk"
+      - name: Installed-binary smoke
+        run: |
+          set -euo pipefail
+          command -v ryk
+          ryk --version
+          ryk doctor
+          ryk redteam --ci
+      - name: brew test (formula test block)
+        run: brew test "${TAP}/ryk"
+      - name: brew uninstall leaves nothing behind
+        run: |
+          set -euo pipefail
+          brew uninstall "${TAP}/ryk"
+          if command -v ryk >/dev/null 2>&1; then
+            echo "::error::ryk still on PATH after brew uninstall"
+            exit 1
+          fi

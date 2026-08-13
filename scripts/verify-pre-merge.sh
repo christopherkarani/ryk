@@ -32,6 +32,10 @@ echo "[verify-pre-merge] Release signing contract"
 grep -qE '^[[:space:]]*sign\)[[:space:]]+phase_sign' scripts/cut-release.sh \
   || { echo "cut-release.sh run_phase is missing sign) phase_sign" >&2; exit 1; }
 
+# Homebrew formula contract (offline). The public tap is not published yet.
+echo "[verify-pre-merge] Homebrew formula contract"
+./scripts/test-homebrew-formula.sh
+
 echo "[verify-pre-merge] First-user install and uninstall regressions"
 ./scripts/install-first-user-regression-test.sh
 ./scripts/uninstall-first-user-regression-test.sh
