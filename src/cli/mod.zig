@@ -125,6 +125,8 @@ test {
     _ = rust_visibility;
     _ = evaluate;
     _ = decide;
+    // Door A deadlock transcript replay (decide + hook surfaces).
+    _ = @import("deadlock_replay.zig");
     _ = agent_hook;
     _ = daemon_contracts;
     _ = packs;
