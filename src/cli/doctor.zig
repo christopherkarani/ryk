@@ -22,13 +22,17 @@ const pack_state = @import("pack_state.zig");
 const readiness = @import("readiness.zig");
 const ensure = @import("ensure.zig");
 const policy_migrate = @import("policy_migrate.zig");
+const deadlock_check = @import("deadlock_check.zig");
 const doctor_tui = @import("doctor_tui.zig");
 const doctor_mcp = @import("doctor_mcp.zig");
+const core_api = @import("ryk_core").api;
 
-// Monopath: pull nested doctor_tui / doctor_mcp tests into the lib test binary.
+// Monopath: pull nested doctor_tui / doctor_mcp / deadlock_check tests into the
+// lib test binary.
 test {
     _ = doctor_tui;
     _ = doctor_mcp;
+    _ = deadlock_check;
 }
 
 const DoctorCapability = struct {
@@ -153,6 +157,9 @@ const DoctorOptions = struct {
     from_install: bool = false,
     /// Optional preset for create-if-missing policy (null → ensure default).
     preset: ?[]const u8 = null,
+    /// Door A self-check: replay a standard coding workflow against the active
+    /// policy and report steps that would stall an agent (or let danger through).
+    deadlock_check: bool = false,
 };
 
 pub fn command(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: anytype) !u8 {
@@ -167,6 +174,11 @@ pub fn command(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: an
     var gpa_state: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa_state.deinit();
     const allocator = gpa_state.allocator();
+
+    // Door A self-check: read-only probe on the active policy, no daemon spawn.
+    if (options.deadlock_check) {
+        return runDeadlockCheck(io, allocator, stdout, stderr);
+    }
 
     // Sole taught repair door (D40): --fix early-branches to ensure before any
     // diagnose collect / daemon spawn. Exit map is ensure.processExitForOutcome
@@ -379,6 +391,10 @@ fn parseDoctorOptions(argv: []const []const u8, stderr: anytype) !DoctorOptions 
             options.fix = true;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--deadlock-check")) {
+            options.deadlock_check = true;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--from-install")) {
             options.from_install = true;
             continue;
@@ -411,7 +427,7 @@ fn parseDoctorOptions(argv: []const []const u8, stderr: anytype) !DoctorOptions 
             continue;
         }
         try suggestions.writeUnknownOption(stderr, "ryk doctor", arg, &.{
-            "--verbose", "-v", "--check", "--json", "--plain", "--no-rich", "--tui", "--fix", "--from-install", "--preset", "--help", "-h",
+            "--verbose", "-v", "--check", "--json", "--plain", "--no-rich", "--tui", "--fix", "--from-install", "--preset", "--deadlock-check", "--help", "-h",
         }, "doctor");
         return error.Usage;
     }
@@ -419,6 +435,12 @@ fn parseDoctorOptions(argv: []const []const u8, stderr: anytype) !DoctorOptions 
     // --fix must not silently dominate probe contracts (--check/--json).
     if (options.fix and (options.check or options.json)) {
         try stderr.writeAll("ryk doctor: cannot combine --fix with --check/--json.\n");
+        return error.Usage;
+    }
+    // --deadlock-check is a focused read-only probe: it neither repairs nor
+    // feeds the readiness envelope, so combining it would hide one of the two.
+    if (options.deadlock_check and (options.fix or options.check or options.json)) {
+        try stderr.writeAll("ryk doctor: cannot combine --deadlock-check with --fix/--check/--json.\n");
         return error.Usage;
     }
     // Ensure-only flags are not silent no-ops without --fix.
@@ -733,6 +755,35 @@ fn writeReportRaw(io: std.Io, stdout: anytype, os: core.platform.Os, backend_rep
     }
     try writePolicyFreshnessNotices(stdout, context);
     try writeRecommendations(stdout, context);
+}
+
+/// `ryk doctor --deadlock-check` (P2-1d): replay a standard coding workflow
+/// against the active policy. Exit 0 when normal work runs unattended and danger
+/// stays blocked; exit 1 when a step would stall an agent or a fence hole exists.
+/// Fails closed on an unloadable policy: an unusable policy is a deadlock.
+fn runDeadlockCheck(io: std.Io, allocator: std.mem.Allocator, stdout: anytype, stderr: anytype) !u8 {
+    const root = supervisor.resolveWorkspaceRoot(io, allocator, null, ".") catch try allocator.dupe(u8, ".");
+    defer allocator.free(root);
+
+    var loaded = core_api.discoverPolicy(io, allocator, null, root) catch |err| {
+        try stderr.print(
+            "ryk doctor: cannot load the active policy ({s}); ryk fails closed, so every command would be denied.\n",
+            .{@errorName(err)},
+        );
+        try stderr.writeAll("  Next: fix the policy, or run `ryk doctor --fix` to seed the current default.\n");
+        return exit_codes.general;
+    };
+    defer loaded.deinit();
+
+    var report = try deadlock_check.run(allocator, loaded.innerPtr());
+    defer report.deinit(allocator);
+
+    const label = try redactDisplayAlloc(allocator, loaded.path);
+    defer allocator.free(label);
+    const origin: deadlock_check.PolicyOrigin = if (loaded.source == .builtin) .builtin else .file;
+    try deadlock_check.writeReport(stdout, &report, label, origin);
+
+    return if (report.clean()) exit_codes.success else exit_codes.general;
 }
 
 /// Stale-default notices (P2 Door A): one line per policy that is not the
