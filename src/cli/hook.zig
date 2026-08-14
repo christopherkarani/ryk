@@ -268,7 +268,6 @@ fn hookCommand(io: std.Io, host: Host, event: Event, original_event_name: []cons
                 \\
                 \\Options:
                 \\  --ci     CI mode: ask decisions become block.
-                \\  --probe  Internal smoke only: evaluate as usual, do not mint allow-once codes.
                 \\
             );
             return exit_codes.success;
@@ -5154,6 +5153,16 @@ test "hook PreToolUse denies notify with structural to+body under effects.deny" 
     var bare_result = try evaluateHookForTest(allocator, @ptrCast(@alignCast(&policy_obj)), .claude, .PreToolUse, std.json.Value{ .object = bare }, false);
     defer bare_result.deinit(allocator);
     try std.testing.expectEqual(PluginDecision.allow, bare_result.decision);
+}
+
+test "hook help does not advertise internal --probe" {
+    var stdout_buf: [4096]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_buf: [256]u8 = undefined;
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+    const code = try command(std.testing.io, &.{ "claude", "PreToolUse", "--help" }, &stdout_writer, &stderr_writer);
+    try std.testing.expectEqual(exit_codes.success, code);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "--probe") == null);
 }
 
 test "hook --probe skips allow-once pending issuance" {
