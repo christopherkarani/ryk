@@ -276,6 +276,17 @@ pub fn build(b: *std.Build) void {
     addPcre2Shim(b, shell_engine_tests.root_module, target, optimize);
     const run_shell_engine_tests = addRunTestTerminal(b, shell_engine_tests);
 
+    const hook_cold_latency_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/shell_engine/cold_latency_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+        .filters = test_filters,
+    });
+    addPcre2Shim(b, hook_cold_latency_tests.root_module, target, optimize);
+    const run_hook_cold_latency_tests = addRunTestTerminal(b, hook_cold_latency_tests);
+
     const cli_package_tests = b.addTest(.{
         .root_module = ryk_cli_mod,
     });
@@ -544,6 +555,7 @@ pub fn build(b: *std.Build) void {
 
     const test_shell_engine_step = b.step("test-shell-engine", "Run Zig shell_engine unit + 100% oracle corpus parity tests");
     test_shell_engine_step.dependOn(&run_shell_engine_tests.step);
+    test_shell_engine_step.dependOn(&run_hook_cold_latency_tests.step);
 
     const compile_test_sandbox_step = b.step("compile-test-sandbox", "Compile sandbox domain tests without running");
     compile_test_sandbox_step.dependOn(&sandbox_tests.step);
@@ -553,6 +565,7 @@ pub fn build(b: *std.Build) void {
 
     const compile_test_shell_engine_step = b.step("compile-test-shell-engine", "Compile shell_engine tests without running");
     compile_test_shell_engine_step.dependOn(&shell_engine_tests.step);
+    compile_test_shell_engine_step.dependOn(&hook_cold_latency_tests.step);
 
     // Serialize runs so local `zig build test-fast` does not launch heavy test
     // binaries at once (parallel runs have hung with no output on some hosts).
@@ -569,6 +582,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&check_fixture_secrets.step);
     test_step.dependOn(&test_release_payload_boundary.step);
     test_step.dependOn(&run_shell_engine_tests.step);
+    test_step.dependOn(&run_hook_cold_latency_tests.step);
     test_step.dependOn(&run_lib_tests.step);
     test_step.dependOn(&run_exe_tests.step);
     test_step.dependOn(&run_core_package_tests.step);
@@ -585,6 +599,7 @@ pub fn build(b: *std.Build) void {
     test_hooks_step.dependOn(&run_hook_dispatch_tests.step);
     test_hooks_step.dependOn(&run_hook_validation_tests.step);
     test_hooks_step.dependOn(&run_plugin_security_tests.step);
+    test_hooks_step.dependOn(&run_hook_cold_latency_tests.step);
 
     test_step.dependOn(&run_hook_host_matrix_tests.step);
     test_step.dependOn(&run_hook_dispatch_tests.step);

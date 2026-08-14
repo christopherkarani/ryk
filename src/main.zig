@@ -7,12 +7,13 @@ pub fn main(init: std.process.Init) !u8 {
         setupWindowsConsole();
     }
 
-    var dbg: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = dbg.deinit();
-    const allocator = dbg.allocator();
+    // Hook invocations are a new process per event and must stay under 5ms.
+    // DebugAllocator leak walks are incompatible with that budget.
+    const allocator = std.heap.smp_allocator;
 
     const io = init.io;
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
+    const is_hook = argv.len > 1 and std.mem.eql(u8, argv[1], "hook");
 
     if (builtin.os.tag == .linux and
         argv.len > 1 and
@@ -33,7 +34,9 @@ pub fn main(init: std.process.Init) !u8 {
     var stdout_writer = std.Io.File.stdout().writerStreaming(io, &stdout_buffer);
     var stderr_writer = std.Io.File.stderr().writerStreaming(io, &stderr_buffer);
 
-    _ = ryk.cli.style.useColor(io, &stdout_writer.interface);
+    if (!is_hook) {
+        _ = ryk.cli.style.useColor(io, &stdout_writer.interface);
+    }
 
     const shim_alias = if (builtin.os.tag == .windows) ryk.intercept.commands.shimAliasFromExecutablePath(argv[0]) else null;
     const code = if (shim_alias) |alias|
@@ -48,7 +51,7 @@ pub fn main(init: std.process.Init) !u8 {
         ryk.cli.run(io, init.environ_map, argv[1..], &stdout_writer.interface, &stderr_writer.interface) catch |err| {
             stdout_writer.interface.flush() catch {};
             stderr_writer.interface.flush() catch {};
-            ryk.telemetry.recordInvocation(io, init.environ_map, allocator, argv[1..], ryk.cli.exit_codes.general);
+            if (!is_hook) ryk.telemetry.recordInvocation(io, init.environ_map, allocator, argv[1..], ryk.cli.exit_codes.general);
             return err;
         };
     try stdout_writer.interface.flush();
@@ -56,7 +59,7 @@ pub fn main(init: std.process.Init) !u8 {
     if (shim_alias) |alias| {
         const telemetry_argv = [_][]const u8{alias};
         ryk.telemetry.recordInvocation(io, init.environ_map, allocator, &telemetry_argv, code);
-    } else {
+    } else if (!is_hook) {
         ryk.telemetry.recordInvocation(io, init.environ_map, allocator, argv[1..], code);
     }
     return code;
