@@ -33,7 +33,7 @@ CLI_BINS_DIR="${RYK_CLI_ARTIFACT_DIR:-${REPO_ROOT}/.release-cli-bins}"
 ALLOWED_BRANCHES="${RYK_RELEASE_BRANCHES:-main master}"
 LOG_FILE=""
 
-PHASES=(preflight version notes gate bump build verify publish-git "done")
+PHASES=(preflight version notes gate bump build verify sign publish-git "done")
 COMPLETED_PHASES=()
 
 # ---------------------------------------------------------------------------
@@ -651,6 +651,74 @@ phase_verify() {
 }
 
 # ---------------------------------------------------------------------------
+# sign
+#
+# One detached signature over checksums.txt authenticates every artifact, since
+# checksums.txt already covers their contents. Signing before publish means an
+# unsigned release never reaches users: a live cut with no key fails here, having
+# pushed nothing.
+# ---------------------------------------------------------------------------
+phase_sign() {
+  local checksums="${DIST_DIR}/checksums.txt"
+  local sig="${checksums}.minisig"
+  local key="${RYK_MINISIGN_SECRET_KEY:-}"
+
+  [[ -s "$checksums" ]] || fail "sign: ${checksums} missing; run the build phase first"
+
+  local signer=""
+  if command -v minisign >/dev/null 2>&1; then
+    signer=minisign
+  elif command -v rsign >/dev/null 2>&1; then
+    signer=rsign
+  fi
+
+  if [[ -z "$key" || -z "$signer" ]]; then
+    local why="RYK_MINISIGN_SECRET_KEY is not set"
+    [[ -n "$key" ]] && why="no signer found (install minisign, or cargo install rsign2)"
+    if [[ "$LIVE" -eq 1 ]]; then
+      fail "sign: ${why}
+Refuse to publish an unsigned release. Nothing has been pushed.
+  Provision the key: docs/release-signing.md
+  Then resume:       ./scripts/cut-release.sh --version ${VERSION} --live --resume-from sign"
+    fi
+    warn "sign: skipped in dry-run (${why}); a live cut would stop here"
+    return 0
+  fi
+
+  log "sign: minisign over checksums.txt…"
+  rm -f "$sig"
+  case "$signer" in
+    minisign)
+      minisign -S -s "$key" -m "$checksums" -x "$sig" \
+        -c "ryk v${VERSION} release checksums" \
+        -t "ryk v${VERSION}" || fail "sign: minisign failed"
+      ;;
+    rsign)
+      rsign sign -s "$key" -x "$sig" -c "ryk v${VERSION} release checksums" \
+        -t "ryk v${VERSION}" "$checksums" || fail "sign: rsign failed"
+      ;;
+  esac
+  [[ -s "$sig" ]] || fail "sign: ${sig} was not produced"
+
+  # Verify what we just produced with the published public key, not the secret
+  # key's own copy: this is the assertion that users will be able to verify it.
+  local pub="keys/ryk-release-minisign.pub"
+  if [[ -f "$pub" ]] && ! grep -q 'UNPROVISIONED' "$pub"; then
+    local pubkey
+    pubkey="$(grep -v '^untrusted comment:' "$pub" | head -n1)"
+    case "$signer" in
+      minisign) minisign -V -P "$pubkey" -x "$sig" -m "$checksums" >/dev/null 2>&1 ;;
+      rsign) rsign verify -P "$pubkey" -x "$sig" "$checksums" >/dev/null 2>&1 ;;
+    esac || fail "sign: signature does not verify against ${pub}
+The signing key and the published public key disagree; users would be unable to
+verify this release. Nothing has been pushed."
+    log "sign: verified against ${pub}"
+  else
+    warn "sign: ${pub} is not provisioned, so the signature was not cross-checked"
+  fi
+}
+
+# ---------------------------------------------------------------------------
 # publish-git
 # ---------------------------------------------------------------------------
 phase_publish_git() {
@@ -673,6 +741,7 @@ phase_publish_git() {
     "${DIST_DIR}/ryk-v${VERSION}-"*.tar.gz \
     "${DIST_DIR}/ryk-v${VERSION}-"*.zip \
     "${DIST_DIR}/checksums.txt" \
+    "${DIST_DIR}/checksums.txt.minisig" \
     "${DIST_DIR}/telemetry-contract.txt" \
     "${DIST_DIR}/sbom.json" \
     "${DIST_DIR}/release-manifest.json"
@@ -680,6 +749,13 @@ phase_publish_git() {
     [[ -f "$f" ]] && assets+=("$f")
   done
   shopt -u nullglob
+
+  # The installer refuses a release whose signature is missing once the public key
+  # is provisioned, so publishing without it would break the install path.
+  if [[ -f keys/ryk-release-minisign.pub ]] && ! grep -q 'UNPROVISIONED' keys/ryk-release-minisign.pub; then
+    [[ -s "${DIST_DIR}/checksums.txt.minisig" ]] || \
+      fail "publish-git: checksums.txt.minisig missing while signing is active; run the sign phase"
+  fi
   [[ ${#assets[@]} -gt 0 ]] || fail "no release assets found under ${DIST_DIR}"
 
   local -a notes_arg=(--generate-notes)
