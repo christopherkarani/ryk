@@ -45,6 +45,14 @@ pub const ShellAuditOptions = struct {
 };
 
 const event_source_run = rust_visibility.event_source_run;
+const shell_eval_cwd = @import("shell_eval_cwd.zig");
+const shell_eval_synth = @import("shell_eval_synth.zig");
+
+test {
+    _ = shell_eval_cwd;
+    _ = shell_eval_synth;
+    _ = shell_eval_fm;
+}
 
 pub const ShellEvalBackend = enum { zig, rust };
 
@@ -59,169 +67,7 @@ pub fn resolveShellEvalBackend() ShellEvalBackend {
     return .zig;
 }
 
-/// Resolve the shell-eval working directory for allow-once / grant matching (M-14).
-///
-/// Prefer `realpath` when it succeeds (Darwin `/var` vs `/private/var` canonicalization).
-/// Under hardened Seatbelt, `realpath` can fail with EPERM even when the directory is
-/// openable for normal use — absolute paths then fall back to as-is after an openDir
-/// usability check (mirrors `hook.resolvePendingIssueCwd`). Relative paths fail closed
-/// when realpath fails (no safe absolute form without a successful walk).
-///
-/// Uses libc `realpath` (not Zig `realPathFileAlloc`) so EPERM does not trip
-/// `unexpectedErrno` stack spam in Debug builds — errno is treated as a soft miss.
-fn resolveEffectiveCwd(allocator: std.mem.Allocator, cwd: ?[]const u8) daemon.DaemonError![]const u8 {
-    const path = cwd orelse ".";
-    var threaded: std.Io.Threaded = .init_single_threaded;
-    return resolveEffectiveCwdIo(threaded.io(), allocator, path);
-}
-
-fn resolveEffectiveCwdIo(io: std.Io, allocator: std.mem.Allocator, path: []const u8) daemon.DaemonError![]const u8 {
-    if (try tryRealpathQuiet(allocator, path)) |resolved| {
-        return resolved;
-    }
-    return resolveEffectiveCwdAfterRealpathFail(io, allocator, path);
-}
-
-/// Quiet realpath: returns null on any libc failure (including EPERM under Seatbelt)
-/// without printing Zig's `unexpected errno` stack. Owned slice on success.
-fn tryRealpathQuiet(allocator: std.mem.Allocator, path: []const u8) error{OutOfMemory}!?[]u8 {
-    if (@import("builtin").os.tag == .windows) {
-        // Windows residual: use Zig Io (no Seatbelt EPERM residual to silence).
-        var threaded: std.Io.Threaded = .init_single_threaded;
-        const io = threaded.io();
-        const resolved_z = std.Io.Dir.cwd().realPathFileAlloc(io, path, allocator) catch return null;
-        defer allocator.free(resolved_z);
-        return try allocator.dupe(u8, resolved_z);
-    }
-    const path_z = try allocator.dupeZ(u8, path);
-    defer allocator.free(path_z);
-    var buf: [std.posix.PATH_MAX]u8 = undefined;
-    const rc = std.c.realpath(path_z.ptr, &buf) orelse return null;
-    return try allocator.dupe(u8, std.mem.span(rc));
-}
-
-/// Quiet getcwd: kernel cwd string without Zig unexpectedErrno on residual EPERM.
-/// Owned slice on success; null when the process cwd is unreadable.
-fn tryGetcwdQuiet(allocator: std.mem.Allocator) error{OutOfMemory}!?[]u8 {
-    if (@import("builtin").os.tag == .windows) return null;
-    var buf: [std.posix.PATH_MAX]u8 = undefined;
-    // libc getcwd returns ?[*]u8 (not sentinel-typed); slice to NUL.
-    const rc = std.c.getcwd(&buf, buf.len) orelse return null;
-    return try allocator.dupe(u8, std.mem.sliceTo(rc, 0));
-}
-
-/// Fallback when realpath fails: keep absolute paths that open as directories.
-/// Used under Seatbelt when realpath walks hit EPERM but the workspace is still usable.
-/// For "." / empty, try process getcwd (already chdir'd into workspace after attach).
-fn resolveEffectiveCwdAfterRealpathFail(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    path: []const u8,
-) daemon.DaemonError![]const u8 {
-    if (std.fs.path.isAbsolute(path)) {
-        // Usability check without following a final symlink (cwd identity for allow-once).
-        // Residual: path remains the lexical absolute string when open succeeds — not
-        // a realpath-canonical form (realpath already failed for this input).
-        var dir = std.Io.Dir.openDirAbsolute(io, path, .{ .follow_symlinks = false }) catch
-            return error.InvalidWorkingDirectory;
-        dir.close(io);
-        return allocator.dupe(u8, path) catch error.OutOfMemory;
-    }
-    // Relative "." after attach: process cwd is usually the granted workspace.
-    // Prefer quiet getcwd over inventing a path from an unproven relative string.
-    if (path.len == 0 or std.mem.eql(u8, path, ".")) {
-        if (try tryGetcwdQuiet(allocator)) |cwd_abs| {
-            errdefer allocator.free(cwd_abs);
-            if (!std.fs.path.isAbsolute(cwd_abs)) return error.InvalidWorkingDirectory;
-            var dir = std.Io.Dir.openDirAbsolute(io, cwd_abs, .{ .follow_symlinks = false }) catch
-                return error.InvalidWorkingDirectory;
-            dir.close(io);
-            return cwd_abs; // success: errdefer does not run
-        }
-    }
-    // Other relative names: without realpath we cannot mint a stable absolute cwd
-    // for allow-once scope. Fail closed rather than inventing an unproven path.
-    return error.InvalidWorkingDirectory;
-}
-
-/// Build a daemon-shaped Evaluate JSON response from a Zig shell_engine result.
-/// Includes explain metadata for local audit/feed consumers. Agent-facing hook
-/// JSON remains thin at the presentation layer (hosts only use stable fields).
-pub fn synthesizeDaemonResponseFromZig(
-    allocator: std.mem.Allocator,
-    eval: shell_engine.Evaluation,
-) daemon.DaemonError!std.json.Parsed(daemon.DaemonResponse) {
-    const status = switch (eval.decision) {
-        .allow => "Allow",
-        .deny => "Deny",
-    };
-
-    const SuggestionJson = struct { description: []const u8 };
-    const PipelineJson = struct { name: []const u8, duration_us: u64 = 0, detail: ?[]const u8 = null };
-
-    // Map static tips into the suggestion objects hooks already understand.
-    var suggestion_objs: std.ArrayList(SuggestionJson) = .empty;
-    defer suggestion_objs.deinit(allocator);
-    for (eval.tips) |tip| {
-        suggestion_objs.append(allocator, .{ .description = tip }) catch return error.OutOfMemory;
-    }
-
-    // Hooks use collector=null → empty pipeline (zero cost). Audit may still
-    // carry tips/match fields when present on Evaluation.
-    var pipeline_objs: std.ArrayList(PipelineJson) = .empty;
-    defer pipeline_objs.deinit(allocator);
-    for (eval.trace) |step| {
-        pipeline_objs.append(allocator, .{
-            .name = step.name,
-            .duration_us = step.duration_us,
-            .detail = step.detail,
-        }) catch return error.OutOfMemory;
-    }
-
-    const payload = struct {
-        id: u64 = 1,
-        result: struct {
-            status: []const u8,
-            reason: []const u8,
-            pack_id: ?[]const u8 = null,
-            pattern_name: ?[]const u8 = null,
-            severity: []const u8,
-            explanation: ?[]const u8 = null,
-            regex_source: ?[]const u8 = null,
-            match_start: ?usize = null,
-            match_end: ?usize = null,
-            matched_text: ?[]const u8 = null,
-            matched_candidate: ?[]const u8 = null,
-            latency_ms: u64 = 0,
-            suggestions: []const SuggestionJson = &.{},
-            pipeline: []const PipelineJson = &.{},
-            source: []const u8 = "zig.shell_engine",
-        },
-    }{
-        .result = .{
-            .status = status,
-            .reason = eval.reason,
-            .pack_id = eval.pack_id,
-            .pattern_name = eval.pattern_name,
-            .severity = eval.severity.toString(),
-            .explanation = eval.explanation,
-            .regex_source = eval.regex_source,
-            .match_start = eval.match_start,
-            .match_end = eval.match_end,
-            .matched_text = eval.matched_text,
-            .matched_candidate = eval.matched_candidate,
-            .latency_ms = eval.latency_ms,
-            .suggestions = suggestion_objs.items,
-            .pipeline = pipeline_objs.items,
-        },
-    };
-    const json_str = std.json.Stringify.valueAlloc(allocator, payload, .{}) catch return error.OutOfMemory;
-    defer allocator.free(json_str);
-    return std.json.parseFromSlice(daemon.DaemonResponse, allocator, json_str, .{
-        .allocate = .alloc_always,
-        .ignore_unknown_fields = true,
-    }) catch return error.ResponseParseFailed;
-}
+pub const synthesizeDaemonResponseFromZig = shell_eval_synth.synthesizeDaemonResponseFromZig;
 
 /// Product-path permanent allowlist + allow-once path resolution.
 /// Distinct from `EvaluateOptions.allowlists` (policy Layered / tests only).
@@ -401,7 +247,7 @@ fn zigEvaluator(
 
     // M-14: realpath evaluate cwd so allow-once scope matches test/explain and
     // Darwin /var vs /private/var does not void cwd-scoped grants.
-    const eval_cwd = try resolveEffectiveCwd(allocator, shell_event.cwd);
+    const eval_cwd = try shell_eval_cwd.resolveEffectiveCwd(allocator, shell_event.cwd);
     defer allocator.free(eval_cwd);
 
     // M-9: prefer session-bound workspace_root when provided (hook). When null,
@@ -712,6 +558,13 @@ pub const ShellWithPolicyDecision = struct {
         }
     }
 };
+
+const shell_eval_fm = @import("shell_eval_fm.zig");
+pub const FmShellContext = shell_eval_fm.FmShellContext;
+pub const applyFmSoftSeatbelt = shell_eval_fm.applyFmSoftSeatbelt;
+pub const FmFakeState = shell_eval_fm.FmFakeState;
+pub const fakeFmClassify = shell_eval_fm.fakeFmClassify;
+pub const fakeFmClient = shell_eval_fm.fakeFmClient;
 
 /// Synthetic or real engine outcome after `shell_engine.evaluateCommand` (or error).
 pub const EngineShellOutcome = enum {
@@ -1069,26 +922,6 @@ pub const DaemonPolicyOpts = struct {
     telemetry_source: []const u8 = "other",
 };
 
-// ---------------------------------------------------------------------------
-// FM soft seatbelt choke point (Phase 4 WP3)
-// ---------------------------------------------------------------------------
-
-/// Context for building a shell risk card + classifying via the Mac steward.
-pub const FmShellContext = struct {
-    command: []const u8,
-    session_id: []const u8 = brand.default_session_id,
-    tool: []const u8 = "bash",
-    executed: bool = true,
-    cwd: ?[]const u8 = null,
-    host: ?[]const u8 = null,
-    /// Null → `defaultClient()` (macOS production / non-macOS continue stub).
-    client: ?fm_steward_client.Client = null,
-    /// When true, return `policy_out` without calling the client.
-    disable_fm: bool = false,
-    timeout_ms: u32 = fm_steward_client.default_timeout_ms,
-    telemetry_source: []const u8 = "other",
-};
-
 fn fmContextFromOpts(opts: DaemonPolicyOpts) FmShellContext {
     return .{
         .command = opts.command,
@@ -1102,125 +935,6 @@ fn fmContextFromOpts(opts: DaemonPolicyOpts) FmShellContext {
         .timeout_ms = opts.fm_timeout_ms,
         .telemetry_source = opts.telemetry_source,
     };
-}
-
-/// After WP4 soft outcomes, optionally upgrade allow/warn → ask via Mac FM steward.
-///
-/// Hard rules:
-/// 1. `.block` → return as-is; **never** call the client
-/// 2. sticky session trust allow → return as-is; **never** re-ask via FM
-/// 3. soft (allow|warn|ask) → risk-card-v1 → `Client.classify`
-/// 4. FM continue / timeout / fallback → keep `policy_out` (never invent ask)
-/// 5. FM ask | ask_sticky_candidate → force `.ask` with explain/why reason
-/// 6. May upgrade allow→ask only; never softens block/deny
-///
-/// Ownership: when upgrading to ask, `owned_reason` is allocator-owned (caller
-/// frees via `ShellWithPolicyDecision.freeOwned` or transfers into `OwnedRunDecision`).
-pub fn applyFmSoftSeatbelt(
-    allocator: std.mem.Allocator,
-    policy_out: ShellWithPolicyDecision,
-    ctx: FmShellContext,
-) !ShellWithPolicyDecision {
-    // 1. Hard outcomes never reach FM.
-    if (policy_out.decision == .block) return policy_out;
-    if (ctx.disable_fm) return policy_out;
-    // 2. Sticky session trust is a terminal soft allow — FM must not re-ask.
-    if (policy_out.reason) |r| {
-        if (std.mem.eql(u8, r, sticky_session_trust_reason)) return policy_out;
-    }
-    // No command → cannot build a meaningful card; keep soft policy.
-    if (std.mem.trim(u8, ctx.command, " \t\r\n").len == 0) return policy_out;
-    if (ctx.session_id.len == 0 or ctx.tool.len == 0) return policy_out;
-
-    const card = policy.risk_card.forShellCommand(.{
-        .session_id = ctx.session_id,
-        .tool = ctx.tool,
-        .command = ctx.command,
-        .executed = ctx.executed,
-        .host = ctx.host,
-        .cwd = ctx.cwd,
-    }) catch return policy_out;
-
-    const card_json = policy.risk_card.encodeJson(allocator, card) catch return policy_out;
-    defer allocator.free(card_json);
-
-    const client = ctx.client orelse fm_steward_client.defaultClient();
-    const timeout = if (ctx.timeout_ms == 0) fm_steward_client.default_timeout_ms else ctx.timeout_ms;
-    var classify_result = client.classify(allocator, card_json, timeout);
-    defer classify_result.deinit(allocator);
-    const initial_decision = policy_out.decision;
-
-    // Timeout / fallback / continue → keep soft policy (no ask-spam).
-    if (classify_result.timed_out or classify_result.fallback) {
-        telemetry.recordFmDecision(
-            ctx.telemetry_source,
-            ctx.host,
-            classify_result.verdict.toWire(),
-            classify_result.fallback,
-            classify_result.timed_out,
-            classify_result.model_available,
-            classify_result.latency_ms,
-            false,
-        );
-        return policy_out;
-    }
-    switch (classify_result.verdict) {
-        .continue_ => {
-            telemetry.recordFmDecision(
-                ctx.telemetry_source,
-                ctx.host,
-                classify_result.verdict.toWire(),
-                classify_result.fallback,
-                classify_result.timed_out,
-                classify_result.model_available,
-                classify_result.latency_ms,
-                false,
-            );
-            return policy_out;
-        },
-        .ask, .ask_sticky_candidate => {
-            // Prefer steward explain, then why; fall back to a stable static string.
-            const reason_src: []const u8 = if (classify_result.explain) |e|
-                if (e.len > 0) e else classify_result.why
-            else
-                classify_result.why;
-            const owned = if (reason_src.len > 0)
-                try allocator.dupe(u8, reason_src)
-            else
-                try allocator.dupe(u8, "fm steward requested confirmation");
-            errdefer allocator.free(owned);
-
-            var sticky_scope: ?[]const u8 = null;
-            errdefer if (sticky_scope) |s| allocator.free(s);
-            var sticky_effect: ?[]const u8 = null;
-            errdefer if (sticky_effect) |s| allocator.free(s);
-            if (classify_result.suggested_sticky_scope) |s| {
-                if (s.len > 0) sticky_scope = try allocator.dupe(u8, s);
-            }
-            if (classify_result.suggested_effect_class) |s| {
-                if (s.len > 0) sticky_effect = try allocator.dupe(u8, s);
-            }
-
-            telemetry.recordFmDecision(
-                ctx.telemetry_source,
-                ctx.host,
-                classify_result.verdict.toWire(),
-                classify_result.fallback,
-                classify_result.timed_out,
-                classify_result.model_available,
-                classify_result.latency_ms,
-                initial_decision != .ask,
-            );
-            return .{
-                .decision = .ask,
-                .reason = policy_out.reason,
-                .owned_reason = owned,
-                .suggested_sticky_scope = sticky_scope,
-                .suggested_effect_class = sticky_effect,
-                .sticky_hints_owned = sticky_scope != null or sticky_effect != null,
-            };
-        },
-    }
 }
 
 const OwnedRunDecision = struct {
@@ -2007,74 +1721,6 @@ test "shell_eval fail_closed is typed on Evaluate failures only" {
             try std.testing.expect(std.mem.indexOf(u8, decision.decision.reason, sub) != null);
         }
     }
-}
-
-test "shell_eval reports a missing command working directory explicitly" {
-    try std.testing.expectError(
-        error.InvalidWorkingDirectory,
-        resolveEffectiveCwd(std.testing.allocator, "/definitely/missing/ryk-working-directory"),
-    );
-    try std.testing.expectEqualStrings(
-        "daemon unavailable: command working directory does not exist",
-        daemonUnavailableReason(error.InvalidWorkingDirectory),
-    );
-}
-
-test "resolveEffectiveCwd prefers realpath when available" {
-    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
-    defer std.testing.allocator.free(abs);
-
-    const resolved = try resolveEffectiveCwd(std.testing.allocator, abs);
-    defer std.testing.allocator.free(resolved);
-    // Realpath should succeed and return a usable absolute path (may equal abs).
-    try std.testing.expect(std.fs.path.isAbsolute(resolved));
-    var dir = try std.Io.Dir.openDirAbsolute(std.testing.io, resolved, .{});
-    dir.close(std.testing.io);
-}
-
-test "resolveEffectiveCwd absolute survives realpath failure when dir is usable" {
-    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
-    defer std.testing.allocator.free(abs);
-
-    // Exercise the Seatbelt residual path directly: realpath already failed.
-    const resolved = try resolveEffectiveCwdAfterRealpathFail(std.testing.io, std.testing.allocator, abs);
-    defer std.testing.allocator.free(resolved);
-    try std.testing.expectEqualStrings(abs, resolved);
-}
-
-test "resolveEffectiveCwd absolute missing still fails closed after realpath fail" {
-    try std.testing.expectError(
-        error.InvalidWorkingDirectory,
-        resolveEffectiveCwdAfterRealpathFail(
-            std.testing.io,
-            std.testing.allocator,
-            "/definitely/missing/ryk-working-directory-fallback",
-        ),
-    );
-}
-
-test "resolveEffectiveCwd relative fails closed when realpath fails" {
-    // Bare relative names cannot be proven absolute without realpath.
-    try std.testing.expectError(
-        error.InvalidWorkingDirectory,
-        resolveEffectiveCwdAfterRealpathFail(std.testing.io, std.testing.allocator, "not-a-proven-absolute-cwd"),
-    );
-}
-
-test "resolveEffectiveCwd dot falls back to getcwd when realpath fails" {
-    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
-    // Realpath already "failed" — "." should still recover via process cwd.
-    const resolved = try resolveEffectiveCwdAfterRealpathFail(std.testing.io, std.testing.allocator, ".");
-    defer std.testing.allocator.free(resolved);
-    try std.testing.expect(std.fs.path.isAbsolute(resolved));
-    var dir = try std.Io.Dir.openDirAbsolute(std.testing.io, resolved, .{});
-    dir.close(std.testing.io);
 }
 
 test "shell_eval ci mode converts warn allow to deny" {
@@ -3318,225 +2964,6 @@ test "zigEvaluator applies opt-in packs from cwd .ryk.toml" {
         defer parsed.deinit();
         try std.testing.expectEqual(daemon.ResponseStatus.deny, daemon.responseStatus(parsed.value.result));
     }
-}
-
-// ---------------------------------------------------------------------------
-// FM soft seatbelt choke point (Phase 4 WP3) — fake-client unit table
-// ---------------------------------------------------------------------------
-
-const FmFakeState = struct {
-    call_count: u32 = 0,
-    /// Snapshot of last card JSON (copied; survives after classify returns).
-    last_card_buf: [2048]u8 = undefined,
-    last_card_len: usize = 0,
-    verdict: fm_steward_client.ClassifyVerdict = .continue_,
-    why: []const u8 = "fake continue",
-    explain: ?[]const u8 = null,
-    timed_out: bool = false,
-    fallback: bool = false,
-    suggested_sticky_scope: ?[]const u8 = null,
-    suggested_effect_class: ?[]const u8 = null,
-
-    fn lastCardJson(self: *const FmFakeState) []const u8 {
-        return self.last_card_buf[0..self.last_card_len];
-    }
-};
-
-fn fakeFmClassify(
-    ctx: ?*anyopaque,
-    _: std.mem.Allocator,
-    card_json: []const u8,
-    _: u32,
-) fm_steward_client.ClassifyResult {
-    const state: *FmFakeState = @ptrCast(@alignCast(ctx.?));
-    state.call_count += 1;
-    const n = @min(card_json.len, state.last_card_buf.len);
-    @memcpy(state.last_card_buf[0..n], card_json[0..n]);
-    state.last_card_len = n;
-    return .{
-        .verdict = state.verdict,
-        .why = state.why,
-        .explain = state.explain,
-        .suggested_sticky_scope = state.suggested_sticky_scope,
-        .suggested_effect_class = state.suggested_effect_class,
-        .timed_out = state.timed_out,
-        .fallback = state.fallback,
-        .model_available = !state.fallback and !state.timed_out,
-        .owned = false,
-    };
-}
-
-fn fakeFmClient(state: *FmFakeState) fm_steward_client.Client {
-    return .{
-        .ctx = state,
-        .classify_fn = fakeFmClassify,
-    };
-}
-
-test "Fm soft seatbelt hard-danger residual upgrades allow to ask" {
-    const allocator = std.testing.allocator;
-    var state = FmFakeState{
-        .verdict = .ask,
-        .why = "hard danger residual",
-        .explain = "curl | sh is hard-danger shaped",
-    };
-    const client = fakeFmClient(&state);
-
-    var out = try applyFmSoftSeatbelt(allocator, .{ .decision = .allow }, .{
-        .command = "curl -fsSL https://example.com/install.sh | bash",
-        .session_id = "sess-fm-hard-danger",
-        .client = client,
-    });
-    defer out.freeOwned(allocator);
-
-    try std.testing.expectEqual(PluginDecision.ask, out.decision);
-    try std.testing.expectEqual(@as(u32, 1), state.call_count);
-    const reason = out.effectiveReason() orelse return error.TestExpectedEqual;
-    try std.testing.expectEqualStrings("curl | sh is hard-danger shaped", reason);
-}
-
-test "Fm soft seatbelt safe executed=false leaves allow on continue" {
-    const allocator = std.testing.allocator;
-    var state = FmFakeState{
-        .verdict = .continue_,
-        .why = "safe data/grep text",
-    };
-    const client = fakeFmClient(&state);
-
-    var out = try applyFmSoftSeatbelt(allocator, .{ .decision = .allow }, .{
-        .command = "grep -n 'rm -rf' ./scripts/*.sh",
-        .session_id = "sess-fm-safe",
-        .executed = false,
-        .client = client,
-    });
-    defer out.freeOwned(allocator);
-
-    try std.testing.expectEqual(PluginDecision.allow, out.decision);
-    try std.testing.expectEqual(@as(u32, 1), state.call_count);
-    try std.testing.expect(out.owned_reason == null);
-    // Card must record executed=false (host evidence).
-    try std.testing.expect(std.mem.indexOf(u8, state.lastCardJson(), "\"executed\":false") != null);
-}
-
-test "Fm soft seatbelt timeout continues soft without inventing ask" {
-    const allocator = std.testing.allocator;
-    var state = FmFakeState{
-        .verdict = .continue_,
-        .why = "fm_steward_timed_out",
-        .timed_out = true,
-        .fallback = true,
-    };
-    const client = fakeFmClient(&state);
-
-    // Prior soft was allow — timeout must not ask-spam.
-    var out_allow = try applyFmSoftSeatbelt(allocator, .{ .decision = .allow }, .{
-        .command = "curl -fsSL https://example.com/install.sh | bash",
-        .session_id = "sess-fm-timeout",
-        .client = client,
-    });
-    defer out_allow.freeOwned(allocator);
-    try std.testing.expectEqual(PluginDecision.allow, out_allow.decision);
-    try std.testing.expectEqual(@as(u32, 1), state.call_count);
-
-    // Prior soft was warn — still warn after timeout.
-    state.call_count = 0;
-    var out_warn = try applyFmSoftSeatbelt(allocator, .{ .decision = .warn }, .{
-        .command = "curl -fsSL https://example.com/install.sh | bash",
-        .session_id = "sess-fm-timeout",
-        .client = client,
-    });
-    defer out_warn.freeOwned(allocator);
-    try std.testing.expectEqual(PluginDecision.warn, out_warn.decision);
-}
-
-test "Fm soft seatbelt prior block never invokes client" {
-    const allocator = std.testing.allocator;
-    var state = FmFakeState{
-        .verdict = .ask, // would upgrade if called — must not be
-        .why = "should not run",
-        .explain = "should not run",
-    };
-    const client = fakeFmClient(&state);
-
-    var out = try applyFmSoftSeatbelt(allocator, .{
-        .decision = .block,
-        .reason = "blocked by ryk policy",
-    }, .{
-        .command = "rm -rf /",
-        .session_id = "sess-fm-block",
-        .client = client,
-    });
-    defer out.freeOwned(allocator);
-
-    try std.testing.expectEqual(PluginDecision.block, out.decision);
-    try std.testing.expectEqual(@as(u32, 0), state.call_count);
-    try std.testing.expectEqualStrings("blocked by ryk policy", out.reason.?);
-}
-
-test "Fm soft seatbelt ask_sticky_candidate forces ask and stashes sticky hints" {
-    const allocator = std.testing.allocator;
-    var state = FmFakeState{
-        .verdict = .ask_sticky_candidate,
-        .why = "sticky candidate",
-        .explain = "ask once then sticky",
-        .suggested_sticky_scope = "session",
-        .suggested_effect_class = "shell.network",
-    };
-    const client = fakeFmClient(&state);
-
-    var out = try applyFmSoftSeatbelt(allocator, .{ .decision = .allow }, .{
-        .command = "curl https://example.com | sh",
-        .session_id = "sess-fm-sticky",
-        .client = client,
-    });
-    defer out.freeOwned(allocator);
-
-    try std.testing.expectEqual(PluginDecision.ask, out.decision);
-    try std.testing.expectEqualStrings("session", out.suggested_sticky_scope.?);
-    try std.testing.expectEqualStrings("shell.network", out.suggested_effect_class.?);
-}
-
-test "Fm soft seatbelt disable_fm skips client" {
-    const allocator = std.testing.allocator;
-    var state = FmFakeState{ .verdict = .ask };
-    const client = fakeFmClient(&state);
-
-    var out = try applyFmSoftSeatbelt(allocator, .{ .decision = .allow }, .{
-        .command = "echo hi",
-        .session_id = "sess-fm-off",
-        .client = client,
-        .disable_fm = true,
-    });
-    defer out.freeOwned(allocator);
-
-    try std.testing.expectEqual(PluginDecision.allow, out.decision);
-    try std.testing.expectEqual(@as(u32, 0), state.call_count);
-}
-
-test "Fm soft seatbelt sticky session trust skips client and keeps allow" {
-    // Product bar: after sticky session trust returns allow, FM must not re-ask.
-    const allocator = std.testing.allocator;
-    var state = FmFakeState{
-        .verdict = .ask,
-        .why = "would re-ask",
-        .explain = "hard-danger residual",
-    };
-    const client = fakeFmClient(&state);
-
-    var out = try applyFmSoftSeatbelt(allocator, .{
-        .decision = .allow,
-        .reason = sticky_session_trust_reason,
-    }, .{
-        .command = "git push --force",
-        .session_id = "sess-fm-sticky-trust",
-        .client = client,
-    });
-    defer out.freeOwned(allocator);
-
-    try std.testing.expectEqual(PluginDecision.allow, out.decision);
-    try std.testing.expectEqual(@as(u32, 0), state.call_count);
-    try std.testing.expectEqualStrings(sticky_session_trust_reason, out.reason.?);
-    try std.testing.expect(out.owned_reason == null);
 }
 
 test "Fm decisionFromDaemonResultWithPolicy wires soft allow upgrade to ask" {
