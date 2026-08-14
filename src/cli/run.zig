@@ -893,8 +893,7 @@ fn commandWithStdioAndEnv(io: std.Io, argv: []const []const u8, stdout: anytype,
                         const sticky_scope: policy.sticky.Scope = if (choice == .allow_session) .session else .once;
                         const sticky_severity = shell_eval.riskLevelFromScore(command_decision.decision.risk_score orelse 80);
                         // best-effort sticky; re-ask on failure
-                        shell_eval.recordStickyFromAskWithHints(
-                            shell_eval.getSessionStickyStore(),
+                        shell_eval.recordSessionStickyFromAskWithHints(
                             raw_display,
                             sticky_scope,
                             sticky_severity,

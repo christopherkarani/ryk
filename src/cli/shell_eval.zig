@@ -888,6 +888,25 @@ pub fn recordStickyFromAskWithHints(
     try recordStickyFromAsk(store, command, fp_scope, severity);
 }
 
+/// Product `ryk run` ask→allow sticky. Uses the process session store so
+/// callers do not name `getSessionStickyStore` at the spawn site.
+pub fn recordSessionStickyFromAskWithHints(
+    command: []const u8,
+    host_scope: policy.sticky.Scope,
+    severity: RiskLevel,
+    suggested_sticky_scope: ?[]const u8,
+    suggested_effect_class: ?[]const u8,
+) !void {
+    try recordStickyFromAskWithHints(
+        getSessionStickyStore(),
+        command,
+        host_scope,
+        severity,
+        suggested_sticky_scope,
+        suggested_effect_class,
+    );
+}
+
 /// Test-only: tear down process sticky so tests do not leak page_allocator keys
 /// across cases that used `getSessionStickyStore`.
 pub fn resetSessionStickyStoreForTests() void {
@@ -921,6 +940,37 @@ pub const DaemonPolicyOpts = struct {
     /// Fixed telemetry source label. Never contains a command or payload.
     telemetry_source: []const u8 = "other",
 };
+
+/// Hook shell path: session sticky + FM forward + `telemetry_source = "hook"`.
+/// `hook.zig` must not name `getSessionStickyStore` / `decideShellWithPolicy` /
+/// `applyFmSoftSeatbelt` (W5 polarity).
+pub fn daemonPolicyOptsForHook(
+    command: []const u8,
+    permit: shell_engine.allowlist.Layered,
+    fm_client: ?fm_steward_client.Client,
+    disable_fm: bool,
+    session_id: []const u8,
+    tool: []const u8,
+    cwd: ?[]const u8,
+    host: ?[]const u8,
+    fm_timeout_ms: u32,
+) DaemonPolicyOpts {
+    return .{
+        .command = command,
+        .permit = permit,
+        .sticky = getSessionStickyStore(),
+        .effect_class = null,
+        .session_id = session_id,
+        .tool = tool,
+        .executed = true,
+        .cwd = cwd,
+        .host = host,
+        .fm_client = fm_client,
+        .disable_fm = disable_fm,
+        .fm_timeout_ms = fm_timeout_ms,
+        .telemetry_source = "hook",
+    };
+}
 
 fn fmContextFromOpts(opts: DaemonPolicyOpts) FmShellContext {
     return .{

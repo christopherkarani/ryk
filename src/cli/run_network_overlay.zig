@@ -25,7 +25,7 @@ pub const NetworkOverlayOptions = struct {
 pub const OverlayNetworkDefault = enum { mediated, legacy };
 
 /// Host aliases default to proxy + OS route-force unless the user escapes.
-/// Keep body identical to `run.zig` `wantsMediatedAgentNetwork` (single rule).
+/// `run.zig` `wantsMediatedAgentNetwork` delegates here (single rule).
 pub fn wantsMediatedAgentNetwork(
     options: NetworkOverlayOptions,
     agent_net_default: OverlayNetworkDefault,
@@ -40,7 +40,7 @@ pub fn wantsMediatedAgentNetwork(
 }
 
 /// CLI network mode: explicit `--network`/`--no-network` wins.
-/// Keep body identical to `run.zig` `cliNetworkMode` (single rule).
+/// `run.zig` `cliNetworkMode` delegates here (single rule).
 pub fn cliNetworkMode(
     options: NetworkOverlayOptions,
     agent_net_default: OverlayNetworkDefault,

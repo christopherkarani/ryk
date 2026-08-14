@@ -1524,6 +1524,19 @@ fn shellEvalPluginDecisionToHook(decision: shell_eval.PluginDecision) PluginDeci
     };
 }
 
+/// 4-tag shell facade → hook 6-tag. observe is warn-allow, not context_only.
+/// Do not use `fromDecisionResult` on this path (that maps observe→context_only).
+fn hookDecisionFromShellFacade(result: core.decision.DecisionResult) PluginDecision {
+    return switch (result) {
+        .allow => .allow,
+        .observe => .warn,
+        .ask => .ask,
+        .deny => .block,
+        // Facade 4-tag path should not emit these; fail closed.
+        .redact, .stage, .broker => .block,
+    };
+}
+
 /// Optional FM soft-seatbelt injection for shell hook paths.
 /// Production callers leave `client` null → `defaultClient()`; tests inject fakes.
 const HookShellFmOpts = struct {
@@ -1538,22 +1551,6 @@ const HookShellFmOpts = struct {
     workspace_root: ?[]const u8 = null,
     timeout_ms: u32 = fm_steward_client.default_timeout_ms,
 };
-
-fn fmShellContext(shell_cmd: []const u8, opts: HookShellFmOpts) shell_eval.FmShellContext {
-    return .{
-        .command = shell_cmd,
-        .session_id = opts.session_id,
-        .tool = opts.tool,
-        // PreToolUse / PermissionRequest shell: about to execute.
-        .executed = true,
-        .cwd = opts.cwd,
-        .host = opts.host,
-        .client = opts.client,
-        .disable_fm = opts.disable_fm,
-        .timeout_ms = opts.timeout_ms,
-        .telemetry_source = "hook",
-    };
-}
 
 fn hookRiskFromShellRisk(shell_risk: shell_eval.RiskLevel) RiskLevel {
     return switch (shell_risk) {
@@ -1601,33 +1598,13 @@ fn buildAgentVisibleDaemonDeny(
     const risk = hookRiskFromShellRisk(shell_risk);
     const ci_mode = mode == .ci;
 
-    // Policy order when command is known: hard fence → sticky → strict refuse → matrix.
-    // Live path: effect_class null (fingerprint-only sticky; not pack_id).
-    // Without command, fall back to mode×severity only (legacy test callers).
-    // Then FM soft seatbelt on non-block (block never reaches the Mac steward).
-    // Re-apply CI after FM so ask upgrades cannot leave soft ask under mode=.ci.
-    var final_policy: shell_eval.ShellWithPolicyDecision = if (shell_command) |cmd| blk: {
-        var out = shell_eval.decideShellWithPolicy(
-            mode,
-            .deny,
-            shell_risk,
-            cmd,
-            permit,
-            shell_eval.getSessionStickyStore(),
-            null,
-        );
-        // CI hardens ask/warn → block before FM (same order as decisionFromDaemonResultWithPolicy).
-        out.decision = out.decision.applyCiMode(ci_mode);
-        var after_fm = try shell_eval.applyFmSoftSeatbelt(allocator, out, fmShellContext(cmd, fm_opts));
-        after_fm.decision = after_fm.decision.applyCiMode(ci_mode);
-        break :blk after_fm;
-    } else .{
-        .decision = shell_eval.pluginDecisionFromModeAndSeverity(mode, shell_risk).applyCiMode(ci_mode),
-        .reason = null,
-    };
-    defer final_policy.freeOwned(allocator);
-
-    const decision = shellEvalPluginDecisionToHook(final_policy.decision);
+    // No-command legacy callers: mode×severity only. Command-known deny goes
+    // through `decisionFromDaemonResultWithPolicy` in hookResponseFromShellFacade.
+    _ = permit;
+    _ = shell_command;
+    _ = fm_opts;
+    const plugin_decision = shell_eval.pluginDecisionFromModeAndSeverity(mode, shell_risk).applyCiMode(ci_mode);
+    const decision = shellEvalPluginDecisionToHook(plugin_decision);
 
     var deny = try shell_eval.buildDaemonDenyReason(allocator, result);
     errdefer {
@@ -1635,14 +1612,10 @@ fn buildAgentVisibleDaemonDeny(
         if (deny.rule) |rule| allocator.free(rule);
     }
 
-    // Prefer FM owned / policy static reason; else daemon block reason or mode-softened.
-    const reason_src: []const u8 = if (decision == .block) blk: {
-        if (final_policy.effectiveReason()) |r| break :blk r;
-        break :blk deny.reason;
-    } else if (final_policy.effectiveReason()) |r|
-        r
+    const reason_src: []const u8 = if (decision == .block)
+        deny.reason
     else
-        shell_eval.modeSoftenedReason(mode, shell_risk, final_policy.decision);
+        shell_eval.modeSoftenedReason(mode, shell_risk, plugin_decision);
     const safe_reason = try core_api.redactAlloc(allocator, reason_src);
     errdefer allocator.free(safe_reason);
     allocator.free(deny.reason);
@@ -1655,17 +1628,6 @@ fn buildAgentVisibleDaemonDeny(
         break :blk safe;
     } else null;
     errdefer if (safe_rule) |rule| allocator.free(rule);
-
-    // Issue allow-once pending short code on hard block (best-effort; store optional).
-    // Pass workspace_root so null/empty host cwd never seeds bare "." (inert grants).
-    // Pending is for the human/operator path only. Redeemable short codes must never
-    // appear in agent-visible message or remediation_commands (M-1) — agents scrape
-    // deny panels; embedding digits would enable self-service bypass.
-    // Recourse/Next for operators live on stderr (writeHumanShellExplain) and in
-    // structured remediation_commands — never stuffed into agent-facing `message`.
-    if (decision == .block and shell_command != null) {
-        tryIssuePendingShortCode(allocator, shell_command.?, fm_opts.cwd, fm_opts.workspace_root, safe_reason);
-    }
 
     // Agent-facing message: short plain reason only (prefer one line). Multi-line
     // daemon explanations are truncated to the first line so Recourse/Next walls
@@ -1913,6 +1875,108 @@ fn emitRedeemCodeToOperator(code: []const u8) void {
     tty.writeStreamingAll(io, line) catch {};
 }
 
+fn hookResponseFromShellFacade(
+    allocator: std.mem.Allocator,
+    result: std.json.Value,
+    mode: policy.schema.Mode,
+    redactions: *std.ArrayList(RedactionEntry),
+    limitations: *std.ArrayList([]const u8),
+    cmd: []const u8,
+    permit: shell_engine.allowlist.Layered,
+    fm_opts: HookShellFmOpts,
+) !HookResponse {
+    if (daemon.responseStringField(result, "matched_text_preview")) |_| {
+        try recordDaemonMetadataRedaction(allocator, redactions, "matched_text_preview");
+    }
+
+    const owned = try shell_eval.decisionFromDaemonResultWithPolicy(
+        allocator,
+        result,
+        mode,
+        shell_eval.daemonPolicyOptsForHook(
+            cmd,
+            permit,
+            fm_opts.client,
+            fm_opts.disable_fm,
+            fm_opts.session_id,
+            fm_opts.tool,
+            fm_opts.cwd,
+            fm_opts.host,
+            fm_opts.timeout_ms,
+        ),
+    );
+    defer owned.deinit(allocator);
+
+    if (owned.fail_closed) {
+        return try makeFailClosedHookResponse(
+            allocator,
+            "command",
+            owned.owned_reason,
+            "Shell command blocked: ryk evaluation error.",
+            redactions,
+            limitations,
+        );
+    }
+
+    const decision = hookDecisionFromShellFacade(owned.decision.result);
+    const risk = hookRiskFromShellRisk(shell_eval.riskLevelFromScore(owned.decision.risk_score orelse 60));
+    const safe_reason = try core_api.redactAlloc(allocator, owned.owned_reason);
+    errdefer allocator.free(safe_reason);
+    const safe_rule = if (owned.owned_rule_id) |rule| try core_api.redactAlloc(allocator, rule) else null;
+    errdefer if (safe_rule) |rule| allocator.free(rule);
+
+    // Pending stays hook-side, void, only after the facade, only deny-route block.
+    if (decision == .block) {
+        tryIssuePendingShortCode(allocator, cmd, fm_opts.cwd, fm_opts.workspace_root, safe_reason);
+    }
+
+    const message = if (decision == .block) blk: {
+        if (daemon.responseStringField(result, "explanation")) |explanation| {
+            const safe = try core_api.redactAlloc(allocator, explanation);
+            defer allocator.free(safe);
+            const line = firstLineOnly(safe);
+            if (line.len == 0) break :blk try buildMessage(allocator, decision, "command");
+            break :blk try std.fmt.allocPrint(allocator, "command blocked by ryk policy: {s}", .{line});
+        }
+        break :blk try buildMessage(allocator, decision, "command");
+    } else try buildMessage(allocator, decision, "command");
+    errdefer allocator.free(message);
+
+    const daemon_status = daemon.responseStatus(result);
+    const include_deny_fields = daemon_status == .deny or decision == .block;
+    var suggestions: [][]const u8 = &.{};
+    var remediation_commands: [][]const u8 = &.{};
+    if (include_deny_fields) {
+        suggestions = try collectDaemonSuggestionTexts(allocator, result);
+        errdefer {
+            for (suggestions) |s| allocator.free(s);
+            if (suggestions.len > 0) allocator.free(suggestions);
+        }
+        remediation_commands = try buildRemediationCommands(allocator, safe_rule);
+    }
+
+    const category = try allocator.dupe(u8, "command");
+    errdefer allocator.free(category);
+    const redactions_owned = try redactions.toOwnedSlice(allocator);
+    errdefer {
+        for (redactions_owned) |r| r.deinit(allocator);
+        allocator.free(redactions_owned);
+    }
+    const host_limitations = try limitations.toOwnedSlice(allocator);
+    return .{
+        .decision = decision,
+        .risk = risk,
+        .category = category,
+        .reason = safe_reason,
+        .rule = safe_rule,
+        .message = message,
+        .redactions = redactions_owned,
+        .host_limitations = host_limitations,
+        .suggestions = suggestions,
+        .remediation_commands = remediation_commands,
+    };
+}
+
 fn hookResponseFromDaemonEvaluate(
     allocator: std.mem.Allocator,
     result: std.json.Value,
@@ -1926,68 +1990,21 @@ fn hookResponseFromDaemonEvaluate(
     const ci_mode = mode == .ci;
     return switch (daemon.responseStatus(result)) {
         .allow => blk: {
-            // Engine allow still applies strict refuse when command + permit known.
-            // Hard refuse → block without FM.
             if (shell_command) |cmd| {
-                const policy_out = shell_eval.decideShellWithPolicy(
+                break :blk try hookResponseFromShellFacade(
+                    allocator,
+                    result,
                     mode,
-                    .allow,
-                    .low,
+                    redactions,
+                    limitations,
                     cmd,
                     permit,
-                    shell_eval.getSessionStickyStore(),
-                    null,
+                    fm_opts,
                 );
-                if (policy_out.decision == .block) {
-                    // Stage owned fields with errdefer so partial OOM does not leak.
-                    const reason_src = policy_out.reason orelse "blocked by ryk policy";
-                    const safe_reason = try core_api.redactAlloc(allocator, reason_src);
-                    errdefer allocator.free(safe_reason);
-                    const category = try allocator.dupe(u8, "command");
-                    errdefer allocator.free(category);
-                    const message = try buildMessage(allocator, .block, "command");
-                    errdefer allocator.free(message);
-                    const redactions_owned = try redactions.toOwnedSlice(allocator);
-                    errdefer {
-                        for (redactions_owned) |r| r.deinit(allocator);
-                        allocator.free(redactions_owned);
-                    }
-                    const host_limitations = try limitations.toOwnedSlice(allocator);
-                    break :blk HookResponse{
-                        .decision = .block,
-                        .risk = .high,
-                        .category = category,
-                        .reason = safe_reason,
-                        .rule = null,
-                        .message = message,
-                        .redactions = redactions_owned,
-                        .host_limitations = host_limitations,
-                    };
-                }
             }
-            // Soft graduated allow/warn/ask → FM seatbelt may upgrade allow→ask.
-            // CI re-applied after FM so ask upgrades harden under mode=.ci.
             const shell_plugin = shell_eval.pluginDecisionFromDaemonAllow(result).applyCiMode(ci_mode);
-            var after_fm: shell_eval.ShellWithPolicyDecision = .{
-                .decision = shell_plugin,
-                .reason = null,
-            };
-            if (shell_command) |cmd| {
-                after_fm = try shell_eval.applyFmSoftSeatbelt(
-                    allocator,
-                    after_fm,
-                    fmShellContext(cmd, fm_opts),
-                );
-            }
-            after_fm.decision = after_fm.decision.applyCiMode(ci_mode);
-            defer after_fm.freeOwned(allocator);
-
-            const decision = shellEvalPluginDecisionToHook(after_fm.decision);
-            const reason_src: []const u8 = if (after_fm.effectiveReason()) |r|
-                r
-            else
-                daemon.responseReason(result) orelse "command allowed by daemon evaluator";
-            // Stage owned fields with errdefer so partial OOM does not leak.
+            const decision = shellEvalPluginDecisionToHook(shell_plugin);
+            const reason_src = daemon.responseReason(result) orelse "command allowed by daemon evaluator";
             const safe_reason = try core_api.redactAlloc(allocator, reason_src);
             errdefer allocator.free(safe_reason);
             const category = try allocator.dupe(u8, "command");
@@ -2017,6 +2034,18 @@ fn hookResponseFromDaemonEvaluate(
             };
         },
         .deny => blk: {
+            if (shell_command) |cmd| {
+                break :blk try hookResponseFromShellFacade(
+                    allocator,
+                    result,
+                    mode,
+                    redactions,
+                    limitations,
+                    cmd,
+                    permit,
+                    fm_opts,
+                );
+            }
             const deny = try buildAgentVisibleDaemonDeny(allocator, result, mode, redactions, shell_command, permit, fm_opts);
             // Deny owns reason/rule/message/suggestions/remediation; free on later OOM.
             errdefer {
