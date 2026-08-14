@@ -43,6 +43,10 @@ pub const EnsureOptions = struct {
     skip_host_wire: bool = false,
     /// Absolute workspace root override. When set, skip cwd/HOME resolution (start path parity).
     workspace_root_override: ?[]const u8 = null,
+    /// Upgrade pristine legacy default policies. Exclusive to `ryk doctor --fix`
+    /// and install ensure — `ryk start` leaves this false so a session start
+    /// never silently rewrites policy.
+    migrate_stale_defaults: bool = false,
 };
 
 pub const HostErrorClass = enum {
@@ -136,18 +140,20 @@ pub fn runEnsure(
     };
     defer allocator.free(workspace_root);
 
-    // Stale-default migration: a workspace policy byte-identical to a previously
-    // shipped default is upgraded to the current default (backup alongside) so
-    // ryk upgrades reach existing installs. Customized/invalid policies are
-    // never rewritten. Soft: migration errors never break ensure.
-    var maybe_report = policy_migrate.migrateWorkspacePolicyIfPristine(io, allocator, workspace_root, stderr, options.quiet) catch |err| blk: {
-        if (!options.quiet) {
-            stderr.print("ryk ensure: policy migration check failed: {s}\n", .{@errorName(err)}) catch {};
+    // Stale-default migration: doctor --fix / install only. A workspace policy
+    // byte-identical to a previously shipped default is upgraded to the current
+    // default (backup alongside). Customized/invalid policies are never rewritten.
+    // Soft: migration errors never break ensure. `ryk start` does not migrate.
+    if (options.migrate_stale_defaults or options.from_install) {
+        var maybe_report = policy_migrate.migrateWorkspacePolicyIfPristine(io, allocator, workspace_root, stderr, options.quiet) catch |err| blk: {
+            if (!options.quiet) {
+                stderr.print("ryk ensure: policy migration check failed: {s}\n", .{@errorName(err)}) catch {};
+            }
+            break :blk null;
+        };
+        if (maybe_report) |*report| {
+            defer report.deinit(allocator);
         }
-        break :blk null;
-    };
-    if (maybe_report) |*report| {
-        defer report.deinit(allocator);
     }
 
     if (onboarding.policyExists(io, workspace_root)) {
@@ -200,9 +206,9 @@ pub fn runEnsure(
     return outcome;
 }
 
-/// User-global policy upkeep on every ensure door: migrate pristine legacy
-/// defaults to the current default (backup alongside; customized/invalid
-/// untouched), then — install door only — create-only seed when missing.
+/// User-global policy upkeep: migrate pristine legacy defaults on doctor --fix
+/// / install only (backup alongside; customized/invalid untouched), then —
+/// install door only — create-only seed when missing.
 fn maybeSeedUserGlobalPolicy(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -211,16 +217,18 @@ fn maybeSeedUserGlobalPolicy(
     core_ok: bool,
 ) void {
     if (!core_ok) return;
-    var report = policy_migrate.migrateUserGlobalPolicies(io, allocator, stderr, options.quiet) catch |err| {
-        if (!options.quiet) {
-            stderr.print("ryk ensure: user policy migration check failed: {s}\n", .{@errorName(err)}) catch {};
-        }
-        if (options.from_install) {
-            seedUserGlobalPolicyIfMissing(io, allocator, options, stderr);
-        }
-        return;
-    };
-    defer report.deinit(allocator);
+    if (options.migrate_stale_defaults or options.from_install) {
+        var report = policy_migrate.migrateUserGlobalPolicies(io, allocator, stderr, options.quiet) catch |err| {
+            if (!options.quiet) {
+                stderr.print("ryk ensure: user policy migration check failed: {s}\n", .{@errorName(err)}) catch {};
+            }
+            if (options.from_install) {
+                seedUserGlobalPolicyIfMissing(io, allocator, options, stderr);
+            }
+            return;
+        };
+        defer report.deinit(allocator);
+    }
     if (options.from_install) {
         seedUserGlobalPolicyIfMissing(io, allocator, options, stderr);
     }
@@ -1370,6 +1378,7 @@ test "EnsureCore API surface freezes EnsureOptions Outcome HostResult fields" {
     try std.testing.expectEqualStrings("generic-agent", opts.preset.?);
     try std.testing.expect(opts.skip_verify);
     try std.testing.expect(!opts.skip_host_wire);
+    try std.testing.expect(!opts.migrate_stale_defaults);
 
     // HostResult shape: host_id / detected / wired / smoke_ok / fix_hint / error_class.
     const host = HostResult{

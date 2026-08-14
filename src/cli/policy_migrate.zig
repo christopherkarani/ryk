@@ -2,10 +2,14 @@
 //! current embedded default (backup written alongside); never touch customized
 //! or invalid policies.
 //!
-//! Runs on the public repair doors (`ryk doctor --fix`, `ryk start`, install
-//! ensure) so a ryk upgrade actually reaches existing installs instead of only
-//! helping new ones. Doctor's diagnose path surfaces the same findings as
-//! one-line notices without writing.
+//! Runs on the public repair doors (`ryk doctor --fix`, install ensure) so a
+//! ryk upgrade actually reaches existing installs instead of only helping new
+//! ones. `ryk start` does not migrate. Doctor's diagnose path surfaces the
+//! same findings as one-line notices without writing.
+//!
+//! Control-path writes refuse a symlink `.ryk/` or `policy.yaml` (O_NOFOLLOW)
+//! and re-hash the destination immediately before rename so a just-customized
+//! file is never clobbered.
 
 const std = @import("std");
 
@@ -27,6 +31,8 @@ pub const Outcome = enum {
     missing,
     /// Read/write failure — left untouched.
     io_error,
+    /// Symlink control path or dest changed before rename — left untouched.
+    refused,
 };
 
 pub const FileReport = struct {
@@ -73,7 +79,17 @@ pub fn migrateFileIfPristine(
     const owned_path = try allocator.dupe(u8, path);
     errdefer allocator.free(owned_path);
 
-    const content = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(4 * 1024 * 1024)) catch |err| {
+    refuseSymlinkControlPath(io, path) catch |err| switch (err) {
+        error.ManagedPathIsSymlink => {
+            if (!quiet) {
+                stderr.print("ryk: refusing to migrate {s} (symlink .ryk or policy.yaml); leaving it untouched\n", .{path}) catch {};
+            }
+            return .{ .path = owned_path, .outcome = .refused };
+        },
+        else => return .{ .path = owned_path, .outcome = .io_error },
+    };
+
+    const content = readFileNoFollowAlloc(io, allocator, path) catch |err| {
         const outcome: Outcome = switch (err) {
             error.FileNotFound => .missing,
             else => .io_error,
@@ -81,6 +97,7 @@ pub fn migrateFileIfPristine(
         return .{ .path = owned_path, .outcome = outcome };
     };
     defer allocator.free(content);
+    const expected_hash = migration.sha256Hex(content);
 
     switch (migration.classify(allocator, content)) {
         .current_default => return .{ .path = owned_path, .outcome = .already_current },
@@ -102,7 +119,13 @@ pub fn migrateFileIfPristine(
     };
     errdefer allocator.free(backup_path);
 
-    replaceFileAtomic(io, allocator, path, migration.currentDefaultBody()) catch |err| {
+    replaceFileAtomic(io, allocator, path, migration.currentDefaultBody(), expected_hash) catch |err| {
+        if (err == error.DestinationChanged or err == error.ManagedPathIsSymlink) {
+            if (!quiet) {
+                stderr.print("ryk: {s} changed or is a symlink; aborting migration (original policy untouched)\n", .{path}) catch {};
+            }
+            return .{ .path = owned_path, .outcome = .refused };
+        }
         if (!quiet) {
             stderr.print("ryk: could not migrate {s} ({s}); original policy untouched\n", .{ path, @errorName(err) }) catch {};
         }
@@ -169,7 +192,7 @@ pub fn migrateUserGlobalPolicies(
 
 pub const StaleKind = enum {
     /// Byte-identical to a previously shipped default — `ryk doctor --fix`
-    /// (or install / `ryk start`) upgrades it automatically.
+    /// (or install ensure) upgrades it automatically.
     legacy_default,
     /// Valid but matches no known default — never auto-migrated; the user
     /// reconciles manually. Note: a policy customized from the *current*
@@ -227,7 +250,8 @@ pub fn scanStalePolicies(io: std.Io, allocator: std.mem.Allocator, workspace_roo
 
 fn scanOne(io: std.Io, allocator: std.mem.Allocator, path: []const u8, notices: *std.ArrayList(StaleNotice)) !void {
     if (!plugin.fileExistsAbsolute(io, path)) return;
-    const content = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(4 * 1024 * 1024)) catch return;
+    refuseSymlinkControlPath(io, path) catch return;
+    const content = readFileNoFollowAlloc(io, allocator, path) catch return;
     defer allocator.free(content);
     const kind: StaleKind = switch (migration.classify(allocator, content)) {
         .legacy_default => .legacy_default,
@@ -266,7 +290,15 @@ fn writeBackup(io: std.Io, allocator: std.mem.Allocator, path: []const u8, conte
 
 /// Temp-write + sync + rename in the same directory (partial bodies never land
 /// as a discoverable policy). Same idiom as the ensure seed path.
-fn replaceFileAtomic(io: std.Io, allocator: std.mem.Allocator, path: []const u8, body: []const u8) !void {
+/// Re-hashes dest bytes immediately before rename and aborts if they changed
+/// (do not clobber a just-customized file) or if the dest became a symlink.
+fn replaceFileAtomic(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    body: []const u8,
+    expected_hash: [64]u8,
+) !void {
     var nonce: u64 = undefined;
     io.random(std.mem.asBytes(&nonce));
     const temp_path = try std.fmt.allocPrint(allocator, "{s}.tmp.{x}", .{ path, nonce });
@@ -278,10 +310,62 @@ fn replaceFileAtomic(io: std.Io, allocator: std.mem.Allocator, path: []const u8,
         try file.writeStreamingAll(io, body);
         try file.sync(io);
     }
+
+    refuseSymlinkControlPath(io, path) catch |err| {
+        std.Io.Dir.cwd().deleteFile(io, temp_path) catch {};
+        return err;
+    };
+    if (!try destStillMatches(io, allocator, path, expected_hash)) {
+        std.Io.Dir.cwd().deleteFile(io, temp_path) catch {};
+        return error.DestinationChanged;
+    }
+
     std.Io.Dir.renameAbsolute(temp_path, path, io) catch |err| {
         std.Io.Dir.cwd().deleteFile(io, temp_path) catch {};
         return err;
     };
+}
+
+fn refuseSymlinkControlPath(io: std.Io, path: []const u8) !void {
+    if (try pathIsSymlink(io, path)) return error.ManagedPathIsSymlink;
+    if (std.fs.path.dirname(path)) |parent| {
+        const base = std.fs.path.basename(parent);
+        if (std.mem.eql(u8, base, ".ryk") and try pathIsSymlink(io, parent)) {
+            return error.ManagedPathIsSymlink;
+        }
+    }
+}
+
+fn pathIsSymlink(io: std.Io, path: []const u8) !bool {
+    const stat = std.Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    return stat.kind == .sym_link;
+}
+
+fn readFileNoFollowAlloc(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    const file = try std.Io.Dir.cwd().openFile(io, path, .{ .follow_symlinks = false });
+    defer file.close(io);
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    var chunk: [4096]u8 = undefined;
+    while (true) {
+        const n = file.readStreaming(io, &.{chunk[0..]}) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return err,
+        };
+        if (n == 0) break;
+        if (buf.items.len + n > 4 * 1024 * 1024) return error.FileTooBig;
+        try buf.appendSlice(allocator, chunk[0..n]);
+    }
+    return try buf.toOwnedSlice(allocator);
+}
+
+fn destStillMatches(io: std.Io, allocator: std.mem.Allocator, path: []const u8, expected_hash: [64]u8) !bool {
+    const now = readFileNoFollowAlloc(io, allocator, path) catch return false;
+    defer allocator.free(now);
+    return std.mem.eql(u8, &migration.sha256Hex(now), &expected_hash);
 }
 
 // ---------------------------------------------------------------------------
@@ -475,4 +559,96 @@ test "scanStalePolicies: flags legacy default and customized, spares current" {
     for (scan2.notices) |notice| {
         try std.testing.expect(!std.mem.eql(u8, notice.path, workspace_policy));
     }
+}
+
+test "migrateFileIfPristine: refuses symlink policy.yaml and leaves target untouched" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const target = try std.fs.path.join(allocator, &.{ root, "real-policy.yaml" });
+    defer allocator.free(target);
+    const link = try std.fs.path.join(allocator, &.{ root, "policy.yaml" });
+    defer allocator.free(link);
+
+    const legacy = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        "tests/fixtures/policy-migration/generic-agent-v1.2.13.yaml",
+        allocator,
+        .limited(1024 * 1024),
+    );
+    defer allocator.free(legacy);
+    try test_helpers.writeFile(io, target, legacy);
+    std.Io.Dir.cwd().symLink(io, target, link, .{}) catch return error.SkipZigTest;
+
+    var stderr_buf: [512]u8 = undefined;
+    var stderr: std.Io.Writer = .fixed(&stderr_buf);
+    var report = try migrateFileIfPristine(io, allocator, link, &stderr, true);
+    defer report.deinit(allocator);
+
+    try std.testing.expectEqual(Outcome.refused, report.outcome);
+    const after = try test_helpers.readAlloc(io, allocator, target);
+    defer allocator.free(after);
+    try std.testing.expectEqualStrings(legacy, after);
+}
+
+test "migrateFileIfPristine: refuses symlink .ryk parent" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const outside = try std.fs.path.join(allocator, &.{ root, "outside" });
+    defer allocator.free(outside);
+    try std.Io.Dir.cwd().createDirPath(io, outside);
+    const target = try std.fs.path.join(allocator, &.{ outside, "policy.yaml" });
+    defer allocator.free(target);
+    const legacy = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        "tests/fixtures/policy-migration/generic-agent-v1.2.13.yaml",
+        allocator,
+        .limited(1024 * 1024),
+    );
+    defer allocator.free(legacy);
+    try test_helpers.writeFile(io, target, legacy);
+
+    const ryk_link = try std.fs.path.join(allocator, &.{ root, ".ryk" });
+    defer allocator.free(ryk_link);
+    std.Io.Dir.cwd().symLink(io, outside, ryk_link, .{}) catch return error.SkipZigTest;
+
+    const path = try std.fs.path.join(allocator, &.{ ryk_link, "policy.yaml" });
+    defer allocator.free(path);
+    var stderr_buf: [512]u8 = undefined;
+    var stderr: std.Io.Writer = .fixed(&stderr_buf);
+    var report = try migrateFileIfPristine(io, allocator, path, &stderr, true);
+    defer report.deinit(allocator);
+
+    try std.testing.expectEqual(Outcome.refused, report.outcome);
+    const after = try test_helpers.readAlloc(io, allocator, target);
+    defer allocator.free(after);
+    try std.testing.expectEqualStrings(legacy, after);
+}
+
+test "destStillMatches: re-hash detects a just-customized dest" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const path = try std.fs.path.join(allocator, &.{ root, "policy.yaml" });
+    defer allocator.free(path);
+
+    try test_helpers.writeFile(io, path, "legacy-body\n");
+    const hash = migration.sha256Hex("legacy-body\n");
+    try std.testing.expect(try destStillMatches(io, allocator, path, hash));
+
+    try test_helpers.writeFile(io, path, "customized-now\n");
+    try std.testing.expect(!try destStillMatches(io, allocator, path, hash));
 }

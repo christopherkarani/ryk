@@ -6,8 +6,8 @@
 //!   1. decide surface — `ryk decide command --json` (host plugins: Codex,
 //!      Claude Code, OpenCode, …), pinned to policies/presets/generic-agent.yaml
 //!      so the test is hermetic on any checkout.
-//!   2. hook surface — the real shell_engine packs fed through the strict
-//!      mode×severity matrix with the DCG empty permit (PreToolUse hooks,
+//!   2. hook surface — live composition: shell_engine packs plus
+//!      `permitFromCommandsAllow` from the loaded policy (PreToolUse hooks,
 //!      PATH shims).
 //!
 //! Corpus: deadlock_replay_corpus.jsonl — one JSON object per line:
@@ -25,6 +25,7 @@ const decide = @import("decide.zig");
 const exit_codes = @import("exit_codes.zig");
 const shell_eval = @import("shell_eval.zig");
 const shell_engine = @import("../shell_engine/mod.zig");
+const ryk_policy = @import("ryk_core").policy;
 
 const corpus = @embedFile("deadlock_replay_corpus.jsonl");
 
@@ -60,9 +61,13 @@ fn riskFromEngineSeverity(severity: shell_engine.Severity) shell_eval.RiskLevel 
     };
 }
 
-/// Hook/shim surface: real pack evaluation through the strict DCG matrix
-/// (empty permit = matrix-only Strict, the shipped coding default shape).
-fn hookSurfaceDecision(allocator: std.mem.Allocator, command_text: []const u8) !shell_eval.PluginDecision {
+/// Hook/shim surface: live composition — pack evaluation plus
+/// `permitFromCommandsAllow` from the loaded policy (mode + commands.allow).
+fn hookSurfaceDecision(
+    allocator: std.mem.Allocator,
+    policy: *const ryk_policy.schema.Policy,
+    command_text: []const u8,
+) !shell_eval.PluginDecision {
     var eval = try shell_engine.evaluateCommand(allocator, command_text, .{});
     defer eval.deinit(allocator);
 
@@ -75,8 +80,9 @@ fn hookSurfaceDecision(allocator: std.mem.Allocator, command_text: []const u8) !
     else
         .low;
 
-    const empty_permit: shell_engine.allowlist.Layered = .{ .entries = &.{} };
-    var decided = shell_eval.decideShellWithPolicy(.strict, outcome, risk, command_text, empty_permit, null, null);
+    const permit = try shell_eval.permitFromCommandsAllow(allocator, policy.commands.allow);
+    defer shell_eval.freePermitEntries(allocator, permit);
+    var decided = shell_eval.decideShellWithPolicy(policy.mode, outcome, risk, command_text, permit, null, null);
     defer decided.freeOwned(allocator);
     return decided.decision;
 }
@@ -116,6 +122,12 @@ test "Door A deadlock transcripts replay clean on both product surfaces" {
 
     const policy_path = try std.Io.Dir.cwd().realPathFileAlloc(io, "policies/presets/generic-agent.yaml", allocator);
     defer allocator.free(policy_path);
+    var policy = try ryk_policy.load.parseFromSlice(
+        allocator,
+        ryk_policy.presets.agentPresetText(.generic_agent),
+        "generic-agent.yaml",
+    );
+    defer policy.deinit();
 
     var total: usize = 0;
     var it = std.mem.splitScalar(u8, corpus, '\n');
@@ -126,7 +138,7 @@ test "Door A deadlock transcripts replay clean on both product surfaces" {
         defer freeCase(case);
         total += 1;
 
-        const hook = try hookSurfaceDecision(allocator, case.command);
+        const hook = try hookSurfaceDecision(allocator, &policy, case.command);
         const decide_code = try decideSurfaceDecision(io, allocator, policy_path, case.command);
 
         if (std.mem.eql(u8, case.expect, "allow")) {

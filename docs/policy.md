@@ -34,7 +34,7 @@ If a discovered policy file exists but is invalid or unreadable, ryk fails close
 
 ### Hard fence (unsoftenable)
 
-Critical severity and always-on catastrophe classes (for example `rm -rf /`) are always **denied**. **YOLO**, sticky trust, and Strict permit lists **cannot** unlock the hard fence.
+Critical severity and always-on catastrophe classes (for example `rm -rf /`) are always **denied**. **YOLO**, sticky trust, and Strict permit lists **cannot** unlock the hard fence. Force-equivalent `git push` (`-f`, `+refspec`, `--delete`, `--mirror`, `:ref`) stays denied on the YAML heuristic and the command + shell-engine fence. Network or opaque-decode piped to an executor (`curl | sh`, `curl | sudo sh`, `base64 -d | sh`) is denied by the shell engine (wrappers unwrapped on both sides of `|`). These are command + shell-engine + pipe-to-executor fences, not a claim of critical deny on every host. After `ryk doctor --fix`, a pristine old default is seeded to generic-agent.
 
 ### Sticky trust
 

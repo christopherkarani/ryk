@@ -45,10 +45,11 @@ pub const StepOutcome = struct {
     /// A step is satisfied when normal work runs and danger does not.
     /// `ask` counts as a failure for `allow` steps: several hosts hard-block
     /// `ask` with no resume, which is the deadlock we are hunting.
+    /// Danger is fence-OK only on deny/block — `ask` is not a fence.
     pub fn ok(self: StepOutcome) bool {
         return switch (self.step.expect) {
             .allow => self.actual == .allow or self.actual == .context_only,
-            .deny => self.actual != .allow and self.actual != .context_only,
+            .deny => self.actual == .block,
         };
     }
 };
@@ -84,7 +85,7 @@ pub const Report = struct {
     }
 
     pub fn clean(self: *const Report) bool {
-        return self.deadlockCount() == 0 and self.fenceHoleCount() == 0;
+        return self.total() > 0 and self.deadlockCount() == 0 and self.fenceHoleCount() == 0;
     }
 };
 
@@ -150,13 +151,14 @@ pub fn run(allocator: std.mem.Allocator, policy: *const ryk_policy.schema.Policy
     while (it.next()) |raw| {
         const line = std.mem.trim(u8, raw, " \t\r");
         if (line.len == 0) continue;
-        const step = try parseLine(allocator, line) orelse continue;
+        const step = (try parseLine(allocator, line)) orelse return error.UnparsedCorpus;
         try outcomes.append(allocator, .{
             .step = step,
             .actual = stepDecision(allocator, policy, step.command),
         });
     }
 
+    if (outcomes.items.len == 0) return error.EmptyCorpus;
     return .{ .outcomes = try outcomes.toOwnedSlice(allocator) };
 }
 
@@ -177,6 +179,11 @@ pub fn writeReport(
     if (origin == .builtin) try stdout.writeAll("  (no policy file found — built-in fallback)");
     try stdout.writeByte('\n');
     try stdout.print("  Workflow steps: {d}\n", .{report.total()});
+
+    if (report.total() == 0) {
+        try stdout.writeAll("  FAIL: corpus empty or unparsed — fail closed.\n");
+        return;
+    }
 
     if (report.clean()) {
         try stdout.writeAll("  OK: normal coding work runs unattended and danger stays blocked.\n");
@@ -331,4 +338,22 @@ test "clean report stays short and says so" {
     try std.testing.expect(std.mem.indexOf(u8, out, "OK:") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "DEADLOCK") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "FENCE HOLE") == null);
+}
+
+test "empty corpus is not clean (fail closed)" {
+    const report = Report{ .outcomes = &.{} };
+    try std.testing.expect(!report.clean());
+    var buf: [2048]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try writeReport(&writer, &report, "empty", .file);
+    const out = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "OK:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "fail closed") != null);
+}
+
+test "danger ask is not fence-OK (only deny/block)" {
+    const step = Step{ .command = "git push -f", .expect = .deny, .note = "test" };
+    try std.testing.expect(!(StepOutcome{ .step = step, .actual = .ask }).ok());
+    try std.testing.expect(!(StepOutcome{ .step = step, .actual = .allow }).ok());
+    try std.testing.expect((StepOutcome{ .step = step, .actual = .block }).ok());
 }

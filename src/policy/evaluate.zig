@@ -805,15 +805,64 @@ fn commandRiskHeuristic(value: []const u8) ?Risk {
     {
         return .{ .score = 90, .reason = "network script command pattern" };
     }
-    if (matchers.matchesCommand("git push --force*", value)) return .{ .score = 95, .reason = "force git remote write" };
+    if (isForceEquivalentGitPush(value)) return .{ .score = 95, .reason = "force git remote write" };
     // Door A (deadlock elimination): no heuristic for plain `git push` or
     // package installs (`npm install*` / `pip install*`). Those are normal
     // coding work; the heuristic denied them on the YAML/decide surface under
     // the strict coding default while the shell-hook surface allowed them —
     // a split-brain deadlock. Presets that want approval keep explicit
     // commands.ask rules (common_strict_rules); danger stays fenced by the
-    // deny list, packs, and the force-push rule above.
+    // deny list, packs, and the force-equivalent git push rule above
+    // (`-f`, `+refspec`, `--delete`, `--mirror`, `:ref`).
     return null;
+}
+
+fn unwrapGitToken(tok: []const u8) []const u8 {
+    if (tok.len >= 2 and ((tok[0] == '\'' and tok[tok.len - 1] == '\'') or (tok[0] == '"' and tok[tok.len - 1] == '"'))) {
+        return tok[1 .. tok.len - 1];
+    }
+    return tok;
+}
+
+fn isShortOptCluster(tok: []const u8, flag: u8) bool {
+    if (tok.len < 2 or tok[0] != '-' or tok[1] == '-') return false;
+    return std.mem.indexOfScalar(u8, tok[1..], flag) != null;
+}
+
+fn isForceRefspec(tok: []const u8) bool {
+    return tok.len >= 2 and tok[0] == '+' and tok[1] != '-';
+}
+
+fn isDeleteRefspec(tok: []const u8) bool {
+    const t = if (tok.len > 0 and tok[0] == '+') tok[1..] else tok;
+    if (t.len < 2 or t[0] != ':') return false;
+    if (t.len >= 3 and t[1] == '/' and t[2] == '/') return false;
+    if (std.mem.indexOfScalar(u8, t, '@') != null) return false;
+    return true;
+}
+
+/// Force-equivalent git push must stay denied on the YAML heuristic (not only
+/// packs): `-f` / `--force*`, `+refspec`, `--delete` / `-d`, `--mirror`, `:ref`.
+/// Plain `git push` / `git push origin main` stay allowed.
+fn isForceEquivalentGitPush(value: []const u8) bool {
+    if (std.ascii.indexOfIgnoreCase(value, "git") == null) return false;
+    if (std.ascii.indexOfIgnoreCase(value, "push") == null) return false;
+
+    var it = std.mem.tokenizeAny(u8, value, " \t");
+    var seen_push = false;
+    while (it.next()) |raw| {
+        const tok = unwrapGitToken(raw);
+        if (!seen_push) {
+            if (std.ascii.eqlIgnoreCase(tok, "push")) seen_push = true;
+            continue;
+        }
+        if (std.ascii.eqlIgnoreCase(tok, "--force") or std.ascii.startsWithIgnoreCase(tok, "--force-")) return true;
+        if (isShortOptCluster(tok, 'f')) return true;
+        if (std.ascii.eqlIgnoreCase(tok, "--delete") or std.mem.eql(u8, tok, "-d")) return true;
+        if (std.ascii.eqlIgnoreCase(tok, "--mirror")) return true;
+        if (isForceRefspec(tok) or isDeleteRefspec(tok)) return true;
+    }
+    return false;
 }
 
 fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
@@ -1016,9 +1065,14 @@ test "Door A: normal coding work allows under generic-agent strict default" {
         try std.testing.expectEqual(core.decision.DecisionResult.allow, result.decision.result);
     }
 
-    // Danger stays blocked on the same surface.
+    // Danger stays blocked on the same surface (YAML heuristic + deny list).
     const danger = [_][]const u8{
         "git push --force origin main",
+        "git push -f",
+        "git push origin +main",
+        "git push --delete origin old-branch",
+        "git push --mirror",
+        "git push origin :old-branch",
         "rm -rf /",
         "cat .env",
         "sudo rm -rf /var",

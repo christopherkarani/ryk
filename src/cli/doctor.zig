@@ -194,6 +194,7 @@ pub fn command(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: an
                 .quiet = false,
                 .preset = options.preset,
                 .skip_verify = false,
+                .migrate_stale_defaults = true,
             },
             stdout,
             stderr,
@@ -775,7 +776,13 @@ fn runDeadlockCheck(io: std.Io, allocator: std.mem.Allocator, stdout: anytype, s
     };
     defer loaded.deinit();
 
-    var report = try deadlock_check.run(allocator, loaded.innerPtr());
+    var report = deadlock_check.run(allocator, loaded.innerPtr()) catch |err| {
+        try stderr.print(
+            "ryk doctor: deadlock corpus failed ({s}); fail closed.\n",
+            .{@errorName(err)},
+        );
+        return exit_codes.general;
+    };
     defer report.deinit(allocator);
 
     const label = try redactDisplayAlloc(allocator, loaded.path);
