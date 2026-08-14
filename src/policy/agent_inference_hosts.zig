@@ -2,7 +2,7 @@
 //! and provider-id catalog (§5.3).
 //!
 //! Pure, FS-free tables + deterministic merge into `network.allow`. Launch seeding
-//! lives in `cli/run.zig` (`applyNetworkOverlayWithHostKey`); this module owns pack
+//! lives in `cli/run_network_overlay.zig` (`applyNetworkOverlayWithHostKey`); this module owns pack
 //! data, provider catalog, and merge only. Normative SoT id: **AINA-2026-08-02**.
 //!
 //! Ownership contract for `mergeAllowList`:

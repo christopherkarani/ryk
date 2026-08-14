@@ -141,6 +141,7 @@ test {
     _ = history;
     _ = danger_confirmation;
     _ = run_command;
+    _ = @import("run_network_overlay.zig");
     _ = shim; // PATH-shim audit mode session attestation (F36)
     _ = run_os_sandbox;
     _ = codex_mcp_sandbox;
