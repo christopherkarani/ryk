@@ -20,6 +20,8 @@ pub const ProgressFn = *const fn (ctx: ?*anyopaque, host: types.Host, phase: Pro
 pub const ScanOptions = struct {
     home: []const u8,
     xdg_data_home: ?[]const u8 = null,
+    /// Workspace root so `ryk run` sessions under `.ryk/sessions` are visible.
+    workspace_root: ?[]const u8 = null,
     days: ?u32 = null,
     all_time: bool = false,
     show_all: bool = false,
@@ -42,6 +44,7 @@ pub fn runScan(io: std.Io, allocator: std.mem.Allocator, options: ScanOptions) !
     const hosts = try discover.discoverAll(io, allocator, .{
         .home = options.home,
         .xdg_data_home = options.xdg_data_home,
+        .workspace_root = options.workspace_root,
         .window = window,
         .only_host = options.only_host,
     });

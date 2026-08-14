@@ -474,6 +474,11 @@ pub fn command(
     stdout: anytype,
     stderr: anytype,
 ) !u8 {
+    if (argv.len > 0 and (std.mem.eql(u8, argv[0], "--help") or std.mem.eql(u8, argv[0], "-h"))) {
+        const help = @import("cli/help.zig");
+        _ = try help.writeCommand(io, stdout, "telemetry");
+        return exit_codes.success;
+    }
     if (argv.len > 0 and std.mem.eql(u8, argv[0], "--summary")) {
         if (!internalWorkerEnabled(environ_map)) {
             try stderr.writeAll("ryk telemetry: unsupported option. Run 'ryk help telemetry'.\n");

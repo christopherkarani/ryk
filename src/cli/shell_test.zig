@@ -6,8 +6,8 @@ const pack_config = @import("pack_config.zig");
 const core = @import("ryk_core").core;
 
 pub fn command(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: anytype) !u8 {
-    if (argv.len == 0 or std.mem.eql(u8, argv[0], "--help") or std.mem.eql(u8, argv[0], "-h")) {
-        try stderr.writeAll(
+    if (argv.len == 0 or hasHelpFlag(argv)) {
+        try stdout.writeAll(
             \\Usage: ryk test [--format json] <command>
             \\
             \\Evaluate a shell command with the in-process Zig shell engine.
@@ -22,23 +22,18 @@ pub fn command(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: an
         return 3;
     }
 
-    var format_json = false;
-    var cmd_start: usize = 0;
-    if (std.mem.eql(u8, argv[0], "--format")) {
-        if (argv.len < 3) {
-            try stderr.writeAll("ryk test: --format requires a value and a command\n");
-            return 64;
-        }
-        if (!std.mem.eql(u8, argv[1], "json")) {
-            try stderr.writeAll("ryk test: only --format json is supported\n");
-            return 64;
-        }
-        format_json = true;
-        cmd_start = 2;
+    const parsed = parseTestArgv(argv, stderr) catch |err| switch (err) {
+        error.Usage => return 64,
+        else => return err,
+    };
+    if (parsed.command_args.len == 0) {
+        try stderr.writeAll("ryk test: a command is required. Try `ryk test --help`.\n");
+        return 64;
     }
 
-    const command_text = try joinArgs(std.heap.smp_allocator, argv[cmd_start..]);
+    const command_text = try joinArgs(std.heap.smp_allocator, parsed.command_args);
     defer std.heap.smp_allocator.free(command_text);
+    const format_json = parsed.format_json;
 
     // Walk up from cwd so nested directories still load project .ryk.toml.
     const workspace = core.supervisor.resolveWorkspaceRoot(io, std.heap.smp_allocator, null, ".") catch ".";
@@ -103,15 +98,75 @@ pub fn command(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: an
         try stdout.writeAll(json);
         try stdout.writeAll("\n");
     } else {
-        try stdout.print("{s}", .{eval.decision.toString()});
-        if (eval.rule_id) |rid| try stdout.print(" ({s})", .{rid});
-        try stdout.writeAll("\n");
-        try stdout.print("{s}\n", .{eval.reason});
+        const decision = switch (eval.decision) {
+            .allow => "ALLOW",
+            .deny => "DENY",
+        };
+        try stdout.print("Decision: {s}\n", .{decision});
+        if (eval.rule_id) |rid| try stdout.print("Rule: {s}\n", .{rid});
+        try stdout.print("Why: {s}\n", .{eval.reason});
+        try stdout.print("Next: ryk explain \"{s}\"\n", .{command_text});
     }
 
     return switch (eval.decision) {
         .allow => 0,
         .deny => 2,
+    };
+}
+
+const ParsedTestArgv = struct {
+    format_json: bool,
+    command_args: []const []const u8,
+};
+
+fn hasHelpFlag(argv: []const []const u8) bool {
+    for (argv) |arg| {
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) return true;
+    }
+    return false;
+}
+
+fn parseTestArgv(argv: []const []const u8, stderr: anytype) !ParsedTestArgv {
+    var format_json = false;
+    var cmd_start: usize = 0;
+    var cmd_end: usize = argv.len;
+    var i: usize = 0;
+    while (i < argv.len) : (i += 1) {
+        const arg = argv[i];
+        if (std.mem.eql(u8, arg, "--format")) {
+            if (i + 1 >= argv.len) {
+                try stderr.writeAll("ryk test: --format requires a value and a command\n");
+                return error.Usage;
+            }
+            if (!std.mem.eql(u8, argv[i + 1], "json")) {
+                try stderr.writeAll("ryk test: only --format json is supported\n");
+                return error.Usage;
+            }
+            format_json = true;
+            if (i == 0) {
+                cmd_start = 2;
+            } else if (i + 2 == argv.len) {
+                cmd_end = i;
+            } else {
+                try stderr.writeAll("ryk test: put --format json before or after the command, not in the middle\n");
+                return error.Usage;
+            }
+            i += 1;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--format=json")) {
+            format_json = true;
+            if (i == 0) cmd_start = 1 else if (i + 1 == argv.len) cmd_end = i;
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "-") and !std.mem.eql(u8, arg, "--")) {
+            try stderr.print("ryk test: unknown option '{s}'\n", .{arg});
+            return error.Usage;
+        }
+    }
+    return .{
+        .format_json = format_json,
+        .command_args = argv[cmd_start..cmd_end],
     };
 }
 
@@ -124,6 +179,63 @@ fn joinArgs(allocator: std.mem.Allocator, args: []const []const u8) ![]u8 {
         try list.appendSlice(allocator, arg);
     }
     return try list.toOwnedSlice(allocator);
+}
+
+test "test --help writes usage to stdout" {
+    var stdout_buf: [1024]u8 = undefined;
+    var stderr_buf: [256]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+    const code = try command(std.testing.io, &.{"--help"}, &stdout_writer, &stderr_writer);
+    try std.testing.expectEqual(@as(u8, 0), code);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "ryk test") != null);
+    try std.testing.expectEqualStrings("", stderr_writer.buffered());
+}
+
+test "test --format json is accepted after the command" {
+    var xdg = try sProductWireIsolateXdg();
+    defer xdg.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, ".git");
+    const previous_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(previous_cwd);
+    try std.process.setCurrentDir(std.testing.io, tmp.dir);
+    defer std.process.setCurrentPath(std.testing.io, previous_cwd) catch {};
+
+    var stdout_buf: [4096]u8 = undefined;
+    var stderr_buf: [1024]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+    const code = try command(std.testing.io, &.{ "echo hello", "--format", "json" }, &stdout_writer, &stderr_writer);
+    try std.testing.expectEqual(@as(u8, 0), code);
+    const out = stdout_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"decision\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"schema_version\"") != null);
+}
+
+test "test human output is a decision panel" {
+    var xdg = try sProductWireIsolateXdg();
+    defer xdg.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, ".git");
+    const previous_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(previous_cwd);
+    try std.process.setCurrentDir(std.testing.io, tmp.dir);
+    defer std.process.setCurrentPath(std.testing.io, previous_cwd) catch {};
+
+    var stdout_buf: [4096]u8 = undefined;
+    var stderr_buf: [1024]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+    const code = try command(std.testing.io, &.{"git status"}, &stdout_writer, &stderr_writer);
+    try std.testing.expectEqual(@as(u8, 0), code);
+    const out = stdout_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "ALLOW") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "ryk explain") != null);
 }
 
 test "joinArgs" {
@@ -305,7 +417,7 @@ test "s-product-wire: shell_test loads permanent allowlist and allows with attri
     const code = try command(std.testing.io, &.{"git branch -D feature"}, &stdout_writer, &stderr_writer);
     try std.testing.expectEqual(@as(u8, 0), code);
     const out = stdout_writer.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, out, "allow") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "ALLOW") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, reason) != null);
 }
 
@@ -339,7 +451,7 @@ test "s-product-wire: shell_test consume_allow_once false (does not burn single-
         const code = try command(std.testing.io, &.{cmd}, &stdout_writer, &stderr_writer);
         try std.testing.expectEqual(@as(u8, 0), code);
         const out = stdout_writer.buffered();
-        try std.testing.expect(std.mem.indexOf(u8, out, "allow") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "ALLOW") != null);
         try std.testing.expect(std.mem.indexOf(u8, out, reason) != null);
     }
 
@@ -352,7 +464,7 @@ test "s-product-wire: shell_test consume_allow_once false (does not burn single-
         const code = try command(std.testing.io, &.{cmd}, &stdout_writer, &stderr_writer);
         try std.testing.expectEqual(@as(u8, 0), code);
         const out = stdout_writer.buffered();
-        try std.testing.expect(std.mem.indexOf(u8, out, "allow") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "ALLOW") != null);
     }
 }
 

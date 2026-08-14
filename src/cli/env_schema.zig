@@ -24,7 +24,9 @@ pub fn command(
         return exit_codes.general;
     };
     var schema = maybe_schema orelse {
-        try stderr.writeAll("ryk env schema: .ryk/env.schema.yaml not found\n");
+        try stderr.writeAll(
+            "ryk env schema: .ryk/env.schema.yaml not found\nNext: create .ryk/env.schema.yaml, then rerun `ryk env schema --agent`.\n",
+        );
         return exit_codes.general;
     };
     defer schema.deinit();
@@ -54,6 +56,20 @@ fn writeAgentSchema(
         if (variable.grant) |grant| try stdout.print(" grant={s}", .{grant});
         try stdout.writeByte('\n');
     }
+}
+
+test "missing env schema names the next command" {
+    var stdout_buf: [256]u8 = undefined;
+    var stderr_buf: [512]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+
+    const code = try command(std.testing.io, &.{ "schema", "--agent" }, &stdout_writer, &stderr_writer);
+    try std.testing.expectEqual(exit_codes.general, code);
+    const err = stderr_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, err, ".ryk/env.schema.yaml not found") != null);
+    try std.testing.expect(std.mem.indexOf(u8, err, "Next: create .ryk/env.schema.yaml") != null);
+    try std.testing.expect(std.mem.indexOf(u8, err, "ryk env schema --agent") != null);
 }
 
 test "agent env schema export reports presence without values" {

@@ -206,13 +206,6 @@ pub fn decideCommandWithPolicy(
         };
     }
 
-    // Log debug info to stderr only
-    if (result.rule) |rule| {
-        try stderr.writeAll("[decide] matched rule: ");
-        try terminal_text.write(stderr, rule, .single_line);
-        try stderr.writeByte('\n');
-    }
-
     return result.decision.exitCode();
 }
 
@@ -893,6 +886,7 @@ test "decide command with safe command returns allow" {
 
     const output = stdout_writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"allow\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "[decide]") == null);
 }
 
 test "decide command machine output matches captured contract fixture" {

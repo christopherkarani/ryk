@@ -29,9 +29,15 @@ pub fn command(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: an
         return exit_codes.general;
     };
     defer allocator.free(diff);
-    try stdout.writeAll(diff);
+    if (diff.len == 0) {
+        try stdout.writeAll(emptyDiffMessage);
+    } else {
+        try stdout.writeAll(diff);
+    }
     return exit_codes.success;
 }
+
+const emptyDiffMessage = "No pending file changes.\n";
 
 const Options = struct {
     session: []const u8 = "last",
@@ -66,4 +72,8 @@ fn parseOptions(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: a
         }
     }
     return options;
+}
+
+test "diff empty staged set prints a no-changes line" {
+    try std.testing.expectEqualStrings("No pending file changes.\n", emptyDiffMessage);
 }
