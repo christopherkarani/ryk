@@ -502,12 +502,14 @@ function buildToolBeforePayload(
   input: ToolExecuteBeforeInput,
   output: ToolExecuteBeforeOutput
 ): Record<string, unknown> {
+  // Pin host identity after flattening args so a model/schema `tool` key
+  // cannot replace the real tool name (e.g. bash + args.tool=read).
   return {
+    ...output.args,
+    args: output.args,
     tool: input.tool,
     sessionID: input.sessionID,
     callID: input.callID,
-    ...output.args,
-    args: output.args,
   };
 }
 
@@ -636,17 +638,23 @@ async function maybeToast(
     variant,
     duration: variant === 'error' ? 8000 : 5000,
   };
+  const toastPromise = invokeShowToast(ctx, payload);
+  // Late reject after timeout must not become an unhandled rejection.
+  void toastPromise.catch(() => undefined);
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     await Promise.race([
-      invokeShowToast(ctx, payload),
-      new Promise<void>((resolve) => {
-        setTimeout(resolve, TOAST_TIMEOUT_MS);
+      toastPromise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error('toast timeout')), TOAST_TIMEOUT_MS);
       }),
     ]);
   } catch (err: unknown) {
     // Host toast is best-effort; never fail open on UI (block path still throws).
     const msg = err instanceof Error ? err.message : String(err);
     toastDebug(`toast failed: ${msg}`);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
   }
 }
 

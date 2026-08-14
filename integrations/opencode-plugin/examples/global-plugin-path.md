@@ -22,6 +22,7 @@ This example shows how to install the ryk plugin globally so it applies to all O
 
    ```bash
    ln -s /path/to/ryk-repo/integrations/opencode-plugin/ryk.ts ~/.config/opencode/plugins/ryk.ts
+   ln -s /path/to/ryk-repo/integrations/opencode-plugin/ryk-tui.ts ~/.config/opencode/plugins/ryk-tui.ts
    ```
 
 3. OpenCode will discover plugins in `~/.config/opencode/plugins/` for every session.

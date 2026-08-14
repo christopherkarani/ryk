@@ -126,7 +126,7 @@ This reports the expected manifest path and existence status.
 ```bash
 ryk plugin install opencode --dry-run
 
-Day-one / `ryk doctor --fix` installs to the **global** path (`~/.config/opencode/plugins/ryk.ts`) by default. Use `--scope project` for a repo-local plugin only.
+Day-one / `ryk doctor --fix` installs to the **global** path (`~/.config/opencode/plugins/ryk.ts` and `ryk-tui.ts`) by default. Use `--scope project` for a repo-local plugin only.
 ```
 
 ### Hook smoke test
@@ -206,7 +206,7 @@ Remove the plugin from your OpenCode configuration:
 
 2. Or delete the global plugin:
    ```bash
-   rm ~/.config/opencode/plugins/ryk.ts
+   rm ~/.config/opencode/plugins/ryk.ts ~/.config/opencode/plugins/ryk-tui.ts
    ```
 
 This plugin does not mutate host configuration beyond the plugin file itself, so uninstalling is safe.
@@ -215,7 +215,7 @@ This plugin does not mutate host configuration beyond the plugin file itself, so
 
 ### Plugin directory not found
 
-Ensure you run `ryk plugin doctor opencode` from the repository root or a project directory that contains the plugin. The doctor looks for `.opencode/plugins/ryk.ts` (local) or `~/.config/opencode/plugins/ryk.ts` (global).
+Ensure you run `ryk plugin doctor opencode` from the repository root or a project directory that contains the plugin. The doctor treats a scope as installed only when both `.opencode/plugins/ryk.ts` and `ryk-tui.ts` (local) or both `~/.config/opencode/plugins/ryk.ts` and `ryk-tui.ts` (global) exist.
 
 ### Hooks timeout
 

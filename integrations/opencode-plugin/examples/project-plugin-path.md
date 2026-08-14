@@ -22,6 +22,7 @@ This example shows how to install the ryk plugin locally within a single project
 
    ```bash
    ln -s /path/to/ryk-repo/integrations/opencode-plugin/ryk.ts .opencode/plugins/ryk.ts
+   ln -s /path/to/ryk-repo/integrations/opencode-plugin/ryk-tui.ts .opencode/plugins/ryk-tui.ts
    ```
 
 3. OpenCode will automatically discover plugins in `.opencode/plugins/` when running inside the project.

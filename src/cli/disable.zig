@@ -6,6 +6,21 @@ const plugin = @import("plugin.zig");
 const danger_confirmation = @import("danger_confirmation.zig");
 const suggestions = @import("suggestions.zig");
 
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+
+fn disableTestSetenv(name: [*:0]const u8, value: [*:0]const u8) c_int {
+    return setenv(name, value, 1);
+}
+
+fn disableTestRestoreHome(prev: ?[:0]const u8) void {
+    if (prev) |value| {
+        _ = setenv("HOME", value.ptr, 1);
+    } else {
+        _ = unsetenv("HOME");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Top-level dispatch
 // ---------------------------------------------------------------------------
@@ -554,6 +569,66 @@ test "stop all requires confirmation in non-TTY" {
     const code = try command(std.testing.io, &.{"all"}, &stdout_writer, &stderr_writer);
     try std.testing.expectEqual(exit_codes.usage, code);
     try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "--yes") != null);
+}
+
+test "disableOpenCode removes planted ryk.ts and ryk-tui.ts in project and global" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    const io = std.testing.io;
+    try std.Io.Dir.cwd().createDirPath(io, ".opencode/plugins");
+    const project_rel = ".opencode/plugins/ryk.ts";
+    const project_tui_rel = ".opencode/plugins/ryk-tui.ts";
+    const prev_hook = std.Io.Dir.cwd().readFileAlloc(io, project_rel, std.testing.allocator, .limited(8 * 1024 * 1024)) catch null;
+    defer if (prev_hook) |bytes| std.testing.allocator.free(bytes);
+    const prev_tui = std.Io.Dir.cwd().readFileAlloc(io, project_tui_rel, std.testing.allocator, .limited(8 * 1024 * 1024)) catch null;
+    defer if (prev_tui) |bytes| std.testing.allocator.free(bytes);
+    defer {
+        if (prev_hook) |bytes| {
+            std.Io.Dir.cwd().writeFile(io, .{ .sub_path = project_rel, .data = bytes }) catch {};
+        } else {
+            std.Io.Dir.cwd().deleteFile(io, project_rel) catch {};
+        }
+        if (prev_tui) |bytes| {
+            std.Io.Dir.cwd().writeFile(io, .{ .sub_path = project_tui_rel, .data = bytes }) catch {};
+        } else {
+            std.Io.Dir.cwd().deleteFile(io, project_tui_rel) catch {};
+        }
+    }
+
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = project_rel, .data = "project-hook\n" });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = project_tui_rel, .data = "project-tui\n" });
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(home);
+    const home_z = try std.testing.allocator.dupeZ(u8, home);
+    defer std.testing.allocator.free(home_z);
+    try tmp.dir.createDirPath(io, ".config/opencode/plugins");
+    try tmp.dir.writeFile(io, .{ .sub_path = ".config/opencode/plugins/ryk.ts", .data = "global-hook\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = ".config/opencode/plugins/ryk-tui.ts", .data = "global-tui\n" });
+
+    const prev_home = if (std.c.getenv("HOME")) |value|
+        try std.testing.allocator.dupeZ(u8, std.mem.span(value))
+    else
+        null;
+    defer if (prev_home) |value| std.testing.allocator.free(value);
+    try std.testing.expectEqual(@as(c_int, 0), disableTestSetenv("HOME", home_z.ptr));
+    defer disableTestRestoreHome(prev_home);
+
+    var stdout_buf: [4096]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    try std.testing.expect(try disableOpenCode(io, std.testing.allocator, &stdout_writer));
+    try std.testing.expect(!plugin.fileExistsAbsolute(io, project_rel));
+    try std.testing.expect(!plugin.fileExistsAbsolute(io, project_tui_rel));
+    const global_hook = try std.fs.path.join(std.testing.allocator, &.{ home, ".config", "opencode", "plugins", "ryk.ts" });
+    defer std.testing.allocator.free(global_hook);
+    const global_tui = try std.fs.path.join(std.testing.allocator, &.{ home, ".config", "opencode", "plugins", "ryk-tui.ts" });
+    defer std.testing.allocator.free(global_tui);
+    try std.testing.expect(!plugin.fileExistsAbsolute(io, global_hook));
+    try std.testing.expect(!plugin.fileExistsAbsolute(io, global_tui));
+    const out = stdout_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "ryk-tui.ts") != null);
 }
 
 test "stop success output points at ryk start not setup" {

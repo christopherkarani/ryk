@@ -44,21 +44,15 @@ function errorText(event: Record<string, unknown>): string {
   if (typeof error === 'string' && error.trim()) return error;
   if (error && typeof error === 'object') {
     const rec = error as Record<string, unknown>;
-    for (const key of ['message', 'data', 'name']) {
-      const value = rec[key];
-      if (typeof value === 'string' && value.trim()) return value;
-    }
-  }
-
-  const properties = event.properties;
-  if (properties && typeof properties === 'object') {
-    return errorText(properties as Record<string, unknown>);
+    const value = rec.message;
+    if (typeof value === 'string' && value.trim()) return value;
   }
   return '';
 }
 
 function looksLikeRyk(text: string): boolean {
-  return /ryk/i.test(text);
+  const line = firstLine(text);
+  return /^\[ryk\]/i.test(line) || /ryk blocked/i.test(line);
 }
 
 async function rykTui(api: TuiPluginApi): Promise<void> {
@@ -67,7 +61,7 @@ async function rykTui(api: TuiPluginApi): Promise<void> {
     toast({
       variant: 'info',
       title: 'ryk',
-      message: 'Guardrails active',
+      message: 'ryk TUI loaded',
       duration: 2500,
     });
   }
@@ -89,13 +83,13 @@ async function rykTui(api: TuiPluginApi): Promise<void> {
       title: 'ryk: status',
       value: 'ryk.status',
       category: 'ryk',
-      description: 'Show that ryk guardrails are active in this session',
+      description: 'Show that the ryk TUI host plugin is loaded',
       onSelect: () => {
         if (typeof toast !== 'function') return;
         toast({
           variant: 'info',
           title: 'ryk',
-          message: 'Policy hooks are guarding this OpenCode session',
+          message: 'OpenCode host plugin loaded — policy hooks live in ryk.ts',
           duration: 4000,
         });
       },
