@@ -2866,3 +2866,109 @@ test("installRykExtension registers decision message renderer", () => {
 	assert.equal(renderers.size, 1);
 	assert.equal(renderers.has("rykanv-decision"), true);
 });
+
+test("decision message renderer returns a TUI component with render()", () => {
+	const { pi, renderers } = makePi();
+	const { spawn } = makeSpawn();
+	installRykExtension(pi, { spawn, rykBin: "ryk" });
+	const renderer = renderers.get("rykanv-decision");
+	assert.ok(renderer);
+
+	const result = renderer(
+		{
+			customType: "rykanv-decision",
+			content: "BLOCKED .env",
+			display: true,
+			details: {
+				variant: "block",
+				title: DISPLAY_BRAND,
+				summary: "blocked secret file",
+			},
+		},
+		{ expanded: false, outputPad: 1 },
+		makeThemeStub(),
+	);
+
+	// Pi CustomMessageComponent.addChild requires Component.render(width).
+	// Returning a themed string crashes the TUI: child.render is not a function.
+	assert.notEqual(typeof result, "string");
+	assert.equal(typeof result, "object");
+	assert.ok(result !== null);
+	const component = result as { render?: (width: number) => unknown };
+	assert.equal(typeof component.render, "function");
+	const lines = component.render!(80);
+	assert.ok(Array.isArray(lines));
+	assert.ok(lines.every((line) => typeof line === "string"));
+	assert.ok(lines.some((line) => line.includes("BLOCKED .env")));
+	assert.ok(lines.some((line) => line.includes("[error]")));
+});
+
+test("decision message renderer ask variant uses warning tone and is renderable", () => {
+	const { pi, renderers } = makePi();
+	const { spawn } = makeSpawn();
+	installRykExtension(pi, { spawn, rykBin: "ryk" });
+	const renderer = renderers.get("rykanv-decision")!;
+	const result = renderer(
+		{
+			customType: "rykanv-decision",
+			content: "ASK cat .env",
+			display: true,
+			details: {
+				variant: "ask",
+				title: DISPLAY_BRAND,
+				summary: "needs approval",
+			},
+		},
+		{ expanded: false, outputPad: 1 },
+		makeThemeStub(),
+	);
+	const component = result as { render: (width: number) => string[] };
+	const lines = component.render(40);
+	assert.ok(lines.some((line) => line.includes("[warning]")));
+	assert.ok(lines.some((line) => line.includes("ASK cat .env")));
+});
+
+test("decision message renderer wait variant and empty content stay renderable", () => {
+	const { pi, renderers } = makePi();
+	const { spawn } = makeSpawn();
+	installRykExtension(pi, { spawn, rykBin: "ryk" });
+	const renderer = renderers.get("rykanv-decision")!;
+
+	const waitResult = renderer(
+		{
+			customType: "rykanv-decision",
+			content: "WAIT parent",
+			display: true,
+			details: {
+				variant: "wait",
+				title: DISPLAY_BRAND,
+				summary: "waiting on parent",
+			},
+		},
+		{ expanded: false, outputPad: 1 },
+		makeThemeStub(),
+	);
+	const waitLines = (waitResult as { render: (width: number) => string[] }).render(80);
+	assert.ok(waitLines.some((line) => line.includes("[dim]")));
+	assert.ok(waitLines.some((line) => line.includes("WAIT parent")));
+
+	const emptyResult = renderer(
+		{
+			customType: "rykanv-decision",
+			content: "",
+			display: true,
+			details: {
+				variant: "block",
+				title: DISPLAY_BRAND,
+				summary: "blocked secret file",
+			},
+		},
+		{ expanded: false, outputPad: 1 },
+		makeThemeStub(),
+	);
+	assert.notEqual(typeof emptyResult, "string");
+	const emptyLines = (emptyResult as { render: (width: number) => string[] }).render(80);
+	assert.ok(Array.isArray(emptyLines));
+	assert.ok(emptyLines.every((line) => typeof line === "string"));
+	assert.ok(emptyLines.some((line) => line.includes(DISPLAY_BRAND)));
+});
