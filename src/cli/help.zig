@@ -193,7 +193,7 @@ pub const commands =
         .{
             .name = "doctor",
             .summary = "Diagnose protection readiness and platform capabilities",
-            .usage = "ryk doctor [-v|--verbose] [--check] [--json] [--tui] [--fix] [--from-install] [--preset <name>]",
+            .usage = "ryk doctor [-v|--verbose] [--check] [--json] [--tui] [--fix] [--from-install] [--preset <name>] [--deadlock-check]",
             .category = .getting_started,
             .public = true,
             .examples = &.{
@@ -203,8 +203,9 @@ pub const commands =
                 "ryk doctor --json",
                 "ryk doctor --tui",
                 "ryk doctor --fix",
+                "ryk doctor --deadlock-check",
             },
-            .additional_completion_flags = &.{ "--verbose", "-v", "--check", "--json", "--tui", "--fix", "--from-install", "--preset" },
+            .additional_completion_flags = &.{ "--verbose", "-v", "--check", "--json", "--tui", "--fix", "--from-install", "--preset", "--deadlock-check" },
             .details = &.{
                 "Default output is a one-line summary plus recommended next steps (linear; fast glance).",
                 "Includes a Packs section (baseline always-on + opt-in enabled) when the daemon is reachable.",
@@ -216,6 +217,8 @@ pub const commands =
                 "Use --fix to repair protection (create policy if missing, auto-wire day-one hosts). Exit 0 when core policy is ok; host soft-fails stay partial.",
                 "--fix is exclusive with --check and --json (cannot combine; probe contracts stay pure).",
                 "Optional --from-install scopes ensure to install HOME/resource-root; --preset selects create-if-missing policy preset. Both require --fix.",
+                "Use --deadlock-check to replay a standard coding workflow against your active policy: exit non-zero when a normal step would ask/deny (an agent would stall) or a dangerous step would be allowed.",
+                "--deadlock-check is read-only and exclusive with --fix/--check/--json.",
             },
         },
         .{

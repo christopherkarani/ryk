@@ -47,7 +47,7 @@ pub fn command(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: an
 // Decision kind
 // ---------------------------------------------------------------------------
 
-const DecisionKind = enum {
+pub const DecisionKind = enum {
     command,
     file,
     prompt,
@@ -70,7 +70,9 @@ fn decideCommand(io: std.Io, kind: DecisionKind, argv: []const []const u8, stdou
     return decideCommandWithPolicy(io, kind, argv, stdout, stderr, null);
 }
 
-fn decideCommandWithPolicy(
+/// Test-visible entry: same as the CLI path but pinned to an explicit policy
+/// file so contract/replay tests are hermetic on any checkout.
+pub fn decideCommandWithPolicy(
     io: std.Io,
     kind: DecisionKind,
     argv: []const []const u8,
@@ -218,7 +220,7 @@ fn decideCommandWithPolicy(
 // Decision evaluation
 // ---------------------------------------------------------------------------
 
-const PluginDecision = enum {
+pub const PluginDecision = enum {
     allow,
     block,
     warn,
@@ -328,31 +330,24 @@ fn evaluateDecision(
             var shell = try shell_engine.evaluateCommand(allocator, command_text, .{});
             defer shell.deinit(allocator);
 
-            if (shell.decision == .deny and packSeverityBlocksPolicyAllow(shell.severity)) {
-                const shell_derived: PluginDecision = switch (shell.severity) {
-                    .critical, .high => .block,
-                    .medium => if (ci_mode or packMediumFenceBlocks(policy_value.mode)) .block else .ask,
-                    .low => unreachable, // excluded by packSeverityBlocksPolicyAllow
-                };
-                const policy_decision = PluginDecision.fromDecisionResult(evaluation.decision.result, ci_mode);
-                // When shell is at least as restrictive as policy, surface the
-                // pack fence (rule/reason). Policy-stricter cases fall through.
-                if (pluginDecisionRestrictiveness(shell_derived) >= pluginDecisionRestrictiveness(policy_decision)) {
-                    const risk: RiskLevel = switch (shell.severity) {
-                        .critical => .critical,
-                        .high => .high,
-                        .medium => .medium,
-                        .low => unreachable,
-                    };
-                    return try buildCommandDecisionOutput(
-                        allocator,
-                        shell_derived,
-                        risk,
-                        shell.reason,
-                        shell.rule_id,
-                        &redactions,
-                    );
-                }
+            // When the pack fence is at least as restrictive as policy it owns
+            // the rule/reason surface; policy-stricter cases fall through.
+            const fence = resolveCommandFence(
+                evaluation.decision.result,
+                policy_value.mode,
+                shell.decision,
+                shell.severity,
+                ci_mode,
+            );
+            if (fence.pack_risk) |risk| {
+                return try buildCommandDecisionOutput(
+                    allocator,
+                    fence.decision,
+                    risk,
+                    shell.reason,
+                    shell.rule_id,
+                    &redactions,
+                );
             }
 
             const decision = PluginDecision.fromDecisionResult(evaluation.decision.result, ci_mode);
@@ -506,6 +501,47 @@ fn packSeverityBlocksPolicyAllow(severity: shell_engine.Severity) bool {
     return switch (severity) {
         .critical, .high, .medium => true,
         .low => false,
+    };
+}
+
+pub const CommandFenceOutcome = struct {
+    decision: PluginDecision,
+    /// Set only when the shell pack fence won, so it owns the reason/rule surface.
+    pack_risk: ?RiskLevel = null,
+};
+
+/// Command precedence for the decide surface: the YAML policy decision merged
+/// with the shell pack fence, taking the more restrictive of the two. Pure and
+/// exported so `ryk doctor --deadlock-check` scores the same composition a live
+/// session applies — the split-brain this program exists to remove came from two
+/// surfaces disagreeing about the same command.
+pub fn resolveCommandFence(
+    policy_result: core.decision.DecisionResult,
+    policy_mode: policy.schema.Mode,
+    shell_decision: shell_engine.Decision,
+    shell_severity: shell_engine.Severity,
+    ci_mode: bool,
+) CommandFenceOutcome {
+    const policy_decision = PluginDecision.fromDecisionResult(policy_result, ci_mode);
+    if (shell_decision != .deny or !packSeverityBlocksPolicyAllow(shell_severity)) {
+        return .{ .decision = policy_decision };
+    }
+    const shell_derived: PluginDecision = switch (shell_severity) {
+        .critical, .high => .block,
+        .medium => if (ci_mode or packMediumFenceBlocks(policy_mode)) .block else .ask,
+        .low => unreachable, // excluded by packSeverityBlocksPolicyAllow
+    };
+    if (pluginDecisionRestrictiveness(shell_derived) < pluginDecisionRestrictiveness(policy_decision)) {
+        return .{ .decision = policy_decision };
+    }
+    return .{
+        .decision = shell_derived,
+        .pack_risk = switch (shell_severity) {
+            .critical => .critical,
+            .high => .high,
+            .medium => .medium,
+            .low => unreachable,
+        },
     };
 }
 

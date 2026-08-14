@@ -21,13 +21,18 @@ const host_status = @import("host_status.zig");
 const pack_state = @import("pack_state.zig");
 const readiness = @import("readiness.zig");
 const ensure = @import("ensure.zig");
+const policy_migrate = @import("policy_migrate.zig");
+const deadlock_check = @import("deadlock_check.zig");
 const doctor_tui = @import("doctor_tui.zig");
 const doctor_mcp = @import("doctor_mcp.zig");
+const core_api = @import("ryk_core").api;
 
-// Monopath: pull nested doctor_tui / doctor_mcp tests into the lib test binary.
+// Monopath: pull nested doctor_tui / doctor_mcp / deadlock_check tests into the
+// lib test binary.
 test {
     _ = doctor_tui;
     _ = doctor_mcp;
+    _ = deadlock_check;
 }
 
 const DoctorCapability = struct {
@@ -91,6 +96,9 @@ const IntegrationContext = struct {
     host_rows: []const HostDoctorRow = &.{},
     hermes_fail_open: bool = true,
     hermes_installed: bool = false,
+    /// Stale-default notices (workspace + user-global policies). Informational
+    /// only — never flips --check. Owned slices.
+    policy_notices: []const policy_migrate.StaleNotice = &.{},
 
     fn deinit(self: *IntegrationContext) void {
         self.allocator.free(self.workspace_root);
@@ -113,6 +121,10 @@ const IntegrationContext = struct {
                 self.allocator.free(row.fix);
             }
             self.allocator.free(self.host_rows);
+        }
+        if (self.policy_notices.len > 0) {
+            for (self.policy_notices) |notice| self.allocator.free(notice.path);
+            self.allocator.free(self.policy_notices);
         }
         self.* = undefined;
     }
@@ -145,6 +157,9 @@ const DoctorOptions = struct {
     from_install: bool = false,
     /// Optional preset for create-if-missing policy (null → ensure default).
     preset: ?[]const u8 = null,
+    /// Door A self-check: replay a standard coding workflow against the active
+    /// policy and report steps that would stall an agent (or let danger through).
+    deadlock_check: bool = false,
 };
 
 pub fn command(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: anytype) !u8 {
@@ -160,6 +175,11 @@ pub fn command(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: an
     defer _ = gpa_state.deinit();
     const allocator = gpa_state.allocator();
 
+    // Door A self-check: read-only probe on the active policy, no daemon spawn.
+    if (options.deadlock_check) {
+        return runDeadlockCheck(io, allocator, stdout, stderr);
+    }
+
     // Sole taught repair door (D40): --fix early-branches to ensure before any
     // diagnose collect / daemon spawn. Exit map is ensure.processExitForOutcome
     // (D25: 0 iff core_ok). No hard-dep on daemon ensure_running (D41).
@@ -174,6 +194,7 @@ pub fn command(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: an
                 .quiet = false,
                 .preset = options.preset,
                 .skip_verify = false,
+                .migrate_stale_defaults = true,
             },
             stdout,
             stderr,
@@ -371,6 +392,10 @@ fn parseDoctorOptions(argv: []const []const u8, stderr: anytype) !DoctorOptions 
             options.fix = true;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--deadlock-check")) {
+            options.deadlock_check = true;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--from-install")) {
             options.from_install = true;
             continue;
@@ -403,7 +428,7 @@ fn parseDoctorOptions(argv: []const []const u8, stderr: anytype) !DoctorOptions 
             continue;
         }
         try suggestions.writeUnknownOption(stderr, "ryk doctor", arg, &.{
-            "--verbose", "-v", "--check", "--json", "--plain", "--no-rich", "--tui", "--fix", "--from-install", "--preset", "--help", "-h",
+            "--verbose", "-v", "--check", "--json", "--plain", "--no-rich", "--tui", "--fix", "--from-install", "--preset", "--deadlock-check", "--help", "-h",
         }, "doctor");
         return error.Usage;
     }
@@ -411,6 +436,12 @@ fn parseDoctorOptions(argv: []const []const u8, stderr: anytype) !DoctorOptions 
     // --fix must not silently dominate probe contracts (--check/--json).
     if (options.fix and (options.check or options.json)) {
         try stderr.writeAll("ryk doctor: cannot combine --fix with --check/--json.\n");
+        return error.Usage;
+    }
+    // --deadlock-check is a focused read-only probe: it neither repairs nor
+    // feeds the readiness envelope, so combining it would hide one of the two.
+    if (options.deadlock_check and (options.fix or options.check or options.json)) {
+        try stderr.writeAll("ryk doctor: cannot combine --deadlock-check with --fix/--check/--json.\n");
         return error.Usage;
     }
     // Ensure-only flags are not silent no-ops without --fix.
@@ -580,6 +611,17 @@ fn writeReport(io: std.Io, stdout: anytype, os: core.platform.Os, backend_report
         for (host_rows) |row| freeHostDoctorRow(allocator, row);
         allocator.free(host_rows);
     }
+    const policy_notices = try allocator.alloc(policy_migrate.StaleNotice, context.policy_notices.len);
+    defer {
+        for (policy_notices) |notice| allocator.free(notice.path);
+        allocator.free(policy_notices);
+    }
+    for (context.policy_notices, 0..) |notice, index| {
+        policy_notices[index] = .{
+            .path = try redactDisplayAlloc(allocator, notice.path),
+            .kind = notice.kind,
+        };
+    }
 
     var safe = context;
     safe.daemon_detail = daemon_detail;
@@ -588,6 +630,7 @@ fn writeReport(io: std.Io, stdout: anytype, os: core.platform.Os, backend_report
     safe.daemon_pid_path = daemon_pid_path;
     safe.policy_error = policy_error;
     safe.host_rows = host_rows;
+    safe.policy_notices = policy_notices;
     try writeReportRaw(io, stdout, os, backend_report, safe, verbose);
 }
 
@@ -635,6 +678,7 @@ fn writeReportRaw(io: std.Io, stdout: anytype, os: core.platform.Os, backend_rep
         try writePacksSection(io, stdout, context);
         try writeHermesFailOpenWarning(io, stdout, context);
         try writePiNote(stdout);
+        try writePolicyFreshnessNotices(stdout, context);
         try writeRecommendations(stdout, context);
         return;
     }
@@ -710,7 +754,63 @@ fn writeReportRaw(io: std.Io, stdout: anytype, os: core.platform.Os, backend_rep
         try writeBackendLine(io, stdout, backend_report, .strong_sandbox);
         try writeBackendLine(io, stdout, backend_report, .audit);
     }
+    try writePolicyFreshnessNotices(stdout, context);
     try writeRecommendations(stdout, context);
+}
+
+/// `ryk doctor --deadlock-check` (P2-1d): replay a standard coding workflow
+/// against the active policy. Exit 0 when normal work runs unattended and danger
+/// stays blocked; exit 1 when a step would stall an agent or a fence hole exists.
+/// Fails closed on an unloadable policy: an unusable policy is a deadlock.
+fn runDeadlockCheck(io: std.Io, allocator: std.mem.Allocator, stdout: anytype, stderr: anytype) !u8 {
+    const root = supervisor.resolveWorkspaceRoot(io, allocator, null, ".") catch try allocator.dupe(u8, ".");
+    defer allocator.free(root);
+
+    var loaded = core_api.discoverPolicy(io, allocator, null, root) catch |err| {
+        try stderr.print(
+            "ryk doctor: cannot load the active policy ({s}); ryk fails closed, so every command would be denied.\n",
+            .{@errorName(err)},
+        );
+        try stderr.writeAll("  Next: fix the policy, or run `ryk doctor --fix` to seed the current default.\n");
+        return exit_codes.general;
+    };
+    defer loaded.deinit();
+
+    var report = deadlock_check.run(allocator, loaded.innerPtr()) catch |err| {
+        try stderr.print(
+            "ryk doctor: deadlock corpus failed ({s}); fail closed.\n",
+            .{@errorName(err)},
+        );
+        return exit_codes.general;
+    };
+    defer report.deinit(allocator);
+
+    const label = try redactDisplayAlloc(allocator, loaded.path);
+    defer allocator.free(label);
+    const origin: deadlock_check.PolicyOrigin = if (loaded.source == .builtin) .builtin else .file;
+    try deadlock_check.writeReport(stdout, &report, label, origin);
+
+    return if (report.clean()) exit_codes.success else exit_codes.general;
+}
+
+/// Stale-default notices (P2 Door A): one line per policy that is not the
+/// current shipped default. Informational; never affects --check exit codes.
+fn writePolicyFreshnessNotices(stdout: anytype, context: IntegrationContext) !void {
+    if (context.policy_notices.len == 0) return;
+    try stdout.writeAll("Policy freshness:\n");
+    for (context.policy_notices) |notice| {
+        switch (notice.kind) {
+            .legacy_default => try stdout.print(
+                "  {s}: old ryk default policy — run `ryk doctor --fix` to upgrade to the current default (a backup is written alongside).\n",
+                .{notice.path},
+            ),
+            .customized => try stdout.print(
+                "  {s}: customized policy — ryk ships a newer default; compare with the generic-agent preset and merge manually (customized policies are never auto-rewritten).\n",
+                .{notice.path},
+            ),
+        }
+    }
+    try stdout.writeByte('\n');
 }
 
 fn writeDefaultPanels(
@@ -1150,6 +1250,11 @@ fn collectIntegrationContextAt(io: std.Io, allocator: std.mem.Allocator, workspa
         allocator.free(host_snapshot.rows);
     }
 
+    // Stale-default scan (diagnose-only, soft): flags policies that are not the
+    // current shipped default so users learn a newer default exists.
+    var stale_scan = policy_migrate.scanStalePolicies(io, allocator, workspace_root) catch policy_migrate.ScanReport{ .notices = &.{} };
+    errdefer stale_scan.deinit(allocator);
+
     return .{
         .allocator = allocator,
         .workspace_root = workspace_root,
@@ -1181,6 +1286,7 @@ fn collectIntegrationContextAt(io: std.Io, allocator: std.mem.Allocator, workspa
         .host_rows = host_snapshot.rows,
         .hermes_fail_open = host_snapshot.hermes_fail_open,
         .hermes_installed = host_snapshot.hermes_installed,
+        .policy_notices = stale_scan.notices,
     };
 }
 

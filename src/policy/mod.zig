@@ -7,6 +7,7 @@ pub const explain = @import("explain.zig");
 pub const matchers = @import("matchers.zig");
 pub const network_eval = @import("network_eval.zig");
 pub const presets = @import("presets.zig");
+pub const default_migration = @import("default_migration.zig");
 pub const effects = @import("effects/mod.zig");
 pub const sticky = @import("sticky.zig");
 pub const risk_card = @import("risk_card.zig");

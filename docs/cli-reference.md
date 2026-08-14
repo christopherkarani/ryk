@@ -54,10 +54,15 @@ After setup:
 ~~~sh
 ryk doctor
 ryk doctor --check
+ryk doctor --deadlock-check
 ryk replay --session last --verify
 ~~~
 
 doctor reports readiness and host capabilities. doctor --check is the automation gate and returns nonzero when core readiness fails. doctor --json is a small readiness document, but a JSON result with ready: false can still exit zero. Use --check when the process exit status is the gate. doctor --fix is a mutating repair path and cannot be combined with --check or --json.
+
+doctor --deadlock-check replays a standard coding workflow (build, test, package install, git inspection, recovery commands) plus dangerous control samples against the active policy, and reports the mismatches: a normal step that would ask or deny is a deadlock, because several hosts hard-block ask with no resume; a dangerous step that would be allowed is a fence hole. It is read-only, exits nonzero on either kind of mismatch, and cannot be combined with --fix, --check, or --json. Decisions use the same policy-plus-pack precedence a live session applies, so a clean result means the composed surface agrees, not just the YAML.
+
+doctor also prints a Policy freshness section when a policy on disk is not the current shipped default. A policy byte-identical to an older shipped default is upgraded in place by doctor --fix or install ensure (the previous file is kept alongside as a .bak). ryk start does not migrate. Migration refuses a symlink .ryk or policy.yaml. A customized policy is never rewritten: doctor names it and points at the generic-agent preset for a manual comparison. After doctor --fix, a pristine old default is seeded to generic-agent.
 
 Use init when you need to create a policy without the guided host setup:
 
