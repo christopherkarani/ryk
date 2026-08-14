@@ -110,6 +110,18 @@ if bash "$ROOT/scripts/check-release-payload-secrets.sh" "$STAGED" >/dev/null 2>
 fi
 rm "$STAGED/docs/leak.txt"
 
+# Windows PE layout can place `http://127.0.0.1:` then NULs then `@`. That is
+# not URI userinfo and must not block a release archive.
+python3 - "$STAGED/docs/loopback-padding.bin" <<'PY'
+import pathlib, sys
+pathlib.Path(sys.argv[1]).write_bytes(b"http://127.0.0.1:" + (b"\x00" * 32) + b"@padding")
+PY
+if ! bash "$ROOT/scripts/check-release-payload-secrets.sh" "$STAGED" >/dev/null 2>&1; then
+  printf '%s\n' 'release-payload-boundary: scanner rejected binary loopback padding' >&2
+  exit 1
+fi
+rm "$STAGED/docs/loopback-padding.bin"
+
 write_assignment "$TMP_ROOT/outside-secret" PASSWORD outside-release-boundary
 ln -s "$TMP_ROOT/outside-secret" "$STAGED/docs/linked-secret"
 if bash "$ROOT/scripts/check-release-payload-secrets.sh" "$STAGED" >/dev/null 2>&1; then

@@ -84,6 +84,21 @@ lowercase_credential_assignment_pattern="(^|[^A-Za-z0-9_])[a-z][a-z0-9_]+_(passw
 structured_assignment_pattern="^[[:space:]]*[\"']?(password|passwd|passphrase|pwd|token|secret|api[_-]?key|apikey|access[_-]?key|private[_-]?key|client[_-]?secret|credential(s)?|authorization|proxy-authorization|cookie|set-cookie)[\"']?[[:space:]]*:[[:space:]]*[^[:space:],;}{]+"
 uri_userinfo_pattern='[A-Za-z][A-Za-z0-9+.-]*://[^/@[:space:]]+:[^/@[:space:]]+@'
 
+printable_strings() {
+  # Prefer `strings` so binary padding cannot join a URL to a later `@`.
+  if command -v strings >/dev/null 2>&1; then
+    strings -a -n 8 "$1" 2>/dev/null || true
+  else
+    python3 -c '
+import sys
+data = open(sys.argv[1], "rb").read().split(b"\x00")
+for part in data:
+    if len(part) >= 8 and all(32 <= b <= 126 for b in part):
+        sys.stdout.buffer.write(part + b"\n")
+' "$1" 2>/dev/null || true
+  fi
+}
+
 is_placeholder_assignment() {
   local match="$1"
   local value="${match#*=}"
@@ -144,7 +159,9 @@ while IFS= read -r -d '' file; do
       violations=$((violations + 1))
     fi
   fi
-  if LC_ALL=C grep -aEq -- "$uri_userinfo_pattern" "$file"; then
+  # Scan NUL-terminated printable strings only. Raw `grep -a` on PE/ELF
+  # binaries false-positives on `http://127.0.0.1:` plus padding then `@`.
+  if printable_strings "$file" | LC_ALL=C grep -Eq -- "$uri_userinfo_pattern"; then
     if ! is_reviewed_synthetic_file "$relative" "$file"; then
       printf 'release-secret-violation: %s contains URI userinfo credentials\n' "$relative" >&2
       violations=$((violations + 1))
