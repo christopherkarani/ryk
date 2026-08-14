@@ -45,6 +45,8 @@ ryk policy-gates:
 - `prompts/get`
 - sampling requests, default-denied unless policy permits them
 
+An interactive **Always this session** approval is kept for the lifetime of that `ryk mcp proxy` process (same fingerprint, no second prompt). **Once** still applies to a single call. `ask` is never treated as allow. CI and non-interactive proxy runs convert `ask` to deny.
+
 ryk also observes and audits `tools/list`, `resources/list`, and `prompts/list` metadata so later calls can be evaluated with the discovered risk context.
 
 ## Unmediated Methods: deny by default
