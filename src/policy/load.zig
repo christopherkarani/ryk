@@ -743,6 +743,9 @@ fn parseYaml(allocator: std.mem.Allocator, text: []const u8, source_path: ?[]con
             continue;
         }
 
+        if (indent == 4 and section == .credentials_broker) {
+            section = .credentials_brokers;
+        }
         if (indent == 4 and section == .credentials_brokers) {
             try requireEmptyGroupingValue(value);
             try builder.startCredentialBroker(key);
@@ -764,6 +767,9 @@ fn parseYaml(allocator: std.mem.Allocator, text: []const u8, source_path: ?[]con
             continue;
         }
 
+        if (indent == 4 and section == .credentials_ref) {
+            section = .credentials_refs;
+        }
         if (indent == 4 and section == .credentials_refs) {
             try requireEmptyGroupingValue(value);
             try builder.startCredentialRef(key);
@@ -865,8 +871,12 @@ fn parseYaml(allocator: std.mem.Allocator, text: []const u8, source_path: ?[]con
         if (indent == 2 and (section == .mcp or section == .mcp_servers or section == .mcp_server or section == .mcp_server_tools)) {
             section = .mcp;
             if (selfActiveMcpServerClear(&builder)) {}
+            if (std.mem.eql(u8, key, "servers")) {
+                try requireEmptyGroupingValue(value);
+                section = .mcp_servers;
+                continue;
+            }
             try applyYamlField(&builder, section, key, value, &list_target);
-            if (std.mem.eql(u8, key, "servers")) section = .mcp_servers;
             continue;
         }
 
@@ -963,6 +973,7 @@ fn applyYamlField(builder: *Builder, section: Section, key: []const u8, value: [
             } else if (std.mem.eql(u8, key, "backend")) {
                 builder.network_backend = schema.NetworkBackend.parse(scalar) orelse return error.InvalidPolicy;
             } else if (std.mem.eql(u8, key, "detect_exfiltration")) {
+                if (scalar.len != 0) return error.InvalidPolicy;
                 list_target.* = .none;
             } else {
                 try applyRuleSetField(builder, .network_allow, .network_deny, .network_ask, &builder.network_default, key, scalar, list_target);
@@ -971,6 +982,7 @@ fn applyYamlField(builder: *Builder, section: Section, key: []const u8, value: [
         .network_detect_exfiltration => try applyNetworkDetectionField(builder, key, scalar),
         .mcp => {
             if (std.mem.eql(u8, key, "servers")) {
+                if (scalar.len != 0) return error.InvalidPolicy;
                 list_target.* = .none;
             } else {
                 try applyRuleSetField(builder, .mcp_allow, .mcp_deny, .mcp_ask, &builder.mcp_default, key, scalar, list_target);

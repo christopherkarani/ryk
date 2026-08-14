@@ -36,6 +36,7 @@ Slices:
   intercept   ./scripts/zig build test-intercept    (src/intercept only)
   lib         ./scripts/zig build test-lib          (full monopath, slow)
   core        ./scripts/zig build test-core
+              --compile-only → compile-test-core (engine addTest only)
   core-contract  ./scripts/zig build test-core-contract
   fast        ./scripts/zig build test-fast         (lib + core chain, slow)
 
@@ -78,7 +79,7 @@ case "${slice}" in
   policy) step=test-policy; [[ "${compile_only}" -eq 1 ]] && { echo "error: policy maps to test-core gates (no separate compile-only)" >&2; exit 2; } ;;
   intercept) step=$([[ "${compile_only}" -eq 1 ]] && echo compile-test-intercept || echo test-intercept) ;;
   lib) step=$([[ "${compile_only}" -eq 1 ]] && echo compile-test-lib || echo test-lib) ;;
-  core) step=test-core; [[ "${compile_only}" -eq 1 ]] && { echo "error: core has no compile-only step; use test-core" >&2; exit 2; } ;;
+  core) step=$([[ "${compile_only}" -eq 1 ]] && echo compile-test-core || echo test-core) ;;
   core-contract) step=test-core-contract; [[ "${compile_only}" -eq 1 ]] && { echo "error: core-contract has no compile-only step" >&2; exit 2; } ;;
   fast) step=$([[ "${compile_only}" -eq 1 ]] && echo compile-test-fast || echo test-fast) ;;
 esac

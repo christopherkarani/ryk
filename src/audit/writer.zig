@@ -371,7 +371,8 @@ test "session writer allocation failure leaves a valid complete chain" {
     defer session_writer.deinit();
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
     session_writer.allocator = failing.allocator();
-    try std.testing.expectError(error.OutOfMemory, session_writer.appendEvent(ev));
+    // Zig 0.16 Writer.Allocating maps allocator exhaustion to WriteFailed.
+    try std.testing.expectError(error.WriteFailed, session_writer.appendEvent(ev));
     session_writer.allocator = std.testing.allocator;
 
     const rel_events_path = try std.fs.path.join(std.testing.allocator, &.{ ".ryk", "sessions", session.id.slice(), "events.jsonl" });

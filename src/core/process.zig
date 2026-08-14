@@ -259,11 +259,12 @@ pub const PreparedChild = struct {
         if (self.process_group_cleanup) {
             if (self.process_group_id) |pgid| {
                 killProcessGroup(pgid);
-                return;
             }
         }
-        // No process group: SIGKILL sticky pid without waitpid / without
-        // touching child.id so the main waiter remains the only reaper.
+        // Always signal the sticky pid. Plain spawn is not a process-group
+        // leader, so kill(-pgid) is ESRCH; skipping this left the child alive.
+        // Sandbox setpgid leaders get both; kill of an already-dead pid is fine.
+        // No waitpid — main waiter remains the only reaper (M-6).
         signalKillPid(self.stickyPosixPid());
     }
 

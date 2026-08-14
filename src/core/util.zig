@@ -97,6 +97,6 @@ test "bounded utf8 duplication rejects oversized or invalid input" {
 test "json string writer escapes bounded values" {
     var buf: [64]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buf);
-    try writeJsonString(&writer.interface, "a\"b\\c\n");
+    try writeJsonString(&writer, "a\"b\\c\n");
     try std.testing.expectEqualStrings("\"a\\\"b\\\\c\\n\"", writer.buffered());
 }

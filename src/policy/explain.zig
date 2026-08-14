@@ -84,7 +84,7 @@ test "explanation includes matched rule where possible" {
     try std.testing.expectEqualStrings("files.read.deny[2]", result.matched_rule.?.id);
     var buf: [512]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buf);
-    try write(&writer.interface, &policy, result);
+    try write(&writer, &policy, result);
     try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "Decision: deny") != null);
     try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "Rule: files.read.deny[2]") != null);
 }
@@ -98,6 +98,8 @@ test "network explanation includes service-aware path rules" {
         \\  github:
         \\    hosts:
         \\      - "api.github.com"
+        \\    methods:
+        \\      - "GET"
         \\    paths:
         \\      allow:
         \\        - "/repos/*/issues"
