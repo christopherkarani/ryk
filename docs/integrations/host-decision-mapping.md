@@ -19,6 +19,17 @@ ryk decisions are host-agnostic:
 
 Adapters **must not** claim stronger enforcement than the host provides. Passive notes are not approval gates.
 
+`ryk hook` (file / prompt / generic-tool) and `ryk decide` share one 6-tag
+`PluginDecision` (`allow|block|warn|ask|context_only|error`) in
+`src/cli/decision_map.zig`. The locked 7×2 map is: allow→allow, deny→block,
+ask→ask (CI→block), observe→context_only, redact→warn, stage→ask (CI→block),
+broker→error. That table is not the shell-facade 4-tag map (`observe`→`warn`
+on `hookDecisionFromShellFacade`), and it is not host emit: evaluate ask stays
+JSON ask / exit 0; Grok / Cursor / OpenClaw ask still deny or block at the
+wire; Claude ask is `permissionDecision: ask`; Hermes ask→approve is host-side
+and must not be rewritten here. Do not merge this enum with `DecisionResult`,
+YAML `DecisionValue`, or `shell_eval.PluginDecision`.
+
 ## CI / noninteractive rule
 
 Where a host already hardens interactive outcomes:

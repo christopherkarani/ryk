@@ -11,6 +11,7 @@ const tui = @import("../tui/render.zig");
 const terminal_text = @import("../tui/terminal_text.zig");
 const suggestions = @import("suggestions.zig");
 const file_policy_path = @import("file_policy_path.zig");
+const decision_map = @import("decision_map.zig");
 
 // Maximum JSON payload size to prevent memory exhaustion from hostile hosts.
 const max_payload_len = 256 * 1024; // 256 KiB
@@ -220,43 +221,11 @@ pub fn decideCommandWithPolicy(
 // Decision evaluation
 // ---------------------------------------------------------------------------
 
-pub const PluginDecision = enum {
-    allow,
-    block,
-    warn,
-    ask,
-    context_only,
-    err,
+pub const PluginDecision = decision_map.PluginDecision;
 
-    pub fn fromDecisionResult(result: core.decision.DecisionResult, ci_mode: bool) PluginDecision {
-        return switch (result) {
-            .allow => .allow,
-            .deny => .block,
-            .ask => if (ci_mode) .block else .ask,
-            .observe => .context_only,
-            .redact => .warn,
-            .stage => if (ci_mode) .block else .ask,
-            .broker => .err,
-        };
-    }
-
-    pub fn toString(self: PluginDecision) []const u8 {
-        return switch (self) {
-            .err => "error",
-            else => @tagName(self),
-        };
-    }
-
-    pub fn exitCode(self: PluginDecision) u8 {
-        return switch (self) {
-            .allow, .context_only => exit_codes.success,
-            .block => exit_codes.denial,
-            .ask => exit_codes.ask,
-            .warn => exit_codes.warn,
-            .err => exit_codes.general,
-        };
-    }
-};
+test {
+    _ = decision_map;
+}
 
 const RiskLevel = enum {
     low,

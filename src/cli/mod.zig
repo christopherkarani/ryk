@@ -127,6 +127,7 @@ test {
     _ = feed_visibility;
     _ = evaluate;
     _ = decide;
+    _ = @import("decision_map.zig");
     // Door A deadlock transcript replay (decide + hook surfaces).
     _ = @import("deadlock_replay.zig");
     _ = @import("deadlock_check.zig");

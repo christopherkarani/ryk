@@ -17,6 +17,7 @@ const file_policy_path = @import("file_policy_path.zig");
 const fm_steward_client = @import("fm_steward_client.zig");
 const grok_deny_reason = @import("grok_deny_reason.zig");
 const hook_grok = @import("hook_grok.zig");
+const decision_map = @import("decision_map.zig");
 
 // Maximum JSON payload size to prevent memory exhaustion from hostile hosts.
 const max_payload_len = 256 * 1024; // 256 KiB
@@ -852,33 +853,7 @@ fn writeClaudePermissionDecision(
 // Host adapter evaluation
 // ---------------------------------------------------------------------------
 
-const PluginDecision = enum {
-    allow,
-    block,
-    warn,
-    ask,
-    context_only,
-    err,
-
-    pub fn fromDecisionResult(result: core.decision.DecisionResult, ci_mode: bool) PluginDecision {
-        return switch (result) {
-            .allow => .allow,
-            .deny => .block,
-            .ask => if (ci_mode) .block else .ask,
-            .observe => .context_only,
-            .redact => .warn,
-            .stage => if (ci_mode) .block else .ask,
-            .broker => .err,
-        };
-    }
-
-    pub fn toString(self: PluginDecision) []const u8 {
-        return switch (self) {
-            .err => "error",
-            else => @tagName(self),
-        };
-    }
-};
+const PluginDecision = decision_map.PluginDecision;
 
 const RiskLevel = enum {
     low,
@@ -5204,6 +5179,7 @@ test {
     // Nested module: Zig 0.16 monopath does not auto-attach transitive import tests.
     _ = grok_deny_reason;
     _ = hook_grok;
+    _ = decision_map;
 }
 
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
