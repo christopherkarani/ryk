@@ -1957,17 +1957,15 @@ fn hookResponseFromShellFacade(
 
     var suggestions: [][]const u8 = &.{};
     var remediation_commands: [][]const u8 = &.{};
+    errdefer {
+        for (suggestions) |s| allocator.free(s);
+        if (suggestions.len > 0) allocator.free(suggestions);
+        for (remediation_commands) |c| allocator.free(c);
+        if (remediation_commands.len > 0) allocator.free(remediation_commands);
+    }
     if (daemon_status == .deny) {
         suggestions = try collectDaemonSuggestionTexts(allocator, result);
-        errdefer {
-            for (suggestions) |s| allocator.free(s);
-            if (suggestions.len > 0) allocator.free(suggestions);
-        }
         remediation_commands = try buildRemediationCommands(allocator, safe_rule);
-        errdefer {
-            for (remediation_commands) |c| allocator.free(c);
-            if (remediation_commands.len > 0) allocator.free(remediation_commands);
-        }
     }
 
     const category = try allocator.dupe(u8, "command");
