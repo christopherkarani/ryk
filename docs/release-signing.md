@@ -85,7 +85,7 @@ outside this repo.
 ### Cutting a signed release
 
 ```sh
-export RYK_MINISIGN_SECRET_KEY="/Volumes/keys/ryk-release-minisign.key"
+export RYK_MINISIGN_SECRET_KEY="$HOME/offline/ryk-release-minisign.key"
 ./scripts/cut-release.sh --version X.Y.Z --live
 ```
 
