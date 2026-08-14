@@ -1,7 +1,7 @@
 {
   "id": "ryk",
   "name": "ryk",
-  "version": "1.2.17",
+  "version": "0.2.18",
   "description": "Runtime guardrails for OpenClaw workflows via the ryk CLI.",
   "activation": {
     "onCapabilities": ["hook", "tool"]

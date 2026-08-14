@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.2.18] - 2026-08-14
+
+## What's Changed
+* fix: P0 security audit 2026-08-12 (shell truncation, allow-once, RYK_OPERATOR, audit redaction, hash-chain fork) by @christopherkarani in https://github.com/christopherkarani/ryk/pull/129
+* fix: P1 security audit 2026-08-12 (shim audit gap, hook fail-open, MCP passthrough, protection copy, telemetry opt-in, DNS rebind) by @christopherkarani in https://github.com/christopherkarani/ryk/pull/130
+* fix: close OS sandbox audit gaps by @christopherkarani in https://github.com/christopherkarani/ryk/pull/132
+* fix: harden secret redaction boundaries by @christopherkarani in https://github.com/christopherkarani/ryk/pull/133
+* fix(opencode): flat showToast for OpenCode 1.18 toast UI by @christopherkarani in https://github.com/christopherkarani/ryk/pull/127
+* chore: repo hygiene Wave 0–1 by @christopherkarani in https://github.com/christopherkarani/ryk/pull/128
+* docs: state Windows is wrapper/hook grade with no OS sandbox by @christopherkarani in https://github.com/christopherkarani/ryk/pull/137
+* feat: sign release checksums and refuse unverifiable installs by @christopherkarani in https://github.com/christopherkarani/ryk/pull/136
+* feat: make the Homebrew channel live (P2-2) by @christopherkarani in https://github.com/christopherkarani/ryk/pull/135
+* feat: Door A — eliminate coding-agent deadlocks (P2-1) by @christopherkarani in https://github.com/christopherkarani/ryk/pull/134
+* fix: close leftover 2026-08-12 audit medium-tail holes by @christopherkarani in https://github.com/christopherkarani/ryk/pull/138
+
+
+**Full Changelog**: https://github.com/christopherkarani/ryk/compare/v1.2.17...v0.2.18
+
 ## [Unreleased]
 
 ### Added
