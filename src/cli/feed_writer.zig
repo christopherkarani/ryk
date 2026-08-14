@@ -518,6 +518,7 @@ fn parseFeedRecord(allocator: std.mem.Allocator, line: []const u8, fallback_work
     errdefer allocator.free(timestamp);
     const workspace_root = try dupWorkspaceRoot(allocator, object, fallback_workspace_root);
     errdefer allocator.free(workspace_root);
+    validateFeedWorkspaceRoot(workspace_root) catch return error.InvalidFeedRecord;
     const event_type = try dupRequiredString(allocator, object, "event_type");
     errdefer allocator.free(event_type);
     const decision = try dupRequiredString(allocator, object, "decision");
@@ -573,6 +574,23 @@ fn dupWorkspaceRoot(allocator: std.mem.Allocator, object: std.json.ObjectMap, fa
     if (try dupOptionalString(allocator, object, "workspace_root")) |root| return root;
     if (fallback) |root| return allocator.dupe(u8, root);
     return error.InvalidFeedRecord;
+}
+
+/// Skip-before-join: reject `..` / `.` segments and extra separators so a
+/// crafted feed `workspace_root` cannot be opened as a directory oracle.
+/// This is a loader skip, not a fail-closed policy deny.
+fn validateFeedWorkspaceRoot(value: []const u8) !void {
+    if (value.len == 0) return error.InvalidFeedRecord;
+    if (std.mem.indexOfScalar(u8, value, 0) != null) return error.InvalidFeedRecord;
+    var it = std.mem.splitAny(u8, value, "/\\");
+    var idx: usize = 0;
+    while (it.next()) |part| : (idx += 1) {
+        if (part.len == 0) {
+            if (idx == 0) continue;
+            return error.InvalidFeedRecord;
+        }
+        if (std.mem.eql(u8, part, "..") or std.mem.eql(u8, part, ".")) return error.InvalidFeedRecord;
+    }
 }
 
 fn dupRequiredString(allocator: std.mem.Allocator, object: std.json.ObjectMap, field: []const u8) ![]u8 {
@@ -692,6 +710,13 @@ test "feed loader accepts legacy records without rule" {
     defer record.deinit(std.testing.allocator);
 
     try std.testing.expect(record.rule == null);
+}
+
+test "feed parse rejects path-traversal workspace_root" {
+    const line =
+        \\{"timestamp":"2026-07-13T00:00:00Z","workspace_root":"/tmp/../outside","event_type":"command_denied","decision":"deny","decision_source":"rust-daemon","event_source":"hook","host":"codex","daemon_status":"healthy","pack_id":"core.shell","severity":"high","reason":"blocked","remediation":null,"target_summary":"shell command (redacted)","session_id":"valid-session","verified":false}
+    ;
+    try std.testing.expectError(error.InvalidFeedRecord, parseFeedRecord(std.testing.allocator, line, null));
 }
 
 test "feed parse rejects path-traversal session_id" {

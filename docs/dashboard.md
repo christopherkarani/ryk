@@ -47,7 +47,7 @@ Machine-wide mode reads ryk's local workspace registry and global decision feed.
 - Denied shell decisions with `workspace_root`, `host`, and recording source
 - Machine-wide daemon health
 
-Decision writers continue to store the existing per-workspace feed and also append a redacted record to `$HOME/.ryk/dashboard/events.jsonl`. `$HOME/.ryk/dashboard/workspaces.json` indexes recently active workspaces for session aggregation. Feed writes are best-effort and do not change hook, run, or evaluate exit behavior.
+Decision writers continue to store the existing per-workspace feed and also append a redacted record to `$HOME/.ryk/dashboard/events.jsonl`. `$HOME/.ryk/dashboard/workspaces.json` indexes recently active workspaces for session aggregation. Feed writes are best-effort and do not change hook, run, or evaluate exit behavior. Crafted feed `session_id` or `workspace_root` values (`..`, extra separators) are skipped before any filesystem join; that is a loader skip, not a fail-closed policy deny.
 
 Machine-wide mode exposes only the global action `ryk doctor`. Policy, replay, report, CI, credential, proxy, and integration actions stay hidden and are rejected server-side until the dashboard is started with an explicit workspace. This prevents ambiguous uses of `last` from `~`.
 

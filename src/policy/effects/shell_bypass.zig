@@ -453,6 +453,14 @@ fn appendCurlLikeHostEffects(
             const t = tokens[j];
             if (t.len == 0) continue;
 
+            // --url=VALUE / -url=VALUE → transfer URL (always classify).
+            if (std.mem.startsWith(u8, t, "--url=") or std.mem.startsWith(u8, t, "-url=")) {
+                const raw = if (std.mem.startsWith(u8, t, "--url=")) t["--url=".len..] else t["-url=".len..];
+                const host = network_tags.hostFromUrlOrHost(raw);
+                try appendCurlHostHit(allocator, hits, host);
+                continue;
+            }
+
             // --url / -url VALUE → transfer URL (always classify).
             if ((std.mem.eql(u8, t, "--url") or std.mem.eql(u8, t, "-url")) and j + 1 < tokens.len) {
                 const host = network_tags.hostFromUrlOrHost(tokens[j + 1]);
@@ -581,6 +589,20 @@ test "curl multi-URL second tagged host still hits" {
 
 test "curl --url tagged host hits" {
     const hits = try classifyCommand(std.testing.allocator, "curl --url https://api.twitter.com/2/tweets");
+    defer std.testing.allocator.free(hits);
+    try std.testing.expect(hits.len >= 1);
+    try std.testing.expectEqualStrings("comms.publish", hits[0].id);
+}
+
+test "curl --url= tagged host hits" {
+    const hits = try classifyCommand(std.testing.allocator, "curl --url=https://api.twitter.com/2/tweets");
+    defer std.testing.allocator.free(hits);
+    try std.testing.expect(hits.len >= 1);
+    try std.testing.expectEqualStrings("comms.publish", hits[0].id);
+}
+
+test "curl -url= tagged host hits" {
+    const hits = try classifyCommand(std.testing.allocator, "curl -url=https://api.twitter.com/2/tweets");
     defer std.testing.allocator.free(hits);
     try std.testing.expect(hits.len >= 1);
     try std.testing.expectEqualStrings("comms.publish", hits[0].id);

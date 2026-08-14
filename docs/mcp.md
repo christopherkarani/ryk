@@ -25,7 +25,7 @@ Effect output never includes raw argument values. For interactive classification
 python3 fixtures/mcp/fake_client.py | ./zig-out/bin/ryk mcp proxy --name demo --policy policies/presets/mcp-dev.yaml --command python3 -- fixtures/mcp/fake_server.py
 ```
 
-The proxy reads client JSON-RPC from stdin and writes protocol responses to stdout. Ryk human diagnostics use stderr, but child-server stderr is discarded because it is attacker-controlled and may contain credentials; this does not affect the separate stdout JSON-RPC channel. Running `ryk mcp proxy` without a client input stream waits for JSON-RPC on stdin. When the proxy session ends, stderr prints the final audit chain hash for out-of-band comparison; detecting a local rewrite of both the event log and the summary is out of scope.
+The proxy reads client JSON-RPC from stdin and writes protocol responses to stdout. Ryk human diagnostics use stderr, but child-server stderr is discarded because it is attacker-controlled and may contain credentials; this does not affect the separate stdout JSON-RPC channel. Running `ryk mcp proxy` without a client input stream waits for JSON-RPC on stdin. When the proxy session ends, stderr prints `ryk mcp proxy: audit chain <sha256>` for out-of-band comparison. That print is not an integrity guarantee; detecting a local rewrite of both the event log and the summary is out of scope.
 
 ## Manifest Support
 
@@ -45,7 +45,7 @@ ryk policy-gates:
 - `prompts/get`
 - sampling requests, default-denied unless policy permits them
 
-An interactive **Always this session** approval is kept for the lifetime of that `ryk mcp proxy` process (same fingerprint, no second prompt). **Once** still applies to a single call. `ask` is never treated as allow. CI and non-interactive proxy runs convert `ask` to deny.
+An interactive **Always this session** approval is kept for the lifetime of that `ryk mcp proxy` process when the JSON-RPC method and canonical args match. **Once** still applies to a single call. `ask` is never treated as allow. Args that cannot be stringified are not stored as a shared Always key. CI and non-interactive proxy runs convert `ask` to deny.
 
 ryk also observes and audits `tools/list`, `resources/list`, and `prompts/list` metadata so later calls can be evaluated with the discovered risk context.
 

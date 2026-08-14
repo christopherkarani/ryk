@@ -263,10 +263,11 @@ audit:
 
 **Command glob matching:** `commands.allow` / `commands.deny` globs collapse
 runs of space, tab, and newline to a single space and strip a leading `./`
-(or `.\\`) from each word before matching — the same normalization the shell
-engine already applies. `cat  .env`, `cat<TAB>.env`, and `cat ./.env` therefore
-still hit a `cat .env` deny. Neighbor paths (`cat .env.example`,
-`cat secrets/.env`) do not.
+or `.//` (or `.\\`) from each word before matching. This is matcher-local
+(whitespace + leading `./`); it is not shell-engine normalization. `cat  .env`,
+`cat<TAB>.env`, and `cat ./.env` therefore still hit a `cat .env` deny.
+Neighbor paths (`cat .env.example`, `cat secrets/.env`) do not. If normalize
+cannot fit the 16KiB bound, evaluation fails closed (deny).
 
 **`.git` / `.ryk` write deny and OS attach:** policy and builtins deny
 `files.write` under `./.git/**` and `./.ryk/**`. When OS sandbox session-attach
