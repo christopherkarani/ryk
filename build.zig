@@ -217,6 +217,7 @@ pub fn build(b: *std.Build) void {
         }),
         .filters = test_filters,
     });
+    core_engine_tests.root_module.link_libc = true;
     const run_core_engine_tests_only = addRunTestTerminal(b, core_engine_tests);
 
     const core_contract_tests = b.addTest(.{

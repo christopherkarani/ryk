@@ -5,8 +5,20 @@ const shell_engine = @import("../shell_engine/mod.zig");
 const theme = @import("../tui/theme.zig");
 const terminal_text = @import("../tui/terminal_text.zig");
 
-/// Pretty DCG-style decision tree for humans.
+/// Glanceable human receipt: decision, why, one next command.
 pub fn writePretty(io: std.Io, writer: anytype, command_text: []const u8, eval: shell_engine.Evaluation) !void {
+    _ = io;
+    const dec_label = switch (eval.decision) {
+        .allow => "ALLOW",
+        .deny => "DENY",
+    };
+    try writer.print("Decision: {s}\nWhy: {s}\nNext: ryk test \"", .{ dec_label, eval.reason });
+    try terminal_text.write(writer, command_text, .single_line);
+    try writer.writeAll("\"\n");
+}
+
+/// Verbose DCG-style decision tree (regex / latency stay in JSON).
+pub fn writePrettyVerbose(io: std.Io, writer: anytype, command_text: []const u8, eval: shell_engine.Evaluation) !void {
     try theme.paintBold(io, writer, .brand, "RYK EXPLAIN");
     try writer.writeAll("\n");
 
@@ -195,7 +207,7 @@ pub fn writeJson(allocator: std.mem.Allocator, writer: anytype, command_text: []
     try writer.writeAll("\n");
 }
 
-test "writePretty includes decision and suggestions headers" {
+test "writePretty is a glanceable decision receipt" {
     theme.setTestActive(.{ .capability = .none, .background = .dark });
     defer theme.setTestActive(null);
     var buf: [4096]u8 = undefined;
@@ -223,21 +235,18 @@ test "writePretty includes decision and suggestions headers" {
     };
     try writePretty(std.testing.io, &w, "rm -rf", eval);
     const out = w.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, out, "RYK EXPLAIN") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "DENY") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "Suggestions") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "Preview first") != null);
-    // Nest rule: timed step + nested details (not peer "matched")
-    try std.testing.expect(std.mem.indexOf(u8, out, "full_evaluation (") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "matched: core.filesystem") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "├── matched") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Decision: DENY") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Why: destructive") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Next: ryk test \"rm -rf\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Pipeline Trace") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "full_evaluation") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "Regex") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "rm\\\\s+") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "Latency") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "Span") == null);
 }
 
-test "writePretty allow path nests details under timed step" {
+test "writePretty allow path is a glanceable receipt" {
     theme.setTestActive(.{ .capability = .none, .background = .dark });
     defer theme.setTestActive(null);
     var buf: [2048]u8 = undefined;
@@ -256,7 +265,8 @@ test "writePretty allow path nests details under timed step" {
     };
     try writePretty(std.testing.io, &w, "git status", eval);
     const out = w.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, out, "ALLOW") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "full_evaluation (") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "no destructive pack matched") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Decision: ALLOW") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Why: No destructive pack matched.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Next: ryk test \"git status\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "full_evaluation") == null);
 }
