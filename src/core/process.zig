@@ -123,9 +123,11 @@ pub const PreparedChild = struct {
     }
 
     fn spawnPlain(self: *PreparedChild) !void {
+        var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const cwd_path = try spawnWorkingDirectory(self.workspace_root, &cwd_buf);
         const child = try std.process.spawn(self.io, .{
             .argv = self.argv,
-            .cwd = .{ .path = spawnWorkingDirectory(self.workspace_root) },
+            .cwd = .{ .path = cwd_path },
             .environ_map = self.env_map,
             .stdin = mapStdio(self.stdio),
             .stdout = mapStdio(self.stdio),
@@ -303,14 +305,37 @@ pub fn prepareChild(io: std.Io, allocator: std.mem.Allocator, request: PrepareRe
 }
 
 /// CreateProcess `lpCurrentDirectory` rejects NT prefixes (`\\?\`, `\??\`).
-/// Workspace roots from some realpath paths still carry them.
-pub fn spawnWorkingDirectory(workspace_root: []const u8) []const u8 {
-    return stripWindowsNtPrefix(workspace_root);
+/// Drive paths become `C:\...`. UNC `\\?\UNC\server\share` becomes
+/// `\\server\share` (written into `buf`). Volume GUID and other `\\?\`
+/// forms are left intact.
+pub fn spawnWorkingDirectory(workspace_root: []const u8, buf: []u8) error{NameTooLong}![]const u8 {
+    return stripWindowsNtPrefix(workspace_root, buf);
 }
 
-pub fn stripWindowsNtPrefix(path: []const u8) []const u8 {
-    if (std.mem.startsWith(u8, path, "\\\\?\\")) return path[4..];
-    if (std.mem.startsWith(u8, path, "\\??\\")) return path[4..];
+pub fn stripWindowsNtPrefix(path: []const u8, buf: []u8) error{NameTooLong}![]const u8 {
+    const rest = if (std.mem.startsWith(u8, path, "\\\\?\\"))
+        path[4..]
+    else if (std.mem.startsWith(u8, path, "\\??\\"))
+        path[4..]
+    else
+        return path;
+
+    if (rest.len >= 4 and std.ascii.eqlIgnoreCase(rest[0..3], "UNC") and
+        (rest[3] == '\\' or rest[3] == '/'))
+    {
+        const tail = rest[4..];
+        const needed = 2 + tail.len;
+        if (needed > buf.len) return error.NameTooLong;
+        buf[0] = '\\';
+        buf[1] = '\\';
+        @memcpy(buf[2..][0..tail.len], tail);
+        return buf[0..needed];
+    }
+
+    if (rest.len >= 2 and std.ascii.isAlphabetic(rest[0]) and rest[1] == ':') {
+        return rest;
+    }
+
     return path;
 }
 
@@ -432,14 +457,40 @@ test "child status exit code mapping" {
 }
 
 test "stripWindowsNtPrefix drops CreateProcess-unsafe prefixes" {
-    try std.testing.expectEqualStrings("C:\\repo", stripWindowsNtPrefix("\\\\?\\C:\\repo"));
-    try std.testing.expectEqualStrings("C:\\repo", stripWindowsNtPrefix("\\??\\C:\\repo"));
-    try std.testing.expectEqualStrings("C:\\repo", stripWindowsNtPrefix("C:\\repo"));
-    try std.testing.expectEqualStrings("/tmp/ryk", stripWindowsNtPrefix("/tmp/ryk"));
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("C:\\repo", try stripWindowsNtPrefix("\\\\?\\C:\\repo", &buf));
+    try std.testing.expectEqualStrings("C:\\repo", try stripWindowsNtPrefix("\\??\\C:\\repo", &buf));
+    try std.testing.expectEqualStrings("C:\\repo", try stripWindowsNtPrefix("C:\\repo", &buf));
+    try std.testing.expectEqualStrings("/tmp/ryk", try stripWindowsNtPrefix("/tmp/ryk", &buf));
+}
+
+test "stripWindowsNtPrefix keeps UNC as \\\\server\\share" {
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "\\\\server\\share\\dir",
+        try stripWindowsNtPrefix("\\\\?\\UNC\\server\\share\\dir", &buf),
+    );
+    try std.testing.expectEqualStrings(
+        "\\\\server\\share",
+        try stripWindowsNtPrefix("\\??\\UNC\\server\\share", &buf),
+    );
+    try std.testing.expectEqualStrings(
+        "\\\\server\\share",
+        try stripWindowsNtPrefix("\\\\?\\unc\\server\\share", &buf),
+    );
+    try std.testing.expectEqualStrings(
+        "\\\\?\\Volume{abc}\\foo",
+        try stripWindowsNtPrefix("\\\\?\\Volume{abc}\\foo", &buf),
+    );
 }
 
 test "spawnWorkingDirectory is the stripped workspace root" {
-    try std.testing.expectEqualStrings("D:\\work", spawnWorkingDirectory("\\\\?\\D:\\work"));
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("D:\\work", try spawnWorkingDirectory("\\\\?\\D:\\work", &buf));
+    try std.testing.expectEqualStrings(
+        "\\\\files\\proj",
+        try spawnWorkingDirectory("\\\\?\\UNC\\files\\proj", &buf),
+    );
 }
 
 test "childLaunchFailureMessage is not a bare AccessDenied on Windows" {
