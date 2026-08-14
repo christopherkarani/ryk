@@ -28,6 +28,7 @@
 ### Security (audit medium tail 2026-08-12)
 
 * **Command deny globs ignore padding:** `commands.deny` patterns collapse extra spaces/tabs and strip a leading `./` on each word before matching, so `cat  ~/.ssh/id_rsa` and `cat ./.env` no longer slip past preset denies such as `cat .env` and `cat ~/.ssh/*`.
+* **Shell effect classification is exhaustive:** `curl`/`wget`/`open` bypass classifiers tokenize the full command instead of silently dropping tokens after 48, so a long header list cannot hide a `comms.publish` URL.
 
 ### Security (OS sandbox audit 2026-08-13)
 

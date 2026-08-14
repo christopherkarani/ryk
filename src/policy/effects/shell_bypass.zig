@@ -15,7 +15,7 @@ pub fn classifyCommand(allocator: std.mem.Allocator, command_text: []const u8) !
     const trimmed = std.mem.trim(u8, command_text, " \t\r\n");
     if (trimmed.len == 0) return try hits.toOwnedSlice(allocator);
 
-    if (matchesMailtoOpen(trimmed)) {
+    if (try matchesMailtoOpen(allocator, trimmed)) {
         try hits.append(allocator, .{
             .id = "comms.message",
             .confidence = .medium,
@@ -26,7 +26,7 @@ pub fn classifyCommand(allocator: std.mem.Allocator, command_text: []const u8) !
     // curl/wget: inspect every URL / tagged host operand (not only the first).
     try appendCurlLikeHostEffects(allocator, trimmed, &hits);
 
-    if (matchesOsascriptMessages(trimmed)) {
+    if (try matchesOsascriptMessages(allocator, trimmed)) {
         if (!hasEffectId(hits.items, "comms.message")) {
             try hits.append(allocator, .{
                 .id = "comms.message",
@@ -70,25 +70,25 @@ fn appendCurlHostHit(
 }
 
 /// `open` / `/usr/bin/open` in command position with a following `mailto:` operand.
-fn matchesMailtoOpen(command_text: []const u8) bool {
-    var tokens: [48][]const u8 = undefined;
-    const n = tokenizeSimple(command_text, &tokens);
-    if (n < 2) return false;
+fn matchesMailtoOpen(allocator: std.mem.Allocator, command_text: []const u8) !bool {
+    const tokens = try tokenizeSimple(allocator, command_text);
+    defer allocator.free(tokens);
+    if (tokens.len < 2) return false;
 
     var i: usize = 0;
-    while (i + 1 < n) : (i += 1) {
+    while (i + 1 < tokens.len) : (i += 1) {
         if (!isOpenToken(tokens[i])) continue;
-        if (!isCommandPosition(tokens[0..n], i)) continue;
+        if (!isCommandPosition(tokens, i)) continue;
 
         // Walk past macOS `open` options (including value-taking flags like -a/-b).
         var j = i + 1;
-        while (j < n) {
+        while (j < tokens.len) {
             if (isShellOperator(tokens[j])) break;
             const t = tokens[j];
             if (t.len > 0 and t[0] == '-') {
                 if (openFlagConsumesNext(t)) {
                     j += 1; // flag
-                    if (j < n and !isShellOperator(tokens[j]) and !(tokens[j].len > 0 and tokens[j][0] == '-')) {
+                    if (j < tokens.len and !isShellOperator(tokens[j]) and !(tokens[j].len > 0 and tokens[j][0] == '-')) {
                         j += 1; // option value (e.g. Mail)
                     }
                     continue;
@@ -247,12 +247,12 @@ fn startsWithIgnoreCase(haystack: []const u8, prefix: []const u8) bool {
     return std.ascii.eqlIgnoreCase(haystack[0..prefix.len], prefix);
 }
 
-fn matchesOsascriptMessages(command_text: []const u8) bool {
-    var tokens: [48][]const u8 = undefined;
-    const n = tokenizeSimple(command_text, &tokens);
+fn matchesOsascriptMessages(allocator: std.mem.Allocator, command_text: []const u8) !bool {
+    const tokens = try tokenizeSimple(allocator, command_text);
+    defer allocator.free(tokens);
     var has_osascript = false;
     var has_messages = false;
-    for (tokens[0..n]) |t| {
+    for (tokens) |t| {
         if (std.ascii.eqlIgnoreCase(t, "osascript") or endsWithIgnoreCase(t, "/osascript")) {
             has_osascript = true;
         }
@@ -279,10 +279,12 @@ fn indexOfIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
 
 /// Whitespace tokenizer with quote stripping; also emits shell operators as tokens
 /// and splits attached operators (e.g. `decoy;` → `decoy`, `;`).
-fn tokenizeSimple(command_text: []const u8, out: [][]const u8) usize {
-    var count: usize = 0;
+/// Exhaustive: every token in `command_text` is returned (no silent 48-token cap).
+fn tokenizeSimple(allocator: std.mem.Allocator, command_text: []const u8) ![][]const u8 {
+    var tokens: std.ArrayList([]const u8) = .empty;
+    errdefer tokens.deinit(allocator);
     var i: usize = 0;
-    while (i < command_text.len and count < out.len) {
+    while (i < command_text.len) {
         while (i < command_text.len and isSpace(command_text[i])) : (i += 1) {}
         if (i >= command_text.len) break;
 
@@ -291,23 +293,21 @@ fn tokenizeSimple(command_text: []const u8, out: [][]const u8) usize {
             i += 1;
             const start = i;
             while (i < command_text.len and command_text[i] != quote) : (i += 1) {}
-            out[count] = command_text[start..i];
-            count += 1;
+            try tokens.append(allocator, command_text[start..i]);
             if (i < command_text.len) i += 1;
             continue;
         }
 
         // Shell operators as their own tokens (including && and ||).
-        if (tryEmitOperator(command_text, &i, out, &count)) continue;
+        if (try tryEmitOperator(allocator, command_text, &i, &tokens)) continue;
 
         const start = i;
         while (i < command_text.len and !isSpace(command_text[i]) and !isOperatorStart(command_text, i)) : (i += 1) {}
         if (i > start) {
-            out[count] = command_text[start..i];
-            count += 1;
+            try tokens.append(allocator, command_text[start..i]);
         }
     }
-    return count;
+    return tokens.toOwnedSlice(allocator);
 }
 
 fn isSpace(c: u8) bool {
@@ -333,13 +333,17 @@ fn isEscapedAt(text: []const u8, i: usize) bool {
     return (bs % 2) == 1;
 }
 
-fn tryEmitOperator(text: []const u8, i: *usize, out: [][]const u8, count: *usize) bool {
-    if (count.* >= out.len or i.* >= text.len) return false;
+fn tryEmitOperator(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    i: *usize,
+    tokens: *std.ArrayList([]const u8),
+) !bool {
+    if (i.* >= text.len) return false;
     if (!isOperatorStart(text, i.*)) return false;
     const c = text[i.*];
     if (c == ';') {
-        out[count.*] = text[i.* .. i.* + 1];
-        count.* += 1;
+        try tokens.append(allocator, text[i.* .. i.* + 1]);
         i.* += 1;
         return true;
     }
@@ -347,13 +351,11 @@ fn tryEmitOperator(text: []const u8, i: *usize, out: [][]const u8, count: *usize
         // Only treat doubled forms as one operator when the second char is also unescaped
         // (second is adjacent so escape only applies to the first).
         if (i.* + 1 < text.len and text[i.* + 1] == c) {
-            out[count.*] = text[i.* .. i.* + 2];
-            count.* += 1;
+            try tokens.append(allocator, text[i.* .. i.* + 2]);
             i.* += 2;
             return true;
         }
-        out[count.*] = text[i.* .. i.* + 1];
-        count.* += 1;
+        try tokens.append(allocator, text[i.* .. i.* + 1]);
         i.* += 1;
         return true;
     }
@@ -435,24 +437,24 @@ fn appendCurlLikeHostEffects(
     command_text: []const u8,
     hits: *std.ArrayList(catalog.EffectHit),
 ) !void {
-    var tokens: [48][]const u8 = undefined;
-    const n = tokenizeSimple(command_text, &tokens);
-    if (n == 0) return;
+    const tokens = try tokenizeSimple(allocator, command_text);
+    defer allocator.free(tokens);
+    if (tokens.len == 0) return;
 
     var i: usize = 0;
-    while (i < n) : (i += 1) {
+    while (i < tokens.len) : (i += 1) {
         if (!isCurlLikeToken(tokens[i])) continue;
-        if (!isCommandPosition(tokens[0..n], i)) continue;
+        if (!isCommandPosition(tokens, i)) continue;
 
         // Scan operands until next shell operator.
         var j = i + 1;
-        while (j < n) : (j += 1) {
+        while (j < tokens.len) : (j += 1) {
             if (isShellOperator(tokens[j])) break;
             const t = tokens[j];
             if (t.len == 0) continue;
 
             // --url / -url VALUE → transfer URL (always classify).
-            if ((std.mem.eql(u8, t, "--url") or std.mem.eql(u8, t, "-url")) and j + 1 < n) {
+            if ((std.mem.eql(u8, t, "--url") or std.mem.eql(u8, t, "-url")) and j + 1 < tokens.len) {
                 const host = network_tags.hostFromUrlOrHost(tokens[j + 1]);
                 try appendCurlHostHit(allocator, hits, host);
                 j += 1;
@@ -461,7 +463,7 @@ fn appendCurlLikeHostEffects(
 
             // Value-taking options: skip the next token (not a transfer URL).
             if (t[0] == '-') {
-                if (curlFlagTakesValue(t) and j + 1 < n and !isShellOperator(tokens[j + 1])) {
+                if (curlFlagTakesValue(t) and j + 1 < tokens.len and !isShellOperator(tokens[j + 1])) {
                     j += 1; // skip option value
                 }
                 continue;
@@ -661,4 +663,29 @@ test "command open mailto still classifies" {
     defer std.testing.allocator.free(hits);
     try std.testing.expect(hits.len >= 1);
     try std.testing.expectEqualStrings("comms.message", hits[0].id);
+}
+
+test "curl publish host after more than 48 tokens still classifies" {
+    // 25 `-H` pairs push curl+headers+URL past the old 48-token cap so the
+    // publish URL was silently dropped and comms.publish never fired.
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(std.testing.allocator);
+    try list.appendSlice(std.testing.allocator, "curl");
+    var i: usize = 0;
+    while (i < 25) : (i += 1) {
+        var hdr_buf: [32]u8 = undefined;
+        const hdr = try std.fmt.bufPrint(&hdr_buf, " -H h{d}:v", .{i});
+        try list.appendSlice(std.testing.allocator, hdr);
+    }
+    try list.appendSlice(std.testing.allocator, " https://api.twitter.com/2/tweets");
+
+    var token_count: usize = 0;
+    var it = std.mem.tokenizeAny(u8, list.items, " \t");
+    while (it.next()) |_| token_count += 1;
+    try std.testing.expect(token_count > 48);
+
+    const hits = try classifyCommand(std.testing.allocator, list.items);
+    defer std.testing.allocator.free(hits);
+    try std.testing.expect(hits.len >= 1);
+    try std.testing.expectEqualStrings("comms.publish", hits[0].id);
 }

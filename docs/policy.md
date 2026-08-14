@@ -335,7 +335,9 @@ deny into allow. Explicit MCP allow does not override an effect deny.
    (including `open -a Mail mailto:…`), multi-URL `curl` to tagged hosts, and
    command-position matching (including wrappers such as `sudo`/`env`/`xargs`)
    map to `comms.message` / `comms.publish` (matcher `shell_bypass.…`) on Zig
-   `command` / `ryk policy explain command` evaluation.
+   `command` / `ryk policy explain command` evaluation. Tokenization is
+   exhaustive (no 48-token cap): a long `curl -H …` list cannot hide a
+   tagged publish URL past the classifier.
 
 Example residual opt-in (block-style lists):
 
