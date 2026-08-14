@@ -545,10 +545,18 @@ fn writeWindowsCmdShim(io: std.Io, allocator: std.mem.Allocator, shim_dir: []con
 pub fn shimAliasFromExecutablePath(executable_path: []const u8) ?[]const u8 {
     const exe = basename(executable_path);
     inline for (shim_names) |name| {
-        if (std.ascii.eqlIgnoreCase(exe, name)) return name;
-        if (endsWithAsciiIgnoreCase(exe, ".exe") and exe.len == name.len + 4 and std.ascii.eqlIgnoreCase(exe[0..name.len], name)) return name;
+        if (shimAliasMatchesBasename(exe, name)) return name;
     }
     return null;
+}
+
+fn shimAliasMatchesBasename(exe: []const u8, name: []const u8) bool {
+    if (std.ascii.eqlIgnoreCase(exe, name)) return true;
+    inline for (.{ ".exe", ".cmd" }) |ext| {
+        if (endsWithAsciiIgnoreCase(exe, ext) and exe.len == name.len + ext.len and
+            std.ascii.eqlIgnoreCase(exe[0..name.len], name)) return true;
+    }
+    return false;
 }
 
 fn isExecutable(io: std.Io, path: []const u8) bool {
@@ -1520,10 +1528,13 @@ test "Windows cmd shim can be written without copying ryk.exe" {
 
 test "Windows executable shim aliases route extension-qualified invocations" {
     try std.testing.expectEqualStrings("cmd", shimAliasFromExecutablePath("C:\\repo\\.ryk\\sessions\\id\\shims\\cmd.exe").?);
+    try std.testing.expectEqualStrings("cmd", shimAliasFromExecutablePath("C:\\repo\\.ryk\\sessions\\id\\shims\\cmd.cmd").?);
     try std.testing.expectEqualStrings("powershell", shimAliasFromExecutablePath("powershell.exe").?);
     try std.testing.expectEqualStrings("pwsh", shimAliasFromExecutablePath("pwsh.exe").?);
     try std.testing.expectEqualStrings("git", shimAliasFromExecutablePath("git.exe").?);
+    try std.testing.expectEqualStrings("git", shimAliasFromExecutablePath("git.cmd").?);
     try std.testing.expect(shimAliasFromExecutablePath("ryk.exe") == null);
+    try std.testing.expect(shimAliasFromExecutablePath("ryk.cmd") == null);
 }
 
 test "approval hashes are bounded and consumable without raw command persistence" {
