@@ -1246,6 +1246,12 @@ fn commandWithStdioAndEnv(io: std.Io, argv: []const []const u8, stdout: anytype,
     // Seatbelt residual where open/exec of the *symlink path* is denied even when
     // the realpath target is RO-granted. Expand to realpath argv before spawn.
     //
+    // `#!/usr/bin/env node` (pi, npm-global agents) PATH-searches `node` after
+    // attach. The session node shim then fails: PATH honesty drops Homebrew, and
+    // home/nvm/hermes node EPERMs under no-bare-home. Expand to absolute
+    // interpreter + script. Host MCP plans keep bare `pi` argv0 — do not skip
+    // this expand when a plan is present (codex MCP expands itself).
+    //
     // PATH honesty (before_process_launch) drops denylisted package trees from the
     // child PATH. Absolute-ize bare argv0 before that filter so spawn does not
     // re-search PATH for brew-installed host aliases (pi, opencode, codex, …).
@@ -1264,27 +1270,18 @@ fn commandWithStdioAndEnv(io: std.Io, argv: []const []const u8, stdout: anytype,
         options.command_argv;
     var launch_argv_owned: ?[]const []const u8 = null;
     defer if (launch_argv_owned) |a| sandbox.apply.freeExpandedShellWrapperArgv(allocator, a);
-    if (secret_boundary == .empty_backpack and planned_argv.len > 0 and codex_mcp_plan == null and host_mcp_plan == null) {
-        launch_argv_owned = sandbox.apply.expandShellWrapperLaunch(
+    const expand_shell_wrapper = secret_boundary == .empty_backpack and codex_mcp_plan == null;
+    if (expand_shell_wrapper or command_guard_context.os_attach_planned) {
+        launch_argv_owned = sandbox.apply.rewriteOsAttachLaunchArgv(
             io,
             allocator,
             planned_argv,
-            &filtered_env.env_map, // mutable: may inject ryk-owned PYTHONPATH for venv
-        ) catch null;
-    }
-    const post_expand_argv: []const []const u8 = launch_argv_owned orelse planned_argv;
-    // Absoluteize even when codex_mcp_plan is set — plan.argv keeps bare "codex"
-    // and hits the same post-filter PATH miss. Expand stays MCP-plan-skipped above.
-    if (command_guard_context.os_attach_planned and post_expand_argv.len > 0) {
-        if (sandbox.apply.absoluteizeLaunchArgv(
-            io,
-            allocator,
-            post_expand_argv,
             &filtered_env.env_map,
-        ) catch null) |absolute_argv| {
-            if (launch_argv_owned) |old| sandbox.apply.freeExpandedShellWrapperArgv(allocator, old);
-            launch_argv_owned = absolute_argv;
-        }
+            .{
+                .expand_shell_wrapper = expand_shell_wrapper,
+                .os_attach = command_guard_context.os_attach_planned,
+            },
+        ) catch null;
     }
     const spawn_argv: []const []const u8 = launch_argv_owned orelse planned_argv;
 

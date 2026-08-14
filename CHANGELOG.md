@@ -20,6 +20,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+* **`ryk pi` launch under OS sandbox:** `#!/usr/bin/env node` host scripts (Pi, npm-global agents) no longer die with `ryk shim exec: real command not found after removing shim path: node`. After attach, PATH honesty drops Homebrew and Seatbelt no-bare-home EPERMs `~/.local` / nvm / Hermes node, so the session `node` shim cannot resolve a real interpreter. The product path now expands env shebangs to absolute interpreter + script before spawn (same rewrite Codex MCP already used). Host MCP plans that keep bare `pi` are included.
+
 ### Added
 
 * **Release signing is wired but not yet active.** `keys/ryk-release-minisign.pub` ships the sentinel `RYK_RELEASE_PUBKEY_UNPROVISIONED`. Until a real key is provisioned, `scripts/install.sh` reports signing is not yet active and continues on SHA-256 only (checksum-only / fail-open). `scripts/install.ps1` is checksum-only (Windows unsigned) and does not verify `checksums.txt.minisig`. After provisioning, the POSIX installer will verify a detached minisign signature over `checksums.txt` and refuse unverifiable releases. `cut-release.sh` has a `sign` phase before `publish-git`; after a dry-run, resume from `sign`, not `publish-git`. CI backup (`release.yml`) still does not attach `checksums.txt.minisig`. See `docs/release-signing.md`.
