@@ -4,7 +4,7 @@ const ryk_core = @import("ryk_core");
 test "core package root exposes curated boundary only" {
     try expectNoDecl(ryk_core, "phase");
     try std.testing.expect(@hasDecl(ryk_core, "api"));
-    try std.testing.expect(@hasDecl(ryk_core, "abi"));
+    try expectNoDecl(ryk_core, "abi");
 
     // Product code needs access to the internal module graph for CLI and intercept
     try std.testing.expect(@hasDecl(ryk_core, "core"));
@@ -23,7 +23,6 @@ test "core package root exposes curated boundary only" {
 
 test "core package sources do not import the monolithic product facade" {
     try expectFileDoesNotContain("packages/core/src/root.zig", "@import(\"aegis\")");
-    try expectFileDoesNotContain("packages/core/src/abi.zig", "@import(\"aegis\")");
 }
 
 test "core engine module graph stays within core policy and audit" {
@@ -235,16 +234,11 @@ test "cli compatibility facade dead code has been removed" {
     try std.testing.expect(std.mem.indexOf(u8, compat_source, "pub const actions = core.types") == null);
 }
 
-test "phase 24 experimental ABI skeleton compiles and documents instability" {
-    try std.testing.expectEqualStrings("experimental", ryk_core.abi.stability);
-    try std.testing.expect(std.mem.indexOf(u8, ryk_core.abi.documentation, "not stable v1") != null);
-
+test "core redaction smoke keeps secret substring absent" {
     const raw = "OPENAI_API_KEY=fake_secret_value_phase24";
-    var output: [128]u8 = undefined;
-    var written: usize = 0;
-    const code = ryk_core.abi.core_redact(raw, raw.len, &output, output.len, &written);
-    try std.testing.expectEqual(@as(c_int, 0), code);
-    try std.testing.expect(std.mem.indexOf(u8, output[0..written], "fake_secret_value_phase24") == null);
+    var buffer: [256]u8 = undefined;
+    const redacted = ryk_core.api.redactStringBounded(raw, &buffer);
+    try std.testing.expect(std.mem.indexOf(u8, redacted, "fake_secret_value_phase24") == null);
 }
 
 fn expectNoDecl(comptime namespace: type, comptime name: []const u8) !void {

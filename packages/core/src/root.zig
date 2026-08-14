@@ -1,7 +1,6 @@
 const engine = @import("core_engine");
 
 pub const api = engine.boundary_api;
-pub const abi = @import("abi.zig");
 
 /// Full internal module graph — used by CLI, dashboard, intercept, etc.
 pub const core = engine.core;
@@ -20,7 +19,6 @@ pub const event = engine.core.event;
 
 test {
     _ = api;
-    _ = abi;
     _ = core;
     _ = policy;
     _ = audit;

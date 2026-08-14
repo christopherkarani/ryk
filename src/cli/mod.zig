@@ -59,8 +59,8 @@ pub const shell_test = @import("shell_test.zig");
 pub const shell_explain = @import("shell_explain.zig");
 pub const allow_once = @import("allow_once.zig");
 pub const allowlist_cmd = @import("allowlist_cmd.zig");
-pub const rust_legacy_stub = @import("rust_legacy_stub.zig");
-pub const rust_visibility = @import("rust_visibility.zig");
+pub const legacy_stub = @import("legacy_stub.zig");
+pub const feed_visibility = @import("feed_visibility.zig");
 pub const feed_writer = @import("feed_writer.zig");
 pub const agent_hook = @import("agent_hook.zig");
 pub const daemon_contracts = @import("daemon_contracts.zig");
@@ -122,8 +122,8 @@ test {
     _ = allow_once;
     _ = allowlist_cmd;
     _ = @import("explain_render.zig");
-    _ = rust_legacy_stub;
-    _ = rust_visibility;
+    _ = legacy_stub;
+    _ = feed_visibility;
     _ = evaluate;
     _ = decide;
     // Door A deadlock transcript replay (decide + hook surfaces).
@@ -481,17 +481,17 @@ fn runWithCwdUsing(
 
     // Slice 1 honesty: hide-list verbs fail short (usage), not a daemon essay.
     if (std.mem.eql(u8, command, "history")) {
-        return rust_legacy_stub.unavailable("history", stderr);
+        return legacy_stub.unavailable("history", stderr);
     }
 
     // Remaining hide-list local mutators (config/rebase-recover).
     if (isDaemonLocalMutatingInvocation(command, argv[1..])) {
-        return rust_legacy_stub.unavailable(command, stderr);
+        return legacy_stub.unavailable(command, stderr);
     }
     // Former ExecuteCli proxies (simulate/classify/…) — unavailable product verbs.
     // `scan` is Zig-native (session forensics); not routed here.
     if (isDaemonProxyCommand(command)) {
-        return rust_legacy_stub.unavailable(command, stderr);
+        return legacy_stub.unavailable(command, stderr);
     }
 
     if (std.mem.eql(u8, command, "test")) return shell_test.command(io, argv[1..], stdout, stderr);

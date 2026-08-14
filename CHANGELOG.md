@@ -20,6 +20,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+* **`ryk start` no longer fails a working setup for expected host leftovers.** Claude install smoke now reads the live `permissionDecision` JSON (deny is a pass; ask is not). Cursor deferred and an unowned Pi extension are skips, not hard failures. Install/doctor hook probes pass `--probe` so they evaluate as usual but do not mint allow-once redeem codes onto the operator TTY.
+
 ### Added
 
 * **Release signing is wired but not yet active.** `keys/ryk-release-minisign.pub` ships the sentinel `RYK_RELEASE_PUBKEY_UNPROVISIONED`. Until a real key is provisioned, `scripts/install.sh` reports signing is not yet active and continues on SHA-256 only (checksum-only / fail-open). `scripts/install.ps1` is checksum-only (Windows unsigned) and does not verify `checksums.txt.minisig`. After provisioning, the POSIX installer will verify a detached minisign signature over `checksums.txt` and refuse unverifiable releases. `cut-release.sh` has a `sign` phase before `publish-git`; after a dry-run, resume from `sign`, not `publish-git`. CI backup (`release.yml`) still does not attach `checksums.txt.minisig`. See `docs/release-signing.md`.

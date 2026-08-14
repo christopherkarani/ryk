@@ -6,7 +6,7 @@ const core_api = @import("ryk_core").api;
 const brand = @import("brand.zig");
 const exit_codes = @import("exit_codes.zig");
 const help = @import("help.zig");
-const rust_visibility = @import("rust_visibility.zig");
+const rust_visibility = @import("feed_visibility.zig");
 const tui = @import("../tui/mod.zig");
 const suggestions = @import("suggestions.zig");
 

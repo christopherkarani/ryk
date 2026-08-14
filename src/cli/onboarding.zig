@@ -494,6 +494,8 @@ fn defaultHostVerifier(
     workspace_root: []const u8,
     host: []const u8,
 ) !bool {
+    // Cursor writer is W3; selection must not fail hook verification.
+    if (std.mem.eql(u8, host, "cursor")) return true;
     // Pi's extension does not route through `ryk hook`; installation completeness
     // is verified by its installer/status path instead.
     if (std.mem.eql(u8, host, "pi")) {
@@ -513,12 +515,18 @@ fn defaultHostVerifier(
 
 pub fn classifyHostEvidence(selected_hosts: []const []const u8) HostEvidence {
     if (selected_hosts.len == 0) return .not_applicable;
+    var claimable: usize = 0;
+    var saw_openclaw = false;
+    var saw_pi = false;
     for (selected_hosts) |host| {
-        if (std.mem.eql(u8, host, "openclaw")) return .wrapper_required;
+        if (std.mem.eql(u8, host, "cursor")) continue;
+        claimable += 1;
+        if (std.mem.eql(u8, host, "openclaw")) saw_openclaw = true;
+        if (std.mem.eql(u8, host, "pi")) saw_pi = true;
     }
-    for (selected_hosts) |host| {
-        if (std.mem.eql(u8, host, "pi")) return .configuration_only;
-    }
+    if (claimable == 0) return .not_applicable;
+    if (saw_openclaw) return .wrapper_required;
+    if (saw_pi) return .configuration_only;
     // Installation already validated the exact managed hook registration. The
     // direct smoke then proves that registered adapter's fail-closed contract.
     // This is strong installation-chain evidence, but intentionally not labeled
@@ -705,6 +713,8 @@ test "onboarding host evidence distinguishes installed chain from native proof" 
     try std.testing.expectEqual(HostEvidence.installed_fail_closed, classifyHostEvidence(&.{"codex"}));
     try std.testing.expectEqual(HostEvidence.configuration_only, classifyHostEvidence(&.{"pi"}));
     try std.testing.expectEqual(HostEvidence.wrapper_required, classifyHostEvidence(&.{ "codex", "openclaw" }));
+    try std.testing.expectEqual(HostEvidence.not_applicable, classifyHostEvidence(&.{"cursor"}));
+    try std.testing.expectEqual(HostEvidence.installed_fail_closed, classifyHostEvidence(&.{ "cursor", "codex" }));
 }
 
 test "onboarding checkDaemonHealth reports unavailable from mock checker" {
@@ -945,6 +955,13 @@ test "DayOneHost ensure HostWireTable membership keys onboarding isSupportedHost
     // Membership single-source remains onboarding.supported_hosts (not a second list).
     try std.testing.expect(isSupportedHost("cursor"));
     try std.testing.expect(isSupportedHost("grok"));
+}
+
+test "onboarding cursor selection does not fail hook verification" {
+    try std.testing.expectEqual(
+        true,
+        (try verifySelectedHostHooks(std.testing.io, std.testing.allocator, ".", &.{"cursor"}, null)).?,
+    );
 }
 
 test "onboarding verifies every selected host before success" {

@@ -182,7 +182,8 @@ pub fn runStart(
     } else if (protection.needsCommandGuard()) {
         const host_failures = try installSelectedHosts(io, allocator, selected_hosts.items, workspace_root, stdout, &configured_hosts);
         failures += host_failures;
-        protection_active = protection_active and host_failures == 0;
+        // Wired hosts are active even when another selected host is deferred/skipped/failed.
+        protection_active = protection_active and configured_hosts.items.len > 0;
         if (host_failures == 0) {
             try tui.render.stepLine(io, stdout, .done, "Hosts", "Integrations configured", 80);
         } else {
@@ -232,13 +233,7 @@ pub fn runStart(
     // Packs / global-verify honesty after host wire. skip_host_wire outcomes are not host
     // receipts — only surface a demotion receipt when packs or verify actually failed.
     if (ensure_outcome.core_ok) {
-        const verify_ok = if (flags.skip_verify)
-            true
-        else if (verification) |v|
-            v.passed()
-        else
-            failures == 0;
-        if (!packs_ok or !verify_ok) {
+        if (shouldReportPacksOrVerifyPartial(packs_ok, flags.skip_verify, verification)) {
             try stdout.writeAll("ryk start: protection partial — packs or shell verify incomplete.\n");
             try stdout.print("  repair: {s}\n", .{ensure.doctor_fix_hint});
         }
@@ -316,7 +311,7 @@ fn resolveSelectedHosts(
             list.deinit(allocator);
         }
         for (host_statuses) |status| {
-            if (!status.detected) continue;
+            if (!shouldAutoSelectHost(status.name, status.detected)) continue;
             try list.append(allocator, try allocator.dupe(u8, status.name));
         }
         return .{ .items = try list.toOwnedSlice(allocator), .owned = true };
@@ -343,7 +338,7 @@ fn resolveSelectedHosts(
         const label = std.fmt.bufPrint(&label_buf, "{s}{s}", .{ status.name, marker }) catch status.name;
         options[visible_idx] = .{
             .label = try allocator.dupe(u8, label),
-            .checked = true,
+            .checked = !std.mem.eql(u8, status.name, "cursor"),
             .id = try allocator.dupe(u8, status.name),
         };
         visible_idx += 1;
@@ -391,7 +386,8 @@ fn installSelectedHosts(
     for (hosts) |host_name| {
         try stdout.print("  → {s}: ", .{host_name});
         // Shared monopath with ensure.installOneHost — no dual timeout/verify drift.
-        switch (ensure.installOneHost(io, allocator, host_name, home, self_exe, workspace_root)) {
+        const result = ensure.installOneHost(io, allocator, host_name, home, self_exe, workspace_root);
+        switch (result) {
             .installed => {
                 if (std.mem.eql(u8, host_name, "pi")) {
                     try stdout.writeAll("installed (bundled extension)\n");
@@ -412,27 +408,24 @@ fn installSelectedHosts(
             },
             .assets_unavailable => {
                 try stdout.print("failed ({s})\n", .{ensure.dayOneInstallFailureReason(.assets_unavailable)});
-                failures += 1;
             },
             .timed_out => {
                 try stdout.print("failed ({s})\n", .{ensure.dayOneInstallFailureReason(.timed_out)});
-                failures += 1;
             },
             .enable_failed => {
                 try stdout.print("failed ({s})\n", .{ensure.dayOneInstallFailureReason(.enable_failed)});
-                failures += 1;
             },
             .trusted_binary_missing => {
                 try stdout.print("failed ({s})\n", .{ensure.dayOneInstallFailureReason(.trusted_binary_missing)});
-                failures += 1;
             },
             .workspace_bind_failed => {
                 try stdout.print("failed ({s})\n", .{ensure.dayOneInstallFailureReason(.workspace_bind_failed)});
-                failures += 1;
             },
             .deferred => {
                 try stdout.writeAll("deferred (Cursor writer ships in W3; ryk doctor --fix)\n");
-                failures += 1;
+            },
+            .skipped_unowned => {
+                try stdout.writeAll("skipped (unowned Pi extension present)\n");
             },
             .failed => {
                 const reason = ensure.dayOneInstallFailureReason(.failed);
@@ -441,9 +434,9 @@ fn installSelectedHosts(
                 } else {
                     try stdout.writeAll("failed\n");
                 }
-                failures += 1;
             },
         }
+        if (hostInstallCountsAsFailure(result)) failures += 1;
     }
     return failures;
 }
@@ -672,6 +665,30 @@ fn hostInList(name: []const u8, list: []const []const u8) bool {
     for (list) |item| {
         if (std.mem.eql(u8, item, name)) return true;
     }
+    return false;
+}
+
+/// Cursor is detect-only until W3; do not auto-wire a host we cannot install.
+fn shouldAutoSelectHost(name: []const u8, detected: bool) bool {
+    return detected and !std.mem.eql(u8, name, "cursor");
+}
+
+fn hostInstallCountsAsFailure(result: ensure.DayOneInstallResult) bool {
+    return switch (result) {
+        .installed, .upgraded, .already_installed, .deferred, .skipped_unowned => false,
+        .assets_unavailable, .timed_out, .enable_failed, .trusted_binary_missing, .workspace_bind_failed, .failed => true,
+    };
+}
+
+/// Only blame packs/verify when those steps actually ran and failed.
+fn shouldReportPacksOrVerifyPartial(
+    packs_ok: bool,
+    skip_verify: bool,
+    verification: ?onboarding.VerificationOutcome,
+) bool {
+    if (!packs_ok) return true;
+    if (skip_verify) return false;
+    if (verification) |v| return !v.passed();
     return false;
 }
 
@@ -1141,6 +1158,40 @@ test "start with existing observe policy does not claim Ask protection" {
     const policy = try tmp.dir.readFileAlloc(std.testing.io, ".ryk/policy.yaml", std.testing.allocator, .limited(4096));
     defer std.testing.allocator.free(policy);
     try std.testing.expect(std.mem.indexOf(u8, policy, "mode: observe") != null);
+}
+
+test "start treats cursor deferred and unowned Pi as non-failures" {
+    try std.testing.expect(!hostInstallCountsAsFailure(.installed));
+    try std.testing.expect(!hostInstallCountsAsFailure(.upgraded));
+    try std.testing.expect(!hostInstallCountsAsFailure(.already_installed));
+    try std.testing.expect(!hostInstallCountsAsFailure(.deferred));
+    try std.testing.expect(!hostInstallCountsAsFailure(.skipped_unowned));
+    try std.testing.expect(hostInstallCountsAsFailure(.failed));
+    try std.testing.expect(hostInstallCountsAsFailure(.timed_out));
+}
+
+test "start auto-select skips detect-only cursor" {
+    try std.testing.expect(shouldAutoSelectHost("claude", true));
+    try std.testing.expect(!shouldAutoSelectHost("cursor", true));
+    try std.testing.expect(!shouldAutoSelectHost("claude", false));
+}
+
+test "start packs-or-verify receipt only when those steps actually failed" {
+    const failed_verify = onboarding.VerificationOutcome{
+        .safe_allowed = false,
+        .dangerous_denied = true,
+        .detail = "failed",
+    };
+    const passed_verify = onboarding.VerificationOutcome{
+        .safe_allowed = true,
+        .dangerous_denied = true,
+        .detail = "ok",
+    };
+    try std.testing.expect(shouldReportPacksOrVerifyPartial(false, false, passed_verify));
+    try std.testing.expect(shouldReportPacksOrVerifyPartial(true, false, failed_verify));
+    try std.testing.expect(!shouldReportPacksOrVerifyPartial(true, false, passed_verify));
+    try std.testing.expect(!shouldReportPacksOrVerifyPartial(true, true, null));
+    try std.testing.expect(!shouldReportPacksOrVerifyPartial(true, false, null));
 }
 
 test "policyModeIsAskEquivalent covers ask/enforce not observe/trusted" {

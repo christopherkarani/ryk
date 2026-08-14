@@ -1,8 +1,6 @@
 //! PCRE2 bindings for shell pack pattern matching.
 const std = @import("std");
-const c = @cImport({
-    @cInclude("pcre2_shim.h");
-});
+const c = @import("pcre2_shim");
 
 pub const Regex = struct {
     ptr: *c.ryk_regex,

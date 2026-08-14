@@ -10,12 +10,13 @@ const help = @import("help.zig");
 const daemon = @import("daemon.zig");
 const shell_eval = @import("shell_eval.zig");
 const shell_engine = @import("../shell_engine/mod.zig");
-const rust_visibility = @import("rust_visibility.zig");
+const rust_visibility = @import("feed_visibility.zig");
 const feed_writer = @import("feed_writer.zig");
 const telemetry = @import("../telemetry.zig");
 const file_policy_path = @import("file_policy_path.zig");
 const fm_steward_client = @import("fm_steward_client.zig");
 const grok_deny_reason = @import("grok_deny_reason.zig");
+const hook_grok = @import("hook_grok.zig");
 
 // Maximum JSON payload size to prevent memory exhaustion from hostile hosts.
 const max_payload_len = 256 * 1024; // 256 KiB
@@ -140,75 +141,6 @@ const Event = enum {
     }
 };
 
-const GrokHookPayloadError = error{
-    InvalidGrokHookPayload,
-    GrokHookEventMismatch,
-    UnsupportedGrokPreToolUse,
-};
-
-/// Validate Grok's raw hook object and return it as the host-adapter payload.
-///
-/// Official Grok Build (xai-org/grok-build) serializes the envelope in camelCase
-/// (`hookEventName`, `toolName`, `toolInput`, `sessionId`) with snake_case event
-/// values (`pre_tool_use`). Claude-compat snake_case keys and PascalCase event
-/// names are also accepted so legacy fixtures and dual-format hosts keep working.
-fn grokHookPayload(value: std.json.Value, event: Event) GrokHookPayloadError!std.json.Value {
-    if (value != .object) return error.InvalidGrokHookPayload;
-
-    const hook_event_name = extractGrokEventName(value) orelse return error.InvalidGrokHookPayload;
-    if (!grokEventNameMatches(hook_event_name, event)) return error.GrokHookEventMismatch;
-
-    if (event == .PreToolUse) {
-        const cwd = extractString(value, "cwd") orelse return error.InvalidGrokHookPayload;
-        const tool_name = extractGrokToolName(value) orelse return error.InvalidGrokHookPayload;
-        const tool_input = extractGrokToolInput(value) orelse return error.InvalidGrokHookPayload;
-        if (std.mem.trim(u8, cwd, " \t\r\n").len == 0 or
-            std.mem.trim(u8, tool_name, " \t\r\n").len == 0 or
-            tool_input != .object)
-        {
-            return error.InvalidGrokHookPayload;
-        }
-        // Phase 3: shell or file-read tools only. Unknown tools stay unsupported.
-        if (!isShellTool(tool_name) and !isFileReadTool(tool_name)) return error.UnsupportedGrokPreToolUse;
-    }
-
-    return value;
-}
-
-fn extractGrokEventName(value: std.json.Value) ?[]const u8 {
-    return extractString(value, "hook_event_name") orelse
-        extractString(value, "hookEventName");
-}
-
-fn extractGrokToolName(value: std.json.Value) ?[]const u8 {
-    return extractString(value, "tool_name") orelse
-        extractString(value, "toolName");
-}
-
-fn extractGrokToolInput(value: std.json.Value) ?std.json.Value {
-    if (value != .object) return null;
-    if (value.object.get("tool_input")) |v| return v;
-    if (value.object.get("toolInput")) |v| return v;
-    return null;
-}
-
-/// Accept PascalCase (`PreToolUse`), snake_case (`pre_tool_use`), and camelCase
-/// (`preToolUse`) spellings that official Grok Build and Claude-compat sources emit.
-fn grokEventNameMatches(name: []const u8, event: Event) bool {
-    if (std.mem.eql(u8, name, @tagName(event))) return true;
-    return switch (event) {
-        .SessionStart => std.mem.eql(u8, name, "session_start") or std.mem.eql(u8, name, "sessionStart"),
-        .UserPromptSubmit => std.mem.eql(u8, name, "user_prompt_submit") or std.mem.eql(u8, name, "userPromptSubmit") or std.mem.eql(u8, name, "beforeSubmitPrompt"),
-        .PreToolUse => std.mem.eql(u8, name, "pre_tool_use") or std.mem.eql(u8, name, "preToolUse") or
-            std.mem.eql(u8, name, "beforeShellExecution") or std.mem.eql(u8, name, "beforeMCPExecution") or std.mem.eql(u8, name, "beforeReadFile"),
-        .PermissionRequest => std.mem.eql(u8, name, "permission_request") or std.mem.eql(u8, name, "permissionRequest"),
-        .PostToolUse => std.mem.eql(u8, name, "post_tool_use") or std.mem.eql(u8, name, "postToolUse") or
-            std.mem.eql(u8, name, "afterShellExecution") or std.mem.eql(u8, name, "afterMCPExecution") or std.mem.eql(u8, name, "afterFileEdit"),
-        .Stop => std.mem.eql(u8, name, "stop"),
-        .SessionEnd => std.mem.eql(u8, name, "session_end") or std.mem.eql(u8, name, "sessionEnd"),
-    };
-}
-
 // OpenCode uses dot-separated event names. Map them to internal events.
 // Some OpenCode events are purely informational and do not have a matching
 // internal evaluation path; those are handled as informational in hookCommand.
@@ -279,8 +211,14 @@ fn isHermesInformationalEvent(event_name: []const u8) bool {
 // Hook command
 // ---------------------------------------------------------------------------
 
+/// When true, skip allow-once pending issuance (internal smoke/probe only).
+/// Product host hook configs must not pass `--probe` — that would mute operator codes.
+var hook_probe_mode: bool = false;
+
 fn hookCommand(io: std.Io, host: Host, event: Event, original_event_name: []const u8, argv: []const []const u8, stdout: anytype, stderr: anytype) !u8 {
     var ci_mode = false;
+    hook_probe_mode = false;
+    defer hook_probe_mode = false;
 
     for (argv) |arg| {
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
@@ -329,12 +267,17 @@ fn hookCommand(io: std.Io, host: Host, event: Event, original_event_name: []cons
                 \\
                 \\Options:
                 \\  --ci     CI mode: ask decisions become block.
+                \\  --probe  Internal smoke only: evaluate as usual, do not mint allow-once codes.
                 \\
             );
             return exit_codes.success;
         }
         if (std.mem.eql(u8, arg, "--ci")) {
             ci_mode = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--probe")) {
+            hook_probe_mode = true;
             continue;
         }
         try stderr.print("ryk hook: unknown option '{s}'.\n", .{arg});
@@ -409,7 +352,7 @@ fn hookCommand(io: std.Io, host: Host, event: Event, original_event_name: []cons
     // Grok sends its Claude-compatible event object directly on stdin. Other
     // integrations use ryk's versioned host/event/payload envelope.
     const raw_grok_payload: ?std.json.Value = if (host == .grok)
-        grokHookPayload(parsed.value, event) catch |err| {
+        hook_grok.grokHookPayload(parsed.value, @tagName(event)) catch |err| {
             return try emitPreEvalFailClosed(
                 allocator,
                 host,
@@ -471,7 +414,7 @@ fn hookCommand(io: std.Io, host: Host, event: Event, original_event_name: []cons
     // Validate event matches (for OpenCode/OpenClaw, compare against original event name).
     // Grok event names are already validated in grokHookPayload (camelCase + aliases).
     const request_event = if (host == .grok)
-        extractGrokEventName(parsed.value) orelse ""
+        hook_grok.extractGrokEventName(parsed.value) orelse ""
     else
         extractString(parsed.value, "event") orelse "";
     if (host != .grok) {
@@ -1817,11 +1760,11 @@ fn buildRemediationCommands(allocator: std.mem.Allocator, rule_id: ?[]const u8) 
 fn resolveRykDataDirForPending(allocator: std.mem.Allocator) !?[]u8 {
     if (std.c.getenv("XDG_DATA_HOME")) |xdg_z| {
         const xdg = std.mem.span(xdg_z);
-        if (xdg.len > 0) return try std.fs.path.join(allocator, &.{ xdg, "ryk"});
+        if (xdg.len > 0) return try std.fs.path.join(allocator, &.{ xdg, "ryk" });
     }
     if (std.c.getenv("HOME")) |home_z| {
         const home = std.mem.span(home_z);
-        if (home.len > 0) return try std.fs.path.join(allocator, &.{ home, ".local", "share", "ryk"});
+        if (home.len > 0) return try std.fs.path.join(allocator, &.{ home, ".local", "share", "ryk" });
     }
     return null;
 }
@@ -1894,6 +1837,8 @@ fn tryIssuePendingShortCode(
     workspace_root: ?[]const u8,
     reason: []const u8,
 ) void {
+    // Start / plugin-install / doctor smoke must not mint operator redeem codes.
+    if (hook_probe_mode) return;
     const data_dir = resolveRykDataDirForPending(allocator) catch return;
     const data_dir_owned = data_dir orelse return;
     defer allocator.free(data_dir_owned);
@@ -2869,7 +2814,7 @@ test "hook adapts raw Grok PreToolUse input to the Claude-compatible payload" {
     );
     defer parsed.deinit();
 
-    const payload = try grokHookPayload(parsed.value, .PreToolUse);
+    const payload = try hook_grok.grokHookPayload(parsed.value, @tagName(Event.PreToolUse));
     try std.testing.expectEqualStrings("bash", extractToolName(payload).?);
     try std.testing.expectEqualStrings("git status", extractShellCommand(payload).found.command);
     try std.testing.expectEqualStrings("/tmp/project", extractCwd(payload).?);
@@ -2889,7 +2834,7 @@ test "hook accepts official Grok Build camelCase PreToolUse envelope" {
     );
     defer parsed.deinit();
 
-    const payload = try grokHookPayload(parsed.value, .PreToolUse);
+    const payload = try hook_grok.grokHookPayload(parsed.value, @tagName(Event.PreToolUse));
     try std.testing.expectEqualStrings("run_terminal_cmd", extractToolName(payload).?);
     try std.testing.expectEqualStrings("git status", extractShellCommand(payload).found.command);
     try std.testing.expectEqualStrings("/tmp/project", extractCwd(payload).?);
@@ -2906,7 +2851,7 @@ test "hook rejects malformed or mismatched raw Grok PreToolUse input" {
         .{},
     );
     defer missing_tool_input.deinit();
-    try std.testing.expectError(error.InvalidGrokHookPayload, grokHookPayload(missing_tool_input.value, .PreToolUse));
+    try std.testing.expectError(error.InvalidGrokHookPayload, hook_grok.grokHookPayload(missing_tool_input.value, @tagName(Event.PreToolUse)));
 
     var wrong_event = try std.json.parseFromSlice(
         std.json.Value,
@@ -2916,7 +2861,7 @@ test "hook rejects malformed or mismatched raw Grok PreToolUse input" {
         .{},
     );
     defer wrong_event.deinit();
-    try std.testing.expectError(error.GrokHookEventMismatch, grokHookPayload(wrong_event.value, .PreToolUse));
+    try std.testing.expectError(error.GrokHookEventMismatch, hook_grok.grokHookPayload(wrong_event.value, @tagName(Event.PreToolUse)));
 
     var unsupported_tool = try std.json.parseFromSlice(
         std.json.Value,
@@ -2926,7 +2871,7 @@ test "hook rejects malformed or mismatched raw Grok PreToolUse input" {
         .{},
     );
     defer unsupported_tool.deinit();
-    try std.testing.expectError(error.UnsupportedGrokPreToolUse, grokHookPayload(unsupported_tool.value, .PreToolUse));
+    try std.testing.expectError(error.UnsupportedGrokPreToolUse, hook_grok.grokHookPayload(unsupported_tool.value, @tagName(Event.PreToolUse)));
 }
 
 test "hook Grok PreToolUse accepts read_file and Read with path" {
@@ -2939,7 +2884,7 @@ test "hook Grok PreToolUse accepts read_file and Read with path" {
         .{},
     );
     defer read_file_payload.deinit();
-    _ = try grokHookPayload(read_file_payload.value, .PreToolUse);
+    _ = try hook_grok.grokHookPayload(read_file_payload.value, @tagName(Event.PreToolUse));
 
     var read_alias = try std.json.parseFromSlice(
         std.json.Value,
@@ -2949,7 +2894,7 @@ test "hook Grok PreToolUse accepts read_file and Read with path" {
         .{},
     );
     defer read_alias.deinit();
-    _ = try grokHookPayload(read_alias.value, .PreToolUse);
+    _ = try hook_grok.grokHookPayload(read_alias.value, @tagName(Event.PreToolUse));
 }
 
 test "hook Grok PreToolUse rejects web_search as unsupported" {
@@ -2962,7 +2907,7 @@ test "hook Grok PreToolUse rejects web_search as unsupported" {
         .{},
     );
     defer web_search.deinit();
-    try std.testing.expectError(error.UnsupportedGrokPreToolUse, grokHookPayload(web_search.value, .PreToolUse));
+    try std.testing.expectError(error.UnsupportedGrokPreToolUse, hook_grok.grokHookPayload(web_search.value, @tagName(Event.PreToolUse)));
 }
 
 test "hook extractFilePath finds camelCase toolInput.target_file and snake file_path" {
@@ -5189,6 +5134,16 @@ test "hook PreToolUse denies notify with structural to+body under effects.deny" 
     try std.testing.expectEqual(PluginDecision.allow, bare_result.decision);
 }
 
+test "hook --probe skips allow-once pending issuance" {
+    hook_probe_mode = true;
+    defer hook_probe_mode = false;
+    var sink = TestRedeemSink{};
+    test_operator_redeem_sink = &sink;
+    defer test_operator_redeem_sink = null;
+    tryIssuePendingShortCode(std.testing.allocator, "rm -rf /", "/tmp", "/tmp", "probe");
+    try std.testing.expectEqual(@as(usize, 0), sink.len);
+}
+
 // ---------------------------------------------------------------------------
 // s-once-cli — pack deny issues pending short code (when store enabled)
 // M-1: pending is issued for the operator path, but redeemable digits must never
@@ -5201,6 +5156,7 @@ test {
     _ = @import("allow_once.zig");
     // Nested module: Zig 0.16 monopath does not auto-attach transitive import tests.
     _ = grok_deny_reason;
+    _ = hook_grok;
 }
 
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;

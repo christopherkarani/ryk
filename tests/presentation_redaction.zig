@@ -4,7 +4,7 @@ const ryk = @import("ryk");
 const core_api = ryk.core_api;
 const presentation = ryk.presentation;
 const report = ryk.report;
-const rust_visibility = ryk.cli.rust_visibility;
+const rust_visibility = ryk.cli.feed_visibility;
 
 test "zh2 cross-sink matrix redacts shared synthetic token from report and feed" {
     const allocator = std.testing.allocator;

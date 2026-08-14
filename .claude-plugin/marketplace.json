@@ -1,0 +1,16 @@
+{
+  "name": "ryk-local-plugins",
+  "version": "1.0.0",
+  "description": "Local ryk plugins for Claude Code.",
+  "owner": {
+    "name": "ryk"
+  },
+  "plugins": [
+    {
+      "name": "ryk",
+      "description": "ryk safety hooks and skills for Claude Code.",
+      "source": "../.claude/plugins/ryk",
+      "category": "developer-tools"
+    }
+  ]
+}

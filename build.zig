@@ -27,6 +27,16 @@ fn addPcre2Shim(
     });
     mod.addCSourceFile(.{ .file = b.path("src/shell_engine/windows_acl.c"), .flags = &.{} });
     if (target.result.os.tag == .windows) mod.linkSystemLibrary("advapi32", .{});
+    // Decls only from the opaque shim header. Do not translate pcre2.h / pcre2_shim.c
+    // and do not addCSourceFile on this translate-c module (that would duplicate
+    // _ryk_regex_* when the consumer module already compiles pcre2_shim.c).
+    const translate = b.addTranslateC(.{
+        .root_source_file = b.path("src/shell_engine/pcre2_shim.h"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    mod.addImport("pcre2_shim", translate.createModule());
 }
 
 fn addRunTestTerminal(b: *std.Build, exe: *std.Build.Step.Compile) *std.Build.Step.Run {
