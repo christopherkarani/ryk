@@ -798,6 +798,8 @@ pub const DayOneInstallResult = enum {
     workspace_bind_failed,
     failed,
     deferred,
+    /// Existing Pi extension is not ryk-managed; refuse overwrite (not a hard fail).
+    skipped_unowned,
 };
 
 /// Day-one plugin install wall budget (ms). OpenClaw host install routinely
@@ -852,6 +854,7 @@ pub fn dayOneInstallFailureReason(result: DayOneInstallResult) []const u8 {
         .workspace_bind_failed => "workspace policy bind failed",
         .failed => "install failed",
         .deferred => "deferred",
+        .skipped_unowned => "refusing to overwrite unowned Pi extension",
         .installed, .upgraded, .already_installed => "",
     };
 }
@@ -869,6 +872,7 @@ pub fn dayOneWireFixHint(result: DayOneInstallResult) []const u8 {
         .workspace_bind_failed => "workspace policy bind failed — check cwd and .ryk/policy.yaml (or ryk doctor --fix)",
         .failed => "install failed — ryk plugin doctor <host> for detail (or ryk doctor --fix)",
         .deferred => "Cursor auto-wire deferred to W3 — ryk doctor --fix",
+        .skipped_unowned => "unowned Pi extension present — back it up and re-run ryk doctor --fix to install the bundled extension",
     };
 }
 
@@ -888,6 +892,7 @@ pub fn installOneHost(
         .installed, .upgraded, .already_installed => "success",
         .assets_unavailable, .timed_out, .enable_failed, .trusted_binary_missing, .workspace_bind_failed, .failed => "failure",
         .deferred => "deferred",
+        .skipped_unowned => "skipped",
     });
     return result;
 }
@@ -915,7 +920,10 @@ fn installOneHostInner(
                 error.IncompleteInstall => "Pi extension install incomplete",
                 else => "Pi extension install failed",
             });
-            return .failed;
+            return switch (err) {
+                error.RefusingToOverwriteUnownedFile => .skipped_unowned,
+                else => .failed,
+            };
         };
         return switch (result) {
             .installed => .installed,
@@ -1169,7 +1177,7 @@ fn attemptHostInstall(
 fn dayOneResultIsWired(result: DayOneInstallResult) bool {
     return switch (result) {
         .installed, .upgraded, .already_installed => true,
-        .assets_unavailable, .timed_out, .enable_failed, .trusted_binary_missing, .workspace_bind_failed, .failed, .deferred => false,
+        .assets_unavailable, .timed_out, .enable_failed, .trusted_binary_missing, .workspace_bind_failed, .failed, .deferred, .skipped_unowned => false,
     };
 }
 
@@ -3035,6 +3043,36 @@ test "day-one install failure reasons surface timeout assets and enable classes"
     try std.testing.expectEqualStrings(
         "enable: failed (hermes exit code: 1)",
         dayOneInstallFailureReason(.enable_failed),
+    );
+    clearInstallDetail();
+    try std.testing.expectEqualStrings(
+        "refusing to overwrite unowned Pi extension",
+        dayOneInstallFailureReason(.skipped_unowned),
+    );
+    try std.testing.expect(!dayOneResultIsWired(.skipped_unowned));
+    try std.testing.expect(std.mem.indexOf(u8, dayOneWireFixHint(.skipped_unowned), "unowned") != null);
+}
+
+test "day-one installOneHost maps cursor to deferred and unowned Pi to skipped" {
+    try std.testing.expectEqual(
+        DayOneInstallResult.deferred,
+        installOneHost(std.testing.io, std.testing.allocator, "cursor", "/tmp", "/opt/ryk/bin/ryk", "/tmp"),
+    );
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, pi_install.relative_install_dir);
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = pi_install.relative_install_dir ++ "/index.ts",
+        .data = "user extension\n",
+    });
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(home);
+    const workspace = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(workspace);
+    try std.testing.expectEqual(
+        DayOneInstallResult.skipped_unowned,
+        installOneHost(std.testing.io, std.testing.allocator, "pi", home, "/opt/ryk/bin/ryk", workspace),
     );
 }
 

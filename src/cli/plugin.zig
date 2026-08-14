@@ -3225,7 +3225,7 @@ pub fn smokeTestHook(allocator: std.mem.Allocator, host: []const u8, event: []co
     const io = threaded.io();
     const self_exe = try std.process.executablePathAlloc(io, allocator);
     defer allocator.free(self_exe);
-    const argv = &[_][]const u8{ self_exe, "hook", host, event };
+    const argv = host_status.hookSmokeArgv(self_exe, host, event);
 
     // This is an internal health probe, not a user hook invocation. Keep its
     // child process out of product telemetry so machine-readable doctor runs
@@ -3248,7 +3248,7 @@ pub fn smokeTestHook(allocator: std.mem.Allocator, host: []const u8, event: []co
     defer allocator.free(fixture);
     const result = try child_process.runHostCommandInputCaptureTimed(
         allocator,
-        argv,
+        &argv,
         fixture,
         10_000,
     );

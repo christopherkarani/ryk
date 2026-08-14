@@ -279,8 +279,14 @@ fn isHermesInformationalEvent(event_name: []const u8) bool {
 // Hook command
 // ---------------------------------------------------------------------------
 
+/// When true, skip allow-once pending issuance (internal smoke/probe only).
+/// Product host hook configs must not pass `--probe` — that would mute operator codes.
+var hook_probe_mode: bool = false;
+
 fn hookCommand(io: std.Io, host: Host, event: Event, original_event_name: []const u8, argv: []const []const u8, stdout: anytype, stderr: anytype) !u8 {
     var ci_mode = false;
+    hook_probe_mode = false;
+    defer hook_probe_mode = false;
 
     for (argv) |arg| {
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
@@ -335,6 +341,10 @@ fn hookCommand(io: std.Io, host: Host, event: Event, original_event_name: []cons
         }
         if (std.mem.eql(u8, arg, "--ci")) {
             ci_mode = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--probe")) {
+            hook_probe_mode = true;
             continue;
         }
         try stderr.print("ryk hook: unknown option '{s}'.\n", .{arg});
@@ -1894,6 +1904,8 @@ fn tryIssuePendingShortCode(
     workspace_root: ?[]const u8,
     reason: []const u8,
 ) void {
+    // Start / plugin-install / doctor smoke must not mint operator redeem codes.
+    if (hook_probe_mode) return;
     const data_dir = resolveRykDataDirForPending(allocator) catch return;
     const data_dir_owned = data_dir orelse return;
     defer allocator.free(data_dir_owned);
@@ -5194,6 +5206,26 @@ test "hook PreToolUse denies notify with structural to+body under effects.deny" 
 // M-1: pending is issued for the operator path, but redeemable digits must never
 // appear in agent-visible message / remediation / codex guard / human panel JSON.
 // ---------------------------------------------------------------------------
+
+test "hook help does not advertise internal --probe" {
+    var stdout_buf: [4096]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_buf: [256]u8 = undefined;
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+    const code = try command(std.testing.io, &.{ "claude", "PreToolUse", "--help" }, &stdout_writer, &stderr_writer);
+    try std.testing.expectEqual(exit_codes.success, code);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "--probe") == null);
+}
+
+test "hook --probe skips allow-once pending issuance" {
+    hook_probe_mode = true;
+    defer hook_probe_mode = false;
+    var sink = TestRedeemSink{};
+    test_operator_redeem_sink = &sink;
+    defer test_operator_redeem_sink = null;
+    tryIssuePendingShortCode(std.testing.allocator, "rm -rf /", "/tmp", "/tmp", "probe");
+    try std.testing.expectEqual(@as(usize, 0), sink.len);
+}
 
 test {
     // Pull allow-once CLI module tests into the lib monopath without touching mod.zig

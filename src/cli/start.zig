@@ -182,9 +182,14 @@ pub fn runStart(
     } else if (protection.needsCommandGuard()) {
         const host_failures = try installSelectedHosts(io, allocator, selected_hosts.items, workspace_root, stdout, &configured_hosts);
         failures += host_failures;
-        protection_active = protection_active and host_failures == 0;
+        // Wired hosts are active even when another selected host is deferred/skipped/failed.
+        protection_active = protection_active and configured_hosts.items.len > 0;
         if (host_failures == 0) {
-            try tui.render.stepLine(io, stdout, .done, "Hosts", "Integrations configured", 80);
+            const host_step = if (configured_hosts.items.len > 0)
+                "Integrations configured"
+            else
+                "No hosts wired (deferred or skipped)";
+            try tui.render.stepLine(io, stdout, .done, "Hosts", host_step, 80);
         } else {
             try tui.render.stepLine(io, stdout, .failed, "Hosts", "Integration failed. Run `ryk plugin doctor`", 80);
         }
@@ -232,13 +237,7 @@ pub fn runStart(
     // Packs / global-verify honesty after host wire. skip_host_wire outcomes are not host
     // receipts — only surface a demotion receipt when packs or verify actually failed.
     if (ensure_outcome.core_ok) {
-        const verify_ok = if (flags.skip_verify)
-            true
-        else if (verification) |v|
-            v.passed()
-        else
-            failures == 0;
-        if (!packs_ok or !verify_ok) {
+        if (shouldReportPacksOrVerifyPartial(packs_ok, flags.skip_verify, verification)) {
             try stdout.writeAll("ryk start: protection partial — packs or shell verify incomplete.\n");
             try stdout.print("  repair: {s}\n", .{ensure.doctor_fix_hint});
         }
@@ -316,7 +315,7 @@ fn resolveSelectedHosts(
             list.deinit(allocator);
         }
         for (host_statuses) |status| {
-            if (!status.detected) continue;
+            if (!shouldAutoSelectHost(status.name, status.detected)) continue;
             try list.append(allocator, try allocator.dupe(u8, status.name));
         }
         return .{ .items = try list.toOwnedSlice(allocator), .owned = true };
@@ -343,7 +342,7 @@ fn resolveSelectedHosts(
         const label = std.fmt.bufPrint(&label_buf, "{s}{s}", .{ status.name, marker }) catch status.name;
         options[visible_idx] = .{
             .label = try allocator.dupe(u8, label),
-            .checked = true,
+            .checked = !std.mem.eql(u8, status.name, "cursor"),
             .id = try allocator.dupe(u8, status.name),
         };
         visible_idx += 1;
@@ -391,7 +390,8 @@ fn installSelectedHosts(
     for (hosts) |host_name| {
         try stdout.print("  → {s}: ", .{host_name});
         // Shared monopath with ensure.installOneHost — no dual timeout/verify drift.
-        switch (ensure.installOneHost(io, allocator, host_name, home, self_exe, workspace_root)) {
+        const result = ensure.installOneHost(io, allocator, host_name, home, self_exe, workspace_root);
+        switch (result) {
             .installed => {
                 if (std.mem.eql(u8, host_name, "pi")) {
                     try stdout.writeAll("installed (bundled extension)\n");
@@ -412,27 +412,24 @@ fn installSelectedHosts(
             },
             .assets_unavailable => {
                 try stdout.print("failed ({s})\n", .{ensure.dayOneInstallFailureReason(.assets_unavailable)});
-                failures += 1;
             },
             .timed_out => {
                 try stdout.print("failed ({s})\n", .{ensure.dayOneInstallFailureReason(.timed_out)});
-                failures += 1;
             },
             .enable_failed => {
                 try stdout.print("failed ({s})\n", .{ensure.dayOneInstallFailureReason(.enable_failed)});
-                failures += 1;
             },
             .trusted_binary_missing => {
                 try stdout.print("failed ({s})\n", .{ensure.dayOneInstallFailureReason(.trusted_binary_missing)});
-                failures += 1;
             },
             .workspace_bind_failed => {
                 try stdout.print("failed ({s})\n", .{ensure.dayOneInstallFailureReason(.workspace_bind_failed)});
-                failures += 1;
             },
             .deferred => {
                 try stdout.writeAll("deferred (Cursor writer ships in W3; ryk doctor --fix)\n");
-                failures += 1;
+            },
+            .skipped_unowned => {
+                try stdout.writeAll("skipped (unowned Pi extension present)\n");
             },
             .failed => {
                 const reason = ensure.dayOneInstallFailureReason(.failed);
@@ -441,9 +438,9 @@ fn installSelectedHosts(
                 } else {
                     try stdout.writeAll("failed\n");
                 }
-                failures += 1;
             },
         }
+        if (hostInstallCountsAsFailure(result)) failures += 1;
     }
     return failures;
 }
@@ -522,7 +519,8 @@ fn writeSuccessEndCard(
         // Grade honesty (P1-4): setup verifies hook/wrapper integration only.
         // No OS sandbox is attached until a session launches via `ryk <host>`;
         // say what was verified and where the live session grade is reported.
-        const hosts_label = try std.mem.join(allocator, ", ", selected_hosts);
+        const claim_hosts = if (configured_hosts.len > 0) configured_hosts else selected_hosts;
+        const hosts_label = try std.mem.join(allocator, ", ", claim_hosts);
         defer allocator.free(hosts_label);
         if (protection.needsCommandGuard()) {
             const title = try std.fmt.allocPrint(allocator, "Setup complete — hooks verified for {s}", .{hosts_label});
@@ -580,6 +578,8 @@ fn writeSuccessEndCard(
     const verify_line: []const u8 = if (verification) |v|
         if (!v.passed())
             "failed"
+        else if (v.host_evidence == .not_applicable and selected_hosts.len > 0)
+            v.host_evidence.label()
         else if (v.host_evidence == .native or v.host_evidence == .not_applicable)
             "passed"
         else
@@ -622,7 +622,7 @@ fn writeSuccessEndCard(
         for (selected_hosts) |host| {
             const ok = hostInList(host, configured_hosts);
             const mark: []const u8 = if (!ok)
-                "failed"
+                leftoverHostMark(host)
             else if (unattended)
                 "configured; run ryk agents health --json"
             else if (std.mem.eql(u8, host, "openclaw"))
@@ -672,6 +672,36 @@ fn hostInList(name: []const u8, list: []const []const u8) bool {
     for (list) |item| {
         if (std.mem.eql(u8, item, name)) return true;
     }
+    return false;
+}
+
+fn leftoverHostMark(host: []const u8) []const u8 {
+    if (std.mem.eql(u8, host, "cursor")) return "deferred (W3)";
+    if (std.mem.eql(u8, host, "pi")) return "skipped (unowned)";
+    return "failed";
+}
+
+/// Cursor is detect-only until W3; do not auto-wire a host we cannot install.
+fn shouldAutoSelectHost(name: []const u8, detected: bool) bool {
+    return detected and !std.mem.eql(u8, name, "cursor");
+}
+
+fn hostInstallCountsAsFailure(result: ensure.DayOneInstallResult) bool {
+    return switch (result) {
+        .installed, .upgraded, .already_installed, .deferred, .skipped_unowned => false,
+        .assets_unavailable, .timed_out, .enable_failed, .trusted_binary_missing, .workspace_bind_failed, .failed => true,
+    };
+}
+
+/// Only blame packs/verify when those steps actually ran and failed.
+fn shouldReportPacksOrVerifyPartial(
+    packs_ok: bool,
+    skip_verify: bool,
+    verification: ?onboarding.VerificationOutcome,
+) bool {
+    if (!packs_ok) return true;
+    if (skip_verify) return false;
+    if (verification) |v| return !v.passed();
     return false;
 }
 
@@ -1018,7 +1048,88 @@ test "start unattended completion never claims active protection before health" 
     try std.testing.expect(std.mem.indexOf(u8, written, "ryk agents health --json") != null);
 }
 
-test "start reports failure when daemon required but unavailable" {
+test "start leftover host marks do not label Pi skip as failed" {
+    try std.testing.expectEqualStrings("deferred (W3)", leftoverHostMark("cursor"));
+    try std.testing.expectEqualStrings("skipped (unowned)", leftoverHostMark("pi"));
+    try std.testing.expectEqualStrings("failed", leftoverHostMark("claude"));
+}
+
+test "start success card does not claim cursor hooks or failed Pi skip" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+
+    const verification = onboarding.VerificationOutcome{
+        .safe_allowed = true,
+        .dangerous_denied = true,
+        .hook_verified = true,
+        .host_evidence = .installed_fail_closed,
+        .detail = "installed",
+    };
+    const daemon_check = onboarding.DaemonCheck{
+        .status = .compatible,
+        .detail = "in-process",
+        .remediation = "none",
+    };
+    var output_buffer: [16 * 1024]u8 = undefined;
+    var output: std.Io.Writer = .fixed(&output_buffer);
+    try writeSuccessEndCard(
+        std.testing.io,
+        std.testing.allocator,
+        &output,
+        root,
+        "generic-agent",
+        .command_guard,
+        &.{ "claude", "cursor", "pi" },
+        &.{"claude"},
+        daemon_check,
+        verification,
+        "strict",
+    );
+    const written = output.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "hooks verified for claude") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "hooks verified for cursor") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "pi  failed") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "pi  skipped (unowned)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "cursor  deferred (W3)") != null);
+}
+
+test "start treats cursor deferred and unowned Pi as non-failures" {
+    try std.testing.expect(!hostInstallCountsAsFailure(.installed));
+    try std.testing.expect(!hostInstallCountsAsFailure(.upgraded));
+    try std.testing.expect(!hostInstallCountsAsFailure(.already_installed));
+    try std.testing.expect(!hostInstallCountsAsFailure(.deferred));
+    try std.testing.expect(!hostInstallCountsAsFailure(.skipped_unowned));
+    try std.testing.expect(hostInstallCountsAsFailure(.failed));
+    try std.testing.expect(hostInstallCountsAsFailure(.timed_out));
+}
+
+test "start auto-select skips detect-only cursor" {
+    try std.testing.expect(shouldAutoSelectHost("claude", true));
+    try std.testing.expect(!shouldAutoSelectHost("cursor", true));
+    try std.testing.expect(!shouldAutoSelectHost("claude", false));
+}
+
+test "start packs-or-verify receipt only when those steps actually failed" {
+    const failed_verify = onboarding.VerificationOutcome{
+        .safe_allowed = false,
+        .dangerous_denied = true,
+        .detail = "failed",
+    };
+    const passed_verify = onboarding.VerificationOutcome{
+        .safe_allowed = true,
+        .dangerous_denied = true,
+        .detail = "ok",
+    };
+    try std.testing.expect(shouldReportPacksOrVerifyPartial(false, false, passed_verify));
+    try std.testing.expect(shouldReportPacksOrVerifyPartial(true, false, failed_verify));
+    try std.testing.expect(!shouldReportPacksOrVerifyPartial(true, false, passed_verify));
+    try std.testing.expect(!shouldReportPacksOrVerifyPartial(true, true, null));
+    try std.testing.expect(!shouldReportPacksOrVerifyPartial(true, false, null));
+}
+
+test "start command-guard succeeds without companion daemon" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -1031,6 +1142,8 @@ test "start reports failure when daemon required but unavailable" {
         .auto = true,
         .protection = .command_guard,
         .skip_verify = true,
+        // Empty selection: do not install real PATH hosts from the developer machine.
+        .hosts_csv = "",
     };
 
     const failing_checker = struct {
@@ -1048,9 +1161,47 @@ test "start reports failure when daemon required but unavailable" {
         failing_checker,
         null,
     );
-    try std.testing.expectEqual(exit_codes.general, code);
-    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "Setup incomplete") != null);
-    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "Protection active now: no") != null);
+    try std.testing.expectEqual(exit_codes.success, code);
+    const output = stdout_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, output, "Zig shell_engine ready") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Setup incomplete") == null);
+}
+
+test "start cursor-only selection is deferred not incomplete" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var stdout_buf: [16384]u8 = undefined;
+    var stderr_buf: [1024]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+
+    const flags = onboarding.StartFlags{
+        .auto = true,
+        .protection = .command_guard,
+        .skip_verify = false,
+        .hosts_csv = "cursor",
+    };
+
+    const mock_checker = struct {
+        fn check(_: std.mem.Allocator, _: bool) !void {}
+    }.check;
+
+    const code = try runStart(
+        std.testing.io,
+        tmp.dir,
+        flags,
+        &stdout_writer,
+        &stderr_writer,
+        mock_checker,
+        onboarding.mockOnboardingEvaluator,
+    );
+    try std.testing.expectEqual(exit_codes.success, code);
+    const output = stdout_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, output, "deferred") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Setup incomplete") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Integrations configured") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Verify       passed") == null);
 }
 
 test "start firewall path verifies without daemon or shell evaluator" {

@@ -4,6 +4,7 @@
 //! smoke_allow, smoke_deny, fix. Smoke maps to each host's real veto path.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const env_util = @import("../env_util.zig");
 const child_process = @import("child_process.zig");
 const pi_install = @import("pi_install.zig");
@@ -211,6 +212,21 @@ pub fn formatFix(
     return try std.fmt.allocPrint(allocator, "install {s} CLI, then ryk plugin install {s} --yes", .{ host, host });
 }
 
+/// Argv for an internal hook smoke/probe. `--probe` skips allow-once pending
+/// issuance so `ryk start` / plugin install do not mint operator redeem codes.
+pub fn hookSmokeArgv(ryk_bin: []const u8, host: []const u8, event: []const u8) [5][]const u8 {
+    return .{ ryk_bin, "hook", host, event, "--probe" };
+}
+
+const SmokeGroupKind = enum { install_probe, health };
+
+fn smokeJoinsParentGroup(kind: SmokeGroupKind) bool {
+    return switch (kind) {
+        .install_probe => false,
+        .health => true,
+    };
+}
+
 /// Pure smoke decision parser — unit-tested without spawning hooks.
 /// `expected` is "allow" or "block".
 pub fn interpretSmokeOutcome(
@@ -231,23 +247,37 @@ pub fn interpretSmokeOutcome(
             if (exit_code == 2) return true;
             // Defensive: accept decision=block JSON if a host version emits it.
             if (exit_code == 0) {
-                if (extractDecision(stdout)) |d| return std.mem.eql(u8, d, "block");
+                if (extractDecision(stdout)) |d| return smokeDecisionIsBlock(host, d);
             }
             return false;
         }
         _ = stderr;
         if (exit_code != 0) return false;
         const decision = extractDecision(stdout) orelse return false;
-        return std.mem.eql(u8, decision, "block");
+        return smokeDecisionIsBlock(host, decision);
     }
     return false;
 }
 
+fn smokeDecisionIsBlock(host: []const u8, decision: []const u8) bool {
+    if (std.mem.eql(u8, decision, "block")) return true;
+    // Claude PreToolUse emits host-native permissionDecision: deny (exit 0).
+    // ask is not a successful deny — hosts must not treat approval-required as blocked.
+    if (std.mem.eql(u8, host, "claude") and std.mem.eql(u8, decision, "deny")) return true;
+    return false;
+}
+
 fn extractDecision(stdout: []const u8) ?[]const u8 {
+    // Claude host-shaped emit uses permissionDecision; other hosts use decision.
+    return extractJsonStringField(stdout, "permissionDecision") orelse
+        extractJsonStringField(stdout, "decision");
+}
+
+fn extractJsonStringField(stdout: []const u8, field: []const u8) ?[]const u8 {
     const trimmed = std.mem.trim(u8, stdout, " \t\r\n");
     if (trimmed.len == 0) return null;
-    // Lightweight scan avoids full JSON parse in the pure helper path.
-    const key = "\"decision\"";
+    var key_buf: [48]u8 = undefined;
+    const key = std.fmt.bufPrint(&key_buf, "\"{s}\":", .{field}) catch return null;
     const idx = std.mem.indexOf(u8, trimmed, key) orelse return null;
     var i = idx + key.len;
     while (i < trimmed.len and (trimmed[i] == ' ' or trimmed[i] == '\t' or trimmed[i] == ':' or trimmed[i] == '\n' or trimmed[i] == '\r')) : (i += 1) {}
@@ -344,6 +374,7 @@ pub fn smokeTestHookPayload(
         fixture_json,
         expected_decision,
         5_000,
+        smokeJoinsParentGroup(.install_probe),
     );
 }
 
@@ -355,21 +386,24 @@ fn smokeTestHookPayloadWithBinary(
     fixture_json: []const u8,
     expected_decision: []const u8,
     timeout_ms: u64,
+    join_parent_group: bool,
 ) !bool {
-    // Health-path smoke joins the parent process group so the agents-health
-    // outer watchdog can reap nested hook probes (M-7). Windows has no join
-    // API; use a private process group there.
-    const result = if (comptime @import("builtin").os.tag == .windows)
+    // Health-path smoke may join the parent process group so `ryk agents health`
+    // can reap nested probes (M-7). Plugin install / start must not — a ryk-managed
+    // parent session watchdog would kill the probe and false-fail Claude/Codex smoke.
+    const argv = hookSmokeArgv(ryk_bin, host, event);
+    const use_private_group = builtin.os.tag == .windows or !join_parent_group;
+    const result = if (use_private_group)
         try child_process.runHostCommandInputCaptureTimed(
             allocator,
-            &.{ ryk_bin, "hook", host, event },
+            &argv,
             fixture_json,
             timeout_ms,
         )
     else
         try child_process.runHostCommandInputCaptureTimedInCurrentProcessGroup(
             allocator,
-            &.{ ryk_bin, "hook", host, event },
+            &argv,
             fixture_json,
             timeout_ms,
         );
@@ -407,6 +441,7 @@ pub fn runHostSmokePairWithBinaryTimed(
         allow_fixture,
         "allow",
         timeout_each_ms,
+        smokeJoinsParentGroup(.health),
     ) catch false;
     const deny_ok = smokeTestHookPayloadWithBinary(
         allocator,
@@ -416,6 +451,7 @@ pub fn runHostSmokePairWithBinaryTimed(
         deny_fixture,
         "block",
         timeout_each_ms,
+        smokeJoinsParentGroup(.health),
     ) catch false;
     return .{
         .allow = if (allow_ok) .pass else .fail,
@@ -667,6 +703,33 @@ test "interpretSmokeOutcome block for flexible hosts uses decision JSON" {
     try std.testing.expect(interpretSmokeOutcome("hermes", "block", 0, "{\n  \"decision\": \"block\"\n}\n", ""));
     try std.testing.expect(interpretSmokeOutcome("opencode", "block", 0, "{\"decision\":\"block\",\"reason\":\"x\"}", ""));
     try std.testing.expect(!interpretSmokeOutcome("openclaw", "block", 0, "{\"decision\":\"allow\"}", ""));
+}
+
+test "interpretSmokeOutcome accepts Claude host-native permissionDecision JSON" {
+    const claude_allow =
+        "{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"allow\",\"permissionDecisionReason\":\"ok\"}}\n";
+    const claude_deny =
+        "{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"blocked\"},\"systemMessage\":\"blocked\"}\n";
+    const claude_ask =
+        "{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"ask\",\"permissionDecisionReason\":\"needs approval\"}}\n";
+    try std.testing.expect(interpretSmokeOutcome("claude", "allow", 0, claude_allow, ""));
+    try std.testing.expect(interpretSmokeOutcome("claude", "block", 0, claude_deny, ""));
+    try std.testing.expect(!interpretSmokeOutcome("claude", "block", 0, claude_ask, ""));
+    try std.testing.expect(!interpretSmokeOutcome("claude", "allow", 0, claude_deny, ""));
+}
+
+test "install smoke uses a private process group and health joins the parent" {
+    try std.testing.expect(!smokeJoinsParentGroup(.install_probe));
+    try std.testing.expect(smokeJoinsParentGroup(.health));
+}
+
+test "hook smoke argv is a probe so start does not mint redeem codes" {
+    const argv = hookSmokeArgv("/usr/bin/ryk", "claude", "PreToolUse");
+    try std.testing.expectEqualStrings("/usr/bin/ryk", argv[0]);
+    try std.testing.expectEqualStrings("hook", argv[1]);
+    try std.testing.expectEqualStrings("claude", argv[2]);
+    try std.testing.expectEqualStrings("PreToolUse", argv[3]);
+    try std.testing.expectEqualStrings("--probe", argv[4]);
 }
 
 test "Grok host status uses raw PreToolUse fixtures and exit-two deny" {
