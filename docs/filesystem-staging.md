@@ -37,6 +37,6 @@ Staging applies to ryk-mediated writes. It is not universal transparent filesyst
 
 - **Linux:** staged writes always; Landlock session-attach when ABI ≥ 1 (kernel 5.13+) on protected agent child launches. CI attach evidence: linux amd64.
 - **macOS:** staged writes always; Seatbelt session-attach on product majors 14–26 (capability gate) via the same `--os-sandbox` flag. CI attach evidence: macos-14; other majors local until freeze jobs cover them.
-- **Windows:** transparent filesystem enforcement remains limited; no Landlock/Seatbelt-equivalent attach path yet.
+- **Windows:** no OS filesystem attach. Staged writes and protected-path matching only (wrapper/hook grade).
 
 See [platform-linux.md](platform-linux.md), [platform-macos.md](platform-macos.md), and [compatibility.md](compatibility.md#protection-grades-canonical).

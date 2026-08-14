@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+* **Windows positioning:** public docs now state that ryk is macOS/Linux-first. Windows sessions have no OS sandbox and run at wrapper/hook grade only. WinGet and Scoop stay deferred pending a Windows story (decision 2026-08-13).
+
 ### Security (OS sandbox audit 2026-08-13)
 
 * **Landlock truncation integrity:** Linux OS-enforced sessions now require Landlock ABI 3+; ABI 1/2 degrade or fail closed because they do not mediate `truncate(2)` and `open(O_TRUNC)`. Doctor reports the probed ABI and gap.
