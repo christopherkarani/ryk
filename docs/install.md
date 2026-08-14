@@ -1,5 +1,10 @@
 # Install
 
+ryk is macOS/Linux-first. The supported install path is the checksum-verified
+curl installer on those platforms. Windows can run the CLI, but sessions there
+have no OS sandbox and stay at wrapper/hook grade — see [Windows Notes](#windows-notes)
+and the [compatibility matrix](compatibility.md).
+
 ## Build From Source
 
 ```sh
@@ -84,4 +89,8 @@ Linux builds use backend detection for namespace, seccomp, Landlock, cgroup, and
 
 ## Windows Notes
 
-Windows builds use `ryk.exe` (`ryk.exe` alias), PowerShell scripts, path normalization, command wrappers, and process cleanup support where implemented. Transparent filesystem and network enforcement are limited; there is no kernel OS filesystem session-attach backend on Windows in this release.
+ryk is macOS/Linux-first. Windows sessions run at **wrapper/hook grade** with **no OS sandbox**. There is no Seatbelt, Landlock, AppContainer, or Windows Filtering Platform session-attach backend; `src/sandbox/windows.zig` reports `strong_sandbox` unavailable. Doctor cannot promote a Windows session to `OS-enforced`. MCP stdio is **proxy** grade.
+
+Windows builds use `ryk.exe`, PowerShell scripts, path normalization, command wrappers, staged writes, and process cleanup support where implemented. Transparent filesystem enforcement is unavailable (ryk-mediated staging and protected-path matching still run). Transparent network enforcement and proxy-mediated HTTP are unavailable (no loopback proxy).
+
+See the [compatibility matrix](compatibility.md) and [Windows platform notes](platform-windows.md). WinGet and Scoop are not published; they stay deferred pending a Windows story ([packaging/README.md](../packaging/README.md)).

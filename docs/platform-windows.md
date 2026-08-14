@@ -1,5 +1,12 @@
 # Windows Platform
 
+ryk is macOS/Linux-first. Windows has no operating-system sandbox. Sessions
+run at `wrapper` / `hook` grade: PATH shims, command wrappers, staged
+writes, env filtering, and policy decisions. MCP stdio is `proxy` grade.
+There is no Seatbelt/Landlock-equivalent session-attach backend. `ryk doctor`
+reports capability; it cannot promote Windows to `OS-enforced`. See the
+[compatibility matrix](compatibility.md).
+
 Run:
 
 ```powershell
@@ -10,16 +17,16 @@ Run:
 
 | Feature | Status |
 |---|---|
-| Process supervision/cleanup | partial unless doctor reports active |
+| Process supervision/cleanup | partial (Job Objects are not used for agent-session supervision; timed host commands in `child_process.zig` do use Job Objects) |
 | Env filtering | active |
 | Staged writes | active |
 | PATH shims | wrapper-only |
-| cmd and PowerShell wrappers | partial |
-| MCP stdio proxy | active |
+| cmd and PowerShell wrappers | wrapper-only |
+| MCP stdio proxy | active (proxy grade) |
 | Network decision engine | active |
-| Transparent network enforcement | unavailable; wrapper/proxy-mediated only, routes not forced |
-| Transparent file enforcement | limited |
-| Strong sandbox | unavailable unless doctor reports otherwise |
+| Transparent network enforcement | unavailable; wrapper-mediated only, routes not forced |
+| Transparent file enforcement | unavailable (no OS filesystem attach; ryk-mediated staging and protected-path matching only) |
+| Strong sandbox | unavailable |
 
 ## Path Normalization
 
@@ -31,4 +38,4 @@ Use policy deny rules for `.env`, SSH keys, cloud credentials, browser credentia
 
 ## Limitations
 
-Batch forwarding is not treated as a strong security boundary. Use ryk-managed sessions and check `doctor` for actual backend status.
+Windows sessions are wrapper/hook grade for command and filesystem mediation. MCP stdio is proxy grade. Batch forwarding is not a security boundary. Absolute paths and non-shimmed tools can skip PATH shims. There is no OS sandbox to attach, and doctor cannot report one. Use ryk-managed sessions and read the [compatibility matrix](compatibility.md) before making an enforcement claim.

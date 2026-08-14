@@ -61,7 +61,6 @@ pub fn detectOs() Os {
 }
 
 pub fn defaultCapabilityState(os: Os, capability: Capability) CapabilityState {
-    _ = os;
     return switch (capability) {
         .env_filtering,
         .path_staging,
@@ -72,9 +71,8 @@ pub fn defaultCapabilityState(os: Os, capability: Capability) CapabilityState {
         .path_shims,
         .network_observe,
         => .partial,
-        .shell_wrapping,
-        .network_proxy_enforce,
-        => .limited,
+        .shell_wrapping => .limited,
+        .network_proxy_enforce => if (os == .windows) .unavailable else .limited,
         .network_enforce,
         .strong_sandbox,
         => .unavailable,
@@ -91,7 +89,7 @@ pub fn reportCapability(os: Os, capability: Capability) CapabilityReport {
         .mcp_stdio_proxy => .active,
         .network_policy_engine => .active,
         .network_observe => .partial,
-        .network_proxy_enforce => .limited,
+        .network_proxy_enforce => if (os == .windows) .unavailable else .limited,
         .network_enforce => .unavailable,
         .strong_sandbox => .unavailable,
     };
@@ -121,6 +119,7 @@ pub fn reportCapability(os: Os, capability: Capability) CapabilityReport {
             .unknown => "backend state is unknown",
             .unavailable => switch (capability) {
                 .network_enforce => "transparent OS-level network enforcement is not implemented in Phase 12",
+                .network_proxy_enforce => "loopback HTTP proxy is unavailable on Windows (ProxyUnsupportedOnWindows)",
                 .strong_sandbox => "OS filesystem sandbox is not active until apply-before-exec succeeds; capability probes alone never mean active",
                 else => "not available on this platform",
             },

@@ -37,7 +37,7 @@ curl -fsSL https://rykanv.com/install | sh
 
 ## Start an agent
 
-`ryk <agent>` launches the host through a protected child session. Ryk attaches the OS filesystem sandbox by default: Seatbelt on macOS and Landlock on Linux.
+`ryk <agent>` launches the host through a protected child session. ryk is macOS/Linux-first: it attaches the OS filesystem sandbox by default on those platforms (Seatbelt on macOS, Landlock on Linux). Windows sessions have no OS sandbox and run at wrapper/hook grade only. See the [compatibility matrix](docs/compatibility.md).
 
 ```sh
 ryk <agent>
@@ -61,7 +61,7 @@ ryk doctor
 | | |
 | --- | --- |
 | Host integrations | Launch aliases for Pi, Hermes, OpenCode, Codex, Claude Code, OpenClaw, and Grok. Cursor is supported through host discovery and its shell hook. |
-| OS sandboxing | Automatic OS filesystem sandboxing with Seatbelt on macOS and Landlock on Linux when available. |
+| OS sandboxing | Automatic OS filesystem sandboxing with Seatbelt on macOS and Landlock on Linux when available. Windows has no OS sandbox (wrapper/hook grade only). |
 | Secret redaction | Secret-like values are redacted before audit and replay data is written. |
 | MCP protection | MCP tool calls are classified locally, and supported stdio servers run through ryk's protected proxy. |
 | 86 safety packs | Built-in command patterns for destructive and sensitive operations, with project-level opt-in packs. |
@@ -170,7 +170,7 @@ ryk dashboard --once
 
 ## Limits
 
-ryk is graded mediation, not a universal OS sandbox. Absolute-path binaries, non-shimmed tools, non-proxy traffic, and host hooks that do not fire can sit outside a particular enforcement surface. `ryk doctor` reports platform capability; it does not prove that a child session attached to an OS sandbox. Read the [compatibility matrix](docs/compatibility.md) and [threat model](docs/threat-model.md) before making a stronger claim.
+ryk is graded mediation, not a universal OS sandbox. It is macOS/Linux-first. Windows sessions run at wrapper/hook grade with no OS sandbox. Absolute-path binaries, non-shimmed tools, non-proxy traffic, and host hooks that do not fire can sit outside a particular enforcement surface. `ryk doctor` reports platform capability; it does not prove that a child session attached to an OS sandbox, and it cannot promote Windows to `OS-enforced`. Read the [compatibility matrix](docs/compatibility.md) and [threat model](docs/threat-model.md) before making a stronger claim.
 
 Release builds include opt-in product telemetry: nothing is collected or sent unless you run `ryk telemetry enable`. See [docs/telemetry.md](docs/telemetry.md) for the exact payload contract.
 
@@ -185,6 +185,7 @@ Start with the [documentation index](docs/README.md). The most useful guides are
 - [Credentials and secret handling](docs/credentials.md)
 - [MCP](docs/mcp.md)
 - [Platform notes](docs/platform-linux.md)
+- [Windows platform](docs/platform-windows.md)
 
 ## Contributing
 

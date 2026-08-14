@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+* **Windows positioning:** public docs and `ryk doctor` now match backend truth. Windows sessions have no OS sandbox and run at wrapper/hook grade (MCP stdio is proxy). Doctor reports cmd/PowerShell wrappers as wrapper-only, and transparent filesystem plus proxy-mediated HTTP as unavailable (no loopback proxy). WinGet and Scoop stay deferred pending a Windows story (decision 2026-08-13).
+
 ### Security (OS sandbox audit 2026-08-13)
 
 * **Landlock truncation integrity:** Linux OS-enforced sessions now require Landlock ABI 3+; ABI 1/2 degrade or fail closed because they do not mediate `truncate(2)` and `open(O_TRUNC)`. Doctor reports the probed ABI and gap.
