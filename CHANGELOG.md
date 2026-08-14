@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+<<<<<<< HEAD
 ### Added
 
 * **Release signing is wired but not yet active.** `keys/ryk-release-minisign.pub` ships the sentinel `RYK_RELEASE_PUBKEY_UNPROVISIONED`. Until a real key is provisioned, `scripts/install.sh` reports signing is not yet active and continues on SHA-256 only (checksum-only / fail-open). `scripts/install.ps1` is checksum-only (Windows unsigned) and does not verify `checksums.txt.minisig`. After provisioning, the POSIX installer will verify a detached minisign signature over `checksums.txt` and refuse unverifiable releases. `cut-release.sh` has a `sign` phase before `publish-git`; after a dry-run, resume from `sign`, not `publish-git`. CI backup (`release.yml`) still does not attach `checksums.txt.minisig`. See `docs/release-signing.md`.
@@ -23,6 +24,10 @@
 * **`ryk doctor --deadlock-check` (P2-1d):** replays a standard coding workflow against the active policy and exits nonzero when a normal step would ask/deny (an agent would stall) or a dangerous step would be allowed. Read-only; shares both the workflow corpus with the regression replay test and the policy-plus-pack precedence with the decide surface, so it cannot drift from what a live session does.
 
 **User-visible behavior changes:** a pristine old default policy is upgraded in place on the next `ryk doctor --fix` / install ensure (backup written alongside; `ryk start` does not migrate); `ryk doctor` may print a Policy freshness notice; under the coding default `npm install`, `pip install`, and plain `git push` now run without approval (force-equivalent push and pipe-to-executor stay denied on the command + shell-engine fence); `ryk doctor --deadlock-check` is new.
+
+### Security (audit medium tail 2026-08-12)
+
+* **Command deny globs ignore padding:** `commands.deny` patterns collapse extra spaces/tabs and strip a leading `./` on each word before matching, so `cat  ~/.ssh/id_rsa` and `cat ./.env` no longer slip past preset denies such as `cat .env` and `cat ~/.ssh/*`.
 
 ### Security (OS sandbox audit 2026-08-13)
 

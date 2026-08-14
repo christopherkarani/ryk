@@ -1,5 +1,9 @@
 const std = @import("std");
 
+/// Same bound as `core.limits.max_command_len`. Kept local so this file stays
+/// a leaf (no core import) and standalone `zig test` still works.
+const max_command_glob_bytes = 16 * 1024;
+
 pub fn matchesPattern(pattern: []const u8, value: []const u8) bool {
     if (std.mem.eql(u8, pattern, value)) return true;
     return globMatch(pattern, value);
@@ -42,7 +46,59 @@ pub fn matchesPath(pattern: []const u8, path: []const u8) bool {
 }
 
 pub fn matchesCommand(pattern: []const u8, command: []const u8) bool {
-    return matchesPattern(pattern, command);
+    if (matchesPattern(pattern, command)) return true;
+
+    // Policy command globs are raw byte patterns. Extra whitespace and a
+    // leading `./` on a word (`cat  ~/.ssh/id_rsa`, `cat ./.env`) are the
+    // same command the shell engine already normalizes; collapse those
+    // before matching so preset denies cannot be spaced or dot-slashed past.
+    var pattern_buf: [max_command_glob_bytes]u8 = undefined;
+    var command_buf: [max_command_glob_bytes]u8 = undefined;
+    const norm_pattern = normalizeCommandGlob(pattern, &pattern_buf) orelse return false;
+    const norm_command = normalizeCommandGlob(command, &command_buf) orelse return false;
+    if (norm_pattern.ptr == pattern.ptr and norm_command.ptr == command.ptr) return false;
+    return matchesPattern(norm_pattern, norm_command);
+}
+
+/// Collapse runs of space/tab/CR/LF to a single space and strip a leading
+/// `./` (or `.\\`) from each word. Returns `src` when already canonical,
+/// or `null` if the result cannot fit `buf` (caller keeps the raw match).
+fn normalizeCommandGlob(src: []const u8, buf: []u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, src, " \t\r\n");
+    var out_len: usize = 0;
+    var i: usize = 0;
+    var pending_space = false;
+    while (i < trimmed.len) {
+        if (isCommandGlobSpace(trimmed[i])) {
+            while (i < trimmed.len and isCommandGlobSpace(trimmed[i])) : (i += 1) {}
+            pending_space = out_len > 0;
+            continue;
+        }
+        var token_end = i;
+        while (token_end < trimmed.len and !isCommandGlobSpace(trimmed[token_end])) : (token_end += 1) {}
+        var token = trimmed[i..token_end];
+        i = token_end;
+        while (token.len >= 2 and token[0] == '.' and (token[1] == '/' or token[1] == '\\')) {
+            token = token[2..];
+        }
+        if (token.len == 0) continue;
+        if (pending_space) {
+            if (out_len >= buf.len) return null;
+            buf[out_len] = ' ';
+            out_len += 1;
+            pending_space = false;
+        }
+        if (out_len + token.len > buf.len) return null;
+        @memcpy(buf[out_len .. out_len + token.len], token);
+        out_len += token.len;
+    }
+    const normalized = buf[0..out_len];
+    if (std.mem.eql(u8, normalized, src)) return src;
+    return normalized;
+}
+
+fn isCommandGlobSpace(c: u8) bool {
+    return c == ' ' or c == '\t' or c == '\n' or c == '\r';
 }
 
 pub fn matchesDomain(pattern: []const u8, host: []const u8) bool {
@@ -201,4 +257,24 @@ test "quick install command allow patterns (bare zig build glob gap)" {
     // Guard: we do not open broad dangerous make neighbors via these patterns.
     try std.testing.expect(!matchesCommand("make test*", "make install"));
     try std.testing.expect(!matchesCommand("make test*", "make deploy"));
+}
+
+test "command deny globs survive whitespace tab and dot-slash evasions" {
+    // Preset denies are exact/glob strings (`cat .env`, `cat ~/.ssh/*`).
+    // Extra spaces, tabs, and a leading `./` on the path word must still match.
+    try std.testing.expect(matchesCommand("cat .env", "cat .env"));
+    try std.testing.expect(matchesCommand("cat .env", "cat  .env"));
+    try std.testing.expect(matchesCommand("cat .env", "cat\t.env"));
+    try std.testing.expect(matchesCommand("cat .env", "cat ./.env"));
+    try std.testing.expect(matchesCommand("cat .env", "  cat   ./.env  "));
+
+    try std.testing.expect(matchesCommand("cat ~/.ssh/*", "cat ~/.ssh/id_rsa"));
+    try std.testing.expect(matchesCommand("cat ~/.ssh/*", "cat  ~/.ssh/id_rsa"));
+    try std.testing.expect(matchesCommand("cat ~/.ssh/*", "cat\t~/.ssh/id_rsa"));
+    try std.testing.expect(matchesCommand("cat ~/.ssh/*", "cat ./~/.ssh/id_rsa"));
+
+    // Normalization must not broaden an exact deny into a neighbor path.
+    try std.testing.expect(!matchesCommand("cat .env", "cat .env.example"));
+    try std.testing.expect(!matchesCommand("cat .env", "cat ./.env.example"));
+    try std.testing.expect(!matchesCommand("cat .env", "cat secrets/.env"));
 }

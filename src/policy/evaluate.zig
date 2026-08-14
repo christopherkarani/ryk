@@ -946,6 +946,39 @@ test "deny priority beats allow for file paths" {
     try std.testing.expectEqualStrings("files.read.deny[0]", result.matched_rule.?.id);
 }
 
+test "preset command denies survive whitespace tab and dot-slash evasions" {
+    const load = @import("load.zig");
+    var policy = try load.parseFromSlice(std.testing.allocator,
+        \\version: 1
+        \\mode: strict
+        \\commands:
+        \\  default: allow
+        \\  deny:
+        \\    - "cat .env"
+        \\    - "cat ~/.ssh/*"
+    , "command-deny-normalize.yaml");
+    defer policy.deinit();
+
+    const evasions = [_][]const u8{
+        "cat  .env",
+        "cat\t.env",
+        "cat ./.env",
+        "cat  ~/.ssh/id_rsa",
+        "cat\t~/.ssh/id_rsa",
+        "cat ./~/.ssh/id_rsa",
+    };
+    for (evasions) |cmd| {
+        var result = try command(&policy, cmd, std.testing.allocator);
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqual(core.decision.DecisionResult.deny, result.decision.result);
+        try std.testing.expect(std.mem.startsWith(u8, result.matched_rule.?.id, "commands.deny"));
+    }
+
+    var neighbor = try command(&policy, "cat .env.example", std.testing.allocator);
+    defer neighbor.deinit(std.testing.allocator);
+    try std.testing.expectEqual(core.decision.DecisionResult.allow, neighbor.decision.result);
+}
+
 test "rule matching covers env command network and mcp" {
     const load = @import("load.zig");
     var policy = try load.loadPreset(std.testing.allocator, .strict);
