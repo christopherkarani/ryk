@@ -6,7 +6,12 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
-import rykPlugin, { findRyk, parseHookResponse } from '../dist/index.js';
+import rykPlugin from '../dist/index.js';
+import tuiModule from '../dist/tui.js';
+
+// Helpers are attached to the default function. Named function exports would be
+// loaded as extra plugins by OpenCode 1.18's legacy loader.
+const { findRyk, parseHookResponse } = rykPlugin;
 
 
 function toastPayload(input) {
@@ -782,13 +787,63 @@ test('ryk.ts is a single-source sync of src/index.ts', async () => {
   );
 });
 
-test('package metadata publishes the canonical OpenCode drop-in', async () => {
+test('package metadata publishes the canonical OpenCode drop-ins', async () => {
   const packageJson = JSON.parse(await readFile(join(pluginRoot, 'package.json'), 'utf8'));
   assert.deepEqual(
     packageJson.files.filter((file) => file.endsWith('.ts')),
-    ['ryk.ts']
+    ['ryk.ts', 'ryk-tui.ts']
   );
-  assert.equal(packageJson.scripts.build, 'tsc -p tsconfig.json && cp src/index.ts ryk.ts');
+  assert.equal(
+    packageJson.scripts.build,
+    'tsc -p tsconfig.json && cp src/index.ts ryk.ts && cp src/tui.ts ryk-tui.ts'
+  );
+});
+
+test('drop-in has no extra named function exports (OpenCode 1.18 legacy loader)', async () => {
+  const mod = await import('../dist/index.js');
+  const namedFns = Object.entries(mod)
+    .filter(([name, value]) => name !== 'default' && typeof value === 'function')
+    .map(([name]) => name);
+  assert.deepEqual(namedFns, [], `named function exports become extra plugins: ${namedFns.join(', ')}`);
+  assert.equal(typeof mod.default, 'function');
+  assert.equal(typeof mod.default.parseHookResponse, 'function');
+  assert.equal(typeof mod.default.findRyk, 'function');
+});
+
+test('TUI host module is a v1 { id, tui } export', () => {
+  assert.equal(tuiModule.id, 'ryk');
+  assert.equal(typeof tuiModule.tui, 'function');
+  assert.equal(tuiModule.server, undefined);
+});
+
+test('TUI host toasts on session.error that mentions ryk', async () => {
+  const toasts = [];
+  await tuiModule.tui({
+    ui: {
+      toast: (input) => {
+        toasts.push(input);
+      },
+    },
+    event: {
+      on: (type, handler) => {
+        if (type === 'session.error') {
+          handler({ message: '[ryk] ryk blocked tool execution: core.git:push-force-long' });
+        }
+      },
+    },
+  });
+  assert.ok(toasts.length >= 2, 'startup toast + error toast');
+  assert.equal(toasts[0].variant, 'info');
+  assert.match(toasts[0].title, /ryk/i);
+  const errorToast = toasts.find((t) => t.variant === 'error');
+  assert.ok(errorToast, 'error toast for ryk session.error');
+  assert.match(errorToast.message, /push-force-long/);
+});
+
+test('ryk-tui.ts is a single-source sync of src/tui.ts', async () => {
+  const src = await readFile(join(pluginRoot, 'src/tui.ts'), 'utf8');
+  const dropIn = await readFile(join(pluginRoot, 'ryk-tui.ts'), 'utf8');
+  assert.equal(dropIn, src, 'ryk-tui.ts must match src/tui.ts (npm run build copies src → ryk-tui.ts)');
 });
 
 test('missing binary registers fail-closed veto hooks', async () => {

@@ -1565,18 +1565,25 @@ fn installCommand(io: std.Io, argv: []const []const u8, stdout: anytype, stderr:
                 // after a global day-one/update install.
                 const source_path = try std.fs.path.join(allocator, &.{ plugin_dir, "ryk.ts" });
                 defer allocator.free(source_path);
+                const tui_source_path = try std.fs.path.join(allocator, &.{ plugin_dir, "ryk-tui.ts" });
+                defer allocator.free(tui_source_path);
                 const destination_path = try resolveOpenCodeDestination(allocator, workspace_root, scope);
                 defer allocator.free(destination_path);
                 const other_scope: InstallScope = if (scope == .global) .project else .global;
                 const other_destination_path = try resolveOpenCodeDestination(allocator, workspace_root, other_scope);
                 defer allocator.free(other_destination_path);
+                const tui_destination_path = try siblingOpenCodePluginPath(allocator, destination_path, "ryk-tui.ts");
+                defer allocator.free(tui_destination_path);
+                const other_tui_destination_path = try siblingOpenCodePluginPath(allocator, other_destination_path, "ryk-tui.ts");
+                defer allocator.free(other_tui_destination_path);
 
                 try stdout.writeAll("  install paths for OpenCode:\n");
-                try stdout.writeAll("    project: .opencode/plugins/ryk.ts\n");
-                try stdout.writeAll("    global:  ~/.config/opencode/plugins/ryk.ts (default)\n");
+                try stdout.writeAll("    project: .opencode/plugins/ryk.ts + ryk-tui.ts\n");
+                try stdout.writeAll("    global:  ~/.config/opencode/plugins/ryk.ts + ryk-tui.ts (default)\n");
                 if (dry_run) {
                     try stdout.writeAll("  action: no changes made (dry-run)\n");
                     try stdout.print("  next step: copy {s} to {s}\n", .{ source_path, destination_path });
+                    try stdout.print("  next step: copy {s} to {s}\n", .{ tui_source_path, tui_destination_path });
                     if (fileExistsAbsolute(io, other_destination_path)) {
                         try stdout.print("  next step: also upgrade existing {s} scope at {s}\n", .{ @tagName(other_scope), other_destination_path });
                     }
@@ -1589,11 +1596,23 @@ fn installCommand(io: std.Io, argv: []const []const u8, stdout: anytype, stderr:
                         error.OpenCodeManagedInstallFailed => return exit_codes.general,
                         else => return err,
                     };
+                    if (fileExistsAbsolute(io, tui_source_path)) {
+                        installOpenCodeManagedDestination(allocator, io, stdout, tui_source_path, tui_destination_path) catch |err| switch (err) {
+                            error.OpenCodeManagedInstallFailed => return exit_codes.general,
+                            else => return err,
+                        };
+                    }
                     if (fileExistsAbsolute(io, other_destination_path)) {
                         installOpenCodeManagedDestination(allocator, io, stdout, source_path, other_destination_path) catch |err| switch (err) {
                             error.OpenCodeManagedInstallFailed => return exit_codes.general,
                             else => return err,
                         };
+                        if (fileExistsAbsolute(io, tui_source_path)) {
+                            installOpenCodeManagedDestination(allocator, io, stdout, tui_source_path, other_tui_destination_path) catch |err| switch (err) {
+                                error.OpenCodeManagedInstallFailed => return exit_codes.general,
+                                else => return err,
+                            };
+                        }
                     }
                     // Light config hygiene so local plugins auto-load.
                     if (ensureOpenCodeConfigSane(io, allocator)) |cfg_note| {
@@ -2182,6 +2201,11 @@ fn ensureOpenCodeConfigSane(io: std.Io, allocator: std.mem.Allocator) ![]const u
         return try allocator.dupe(u8, "repaired broken plugin list placeholder in opencode.json");
     }
     return try allocator.dupe(u8, "opencode.json present (local plugins auto-load when plugin is empty or omitted)");
+}
+
+fn siblingOpenCodePluginPath(allocator: std.mem.Allocator, destination_path: []const u8, name: []const u8) ![]u8 {
+    const dir = std.fs.path.dirname(destination_path) orelse return std.fs.path.join(allocator, &.{ name });
+    return std.fs.path.join(allocator, &.{ dir, name });
 }
 
 pub fn resolveOpenCodeDestination(allocator: std.mem.Allocator, workspace_root: []const u8, scope: InstallScope) ![]u8 {

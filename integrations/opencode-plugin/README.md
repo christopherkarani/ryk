@@ -49,6 +49,7 @@ Copy or symlink this directory into your project:
 # From the ryk repo root
 mkdir -p .opencode/plugins
 cp integrations/opencode-plugin/ryk.ts .opencode/plugins/ryk.ts
+cp integrations/opencode-plugin/ryk-tui.ts .opencode/plugins/ryk-tui.ts
 ```
 
 See `examples/project-plugin-path.md` for details.
@@ -60,6 +61,7 @@ Copy or symlink to the OpenCode global plugins directory:
 ```bash
 mkdir -p ~/.config/opencode/plugins
 cp integrations/opencode-plugin/ryk.ts ~/.config/opencode/plugins/ryk.ts
+cp integrations/opencode-plugin/ryk-tui.ts ~/.config/opencode/plugins/ryk-tui.ts
 ```
 
 See `examples/global-plugin-path.md` for details.
@@ -135,7 +137,7 @@ Example response:
 }
 ```
 
-If the decision is `block`, the plugin shows a short TUI error toast (when available), logs a **short** one-line message to stderr by default, and throws a **single-line** `Error` so OpenCode’s tool row and status line stay short (no multi-line Recourse/Next wall). Set `RYK_OPENCODE_VERBOSE=1` to also log full operator detail (Next / remediation) to stderr. The throw still prevents the tool from executing.
+If the decision is `block`, the server hook throws a **single-line** `Error` so the tool does not run. The companion `ryk-tui.ts` host (`id: "ryk"`) is what vanilla OpenCode lists as a plugin and is what shows the toast — a server-only file cannot also export `tui` on OpenCode 1.18. Set `RYK_OPENCODE_VERBOSE=1` to also log full operator detail (Next / remediation) to stderr. Do not `console.log` from the plugin: OpenCode dumps that into the prompt.
 
 ## Run redteam
 
@@ -154,11 +156,11 @@ ryk replay --session last --verify
 Remove the local plugin from your OpenCode configuration:
 
 ```bash
-# Project-local file
-rm .opencode/plugins/ryk.ts
+# Project-local files
+rm .opencode/plugins/ryk.ts .opencode/plugins/ryk-tui.ts
 
-# Global file
-rm ~/.config/opencode/plugins/ryk.ts
+# Global files
+rm ~/.config/opencode/plugins/ryk.ts ~/.config/opencode/plugins/ryk-tui.ts
 ```
 
 This plugin does not mutate host configuration, so uninstalling is safe.

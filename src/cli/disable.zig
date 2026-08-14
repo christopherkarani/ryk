@@ -149,36 +149,52 @@ pub fn command(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: an
 // Per-host disable functions (pub so uninstall.zig can delegate)
 // ---------------------------------------------------------------------------
 
+fn removeOpenCodePluginFile(
+    io: std.Io,
+    stdout: anytype,
+    path: []const u8,
+    ok_line: []const u8,
+) !bool {
+    if (!plugin.fileExistsAbsolute(io, path)) return false;
+    std.Io.Dir.cwd().deleteFile(io, path) catch |err| {
+        try stdout.print("  plugin: failed to remove {s} ({s})\n", .{ path, @errorName(err) });
+        return false;
+    };
+    try stdout.writeAll(ok_line);
+    return true;
+}
+
 pub fn disableOpenCode(io: std.Io, allocator: std.mem.Allocator, stdout: anytype) !bool {
     var removed = false;
     const project_path = try std.fs.path.join(allocator, &.{ ".opencode", "plugins", "ryk.ts" });
     defer allocator.free(project_path);
+    const project_tui_path = try std.fs.path.join(allocator, &.{ ".opencode", "plugins", "ryk-tui.ts" });
+    defer allocator.free(project_tui_path);
     const global_path = blk: {
         const home = std.c.getenv("HOME") orelse break :blk null;
         break :blk try std.fs.path.join(allocator, &.{ std.mem.span(home), ".config", "opencode", "plugins", "ryk.ts" });
     };
     defer if (global_path) |p| allocator.free(p);
+    const global_tui_path = blk: {
+        const home = std.c.getenv("HOME") orelse break :blk null;
+        break :blk try std.fs.path.join(allocator, &.{ std.mem.span(home), ".config", "opencode", "plugins", "ryk-tui.ts" });
+    };
+    defer if (global_tui_path) |p| allocator.free(p);
 
-    if (plugin.fileExistsAbsolute(io, project_path)) {
-        blk: {
-            std.Io.Dir.cwd().deleteFile(io, project_path) catch |err| {
-                try stdout.print("  project plugin: failed to remove ({s})\n", .{@errorName(err)});
-                break :blk;
-            };
-            try stdout.writeAll("  project plugin: removed (.opencode/plugins/ryk.ts)\n");
+    if (try removeOpenCodePluginFile(io, stdout, project_path, "  project plugin: removed (.opencode/plugins/ryk.ts)\n")) {
+        removed = true;
+    }
+    if (try removeOpenCodePluginFile(io, stdout, project_tui_path, "  project plugin: removed (.opencode/plugins/ryk-tui.ts)\n")) {
+        removed = true;
+    }
+    if (global_path) |gp| {
+        if (try removeOpenCodePluginFile(io, stdout, gp, "  global plugin: removed (~/.config/opencode/plugins/ryk.ts)\n")) {
             removed = true;
         }
     }
-    if (global_path) |gp| {
-        if (plugin.fileExistsAbsolute(io, gp)) {
-            blk: {
-                std.Io.Dir.cwd().deleteFile(io, gp) catch |err| {
-                    try stdout.print("  global plugin: failed to remove ({s})\n", .{@errorName(err)});
-                    break :blk;
-                };
-                try stdout.writeAll("  global plugin: removed (~/.config/opencode/plugins/ryk.ts)\n");
-                removed = true;
-            }
+    if (global_tui_path) |gp| {
+        if (try removeOpenCodePluginFile(io, stdout, gp, "  global plugin: removed (~/.config/opencode/plugins/ryk-tui.ts)\n")) {
+            removed = true;
         }
     }
     return removed;

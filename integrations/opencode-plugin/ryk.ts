@@ -16,33 +16,34 @@ interface RykResponse {
   suggestions?: string[];
 }
 
+type ToastPayload = {
+  title?: string;
+  message: string;
+  variant?: 'info' | 'success' | 'warning' | 'error';
+  duration?: number;
+};
+
 /** Minimal OpenCode plugin context (auto-load + typed Plugin). */
 type PluginContext = {
   directory: string;
   worktree: string;
   client?: {
+    app?: {
+      log?: (input: {
+        body: {
+          service: string;
+          level: 'debug' | 'info' | 'warn' | 'error';
+          message: string;
+        };
+      }) => Promise<unknown>;
+    };
     tui?: {
       /**
        * OpenCode 1.18+ SDK: flat fields mapped into POST /tui/show-toast body.
-       * Older SDK Options shape: `{ body: { title, message, variant, duration } }`.
+       * Second arg is SDK Options (`throwOnError`). Older clients wrap `{ body }`.
        */
-      showToast?: (
-        input:
-          | {
-              title?: string;
-              message: string;
-              variant?: 'info' | 'success' | 'warning' | 'error';
-              duration?: number;
-            }
-          | {
-              body: {
-                title?: string;
-                message: string;
-                variant?: 'info' | 'success' | 'warning' | 'error';
-                duration?: number;
-              };
-            }
-      ) => Promise<unknown>;
+      showToast?: (input: ToastPayload | { body: ToastPayload }, options?: unknown) => Promise<unknown>;
+      publish?: (input: Record<string, unknown>) => Promise<unknown>;
     };
   };
 };
@@ -261,7 +262,7 @@ function parseOptionalStringArray(value: unknown): string[] | undefined {
  * `error`, and unrecognized decisions. `ask` is preserved for OpenCode permission.ask UX;
  * tool.execute.before still hard-blocks ask via applyBlockingDecision.
  */
-export function parseHookResponse(stdout: string, blocking: boolean): RykResponse {
+function parseHookResponse(stdout: string, blocking: boolean): RykResponse {
   const fail = (reason: string, blockMsg: string, softMsg: string): RykResponse =>
     blocking ? failClosedBlock(reason, blockMsg) : softAllow(reason, softMsg);
 
@@ -329,7 +330,7 @@ export function parseHookResponse(stdout: string, blocking: boolean): RykRespons
  * Workspace candidates remain opt-in for development only. PATH lookup is
  * implemented directly so Windows does not depend on the Unix-only `which`.
  */
-export function findRyk(cwd?: string, platform: NodeJS.Platform = process.platform): string | null {
+function findRyk(cwd?: string, platform: NodeJS.Platform = process.platform): string | null {
   const envBin = process.env.RYK_BIN?.trim();
   if (envBin) {
     if (envBin.includes('/') || envBin.includes('\\')) {
@@ -480,8 +481,10 @@ function callRyk(
 
     return parseHookResponse(stdout, blocking);
   } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : String(err);
-    console.error(`[ryk] Hook ${event} failed: ${message}`);
+    if (process.env.RYK_OPENCODE_VERBOSE === '1') {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`[ryk] Hook ${event} failed: ${message}`);
+    }
 
     return blocking
       ? failClosedBlock(
@@ -562,20 +565,72 @@ function formatOperatorDetail(response: RykResponse, context: string): string {
 /** Cap toast RPC wait so a stuck TUI client cannot freeze the hard-block path. */
 const TOAST_TIMEOUT_MS = 1500;
 
+function toastDebug(message: string): void {
+  if (process.env.RYK_OPENCODE_TOAST_DEBUG === '1' || process.env.RYK_OPENCODE_VERBOSE === '1') {
+    console.error(`[ryk] ${message}`);
+  }
+}
+
+/** Structured host log — never console.log (OpenCode dumps that into the TUI prompt). */
+function pluginLog(
+  ctx: PluginContext,
+  level: 'debug' | 'info' | 'warn' | 'error',
+  message: string
+): void {
+  const log = ctx.client?.app?.log;
+  if (typeof log === 'function') {
+    void Promise.resolve(log({ body: { service: 'ryk', level, message } })).catch(() => undefined);
+    return;
+  }
+  if (level === 'error' || process.env.RYK_OPENCODE_VERBOSE === '1') {
+    console.error(`[ryk] ${message}`);
+  }
+}
+
+async function invokeShowToast(ctx: PluginContext, payload: ToastPayload): Promise<void> {
+  const tui = ctx.client?.tui;
+  const showToast = tui?.showToast;
+  if (typeof showToast === 'function') {
+    // 1.18 SDK maps flat fields into POST /tui/show-toast. throwOnError surfaces transport misses.
+    try {
+      await showToast(payload, { throwOnError: true });
+      return;
+    } catch {
+      // older / mock clients take a single argument
+    }
+    try {
+      await showToast(payload);
+      return;
+    } catch {
+      // pre-1.18 Options shape
+    }
+    await showToast({ body: payload });
+    return;
+  }
+
+  // Some TUI builds only honor published toast events, not the HTTP helper.
+  const publish = tui?.publish;
+  if (typeof publish === 'function') {
+    await publish({
+      type: 'tui.toast.show',
+      title: payload.title,
+      message: payload.message,
+      variant: payload.variant,
+      duration: payload.duration,
+    });
+    return;
+  }
+
+  throw new Error('client.tui.showToast missing');
+}
+
 async function maybeToast(
   ctx: PluginContext,
   variant: 'info' | 'success' | 'warning' | 'error',
   title: string,
   message: string
 ): Promise<void> {
-  const showToast = ctx.client?.tui?.showToast;
-  if (typeof showToast !== 'function') {
-    if (process.env.RYK_OPENCODE_TOAST_DEBUG === '1') {
-      console.error('[ryk] toast unavailable: client.tui.showToast missing');
-    }
-    return;
-  }
-  const payload = {
+  const payload: ToastPayload = {
     title,
     message: message.slice(0, 280),
     variant,
@@ -583,34 +638,15 @@ async function maybeToast(
   };
   try {
     await Promise.race([
-      (async () => {
-        // Prefer flat args (OpenCode 1.18+ / current SDK client).
-        // Fall back to nested `{ body }` for older plugin clients.
-        try {
-          await showToast(payload);
-        } catch (flatErr: unknown) {
-          try {
-            await showToast({ body: payload });
-          } catch (bodyErr: unknown) {
-            if (process.env.RYK_OPENCODE_TOAST_DEBUG === '1') {
-              const flatMsg = flatErr instanceof Error ? flatErr.message : String(flatErr);
-              const bodyMsg = bodyErr instanceof Error ? bodyErr.message : String(bodyErr);
-              console.error(`[ryk] toast failed (flat): ${flatMsg}`);
-              console.error(`[ryk] toast failed (body): ${bodyMsg}`);
-            }
-          }
-        }
-      })(),
+      invokeShowToast(ctx, payload),
       new Promise<void>((resolve) => {
         setTimeout(resolve, TOAST_TIMEOUT_MS);
       }),
     ]);
   } catch (err: unknown) {
     // Host toast is best-effort; never fail open on UI (block path still throws).
-    if (process.env.RYK_OPENCODE_TOAST_DEBUG === '1') {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.error(`[ryk] toast failed: ${msg}`);
-    }
+    const msg = err instanceof Error ? err.message : String(err);
+    toastDebug(`toast failed: ${msg}`);
   }
 }
 
@@ -643,7 +679,6 @@ async function applyBlockingDecision(
   ctx: PluginContext
 ): Promise<void> {
   if (response.decision === 'warn') {
-    console.warn(`[ryk] Warning: ${response.message || response.reason}`);
     return;
   }
 
@@ -683,9 +718,6 @@ function applyPermissionDecision(response: RykResponse, output: PermissionAskOut
   if (status === 'deny' && process.env.RYK_OPENCODE_VERBOSE === '1') {
     const msg = response.message || response.reason || 'ryk blocked this command.';
     console.error(`[ryk] Blocked permission: ${msg}`);
-  }
-  if (response.decision === 'warn') {
-    console.warn(`[ryk] Permission warning: ${response.message || response.reason}`);
   }
   output.status = status;
 }
@@ -754,7 +786,7 @@ async function localDotenvGuard(
 
 const MISSING_BINARY_MSG = 'ryk binary not found; blocking as a precaution.';
 
-export default async function rykPlugin(ctx: PluginContext): Promise<PluginHooks> {
+async function rykPlugin(ctx: PluginContext): Promise<PluginHooks> {
   const cwd = ctx.worktree || ctx.directory || process.cwd();
   // Fail closed on unexpected resolve errors so hooks still register.
   let rykBin: string | null = null;
@@ -762,13 +794,15 @@ export default async function rykPlugin(ctx: PluginContext): Promise<PluginHooks
     rykBin = findRyk(cwd);
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
-    console.error(`[ryk] Binary resolve failed (fail-closed): ${message}`);
+    pluginLog(ctx, 'error', `Binary resolve failed (fail-closed): ${message}`);
     rykBin = null;
   }
 
   if (!rykBin) {
-    console.warn(
-      '[ryk] Binary not found in PATH or typical build paths. ' +
+    pluginLog(
+      ctx,
+      'warn',
+      'Binary not found in PATH or typical build paths. ' +
         'Registering fail-closed veto hooks. ' +
         'Install ryk, then run: ryk plugin install opencode --yes.'
     );
@@ -809,7 +843,7 @@ export default async function rykPlugin(ctx: PluginContext): Promise<PluginHooks
     };
   }
 
-  console.log(`[ryk] Plugin loaded. Binary: ${rykBin}`);
+  pluginLog(ctx, 'info', `Plugin loaded. Binary: ${rykBin}`);
 
   return {
     event: async ({ event }) => {
@@ -817,7 +851,7 @@ export default async function rykPlugin(ctx: PluginContext): Promise<PluginHooks
       if (!AUDIT_EVENT_TYPES.has(eventType)) return;
 
       if (eventType === 'session.created') {
-        console.log('[ryk] Plugin ready for session.');
+        pluginLog(ctx, 'info', 'Plugin ready for session.');
       }
 
       await callRyk(
@@ -924,8 +958,10 @@ export default async function rykPlugin(ctx: PluginContext): Promise<PluginHooks
       const scrubbed = scrubEnv(output.env);
       output.env = scrubbed.env;
       if (scrubbed.removed.length > 0) {
-        console.warn(
-          `[ryk] Scrubbed ${scrubbed.removed.length} secret env var(s) from shell.env`
+        pluginLog(
+          ctx,
+          'warn',
+          `Scrubbed ${scrubbed.removed.length} secret env var(s) from shell.env`
         );
       }
 
@@ -947,3 +983,17 @@ export default async function rykPlugin(ctx: PluginContext): Promise<PluginHooks
     },
   };
 }
+
+/**
+ * OpenCode 1.18 legacy loader treats *every named function export* as a plugin.
+ * parseHookResponse / findRyk must not be ESM named exports — they get invoked
+ * as plugins and dump TypeError text into the vanilla TUI prompt.
+ *
+ * Tests read helpers off the default function. Do not add `export function`.
+ */
+const plugin = Object.assign(rykPlugin, {
+  parseHookResponse,
+  findRyk,
+});
+
+export default plugin;

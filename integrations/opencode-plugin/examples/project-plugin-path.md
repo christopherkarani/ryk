@@ -15,6 +15,7 @@ This example shows how to install the ryk plugin locally within a single project
    ```bash
    # Adjust the source path to point to the ryk repository
    cp /path/to/ryk-repo/integrations/opencode-plugin/ryk.ts .opencode/plugins/ryk.ts
+   cp /path/to/ryk-repo/integrations/opencode-plugin/ryk-tui.ts .opencode/plugins/ryk-tui.ts
    ```
 
    Or create a symlink:
