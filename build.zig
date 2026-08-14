@@ -206,10 +206,9 @@ pub fn build(b: *std.Build) void {
     // `-Dtest-filter=…`. Dedicated module (not ryk_core_engine_mod) — reusing the
     // package import as test root fails nested audit/core compile under 0.16.
     //
-    // Not on test-fast / compile-test-fast: unfiltered core_engine still hits
-    // pre-existing Zig 0.16 API breakages in audit/load/supervisor/effects tests
-    // (~29 errors). Product seed path is covered on monopath via cli/run.zig;
-    // pure pack suite: `./scripts/zig build test-core -Dtest-filter=agent_inference`.
+    // Dedicated engine addTest (not ryk_core re-exports). On test-fast serial
+    // chain, compile-test-fast, and `test` after P0-s4. Focused `test-core`
+    // still uses run_core_engine_tests_only so the slice does not wait on lib.
     const core_engine_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/core_engine.zig"),
@@ -218,7 +217,6 @@ pub fn build(b: *std.Build) void {
         }),
         .filters = test_filters,
     });
-    // Focused run only (not on test-fast / full test serial chain — see addTest comment).
     const run_core_engine_tests_only = addRunTestTerminal(b, core_engine_tests);
 
     const core_contract_tests = b.addTest(.{
@@ -509,13 +507,17 @@ pub fn build(b: *std.Build) void {
     const compile_test_lib_step = b.step("compile-test-lib", "Compile ryk lib unit tests without running");
     compile_test_lib_step.dependOn(&lib_tests.step);
 
-    // Keep membership identical to `test-fast` (lib + ryk_core package + core contract).
-    // core_engine_tests is test-core/test-policy only (see comment at addTest) — not fast.
+    // Dedicated core_engine addTest only — not the package half of test-core.
+    const compile_test_core_step = b.step("compile-test-core", "Compile dedicated core_engine unit tests without running");
+    compile_test_core_step.dependOn(&core_engine_tests.step);
+
+    // Keep membership identical to `test-fast` (lib + ryk_core package + contract + core_engine).
     // daemon_ipc_hardening is full-suite only (`test` step), not the fast gate.
     const compile_test_fast_step = b.step("compile-test-fast", "Compile test-fast artifacts without running");
     compile_test_fast_step.dependOn(&lib_tests.step);
     compile_test_fast_step.dependOn(&core_package_tests.step);
     compile_test_fast_step.dependOn(&core_contract_tests.step);
+    compile_test_fast_step.dependOn(&core_engine_tests.step);
 
     const test_lib_step = b.step("test-lib", "Run ryk lib inline tests only");
     test_lib_step.dependOn(&run_lib_tests.step);
@@ -554,12 +556,14 @@ pub fn build(b: *std.Build) void {
 
     // Serialize runs so local `zig build test-fast` does not launch heavy test
     // binaries at once (parallel runs have hung with no output on some hosts).
-    // core_engine_tests deliberately omitted from this chain (see addTest comment).
+    // New run step (not run_core_engine_tests_only) so test-core stays independent.
+    const run_core_engine_tests = addRunTestTerminal(b, core_engine_tests);
     run_core_package_tests.step.dependOn(&run_lib_tests.step);
     run_core_contract_tests.step.dependOn(&run_core_package_tests.step);
+    run_core_engine_tests.step.dependOn(&run_core_contract_tests.step);
 
-    const test_fast_step = b.step("test-fast", "Run fast unit tests (ryk lib + ryk_core package + contract)");
-    test_fast_step.dependOn(&run_core_contract_tests.step);
+    const test_fast_step = b.step("test-fast", "Run fast unit tests (ryk lib + ryk_core package + contract + core_engine)");
+    test_fast_step.dependOn(&run_core_engine_tests.step);
 
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&check_fixture_secrets.step);
@@ -568,7 +572,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_lib_tests.step);
     test_step.dependOn(&run_exe_tests.step);
     test_step.dependOn(&run_core_package_tests.step);
-    // core_engine_tests: test-core/test-policy only until Zig 0.16 suite bitrot is fixed.
+    // _only so full `test` does not wait on the test-fast lib serial chain.
+    test_step.dependOn(&run_core_engine_tests_only.step);
     test_step.dependOn(&run_core_contract_tests.step);
     test_step.dependOn(&run_cli_package_tests.step);
     test_step.dependOn(&run_cli_contract_tests.step);

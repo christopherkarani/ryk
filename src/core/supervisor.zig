@@ -467,7 +467,10 @@ test "workspace detection finds nearest ryk policy parent" {
 }
 
 test "workspace detection falls back to start directory outside git" {
-    const tmp_parent = if (std.process.getEnvVarOwned(std.testing.allocator, "TMPDIR")) |value| value else |_| try std.testing.allocator.dupe(u8, "/tmp");
+    const tmp_parent = if (std.c.getenv("TMPDIR")) |value|
+        try std.testing.allocator.dupe(u8, std.mem.span(value))
+    else
+        try std.testing.allocator.dupe(u8, "/tmp");
     defer std.testing.allocator.free(tmp_parent);
 
     var suffix_buf: [8]u8 = undefined;
@@ -477,7 +480,7 @@ test "workspace detection falls back to start directory outside git" {
     const tmp_path = try std.fs.path.join(std.testing.allocator, &.{ tmp_parent, relative_name });
     defer std.testing.allocator.free(tmp_path);
 
-    try std.Io.Dir.cwd().makePath(std.testing.io, tmp_path);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, tmp_path);
     defer std.Io.Dir.cwd().deleteTree(std.testing.io, tmp_path) catch {};
 
     const root = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, tmp_path, std.testing.allocator);
@@ -568,7 +571,7 @@ test "session start hook failure cleans up spawned child and returns hook error"
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 
     var context: FailingHookContext = .{};
-    const started = std.time.milliTimestamp();
+    const started = std.Io.Timestamp.now(std.testing.io, .awake).toMilliseconds();
     try std.testing.expectError(error.IntentionalHookFailure, run(std.testing.io, std.testing.allocator, .{
         .command = "/bin/sh",
         .args = &.{ "-c", "sleep 0.1" },
@@ -579,7 +582,7 @@ test "session start hook failure cleans up spawned child and returns hook error"
             .callback = FailingHookContext.fail,
         },
     }));
-    const elapsed_ms = std.time.milliTimestamp() - started;
+    const elapsed_ms = std.Io.Timestamp.now(std.testing.io, .awake).toMilliseconds() - started;
 
     try std.testing.expectEqual(@as(usize, 1), context.calls);
     try std.testing.expect(elapsed_ms < 1_500);
@@ -599,10 +602,10 @@ test "health monitor terminates child when required runtime dies" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 
     var context: FailingHealthContext = .{};
-    const started = std.time.milliTimestamp();
+    const started = std.Io.Timestamp.now(std.testing.io, .awake).toMilliseconds();
     var result = try run(std.testing.io, std.testing.allocator, .{
         .command = "/bin/sh",
-        .args = &.{ "-c", "sleep 0.1" },
+        .args = &.{ "-c", "sleep 2" },
         .workspace = ".",
         .stdio = .ignore,
         .health_monitor = .{
@@ -611,7 +614,7 @@ test "health monitor terminates child when required runtime dies" {
         },
     });
     defer result.deinit();
-    const elapsed_ms = std.time.milliTimestamp() - started;
+    const elapsed_ms = std.Io.Timestamp.now(std.testing.io, .awake).toMilliseconds() - started;
 
     try std.testing.expect(result.exitCode() != 0);
     try std.testing.expect(elapsed_ms < 1_500);

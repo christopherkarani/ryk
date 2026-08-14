@@ -753,7 +753,9 @@ test "string-value padding cannot hide email on contact key" {
     var i: usize = 0;
     while (i < max_string_values) : (i += 1) {
         if (i > 0) try list.appendSlice(std.testing.allocator, ",");
-        try list.writer(std.testing.allocator).print("\"decoy{d}\":\"x\"", .{i});
+        var decoy_buf: [32]u8 = undefined;
+        const decoy = try std.fmt.bufPrint(&decoy_buf, "\"decoy{d}\":\"x\"", .{i});
+        try list.appendSlice(std.testing.allocator, decoy);
     }
     try list.appendSlice(std.testing.allocator, ",\"email\":\"user@example.com\"}");
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, list.items, .{});
@@ -774,7 +776,9 @@ test "large decoy object cannot hide to+body past scan window" {
     var i: usize = 0;
     while (i < max_object_entries_scanned + 8) : (i += 1) {
         if (i > 0) try list.appendSlice(std.testing.allocator, ",");
-        try list.writer(std.testing.allocator).print("\"decoy{d}\":\"x\"", .{i});
+        var decoy_buf: [32]u8 = undefined;
+        const decoy = try std.fmt.bufPrint(&decoy_buf, "\"decoy{d}\":\"x\"", .{i});
+        try list.appendSlice(std.testing.allocator, decoy);
     }
     try list.appendSlice(std.testing.allocator, ",\"to\":\"a@b.com\",\"body\":\"hi\"}");
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, list.items, .{});
@@ -795,7 +799,7 @@ fn assertUrlShapeSurvivesInterestingPadding(comptime url_key: []const u8) !void 
     // a non-interesting href/uri would be considered in pass 2.
     const padding_keys = [_][]const u8{
         "to",      "body",     "message", "recipient", "phone",  "text",
-        "channel", "email",    "subject", "tweet",     "status", "post_text",
+        "channel", "email",    "subject", "mailto",    "status", "from",
         "amount",  "currency", "price",   "payload",
     };
     comptime {
@@ -806,12 +810,17 @@ fn assertUrlShapeSurvivesInterestingPadding(comptime url_key: []const u8) !void 
     defer list.deinit(std.testing.allocator);
     try list.appendSlice(std.testing.allocator, "{");
     // url-shape key first so, once interesting, it is collected in pass 1 before the cap fills.
-    try list.writer(std.testing.allocator).print(
+    var url_buf: [64]u8 = undefined;
+    const url_field = try std.fmt.bufPrint(
+        &url_buf,
         "\"{s}\":\"https://api.twitter.com/2/tweets\"",
         .{url_key},
     );
+    try list.appendSlice(std.testing.allocator, url_field);
     for (padding_keys) |pk| {
-        try list.writer(std.testing.allocator).print(",\"{s}\":\"x\"", .{pk});
+        var pad_buf: [32]u8 = undefined;
+        const pad = try std.fmt.bufPrint(&pad_buf, ",\"{s}\":\"x\"", .{pk});
+        try list.appendSlice(std.testing.allocator, pad);
     }
     try list.appendSlice(std.testing.allocator, "}");
 
