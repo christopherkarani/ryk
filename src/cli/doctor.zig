@@ -917,11 +917,11 @@ fn writeWindowsBackendReport(io: std.Io, stdout: anytype, backend_report: sandbo
     const shell = backend_report.get(.shell_wrapping);
     const shell_cg = levelColorAndGlyph(shell.level);
     if (style.useColor(io, stdout)) {
-        try stdout.print("  {s} cmd wrapper: {s}partial{s} ({s})\n", .{ shell_cg.glyph, style.Style.yellow, style.Style.reset, shell.note });
-        try stdout.print("  {s} PowerShell wrapper: {s}partial{s} ({s})\n", .{ shell_cg.glyph, style.Style.yellow, style.Style.reset, shell.note });
+        try stdout.print("  {s} cmd wrapper: {s}{s}{s} ({s})\n", .{ shell_cg.glyph, shell_cg.color, shell.level.toString(), style.Style.reset, shell.note });
+        try stdout.print("  {s} PowerShell wrapper: {s}{s}{s} ({s})\n", .{ shell_cg.glyph, shell_cg.color, shell.level.toString(), style.Style.reset, shell.note });
     } else {
-        try stdout.print("  cmd wrapper: partial ({s})\n", .{shell.note});
-        try stdout.print("  PowerShell wrapper: partial ({s})\n", .{shell.note});
+        try stdout.print("  cmd wrapper: {s} ({s})\n", .{ shell.level.toString(), shell.note });
+        try stdout.print("  PowerShell wrapper: {s} ({s})\n", .{ shell.level.toString(), shell.note });
     }
     const cleanup = backend_report.get(.process_supervision);
     const cleanup_cg = levelColorAndGlyph(cleanup.level);
@@ -930,8 +930,15 @@ fn writeWindowsBackendReport(io: std.Io, stdout: anytype, backend_report: sandbo
     } else {
         try stdout.print("  process cleanup: {s} ({s})\n", .{ cleanup.level.toString(), cleanup.note });
     }
-    try stdout.writeAll("  transparent file enforcement: limited (no transparent Windows filesystem enforcement is installed; ryk-mediated staging and protected path matching are active)\n");
+    try stdout.writeAll("  transparent file enforcement: unavailable (no transparent Windows filesystem enforcement is installed; ryk-mediated staging and protected path matching are active)\n");
     try writeBackendLine(io, stdout, backend_report, .network_enforce);
+    const proxy = backend_report.get(.network_proxy_enforce);
+    const proxy_cg = levelColorAndGlyph(proxy.level);
+    if (style.useColor(io, stdout)) {
+        try stdout.print("  {s} proxy-mediated HTTP: {s}{s}{s} ({s})\n", .{ proxy_cg.glyph, proxy_cg.color, proxy.level.toString(), style.Style.reset, proxy.note });
+    } else {
+        try stdout.print("  proxy-mediated HTTP: {s} ({s})\n", .{ proxy.level.toString(), proxy.note });
+    }
     try writeBackendLine(io, stdout, backend_report, .strong_sandbox);
     try writeBackendLine(io, stdout, backend_report, .mcp_stdio_proxy);
     try writeBackendLine(io, stdout, backend_report, .audit);
@@ -1389,7 +1396,7 @@ test "doctor renders verbose OS and planned capabilities from an injected contex
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "process supervision:") != null);
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "network policy engine: active") != null);
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "transparent network enforcement: unavailable") != null or std.mem.indexOf(u8, stdout_writer.buffered(), "transparent network enforcement: limited") != null or std.mem.indexOf(u8, stdout_writer.buffered(), "transparent network enforcement: observe-only") != null);
-    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "proxy-mediated enforcement: limited") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "proxy-mediated enforcement: limited") != null or std.mem.indexOf(u8, stdout_writer.buffered(), "proxy-mediated enforcement: unavailable") != null);
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "Backend:") != null or std.mem.indexOf(u8, stdout_writer.buffered(), "Linux backend:") != null or std.mem.indexOf(u8, stdout_writer.buffered(), "macOS backend:") != null);
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "env filtering: active") != null);
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "strong sandbox:") != null);
@@ -1494,10 +1501,11 @@ test "doctor can render Windows backend details from an injected report" {
     try std.testing.expect(std.mem.indexOf(u8, written, "env filtering: active") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "path staging: active") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "PATH shims: wrapper-only") != null);
-    try std.testing.expect(std.mem.indexOf(u8, written, "cmd wrapper: partial") != null);
-    try std.testing.expect(std.mem.indexOf(u8, written, "PowerShell wrapper: partial") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "cmd wrapper: wrapper-only") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "PowerShell wrapper: wrapper-only") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "process cleanup: partial") != null);
-    try std.testing.expect(std.mem.indexOf(u8, written, "transparent file enforcement: limited") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "transparent file enforcement: unavailable") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "proxy-mediated HTTP: unavailable") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "transparent network enforcement: unavailable") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "strong sandbox: unavailable") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "mcp stdio proxy: active") != null);

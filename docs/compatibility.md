@@ -52,8 +52,8 @@ Reserve marketing “firewall” / “maximum protection” for a **verified** m
 | MCP manifests | active | active | active |
 | MCP sampling controls | active | active | active |
 | Network decision engine | active | active | active |
-| Proxy-mediated network enforcement | limited; explicit loopback proxy when requested; route forcing when OS sandbox supports it | limited; explicit loopback proxy when requested; route forcing when OS sandbox supports it | limited; explicit loopback proxy when requested, routes not forced |
-| Transparent network enforcement | per-session Landlock TCP route forcing with ABI >= 4; otherwise observe-only | per-session Seatbelt TCP route forcing with proxy backend + OS sandbox; otherwise unavailable | unavailable; wrapper/proxy-mediated only, routes not forced |
+| Proxy-mediated network enforcement | limited; explicit loopback proxy when requested; route forcing when OS sandbox supports it | limited; explicit loopback proxy when requested; route forcing when OS sandbox supports it | unavailable (no loopback proxy) |
+| Transparent network enforcement | per-session Landlock TCP route forcing with ABI >= 4; otherwise observe-only | per-session Seatbelt TCP route forcing with proxy backend + OS sandbox; otherwise unavailable | unavailable; wrapper-mediated only, routes not forced |
 | Transparent filesystem enforcement | staged writes; Landlock attach when available | limited; Seatbelt attach when available | unavailable; no OS attach. Staged writes and protected-path matching only (wrapper/hook) |
 | Strong sandbox (session-attach) | Landlock when ABI ≥ 3 (kernel 6.2+); else unavailable | Seatbelt capability majors 14–26; else unavailable | unavailable |
 | Advanced `--os-sandbox` flag | auto \| on \| off (default auto) | auto \| on \| off (default auto) | off / unavailable |
@@ -61,9 +61,9 @@ Reserve marketing “firewall” / “maximum protection” for a **verified** m
 | Process cleanup | active or partial | active | partial |
 | Red-team suite | active | active | active |
 
-`wrapper-only` means ryk-mediated command paths are protected by shims or wrappers (grade **`wrapper`**). It is not transparent OS enforcement. Absolute paths can skip PATH shims; OS filesystem attach and network route-force (when active) still apply to the child process. PATH honesty under attach uses a **denylist** of known package trees plus an optional essentials file-only `.exec` pack (`RYK_TOOL_PACK`) — see `docs/commands.md`.
+`wrapper-only` means ryk-mediated command paths are protected by shims or wrappers (grade **`wrapper`**). It is not transparent OS enforcement. Absolute paths can skip PATH shims. On macOS and Linux, OS filesystem attach and network route-force (when active) still apply to the child process. PATH honesty under attach uses a **denylist** of known package trees plus an optional essentials file-only `.exec` pack (`RYK_TOOL_PACK`) — see `docs/commands.md`.
 
-**Windows:** ryk is macOS/Linux-first. There is no OS sandbox backend (`src/sandbox/windows.zig` reports `strong_sandbox` unavailable). Sessions are `wrapper` / `hook` grade only. Doctor probes cannot promote Windows to `OS-enforced`. See [platform-windows.md](platform-windows.md).
+**Windows:** ryk is macOS/Linux-first. There is no OS-enforced session-attach (`src/sandbox/windows.zig` reports `strong_sandbox` unavailable). Sessions are `wrapper` / `hook` grade; MCP stdio is `proxy` grade. Doctor probes cannot promote Windows to `OS-enforced`. See [platform-windows.md](platform-windows.md).
 
 **Probe vs session-attach:** Doctor and platform matrices may report sandbox **capability** (`partial` / API present). That is not a live session `active` claim. Trust **`OS-enforced`** filesystem isolation only for a protected agent session that completed child apply-before-exec attach (profile hash present). Use advanced `ryk run --os-sandbox on` to fail closed when attach cannot complete.
 

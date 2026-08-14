@@ -89,8 +89,8 @@ Linux builds use backend detection for namespace, seccomp, Landlock, cgroup, and
 
 ## Windows Notes
 
-ryk is macOS/Linux-first. Windows sessions run at **wrapper/hook grade** with **no OS sandbox**. There is no Seatbelt, Landlock, AppContainer, or Windows Filtering Platform session-attach backend; `src/sandbox/windows.zig` reports `strong_sandbox` unavailable. Doctor cannot promote a Windows session to `OS-enforced`.
+ryk is macOS/Linux-first. Windows sessions run at **wrapper/hook grade** with **no OS sandbox**. There is no Seatbelt, Landlock, AppContainer, or Windows Filtering Platform session-attach backend; `src/sandbox/windows.zig` reports `strong_sandbox` unavailable. Doctor cannot promote a Windows session to `OS-enforced`. MCP stdio is **proxy** grade.
 
-Windows builds use `ryk.exe`, PowerShell scripts, path normalization, command wrappers, staged writes, and process cleanup support where implemented. Transparent filesystem enforcement is not installed (ryk-mediated staging and protected-path matching still run). Transparent network enforcement is unavailable; only wrapper/proxy-mediated hooks apply, and routes are not forced.
+Windows builds use `ryk.exe`, PowerShell scripts, path normalization, command wrappers, staged writes, and process cleanup support where implemented. Transparent filesystem enforcement is unavailable (ryk-mediated staging and protected-path matching still run). Transparent network enforcement and proxy-mediated HTTP are unavailable (no loopback proxy).
 
 See the [compatibility matrix](compatibility.md) and [Windows platform notes](platform-windows.md). WinGet and Scoop are not published; they stay deferred pending a Windows story ([packaging/README.md](../packaging/README.md)).

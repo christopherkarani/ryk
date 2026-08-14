@@ -4,7 +4,7 @@
 
 ### Changed
 
-* **Windows positioning:** public docs now state that ryk is macOS/Linux-first. Windows sessions have no OS sandbox and run at wrapper/hook grade only. WinGet and Scoop stay deferred pending a Windows story (decision 2026-08-13).
+* **Windows positioning:** public docs and `ryk doctor` now match backend truth. Windows sessions have no OS sandbox and run at wrapper/hook grade (MCP stdio is proxy). Doctor reports cmd/PowerShell wrappers as wrapper-only, and transparent filesystem plus proxy-mediated HTTP as unavailable (no loopback proxy). WinGet and Scoop stay deferred pending a Windows story (decision 2026-08-13).
 
 ### Security (OS sandbox audit 2026-08-13)
 
