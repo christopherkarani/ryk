@@ -22,6 +22,7 @@ Use `./scripts/agent-gate.sh` when you are unsure which check fits the change. I
 - `verify-release.sh` checks archives, manifests, checksums, and version alignment.
 - `release-dry-run.sh` builds and verifies a host archive without publishing it.
 - `cut-release.sh` is the maintainer release orchestrator. Read [the release guide](../docs/dev/release.md) before using its live mode.
+- `test-release-signing.sh` proves the installer refuses a release it cannot authenticate (tampered, forged, wrong-key, or missing signature). Uses a throwaway keypair, never the release key. Runs inside `verify-pre-merge.sh`; see [release signing](../docs/release-signing.md).
 
 The release scripts write archives and generated metadata under ignored `dist/` or `dist-dry-run/` directories. Do not commit those outputs.
 

@@ -25,6 +25,11 @@ else
   echo "[verify-pre-merge] skip openclaw release assets (plugin node_modules/.bin/tsc missing)"
 fi
 
+# The installer must refuse a release it cannot authenticate. Skips loudly when no
+# minisign/rsign is installed rather than passing silently.
+echo "[verify-pre-merge] Release signing contract"
+./scripts/test-release-signing.sh
+
 echo "[verify-pre-merge] First-user install and uninstall regressions"
 ./scripts/install-first-user-regression-test.sh
 ./scripts/uninstall-first-user-regression-test.sh

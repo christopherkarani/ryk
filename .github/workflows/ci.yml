@@ -73,3 +73,54 @@ jobs:
           name: ${{ matrix.artifact_name }}
           path: planning/security/evidence/
           if-no-files-found: error
+
+  # Release signing is a dry run on purpose: the secret key must never exist in
+  # CI, so this proves the *verification* contract with a throwaway keypair. The
+  # matrix covers both verifier implementations the installer accepts, and runs on
+  # both platforms because the installer's shell is what differs between them.
+  release-signing:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runs-on: ubuntu-latest
+            verifier: minisign
+          - runs-on: macos-14
+            verifier: minisign
+          - runs-on: macos-14
+            verifier: rsign
+    runs-on: ${{ matrix.runs-on }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ${{ matrix.verifier }}
+        env:
+          VERIFIER: ${{ matrix.verifier }}
+        run: |
+          set -euo pipefail
+          case "$VERIFIER" in
+            minisign)
+              if [ "$RUNNER_OS" = "Linux" ]; then
+                sudo apt-get update && sudo apt-get install -y minisign
+              else
+                brew install minisign
+              fi
+              minisign -v
+              ;;
+            rsign)
+              cargo install rsign2 --locked
+              echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+              ;;
+          esac
+      - name: Signature contract (fail-closed boundary)
+        run: ./scripts/test-release-signing.sh
+      - name: Refuse to skip when a verifier is present
+        run: |
+          set -euo pipefail
+          # The test skips when no verifier exists. A skip here would mean the
+          # install step above silently failed, so the signal must be a real pass.
+          ./scripts/test-release-signing.sh | tee /tmp/signing.log
+          if grep -q 'SKIPPED' /tmp/signing.log; then
+            echo "release signing test skipped despite an installed verifier" >&2
+            exit 1
+          fi
+          grep -q 'test-release-signing: passed' /tmp/signing.log
