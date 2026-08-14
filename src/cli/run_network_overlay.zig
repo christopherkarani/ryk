@@ -12,16 +12,48 @@ const core = @import("ryk_core").core;
 const policy = @import("ryk_core").policy;
 const intercept = @import("../intercept/mod.zig");
 
-const run_mod = @import("run.zig");
-const RunOptions = run_mod.RunOptions;
-const AgentNetworkDefault = run_mod.AgentNetworkDefault;
-const wantsMediatedAgentNetwork = run_mod.wantsMediatedAgentNetwork;
-const cliNetworkMode = run_mod.cliNetworkMode;
-const installNetworkEnvironment = run_mod.installNetworkEnvironment;
+/// Overlay-facing launch inputs. `run.zig` maps `RunOptions` into this at the
+/// product site so this file never imports `run.zig` (no test-binary cycle).
+pub const NetworkOverlayOptions = struct {
+    network_mode: ?policy.schema.NetworkMode = null,
+    network_backend: ?policy.schema.NetworkBackend = null,
+    allow_network: []const []const u8 = &.{},
+    command_argv: []const []const u8 = &.{},
+};
+
+/// Same tags as `run.zig`'s `AgentNetworkDefault`. Product maps at the call site.
+pub const OverlayNetworkDefault = enum { mediated, legacy };
+
+/// Host aliases default to proxy + OS route-force unless the user escapes.
+/// Keep body identical to `run.zig` `wantsMediatedAgentNetwork` (single rule).
+pub fn wantsMediatedAgentNetwork(
+    options: NetworkOverlayOptions,
+    agent_net_default: OverlayNetworkDefault,
+    trusted_agent_host: bool,
+) bool {
+    if (agent_net_default != .mediated) return false;
+    if (!trusted_agent_host) return false;
+    if (options.network_mode) |mode| {
+        if (mode == .open) return false;
+    }
+    return true;
+}
+
+/// CLI network mode: explicit `--network`/`--no-network` wins.
+/// Keep body identical to `run.zig` `cliNetworkMode` (single rule).
+pub fn cliNetworkMode(
+    options: NetworkOverlayOptions,
+    agent_net_default: OverlayNetworkDefault,
+    trusted_agent_host: bool,
+) policy.schema.NetworkMode {
+    if (options.network_mode) |mode| return mode;
+    if (wantsMediatedAgentNetwork(options, agent_net_default, trusted_agent_host)) return .allowlist;
+    return .ask;
+}
 
 /// Basename of argv0 for unit-test / fallback overlay selection when the product
 /// call site has not supplied a resolved trusted host key.
-pub fn hostKeyFromCommandArgv(options: RunOptions) ?[]const u8 {
+pub fn hostKeyFromCommandArgv(options: NetworkOverlayOptions) ?[]const u8 {
     if (options.command_argv.len == 0) return null;
     const base = std.fs.path.basename(options.command_argv[0]);
     if (base.len == 0) return null;
@@ -42,8 +74,8 @@ pub const DiscoveryLaunchContext = struct {
 pub fn applyNetworkOverlay(
     allocator: std.mem.Allocator,
     selected_policy: *policy.schema.Policy,
-    options: RunOptions,
-    agent_net_default: AgentNetworkDefault,
+    options: NetworkOverlayOptions,
+    agent_net_default: OverlayNetworkDefault,
     trusted_agent_host: bool,
 ) !void {
     try applyNetworkOverlayWithHostKey(
@@ -75,8 +107,8 @@ pub fn applyNetworkOverlay(
 pub fn applyNetworkOverlayWithHostKey(
     allocator: std.mem.Allocator,
     selected_policy: *policy.schema.Policy,
-    options: RunOptions,
-    agent_net_default: AgentNetworkDefault,
+    options: NetworkOverlayOptions,
+    agent_net_default: OverlayNetworkDefault,
     trusted_agent_host: bool,
     host_key: ?[]const u8,
     discovery: ?DiscoveryLaunchContext,
@@ -106,7 +138,7 @@ pub fn applyNetworkOverlayWithHostKey(
     }
 
     // CLI --allow-network after seed (EFF-3); no-op when empty keeps seed-only list.
-    const runtime_allow = options.allowNetwork();
+    const runtime_allow = options.allow_network;
     if (runtime_allow.len == 0) return;
 
     const old_allow = selected_policy.network.allow;
@@ -206,9 +238,7 @@ test "applyNetworkOverlay defaults to ask and does not force allowlist for --all
     try std.testing.expect(pol.network.backend == null or pol.network.backend.? == .decision_only);
 
     pol.network.mode = .allowlist;
-    var opts: RunOptions = .{};
-    opts.allow_network_values[0] = "api.example.com";
-    opts.allow_network_count = 1;
+    const opts: NetworkOverlayOptions = .{ .allow_network = &.{"api.example.com"} };
     try applyNetworkOverlay(std.testing.allocator, &pol, opts, .mediated, false);
     try std.testing.expectEqual(policy.schema.NetworkMode.ask, pol.network.mode.?);
     try std.testing.expect(pol.network.allow.len >= 1);
@@ -226,7 +256,7 @@ test "applyNetworkOverlay trusted host-alias defaults force proxy backend and al
     pol.network.mode = .ask;
     pol.network.backend = null;
 
-    const host_opts: RunOptions = .{ .command_argv = &.{"pi"} };
+    const host_opts: NetworkOverlayOptions = .{ .command_argv = &.{"pi"} };
     try applyNetworkOverlay(std.testing.allocator, &pol, host_opts, .mediated, true);
     try std.testing.expectEqual(policy.schema.NetworkMode.allowlist, pol.network.mode.?);
     try std.testing.expectEqual(policy.schema.NetworkBackend.proxy, pol.network.backend.?);
@@ -243,7 +273,7 @@ test "applyNetworkOverlay trusted host-alias defaults force proxy backend and al
 
     // --network open: no proxy force, mediation off.
     pol.network.backend = null;
-    const open_opts: RunOptions = .{ .command_argv = &.{"pi"}, .network_mode = .open };
+    const open_opts: NetworkOverlayOptions = .{ .command_argv = &.{"pi"}, .network_mode = .open };
     try applyNetworkOverlay(std.testing.allocator, &pol, open_opts, .mediated, true);
     try std.testing.expectEqual(policy.schema.NetworkMode.open, pol.network.mode.?);
     try std.testing.expect(pol.network.backend == null);
@@ -326,9 +356,9 @@ test "applyNetworkOverlay seeds core pack and pi overlay on mediated trusted hos
     var pol: policy.schema.Policy = .{ .allocator = allocator };
     defer pol.network.deinit(allocator);
     try std.testing.expectEqual(@as(usize, 0), pol.network.allow.len);
-    try std.testing.expectEqual(@as(usize, 0), (@as(RunOptions, .{})).allow_network_count);
+    try std.testing.expectEqual(@as(usize, 0), (@as(NetworkOverlayOptions, .{})).allow_network.len);
 
-    const opts: RunOptions = .{ .command_argv = &.{"pi"} };
+    const opts: NetworkOverlayOptions = .{ .command_argv = &.{"pi"} };
     try applyNetworkOverlay(allocator, &pol, opts, .mediated, true);
 
     try std.testing.expectEqual(policy.schema.NetworkMode.allowlist, pol.network.mode.?);
@@ -445,9 +475,10 @@ test "applyNetworkOverlay seed composes CLI --allow-network after pack without r
     defer pol.network.deinit(allocator);
     pol.network.allow = try policy.schema.duplicateStringList(allocator, &.{"github.com"});
 
-    var opts: RunOptions = .{ .command_argv = &.{"opencode"} };
-    opts.allow_network_values[0] = "api.custom-provider.example";
-    opts.allow_network_count = 1;
+    const opts: NetworkOverlayOptions = .{
+        .command_argv = &.{"opencode"},
+        .allow_network = &.{"api.custom-provider.example"},
+    };
 
     try applyNetworkOverlay(allocator, &pol, opts, .mediated, true);
 
@@ -534,9 +565,10 @@ test "applyNetworkOverlay non-alias with CLI --allow-network still does not seed
     var pol: policy.schema.Policy = .{ .allocator = allocator };
     defer pol.network.deinit(allocator);
 
-    var opts: RunOptions = .{ .command_argv = &.{"/bin/true"} };
-    opts.allow_network_values[0] = "api.example.com";
-    opts.allow_network_count = 1;
+    const opts: NetworkOverlayOptions = .{
+        .command_argv = &.{"/bin/true"},
+        .allow_network = &.{"api.example.com"},
+    };
 
     try applyNetworkOverlay(allocator, &pol, opts, .mediated, false);
 
@@ -572,7 +604,7 @@ const p3_launch_pi_settings_json =
 ;
 
 /// Opencode auth: xai oauth key → catalog api.x.ai + auth.x.ai; opencode key → overlay hosts.
-const p3_launch_opencode_auth_json =
+pub const p3_launch_opencode_auth_json =
     \\{
     \\  "xai": {
     \\    "type": "oauth",
@@ -612,7 +644,7 @@ const p3_launch_fixture_secret_needles = [_][]const u8{
     "NOT-REAL",
 };
 
-fn p3LaunchAbsPath(tmp: anytype) ![]u8 {
+pub fn p3LaunchAbsPath(tmp: anytype) ![]u8 {
     // realPathFileAlloc → [:0]u8; re-dupe so free size matches DebugAllocator (Zig 0.16).
     const z = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(z);
@@ -633,7 +665,7 @@ fn p3LaunchPlantPiHome(home_dir: anytype, auth: []const u8, settings: ?[]const u
     if (settings) |s| try p3LaunchWriteRel(home_dir, ".pi/agent/settings.json", s);
 }
 
-fn p3LaunchPlantOpencodeHome(home_dir: anytype, auth: []const u8) !void {
+pub fn p3LaunchPlantOpencodeHome(home_dir: anytype, auth: []const u8) !void {
     try p3LaunchWriteRel(home_dir, ".local/share/opencode/auth.json", auth);
 }
 
@@ -1126,9 +1158,10 @@ test "applyNetworkOverlayWithHostKey P3 CLI --allow-network composes after disco
     defer pol.network.deinit(allocator);
     pol.network.allow = try policy.schema.duplicateStringList(allocator, &.{"github.com"});
 
-    var opts: RunOptions = .{ .command_argv = &.{"pi"} };
-    opts.allow_network_values[0] = "api.session-cli.example";
-    opts.allow_network_count = 1;
+    const opts: NetworkOverlayOptions = .{
+        .command_argv = &.{"pi"},
+        .allow_network = &.{"api.session-cli.example"},
+    };
 
     try applyNetworkOverlayWithHostKey(
         allocator,
@@ -1260,52 +1293,4 @@ test "applyNetworkOverlayWithHostKey P3 host_key scopes managed grants (no cross
 
     try std.testing.expect(testNetworkAllowContains(pol.network.allow, "auth.x.ai"));
     try std.testing.expect(!testNetworkAllowContains(pol.network.allow, "opencode-only-managed.invalid"));
-}
-
-test "applyNetworkOverlayWithHostKey P3 RYK_NETWORK_ALLOW includes discovered hosts after installNetworkEnvironment" {
-    // LIVE unit proxy: product exports effective allow via RYK_NETWORK_ALLOW (installNetworkEnvironment).
-    // Full binary ryk pi/opencode CONNECT smoke remains implementer / p3-docs-live gate.
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-
-    var ws_tmp = std.testing.tmpDir(.{});
-    defer ws_tmp.cleanup();
-    const workspace_root = try p3LaunchAbsPath(&ws_tmp);
-    defer allocator.free(workspace_root);
-    try policy.network_discovered.writeManaged(io, allocator, workspace_root, &.{
-        .{ .host = "auth.x.ai", .sources = &.{"opencode:discover"} },
-    });
-
-    var home_tmp = std.testing.tmpDir(.{});
-    defer home_tmp.cleanup();
-    try p3LaunchPlantOpencodeHome(home_tmp.dir, p3_launch_opencode_auth_json);
-    const home = try p3LaunchAbsPath(&home_tmp);
-    defer allocator.free(home);
-
-    var pol: policy.schema.Policy = .{ .allocator = allocator };
-    defer pol.network.deinit(allocator);
-
-    try applyNetworkOverlayWithHostKey(
-        allocator,
-        &pol,
-        .{ .command_argv = &.{"opencode"} },
-        .mediated,
-        true,
-        "opencode",
-        .{ .io = io, .workspace_root = workspace_root, .home = home },
-    );
-
-    var env_map = std.process.Environ.Map.init(allocator);
-    defer env_map.deinit();
-    try installNetworkEnvironment(allocator, &env_map, pol.network);
-
-    const allow_csv = env_map.get("RYK_NETWORK_ALLOW") orelse {
-        try std.testing.expect(false); // must export when allow non-empty
-        return;
-    };
-    try std.testing.expect(std.mem.indexOf(u8, allow_csv, "auth.x.ai") != null);
-    try std.testing.expect(std.mem.indexOf(u8, allow_csv, "api.x.ai") != null);
-    try std.testing.expect(std.mem.indexOf(u8, allow_csv, "opencode.ai") != null);
-    try std.testing.expect(std.mem.indexOf(u8, allow_csv, "pastebin.com") == null);
-    try std.testing.expect(std.mem.indexOf(u8, allow_csv, "NOT-REAL") == null);
 }

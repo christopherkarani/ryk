@@ -24,7 +24,7 @@ const codex_mcp_sandbox = @import("codex_mcp_sandbox.zig");
 const host_mcp_sandbox = @import("host_mcp_sandbox.zig");
 const run_network_overlay = @import("run_network_overlay.zig");
 
-pub const RunOptions = struct {
+const RunOptions = struct {
     workspace: ?[]const u8 = null,
     mode: core.types.Mode = .observe,
     mode_explicit: bool = false,
@@ -49,7 +49,7 @@ pub const RunOptions = struct {
     required_backend_count: usize = 0,
     command_argv: []const []const u8 = &.{},
 
-    pub fn allowNetwork(self: *const RunOptions) []const []const u8 {
+    fn allowNetwork(self: *const RunOptions) []const []const u8 {
         return self.allow_network_values[0..self.allow_network_count];
     }
 
@@ -299,8 +299,8 @@ fn commandWithStdioAndEnv(io: std.Io, argv: []const []const u8, stdout: anytype,
     try run_network_overlay.applyNetworkOverlayWithHostKey(
         allocator,
         loaded_policy.innerMutPtr(),
-        options,
-        agent_net_default,
+        overlayOptionsFromRun(options),
+        overlayDefaultFromRun(agent_net_default),
         trusted_agent_host,
         if (trusted_host_key.len > 0) trusted_host_key else null,
         .{
@@ -1766,7 +1766,7 @@ fn parseOptions(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: a
 /// `--network open` / policy escape. Emits WARNING on use (see parse path).
 /// Target: remove no later than the release after 2026-09 (or earlier if
 /// usage is zero). Do not treat as a permanent product surface.
-pub const AgentNetworkDefault = enum { mediated, legacy };
+const AgentNetworkDefault = enum { mediated, legacy };
 
 /// Effective session sandbox grade (Phase 5 honesty). Advertised via
 /// `RYK_SESSION_SANDBOX_GRADE` and the session banner. Distinct from doctor
@@ -1824,23 +1824,39 @@ fn parseAgentNetworkDefault(value: ?[]const u8) AgentNetworkDefault {
 /// Escapes only: `--network open` and `RYK_AGENT_NETWORK_DEFAULT=legacy`.
 /// `--network-backend decision-only` does **not** opt out (would recreate labels-only theater).
 /// Requires **trusted** agent host identity (F-02), not basename alone.
-pub fn wantsMediatedAgentNetwork(options: RunOptions, agent_net_default: AgentNetworkDefault, trusted_agent_host: bool) bool {
-    if (agent_net_default != .mediated) return false;
-    if (!trusted_agent_host) return false;
-    if (options.network_mode) |mode| {
-        // Explicit unrestricted escape — no route-force required.
-        if (mode == .open) return false;
-    }
-    return true;
+fn overlayOptionsFromRun(options: RunOptions) run_network_overlay.NetworkOverlayOptions {
+    return .{
+        .network_mode = options.network_mode,
+        .network_backend = options.network_backend,
+        .allow_network = options.allowNetwork(),
+        .command_argv = options.command_argv,
+    };
+}
+
+fn overlayDefaultFromRun(agent_net_default: AgentNetworkDefault) run_network_overlay.OverlayNetworkDefault {
+    return switch (agent_net_default) {
+        .mediated => .mediated,
+        .legacy => .legacy,
+    };
+}
+
+fn wantsMediatedAgentNetwork(options: RunOptions, agent_net_default: AgentNetworkDefault, trusted_agent_host: bool) bool {
+    return run_network_overlay.wantsMediatedAgentNetwork(
+        overlayOptionsFromRun(options),
+        overlayDefaultFromRun(agent_net_default),
+        trusted_agent_host,
+    );
 }
 
 /// CLI network mode: explicit `--network`/`--no-network` wins.
 /// Trusted host-alias mediated default is allowlist (headless-safe); everything else stays ask.
 /// Secretless is intentionally not defaulted here (Phase 1 SECRETLESS_DEFAULT_GO: no).
-pub fn cliNetworkMode(options: RunOptions, agent_net_default: AgentNetworkDefault, trusted_agent_host: bool) policy.schema.NetworkMode {
-    if (options.network_mode) |mode| return mode;
-    if (wantsMediatedAgentNetwork(options, agent_net_default, trusted_agent_host)) return .allowlist;
-    return .ask;
+fn cliNetworkMode(options: RunOptions, agent_net_default: AgentNetworkDefault, trusted_agent_host: bool) policy.schema.NetworkMode {
+    return run_network_overlay.cliNetworkMode(
+        overlayOptionsFromRun(options),
+        overlayDefaultFromRun(agent_net_default),
+        trusted_agent_host,
+    );
 }
 
 /// Empty backpack for explicit `--secretless` or a **trusted** host-launch alias.
@@ -1863,7 +1879,7 @@ fn requiresBackend(options: RunOptions, feature: sandbox.backend.Feature) bool {
     return false;
 }
 
-pub fn installNetworkEnvironment(allocator: std.mem.Allocator, env_map: *std.process.Environ.Map, network_policy: policy.schema.NetworkPolicy) !void {
+fn installNetworkEnvironment(allocator: std.mem.Allocator, env_map: *std.process.Environ.Map, network_policy: policy.schema.NetworkPolicy) !void {
     try env_map.put("RYK_NETWORK_POLICY_ENGINE", "active");
     try env_map.put("RYK_NETWORK_MODE", network_policy.effectiveMode().toString());
     try env_map.put("RYK_TRANSPARENT_NETWORK_ENFORCEMENT", "unavailable");
@@ -3192,6 +3208,54 @@ test "writeSessionPosture attests boundary sandbox gateway and escape truthfully
     );
 }
 
+
+test "applyNetworkOverlayWithHostKey P3 RYK_NETWORK_ALLOW includes discovered hosts after installNetworkEnvironment" {
+    // LIVE unit proxy: product exports effective allow via RYK_NETWORK_ALLOW (installNetworkEnvironment).
+    // Full binary ryk pi/opencode CONNECT smoke remains implementer / p3-docs-live gate.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var ws_tmp = std.testing.tmpDir(.{});
+    defer ws_tmp.cleanup();
+    const workspace_root = try run_network_overlay.p3LaunchAbsPath(&ws_tmp);
+    defer allocator.free(workspace_root);
+    try policy.network_discovered.writeManaged(io, allocator, workspace_root, &.{
+        .{ .host = "auth.x.ai", .sources = &.{"opencode:discover"} },
+    });
+
+    var home_tmp = std.testing.tmpDir(.{});
+    defer home_tmp.cleanup();
+    try run_network_overlay.p3LaunchPlantOpencodeHome(home_tmp.dir, run_network_overlay.p3_launch_opencode_auth_json);
+    const home = try run_network_overlay.p3LaunchAbsPath(&home_tmp);
+    defer allocator.free(home);
+
+    var pol: policy.schema.Policy = .{ .allocator = allocator };
+    defer pol.network.deinit(allocator);
+
+    try run_network_overlay.applyNetworkOverlayWithHostKey(
+        allocator,
+        &pol,
+        .{ .command_argv = &.{"opencode"} },
+        .mediated,
+        true,
+        "opencode",
+        .{ .io = io, .workspace_root = workspace_root, .home = home },
+    );
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try installNetworkEnvironment(allocator, &env_map, pol.network);
+
+    const allow_csv = env_map.get("RYK_NETWORK_ALLOW") orelse {
+        try std.testing.expect(false); // must export when allow non-empty
+        return;
+    };
+    try std.testing.expect(std.mem.indexOf(u8, allow_csv, "auth.x.ai") != null);
+    try std.testing.expect(std.mem.indexOf(u8, allow_csv, "api.x.ai") != null);
+    try std.testing.expect(std.mem.indexOf(u8, allow_csv, "opencode.ai") != null);
+    try std.testing.expect(std.mem.indexOf(u8, allow_csv, "pastebin.com") == null);
+    try std.testing.expect(std.mem.indexOf(u8, allow_csv, "NOT-REAL") == null);
+}
 
 test "parseAgentNetworkDefault only legacy opts out" {
     try std.testing.expectEqual(AgentNetworkDefault.mediated, parseAgentNetworkDefault(null));
