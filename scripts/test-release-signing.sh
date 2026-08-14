@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # Release signing contract, offline and hermetic.
 #
-# Drives the real scripts/install.sh signature path with a throwaway keypair —
-# the production key is never needed and never touched. The point is the
-# fail-closed boundary: a release that cannot be authenticated must not install,
-# and "cannot be authenticated" includes a tampered checksums file, a tampered
-# signature, a signature from the wrong key, and a missing signature.
+# Always asserts the cut-release dispatcher includes sign) — that check does not
+# need a verifier. When minisign/rsign is present, also drives the real
+# scripts/install.sh signature path with a throwaway keypair (never the
+# production key). Those cases prove the provisioned-key fail-closed boundary:
+# a release that cannot be authenticated must not install. Current shipping
+# behavior is sentinel / checksum-only; see docs/release-signing.md.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -16,6 +17,21 @@ pass() { printf '  ok   %s\n' "$1"; }
 fail() { printf '  FAIL %s\n' "$1" >&2; exit 1; }
 note() { printf '%s\n' "$1"; }
 
+# ── always-on: dispatcher contract (no verifier required) ─────────────────────
+note "test-release-signing: cut-release dispatcher"
+
+grep -qE '^[[:space:]]*sign\)[[:space:]]+phase_sign' scripts/cut-release.sh \
+  || fail "scripts/cut-release.sh run_phase is missing 'sign) phase_sign' — live cut dies on unknown phase sign"
+pass "run_phase dispatches sign)"
+
+grep -q 'sign publish-git' scripts/cut-release.sh \
+  || fail "PHASES must list sign before publish-git"
+
+if grep -q -- '--resume-from publish-git' scripts/cut-release.sh docs/dev/cut-release-shortcut.md; then
+  fail "cut-release still documents --resume-from publish-git; next step is --resume-from sign"
+fi
+pass "resume path is --resume-from sign, not publish-git"
+
 SIGNER=""
 if command -v minisign >/dev/null 2>&1; then
   SIGNER=minisign
@@ -23,8 +39,9 @@ elif command -v rsign >/dev/null 2>&1; then
   SIGNER=rsign
 fi
 if [[ -z "$SIGNER" ]]; then
-  note "test-release-signing: SKIPPED (no minisign or rsign available)"
+  note "test-release-signing: crypto tests SKIPPED (no minisign or rsign available)"
   note "  install one: brew install minisign | cargo install rsign2"
+  note "test-release-signing: dispatcher contract passed"
   exit 0
 fi
 

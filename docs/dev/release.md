@@ -27,12 +27,14 @@ What it does:
 4. Builds the macOS, Linux, and Windows CLI archives.
 5. Verifies checksums, SBOM, telemetry contract, and release manifest.
 6. Signs `checksums.txt` (see [release signing](../release-signing.md)). A live
-   cut with no key stops here, having pushed nothing.
+   cut with no key stops here, having pushed nothing. Signing is not yet active
+   for installers (sentinel key; checksum-only until provisioned).
 7. Creates the GitHub Release with the assets required by `curl | sh`, including
-   `checksums.txt.minisig`.
+   `checksums.txt.minisig` when the Mac cutter produced one.
 
 CI `release.yml` is a backup path. It skips when the complete curl installer
-asset set is already attached to the tag's GitHub Release.
+asset set is already attached to the tag's GitHub Release. The backup still does
+not attach `checksums.txt.minisig` and must not grow a CI signing pipeline.
 
 ## Lower-level scripts
 

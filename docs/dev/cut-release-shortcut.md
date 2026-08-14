@@ -19,15 +19,16 @@ GitHub Actions `release.yml` remains a **manual backup** (`workflow_dispatch`). 
 # Plan only (no tests/build/publish)
 ./scripts/cut-release.sh --bump patch --plan-only
 
-# Dry-run: preflight → gate → bump → build → verify (no push or tag)
+# Dry-run: preflight → … → verify → sign (no push or tag)
 ./scripts/cut-release.sh --bump patch
 
 # Live cut after one human confirm (Shortcut or terminal)
 ./scripts/cut-release.sh --bump patch --live
 ./scripts/cut-release.sh --version 1.3.0 --live
 
-# Resume after a mid-flight failure (no automatic rollback)
-./scripts/cut-release.sh --live --version 1.2.9 --resume-from publish-git
+# Resume after a dry-run or a mid-flight failure (no automatic rollback).
+# Next step is sign, never publish-git — that would skip signing.
+./scripts/cut-release.sh --live --version 1.2.9 --resume-from sign
 ```
 
 ### Release stages
@@ -124,7 +125,7 @@ PY
 No automatic rollback of tags or releases.
 
 ```sh
-./scripts/cut-release.sh --live --version X.Y.Z --resume-from publish-git
+./scripts/cut-release.sh --live --version X.Y.Z --resume-from sign
 ```
 
 See the recovery block printed on failure and `.release-cut/state.env`.

@@ -2,15 +2,16 @@
 # Mac-local release cutter for ryk (Rykan V).
 #
 # Orchestrates: preflight → version → notes → gate → bump → build → verify
-#               → publish-git → done
+#               → sign → publish-git → done
 #
 # Default is dry-run (no push or tag). Pass --live after human confirm
 # (Shortcuts.app or terminal). Resume with --resume-from PHASE after a partial cut.
+# After a dry-run, the next live step is --resume-from sign (never publish-git).
 #
 # Usage:
 #   ./scripts/cut-release.sh --bump patch|minor|major [--live] [--plan-only]
 #   ./scripts/cut-release.sh --version 1.3.0 [--live]
-#   ./scripts/cut-release.sh --live --resume-from publish-git --version 1.2.9
+#   ./scripts/cut-release.sh --live --resume-from sign --version 1.2.9
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -84,7 +85,7 @@ Options:
   --skip-gate         Skip verify-pre-merge.sh (not recommended)
   -h, --help          Show this help
 
-Default without --live is dry-run: runs through verify, never publishes.
+Default without --live is dry-run: runs through sign (safe skip if no key), never publishes.
 EOF
 }
 
@@ -638,26 +639,38 @@ phase_verify() {
   do
     [[ -f "$f" ]] || fail "missing required artifact: $f"
   done
-
-  if [[ "$LIVE" -eq 0 ]]; then
-    printf '\n=== DRY-RUN COMPLETE ===\n'
-    printf 'Version %s built and verified under %s/\n' "$VERSION" "$DIST_DIR"
-    printf 'No push or tag was performed.\n'
-    printf 'To publish:\n'
-    printf '  ./scripts/cut-release.sh --version %s --live --resume-from publish-git\n' "$VERSION"
-    printf '  (or re-run full --live after resetting if you need a clean bump path)\n'
-    printf '========================\n\n'
-  fi
 }
 
 # ---------------------------------------------------------------------------
 # sign
 #
 # One detached signature over checksums.txt authenticates every artifact, since
-# checksums.txt already covers their contents. Signing before publish means an
-# unsigned release never reaches users: a live cut with no key fails here, having
-# pushed nothing.
+# checksums.txt already covers their contents. A live cut with no key fails here
+# before git push. While keys/ryk-release-minisign.pub is the UNPROVISIONED
+# sentinel, installers are checksum-only — do not claim unsigned never reaches
+# users. CI backup (release.yml) still does not attach checksums.txt.minisig.
 # ---------------------------------------------------------------------------
+# Verify checksums.txt.minisig against the published public key. Returns 0/1.
+verify_checksums_minisig() {
+  local checksums="$1" sig="$2" pub="$3"
+  local signer="" pubkey
+  [[ -s "$checksums" && -s "$sig" && -f "$pub" ]] || return 1
+  if command -v minisign >/dev/null 2>&1; then
+    signer=minisign
+  elif command -v rsign >/dev/null 2>&1; then
+    signer=rsign
+  else
+    return 1
+  fi
+  pubkey="$(grep -v '^untrusted comment:' "$pub" | head -n1)"
+  [[ -n "$pubkey" ]] || return 1
+  case "$signer" in
+    minisign) minisign -V -P "$pubkey" -x "$sig" -m "$checksums" >/dev/null 2>&1 ;;
+    rsign) rsign verify -P "$pubkey" -x "$sig" "$checksums" >/dev/null 2>&1 ;;
+    *) return 1 ;;
+  esac
+}
+
 phase_sign() {
   local checksums="${DIST_DIR}/checksums.txt"
   local sig="${checksums}.minisig"
@@ -704,12 +717,7 @@ Refuse to publish an unsigned release. Nothing has been pushed.
   # key's own copy: this is the assertion that users will be able to verify it.
   local pub="keys/ryk-release-minisign.pub"
   if [[ -f "$pub" ]] && ! grep -q 'UNPROVISIONED' "$pub"; then
-    local pubkey
-    pubkey="$(grep -v '^untrusted comment:' "$pub" | head -n1)"
-    case "$signer" in
-      minisign) minisign -V -P "$pubkey" -x "$sig" -m "$checksums" >/dev/null 2>&1 ;;
-      rsign) rsign verify -P "$pubkey" -x "$sig" "$checksums" >/dev/null 2>&1 ;;
-    esac || fail "sign: signature does not verify against ${pub}
+    verify_checksums_minisig "$checksums" "$sig" "$pub" || fail "sign: signature does not verify against ${pub}
 The signing key and the published public key disagree; users would be unable to
 verify this release. Nothing has been pushed."
     log "sign: verified against ${pub}"
@@ -724,15 +732,32 @@ verify this release. Nothing has been pushed."
 phase_publish_git() {
   [[ "$LIVE" -eq 1 ]] || fail "internal: publish-git requires --live"
 
+  local checksums="${DIST_DIR}/checksums.txt"
+  local sig="${checksums}.minisig"
+  local pub="keys/ryk-release-minisign.pub"
+
+  # Collect assets and check the signature BEFORE git push so a missing or
+  # unverifiable minisig cannot ship by resuming at publish-git and skipping sign.
+  [[ -s "$checksums" ]] || fail "dist/checksums.txt missing; refuse to publish"
+
+  if [[ -f "$pub" ]] && ! grep -q 'UNPROVISIONED' "$pub"; then
+    [[ -s "$sig" ]] || fail "publish-git: checksums.txt.minisig missing while signing is active
+Resume: ./scripts/cut-release.sh --version ${VERSION} --live --resume-from sign"
+    verify_checksums_minisig "$checksums" "$sig" "$pub" || fail "publish-git: checksums.txt.minisig does not verify against ${pub}
+A non-empty file is not enough; the signature must verify. Nothing has been pushed.
+Resume: ./scripts/cut-release.sh --version ${VERSION} --live --resume-from sign"
+  elif [[ -s "$sig" ]]; then
+    log "publish-git: checksums.txt.minisig present (sentinel key; installers are still checksum-only)"
+  else
+    warn "publish-git: no checksums.txt.minisig (signing not yet active; checksum-only until a real key is provisioned)"
+  fi
+
   local branch sha
   branch="$(git rev-parse --abbrev-ref HEAD)"
   sha="$(git rev-parse HEAD)"
   log "publish-git: push ${branch}, GitHub Release v${VERSION} (assets before CI tag race)…"
 
   git push origin "$branch"
-
-  # Collect assets; require checksums.txt so installers never 404.
-  [[ -s "${DIST_DIR}/checksums.txt" ]] || fail "dist/checksums.txt missing; refuse to publish"
 
   local -a assets=()
   local f
@@ -750,12 +775,6 @@ phase_publish_git() {
   done
   shopt -u nullglob
 
-  # The installer refuses a release whose signature is missing once the public key
-  # is provisioned, so publishing without it would break the install path.
-  if [[ -f keys/ryk-release-minisign.pub ]] && ! grep -q 'UNPROVISIONED' keys/ryk-release-minisign.pub; then
-    [[ -s "${DIST_DIR}/checksums.txt.minisig" ]] || \
-      fail "publish-git: checksums.txt.minisig missing while signing is active; run the sign phase"
-  fi
   [[ ${#assets[@]} -gt 0 ]] || fail "no release assets found under ${DIST_DIR}"
 
   local -a notes_arg=(--generate-notes)
@@ -838,10 +857,17 @@ main() {
         ;;
       build) phase_build ;;
       verify) phase_verify ;;
+      sign) phase_sign ;;
       publish-git)
         if [[ "$LIVE" -ne 1 ]]; then
+          printf '\n=== DRY-RUN COMPLETE ===\n'
+          printf 'Version %s built, verified, and sign-phase checked under %s/\n' "$VERSION" "$DIST_DIR"
+          printf 'No push or tag was performed.\n'
+          printf 'To publish (re-runs sign, then publish-git):\n'
+          printf '  ./scripts/cut-release.sh --version %s --live --resume-from sign\n' "$VERSION"
+          printf '  (or re-run full --live after resetting if you need a clean bump path)\n'
+          printf '========================\n\n'
           log "dry-run: skipping publish-git and later phases"
-          mark_phase verify
           exit 0
         fi
         phase_publish_git

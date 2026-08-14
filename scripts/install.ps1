@@ -107,6 +107,10 @@ function Get-ChecksumEntry($ChecksumsPath, $ArtifactName) {
     return $null
 }
 
+# Windows install is checksum-only (unsigned). This script verifies SHA-256
+# against checksums.txt and does not consume checksums.txt.minisig. The POSIX
+# installer (scripts/install.sh) is the minisign path; signing is not yet
+# active until the public key is provisioned. See docs/release-signing.md.
 function Verify-Checksum($ArtifactPath, $ChecksumsPath, $ArtifactName) {
     if (-not (Test-Path -LiteralPath $ChecksumsPath)) {
         Fail "checksums.txt not found" "Download checksums.txt with the archive and verify manually before installing."

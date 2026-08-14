@@ -22,9 +22,16 @@ ryk does not make arbitrary malicious code safe, and it does not provide univers
 
 ## Release integrity
 
-Releases publish `checksums.txt` and a detached Ed25519 signature over it,
-`checksums.txt.minisig`. `scripts/install.sh` verifies the signature before it
-trusts any digest and refuses to install a release it cannot authenticate.
+Signing is not yet active. The published public key is the sentinel
+`RYK_RELEASE_PUBKEY_UNPROVISIONED`, so installers are checksum-only
+(fail-open on signatures) until a real key is provisioned.
+
+`scripts/install.sh` reports `not yet active for this release` and verifies
+SHA-256. `scripts/install.ps1` is checksum-only (Windows unsigned) and does
+not consume `checksums.txt.minisig`.
+
+After provisioning, releases will publish `checksums.txt.minisig` and the
+POSIX installer will verify it before trusting any digest.
 
 Verifying by hand is the strongest path, because `curl … | sh` trusts whoever
 served the script. [Release signing](docs/release-signing.md) documents the key,

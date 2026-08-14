@@ -1,6 +1,16 @@
 # Release signing
 
-Release artifacts are authenticated with an Ed25519 signature in
+**Signing is not yet active.** `keys/ryk-release-minisign.pub` holds the sentinel
+`RYK_RELEASE_PUBKEY_UNPROVISIONED`. Until a real key is provisioned, installers
+are checksum-only (fail-open on signatures): `scripts/install.sh` prints
+`not yet active for this release` and continues on SHA-256; `scripts/install.ps1`
+is checksum-only (Windows unsigned) and never reads `checksums.txt.minisig`.
+CI backup (`release.yml`) still does not attach a minisig.
+
+The machinery below is wired for the day a key is provisioned. It is not current
+shipping enforcement.
+
+Release artifacts will then be authenticated with an Ed25519 signature in
 [minisign](https://jedisct1.github.io/minisign/) format. `checksums.txt` already
 covers the contents of every artifact, so one detached signature over it —
 `checksums.txt.minisig` — authenticates the whole release.
@@ -79,14 +89,17 @@ export RYK_MINISIGN_SECRET_KEY="/Volumes/keys/ryk-release-minisign.key"
 ./scripts/cut-release.sh --version X.Y.Z --live
 ```
 
-The `sign` phase runs after `verify` and before `publish-git`, so an unsigned
-release never reaches users. It signs `checksums.txt`, then verifies the result
-against `keys/ryk-release-minisign.pub` — not against the secret key's own copy —
-because the assertion that matters is that *users* can verify it. If the two
-disagree it fails with nothing pushed.
+The `sign` phase runs after `verify` and before `publish-git`. A live cut with
+no key stops in `sign` before `git push`. While the sentinel is shipped, do not
+read that as "unsigned never reaches users": installers are still checksum-only,
+and CI backup does not attach a minisig. After provisioning, `sign` verifies the
+result against `keys/ryk-release-minisign.pub` — not against the secret key's own
+copy — because the assertion that matters is that *users* can verify it. If the
+two disagree it fails with nothing pushed.
 
-`publish-git` uploads `checksums.txt.minisig` alongside `checksums.txt`, and
-refuses to publish without it once the key is provisioned.
+`publish-git` checks `checksums.txt.minisig` before `git push`. After
+provisioning it requires a signature that actually verifies, not merely a
+non-empty file, and uploads it alongside `checksums.txt`.
 
 To resume after fixing a signing problem:
 
@@ -107,10 +120,12 @@ before publishing anything else signed by the old key.
 
 ## Verifier availability
 
-The installer verifies with `minisign` if present, or `rsign` (the Rust
-implementation of the same format) otherwise. If neither is installed it fails
-closed with install instructions, because an unverifiable release is ambiguous
-state, not an implicit pass.
+After provisioning, the POSIX installer verifies with `minisign` if present, or
+`rsign` (the Rust implementation of the same format) otherwise. If neither is
+installed it will fail closed with install instructions, because an unverifiable
+release is ambiguous state, not an implicit pass. That fail-closed path is not
+current shipping behavior: today the sentinel key keeps installers on
+checksum-only trust.
 
 A user who cannot install a verifier can explicitly accept checksum-only trust:
 
@@ -123,14 +138,17 @@ release host cannot set it — only the person running the installer can.
 
 ## Tests
 
-`scripts/test-release-signing.sh` (in `verify-pre-merge.sh`) generates a
-throwaway keypair, never touching the production key, and drives the real
-installer offline. It asserts a valid signature verifies; a tampered
+`scripts/test-release-signing.sh` (in `verify-pre-merge.sh`) always asserts
+`cut-release.sh` dispatches `sign)` and does not document `--resume-from
+publish-git`. When a verifier is installed it also generates a throwaway
+keypair, never touching the production key, and drives the real installer
+offline. Those cases assert a valid signature verifies; a tampered
 `checksums.txt`, a forged signature, a signature from an unrelated key, and a
 missing signature are each refused; the tampered case fails at the signature
 *before* any digest is trusted; the opt-out announces itself; and, under the
 sentinel key, SHA-256 verification still catches a bad digest. It also asserts
 the key in `scripts/install.sh` matches `keys/ryk-release-minisign.pub`.
 
-The script skips with a clear message when no verifier is installed, so it never
-silently passes.
+Crypto installer cases skip with a clear message when no verifier is installed.
+The dispatcher contract still runs, so a missing `sign)` arm cannot hide behind
+that skip.

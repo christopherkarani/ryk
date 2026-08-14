@@ -25,10 +25,12 @@ verification side runs inside a POSIX `sh` installer on the user's machine, wher
 single small Ed25519 signature check is the whole requirement — cosign would pull
 an OIDC/transparency-log stack into that path for no gain at this scale.
 
-`scripts/install.sh` verifies with `minisign`, or `rsign` (Rust implementation of
-the same format) if minisign is absent, and fails closed when neither exists. The
-public key lives in `keys/ryk-release-minisign.pub`; the secret key must never be
-in this repo or in CI. See [`../release-signing.md`](../release-signing.md).
+Signing is not yet active (sentinel `RYK_RELEASE_PUBKEY_UNPROVISIONED`). After
+provisioning, `scripts/install.sh` will verify with `minisign`, or `rsign` (Rust
+implementation of the same format) if minisign is absent, and fail closed when
+neither exists. `scripts/install.ps1` remains checksum-only (Windows unsigned).
+The public key lives in `keys/ryk-release-minisign.pub`; the secret key must never
+be in this repo or in CI. See [`../release-signing.md`](../release-signing.md).
 
 ## macOS FM steward
 
