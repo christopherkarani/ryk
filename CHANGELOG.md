@@ -29,6 +29,7 @@
 
 * **Command deny globs ignore padding:** `commands.deny` patterns collapse extra spaces/tabs and strip a leading `./` on each word before matching, so `cat  ~/.ssh/id_rsa` and `cat ./.env` no longer slip past preset denies such as `cat .env` and `cat ~/.ssh/*`.
 * **Shell effect classification is exhaustive:** `curl`/`wget`/`open` bypass classifiers tokenize the full command instead of silently dropping tokens after 48, so a long header list cannot hide a `comms.publish` URL.
+* **Audit redactor covers more secret shapes:** standard base64 values that contain `/` no longer skip the entropy heuristic; compact JWTs (4+ character parts, `eyJ` header) and shorter provider prefixes (`ghp_` / `sk-` at 12+ characters) are classified; query-embedded forms of those fixtures are redacted. Path-shaped strings, `sk-learn`, and dotted rule ids (`files.read.deny`) stay unredacted. URL userinfo (`scheme://user:pw@host`) was already closed.
 
 ### Security (OS sandbox audit 2026-08-13)
 
