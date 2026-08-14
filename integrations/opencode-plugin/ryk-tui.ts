@@ -36,18 +36,38 @@ function firstLine(text: string): string {
   return '';
 }
 
-function errorText(event: Record<string, unknown>): string {
-  const direct = event.message;
-  if (typeof direct === 'string' && direct.trim()) return direct;
-
-  const error = event.error;
-  if (typeof error === 'string' && error.trim()) return error;
-  if (error && typeof error === 'object') {
-    const rec = error as Record<string, unknown>;
-    const value = rec.message;
-    if (typeof value === 'string' && value.trim()) return value;
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
   }
+  return undefined;
+}
+
+/**
+ * OpenCode TUI `event.on` delivers `{ type, properties }`. Tests and older
+ * buses pass a flat payload. Only unwrap when `type` is present so a sibling
+ * `properties.message` on a flat error object is not treated as the toast.
+ */
+function eventPayload(event: Record<string, unknown>): Record<string, unknown> {
+  if (typeof event.type === 'string') {
+    return asRecord(event.properties) ?? asRecord(event.data) ?? event;
+  }
+  return event;
+}
+
+function messageFromUnknown(value: unknown): string {
+  if (typeof value === 'string' && value.trim()) return value;
+  const rec = asRecord(value);
+  if (!rec) return '';
+  if (typeof rec.message === 'string' && rec.message.trim()) return rec.message;
   return '';
+}
+
+function errorText(event: Record<string, unknown>): string {
+  const payload = eventPayload(event);
+  const direct = messageFromUnknown(payload.message) || messageFromUnknown(event.message);
+  if (direct) return direct;
+  return messageFromUnknown(payload.error) || messageFromUnknown(event.error);
 }
 
 function looksLikeRyk(text: string): boolean {
