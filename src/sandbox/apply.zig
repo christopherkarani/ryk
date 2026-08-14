@@ -830,6 +830,60 @@ pub fn absoluteizeLaunchArgv(
     return try list.toOwnedSlice(allocator);
 }
 
+/// Which launch rewrites to apply before spawn / PATH honesty.
+///
+/// `expand_shell_wrapper` is empty-backpack only (Hermes venv symlink residual).
+/// `os_attach` is any planned OS attach, including host MCP plans that keep a
+/// bare host name (`pi`). Codex MCP expands itself and should not set the
+/// shell-wrapper bit.
+pub const LaunchArgvRewrite = struct {
+    expand_shell_wrapper: bool = false,
+    os_attach: bool = false,
+};
+
+/// Rewrite child argv before OS attach.
+///
+/// Order: shell-wrapper realpath → env/non-shell shebang (`#!/usr/bin/env node`)
+/// → absoluteize remaining bare argv0. Returns null when no rewrite applies
+/// (caller keeps the original argv). On success, caller frees with
+/// `freeExpandedShellWrapperArgv`.
+///
+/// OutOfMemory is propagated so inventory can fail closed; the product spawn
+/// path may still fail-open (`catch null`) and let exec surface not-found.
+pub fn rewriteOsAttachLaunchArgv(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    planned_argv: []const []const u8,
+    env_map: ?*std.process.Environ.Map,
+    opts: LaunchArgvRewrite,
+) error{OutOfMemory}!?[]const []const u8 {
+    if (planned_argv.len == 0) return null;
+    if (!opts.expand_shell_wrapper and !opts.os_attach) return null;
+
+    var owned: ?[]const []const u8 = null;
+    errdefer if (owned) |a| freeExpandedShellWrapperArgv(allocator, a);
+
+    if (opts.expand_shell_wrapper) {
+        owned = try expandShellWrapperLaunch(io, allocator, planned_argv, env_map);
+    }
+
+    if (opts.os_attach) {
+        const env_const: ?*const std.process.Environ.Map = env_map;
+        const after_shell: []const []const u8 = owned orelse planned_argv;
+        if (try expandEnvShebangLaunch(io, allocator, after_shell, env_const)) |expanded| {
+            if (owned) |old| freeExpandedShellWrapperArgv(allocator, old);
+            owned = expanded;
+        }
+
+        const after_shebang: []const []const u8 = owned orelse planned_argv;
+        if (try absoluteizeLaunchArgv(io, allocator, after_shebang, env_const)) |absolute| {
+            if (owned) |old| freeExpandedShellWrapperArgv(allocator, old);
+            owned = absolute;
+        }
+    }
+    return owned;
+}
+
 /// If `python_path` is `…/bin/python*`, locate `…/lib/python*/site-packages` and
 /// put it into `PYTHONPATH` on `env_map` (owned by the map). No-op when layout
 /// does not match or site-packages is missing.
@@ -2885,6 +2939,89 @@ test "expandEnvShebangLaunch rewrites node shebang to absolute interpreter plus 
     defer allocator.free(wrap);
     const wrap_argv = [_][]const u8{wrap};
     try std.testing.expect((try expandEnvShebangLaunch(io, allocator, &wrap_argv, &env_map)) == null);
+}
+
+test "rewriteOsAttachLaunchArgv expands pi-style env-node shebang before PATH honesty" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+
+    try tmp.dir.createDirPath(io, "runtime/bin");
+    try tmp.dir.createDirPath(io, "pkg/bin");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "runtime/bin/node",
+        .data = "#!/bin/sh\nexec cat \"$1\"\n",
+    });
+    try tmp.dir.setFilePermissions(io, "runtime/bin/node", std.Io.File.Permissions.fromMode(0o755), .{});
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "pkg/bin/cli.js",
+        .data = "#!/usr/bin/env node\nconsole.log('ok');\n",
+    });
+    try tmp.dir.setFilePermissions(io, "pkg/bin/cli.js", std.Io.File.Permissions.fromMode(0o755), .{});
+    // Product layout: ~/.local/bin/pi → package cli.js (same as @earendil-works/pi).
+    try tmp.dir.symLink(io, "../../pkg/bin/cli.js", "runtime/bin/pi", .{});
+
+    const want_node = try tmp.dir.realPathFileAlloc(io, "runtime/bin/node", allocator);
+    defer allocator.free(want_node);
+    const want_script = try tmp.dir.realPathFileAlloc(io, "pkg/bin/cli.js", allocator);
+    defer allocator.free(want_script);
+    const runtime_bin = try std.fs.path.join(allocator, &.{ root, "runtime/bin" });
+    defer allocator.free(runtime_bin);
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("PATH", runtime_bin);
+    try env_map.put("HOME", root);
+
+    const planned = [_][]const u8{ "pi", "--mcp-config", "/tmp/closed.json" };
+    // os_attach alone is the host-MCP path: shebang expand is not gated on
+    // empty-backpack / shell-wrapper rewrite.
+    const attach_only = (try rewriteOsAttachLaunchArgv(io, allocator, &planned, &env_map, .{
+        .os_attach = true,
+    })) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    defer freeExpandedShellWrapperArgv(allocator, attach_only);
+    try std.testing.expectEqual(@as(usize, 4), attach_only.len);
+    try std.testing.expectEqualStrings(want_node, attach_only[0]);
+    try std.testing.expectEqualStrings(want_script, attach_only[1]);
+    try std.testing.expectEqualStrings("--mcp-config", attach_only[2]);
+    try std.testing.expectEqualStrings("/tmp/closed.json", attach_only[3]);
+
+    const with_shell = (try rewriteOsAttachLaunchArgv(io, allocator, &planned, &env_map, .{
+        .expand_shell_wrapper = true,
+        .os_attach = true,
+    })) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    defer freeExpandedShellWrapperArgv(allocator, with_shell);
+    try std.testing.expectEqualStrings(attach_only[0], with_shell[0]);
+    try std.testing.expectEqualStrings(attach_only[1], with_shell[1]);
+
+    // Shell shebang stays a host script: only absoluteize argv0 (no node interp).
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "runtime/bin/wrap-pi",
+        .data = "#!/bin/sh\nexec /bin/true\n",
+    });
+    try tmp.dir.setFilePermissions(io, "runtime/bin/wrap-pi", std.Io.File.Permissions.fromMode(0o755), .{});
+    const wrap_planned = [_][]const u8{"wrap-pi"};
+    const wrap_expanded = (try rewriteOsAttachLaunchArgv(io, allocator, &wrap_planned, &env_map, .{
+        .expand_shell_wrapper = true,
+        .os_attach = true,
+    })) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    defer freeExpandedShellWrapperArgv(allocator, wrap_expanded);
+    try std.testing.expectEqual(@as(usize, 1), wrap_expanded.len);
+    try std.testing.expect(std.mem.endsWith(u8, wrap_expanded[0], "wrap-pi"));
 }
 
 test "expandShellWrapperLaunch rewrites hermes-style exec to realpath python" {

@@ -1270,14 +1270,19 @@ fn commandWithStdioAndEnv(io: std.Io, argv: []const []const u8, stdout: anytype,
         options.command_argv;
     var launch_argv_owned: ?[]const []const u8 = null;
     defer if (launch_argv_owned) |a| sandbox.apply.freeExpandedShellWrapperArgv(allocator, a);
-    launch_argv_owned = rewriteOsAttachLaunchArgv(
-        io,
-        allocator,
-        planned_argv,
-        &filtered_env.env_map,
-        secret_boundary == .empty_backpack and planned_argv.len > 0 and codex_mcp_plan == null,
-        command_guard_context.os_attach_planned,
-    ) catch null;
+    const expand_shell_wrapper = secret_boundary == .empty_backpack and codex_mcp_plan == null;
+    if (expand_shell_wrapper or command_guard_context.os_attach_planned) {
+        launch_argv_owned = sandbox.apply.rewriteOsAttachLaunchArgv(
+            io,
+            allocator,
+            planned_argv,
+            &filtered_env.env_map,
+            .{
+                .expand_shell_wrapper = expand_shell_wrapper,
+                .os_attach = command_guard_context.os_attach_planned,
+            },
+        ) catch null;
+    }
     const spawn_argv: []const []const u8 = launch_argv_owned orelse planned_argv;
 
     var result = supervisor.run(io, allocator, .{
@@ -2133,47 +2138,6 @@ fn writeOmittedModelKeyNotes(
     }
 }
 
-/// Rewrite child argv before OS attach.
-///
-/// Order: shell-wrapper realpath (empty-backpack) → env/non-shell shebang
-/// (`#!/usr/bin/env node`) → absoluteize remaining bare argv0. The shebang
-/// expand must run for host MCP plans (`ryk pi`) — those keep a bare host
-/// name and otherwise die in the session `node` shim after PATH honesty.
-fn rewriteOsAttachLaunchArgv(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    planned_argv: []const []const u8,
-    env_map: *std.process.Environ.Map,
-    expand_shell_wrapper: bool,
-    os_attach_planned: bool,
-) error{OutOfMemory}!?[]const []const u8 {
-    if (planned_argv.len == 0) return null;
-
-    var owned: ?[]const []const u8 = null;
-    errdefer if (owned) |a| sandbox.apply.freeExpandedShellWrapperArgv(allocator, a);
-
-    if (expand_shell_wrapper) {
-        owned = sandbox.apply.expandShellWrapperLaunch(io, allocator, planned_argv, env_map) catch null;
-    }
-
-    const after_shell: []const []const u8 = owned orelse planned_argv;
-    if (os_attach_planned) {
-        if (sandbox.apply.expandEnvShebangLaunch(io, allocator, after_shell, env_map) catch null) |expanded| {
-            if (owned) |old| sandbox.apply.freeExpandedShellWrapperArgv(allocator, old);
-            owned = expanded;
-        }
-    }
-
-    const after_shebang: []const []const u8 = owned orelse planned_argv;
-    if (os_attach_planned) {
-        if (sandbox.apply.absoluteizeLaunchArgv(io, allocator, after_shebang, env_map) catch null) |absolute| {
-            if (owned) |old| sandbox.apply.freeExpandedShellWrapperArgv(allocator, old);
-            owned = absolute;
-        }
-    }
-    return owned;
-}
-
 fn gatewayPostureLabel(anthropic: bool, openai: bool) []const u8 {
     if (anthropic and openai) return "anthropic+openai";
     if (anthropic) return "anthropic";
@@ -2704,72 +2668,6 @@ test "run rejects secretless with os sandbox off before child launch" {
         ) != null,
     );
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(std.testing.io, "child-started", .{}));
-}
-
-test "rewriteOsAttachLaunchArgv expands pi-style env-node shebang before PATH honesty" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
-    defer allocator.free(root);
-
-    try tmp.dir.createDirPath(io, "runtime/bin");
-    try tmp.dir.createDirPath(io, "pkg/bin");
-    try tmp.dir.writeFile(io, .{
-        .sub_path = "runtime/bin/node",
-        .data = "#!/bin/sh\nexec cat \"$1\"\n",
-    });
-    try tmp.dir.setFilePermissions(io, "runtime/bin/node", std.Io.File.Permissions.fromMode(0o755), .{});
-    try tmp.dir.writeFile(io, .{
-        .sub_path = "pkg/bin/cli.js",
-        .data = "#!/usr/bin/env node\nconsole.log('ok');\n",
-    });
-    try tmp.dir.setFilePermissions(io, "pkg/bin/cli.js", std.Io.File.Permissions.fromMode(0o755), .{});
-    // Product layout: ~/.local/bin/pi → package cli.js (same as @earendil-works/pi).
-    try tmp.dir.symLink(io, "../../pkg/bin/cli.js", "runtime/bin/pi", .{});
-
-    const want_node = try tmp.dir.realPathFileAlloc(io, "runtime/bin/node", allocator);
-    defer allocator.free(want_node);
-    const want_script = try tmp.dir.realPathFileAlloc(io, "pkg/bin/cli.js", allocator);
-    defer allocator.free(want_script);
-    const runtime_bin = try std.fs.path.join(allocator, &.{ root, "runtime/bin" });
-    defer allocator.free(runtime_bin);
-
-    var env_map = std.process.Environ.Map.init(allocator);
-    defer env_map.deinit();
-    try env_map.put("PATH", runtime_bin);
-    try env_map.put("HOME", root);
-
-    const planned = [_][]const u8{ "pi", "--mcp-config", "/tmp/closed.json" };
-    const expanded = (try rewriteOsAttachLaunchArgv(io, allocator, &planned, &env_map, true, true)) orelse {
-        try std.testing.expect(false);
-        return;
-    };
-    defer sandbox.apply.freeExpandedShellWrapperArgv(allocator, expanded);
-
-    try std.testing.expectEqual(@as(usize, 4), expanded.len);
-    try std.testing.expectEqualStrings(want_node, expanded[0]);
-    try std.testing.expectEqualStrings(want_script, expanded[1]);
-    try std.testing.expectEqualStrings("--mcp-config", expanded[2]);
-    try std.testing.expectEqualStrings("/tmp/closed.json", expanded[3]);
-
-    // Shell shebang stays a host script: only absoluteize argv0 (no node interp).
-    try tmp.dir.writeFile(io, .{
-        .sub_path = "runtime/bin/wrap-pi",
-        .data = "#!/bin/sh\nexec /bin/true\n",
-    });
-    try tmp.dir.setFilePermissions(io, "runtime/bin/wrap-pi", std.Io.File.Permissions.fromMode(0o755), .{});
-    const wrap_planned = [_][]const u8{"wrap-pi"};
-    const wrap_expanded = (try rewriteOsAttachLaunchArgv(io, allocator, &wrap_planned, &env_map, true, true)) orelse {
-        try std.testing.expect(false);
-        return;
-    };
-    defer sandbox.apply.freeExpandedShellWrapperArgv(allocator, wrap_expanded);
-    try std.testing.expectEqual(@as(usize, 1), wrap_expanded.len);
-    try std.testing.expect(std.mem.endsWith(u8, wrap_expanded[0], "wrap-pi"));
 }
 
 test "run parses with-host-secrets and suggests the escape flag" {
