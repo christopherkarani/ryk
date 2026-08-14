@@ -939,6 +939,8 @@ pub const DaemonPolicyOpts = struct {
     fm_timeout_ms: u32 = fm_steward_client.default_timeout_ms,
     /// Fixed telemetry source label. Never contains a command or payload.
     telemetry_source: []const u8 = "other",
+    /// When false, the facade skips `recordEnforcement` (caller records at the product edge).
+    record_enforcement: bool = true,
 };
 
 /// Hook shell path: session sticky + FM forward + `telemetry_source = "hook"`.
@@ -969,6 +971,7 @@ pub fn daemonPolicyOptsForHook(
         .disable_fm = disable_fm,
         .fm_timeout_ms = fm_timeout_ms,
         .telemetry_source = "hook",
+        .record_enforcement = false,
     };
 }
 
@@ -1328,7 +1331,7 @@ pub fn decisionFromDaemonResultWithPolicy(
             "unexpected daemon response for shell command evaluation",
         ),
     };
-    if (!std.mem.eql(u8, opts.telemetry_source, "run")) {
+    if (opts.record_enforcement and !std.mem.eql(u8, opts.telemetry_source, "run")) {
         telemetry.recordEnforcement(
             opts.telemetry_source,
             opts.host,

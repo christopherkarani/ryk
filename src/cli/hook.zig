@@ -1937,8 +1937,9 @@ fn hookResponseFromShellFacade(
     const safe_rule = if (owned.owned_rule_id) |rule| try core_api.redactAlloc(allocator, rule) else null;
     errdefer if (safe_rule) |rule| allocator.free(rule);
 
+    const daemon_status = daemon.responseStatus(result);
     // Pending stays hook-side, void, only after the facade, only deny-route block.
-    if (decision == .block) {
+    if (decision == .block and daemon_status == .deny) {
         tryIssuePendingShortCode(allocator, cmd, fm_opts.cwd, fm_opts.workspace_root, safe_reason);
     }
 
@@ -1954,17 +1955,19 @@ fn hookResponseFromShellFacade(
     } else try buildMessage(allocator, decision, "command");
     errdefer allocator.free(message);
 
-    const daemon_status = daemon.responseStatus(result);
-    const include_deny_fields = daemon_status == .deny or decision == .block;
     var suggestions: [][]const u8 = &.{};
     var remediation_commands: [][]const u8 = &.{};
-    if (include_deny_fields) {
+    if (daemon_status == .deny) {
         suggestions = try collectDaemonSuggestionTexts(allocator, result);
         errdefer {
             for (suggestions) |s| allocator.free(s);
             if (suggestions.len > 0) allocator.free(suggestions);
         }
         remediation_commands = try buildRemediationCommands(allocator, safe_rule);
+        errdefer {
+            for (remediation_commands) |c| allocator.free(c);
+            if (remediation_commands.len > 0) allocator.free(remediation_commands);
+        }
     }
 
     const category = try allocator.dupe(u8, "command");
@@ -1975,6 +1978,10 @@ fn hookResponseFromShellFacade(
         allocator.free(redactions_owned);
     }
     const host_limitations = try limitations.toOwnedSlice(allocator);
+    errdefer {
+        for (host_limitations) |l| allocator.free(l);
+        allocator.free(host_limitations);
+    }
     return .{
         .decision = decision,
         .risk = risk,
