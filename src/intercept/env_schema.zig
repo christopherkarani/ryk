@@ -40,34 +40,38 @@ pub const Schema = struct {
     }
 };
 
-const Builder = struct {
-    name: []u8,
+/// In-progress variable. Not an optional: Zig 0.16 result-location assignment
+/// `active = .{ .name = try dupe(...) }` sets a `?T` tag to Some before `try`
+/// completes, leaving a 0xaa payload that `destroyActive` then frees.
+const ActiveVar = struct {
+    occupied: bool = false,
+    name_ptr: usize = 0,
+    name_len: usize = 0,
     class: ?VarClass = null,
-    grant: ?[]u8 = null,
+    has_grant: bool = false,
+    grant_ptr: usize = 0,
+    grant_len: usize = 0,
 
-    fn deinit(self: *Builder, allocator: std.mem.Allocator) void {
-        allocator.free(self.name);
-        if (self.grant) |grant| allocator.free(grant);
-        self.* = undefined;
+    fn nameSlice(self: ActiveVar) []u8 {
+        if (self.name_len == 0) return &.{};
+        const ptr: [*]u8 = @ptrFromInt(self.name_ptr);
+        return ptr[0..self.name_len];
     }
 
-    fn intoVariable(self: *Builder) !Variable {
-        const class = self.class orelse return error.InvalidEnvSchema;
-        if (class == .public and self.grant != null) return error.InvalidEnvSchema;
-        const variable: Variable = .{ .name = self.name, .class = class, .grant = self.grant };
-        self.* = undefined;
-        return variable;
+    fn grantSlice(self: ActiveVar) ?[]u8 {
+        if (!self.has_grant) return null;
+        const ptr: [*]u8 = @ptrFromInt(self.grant_ptr);
+        return ptr[0..self.grant_len];
     }
 };
 
 pub fn parseFromSlice(allocator: std.mem.Allocator, text: []const u8) !Schema {
+    var scratch_arena = std.heap.ArenaAllocator.init(allocator);
+    defer scratch_arena.deinit();
+    const scratch = scratch_arena.allocator();
+
     var variables: std.ArrayList(Variable) = .empty;
-    errdefer {
-        for (variables.items) |variable| variable.deinit(allocator);
-        variables.deinit(allocator);
-    }
-    var active: ?Builder = null;
-    defer if (active) |*builder| builder.deinit(allocator);
+    var active: ActiveVar = .{};
     var saw_unknown_omit = false;
     var section: enum { none, defaults, vars } = .none;
 
@@ -80,12 +84,12 @@ pub fn parseFromSlice(allocator: std.mem.Allocator, text: []const u8) !Schema {
         const indent = without_cr.len - std.mem.trimStart(u8, without_cr, " ").len;
 
         if (indent == 0 and std.mem.eql(u8, content, "defaults:")) {
-            try finishActive(allocator, &variables, &active);
+            try commitActive(scratch, &variables, &active);
             section = .defaults;
             continue;
         }
         if (indent == 0 and std.mem.eql(u8, content, "vars:")) {
-            try finishActive(allocator, &variables, &active);
+            try commitActive(scratch, &variables, &active);
             section = .vars;
             continue;
         }
@@ -99,32 +103,40 @@ pub fn parseFromSlice(allocator: std.mem.Allocator, text: []const u8) !Schema {
             continue;
         }
         if (section == .vars and indent == 2 and std.mem.endsWith(u8, content, ":")) {
-            try finishActive(allocator, &variables, &active);
+            try commitActive(scratch, &variables, &active);
             const name = std.mem.trim(u8, content[0 .. content.len - 1], " ");
             try validateEnvName(name);
             for (variables.items) |variable| {
                 if (std.mem.eql(u8, variable.name, name)) return error.InvalidEnvSchema;
             }
-            active = .{ .name = try allocator.dupe(u8, name) };
+            const copied = try scratch.dupe(u8, name);
+            active = .{
+                .occupied = true,
+                .name_ptr = @intFromPtr(copied.ptr),
+                .name_len = copied.len,
+            };
             continue;
         }
         if (section == .vars and indent == 4) {
-            const builder = if (active) |*value| value else return error.InvalidEnvSchema;
+            if (!active.occupied) return error.InvalidEnvSchema;
             const pair = try splitPair(content);
             if (std.mem.eql(u8, pair.key, "class")) {
-                if (builder.class != null) return error.InvalidEnvSchema;
-                builder.class = VarClass.parse(pair.value) orelse return error.InvalidEnvSchema;
+                if (active.class != null) return error.InvalidEnvSchema;
+                active.class = VarClass.parse(pair.value) orelse return error.InvalidEnvSchema;
             } else if (std.mem.eql(u8, pair.key, "grant")) {
-                if (builder.grant != null or pair.value.len == 0) return error.InvalidEnvSchema;
-                builder.grant = try allocator.dupe(u8, pair.value);
+                if (active.has_grant or pair.value.len == 0) return error.InvalidEnvSchema;
+                const copied = try scratch.dupe(u8, pair.value);
+                active.has_grant = true;
+                active.grant_ptr = @intFromPtr(copied.ptr);
+                active.grant_len = copied.len;
             } else return error.InvalidEnvSchema;
             continue;
         }
         return error.InvalidEnvSchema;
     }
-    try finishActive(allocator, &variables, &active);
+    try commitActive(scratch, &variables, &active);
     if (!saw_unknown_omit) return error.InvalidEnvSchema;
-    return .{ .allocator = allocator, .vars = try variables.toOwnedSlice(allocator) };
+    return try freezeSchema(allocator, variables.items);
 }
 
 pub fn loadOptional(
@@ -142,21 +154,38 @@ pub fn loadOptional(
     return try parseFromSlice(allocator, text);
 }
 
-fn finishActive(
-    allocator: std.mem.Allocator,
+fn commitActive(
+    scratch: std.mem.Allocator,
     variables: *std.ArrayList(Variable),
-    active: *?Builder,
+    active: *ActiveVar,
 ) !void {
-    if (active.*) |builder_value| {
-        var builder = builder_value;
-        active.* = null;
-        var transferred = false;
-        defer if (!transferred) builder.deinit(allocator);
-        const variable = try builder.intoVariable();
-        transferred = true;
-        errdefer variable.deinit(allocator);
-        try variables.append(allocator, variable);
+    if (!active.occupied) return;
+    const resolved_class = active.class orelse return error.InvalidEnvSchema;
+    if (resolved_class == .public and active.has_grant) return error.InvalidEnvSchema;
+    const variable: Variable = .{
+        .name = active.nameSlice(),
+        .class = resolved_class,
+        .grant = active.grantSlice(),
+    };
+    active.* = .{};
+    try variables.append(scratch, variable);
+}
+
+fn freezeSchema(allocator: std.mem.Allocator, items: []const Variable) !Schema {
+    const vars = try allocator.alloc(Variable, items.len);
+    errdefer allocator.free(vars);
+    var done: usize = 0;
+    errdefer {
+        for (vars[0..done]) |item| item.deinit(allocator);
     }
+    for (items) |item| {
+        const name = try allocator.dupe(u8, item.name);
+        errdefer allocator.free(name);
+        const grant = if (item.grant) |value| try allocator.dupe(u8, value) else null;
+        vars[done] = .{ .name = name, .class = item.class, .grant = grant };
+        done += 1;
+    }
+    return .{ .allocator = allocator, .vars = vars };
 }
 
 const Pair = struct { key: []const u8, value: []const u8 };
