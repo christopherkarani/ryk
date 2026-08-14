@@ -1017,6 +1017,16 @@ fn defaultShellCommandEvaluator(allocator: std.mem.Allocator, shell_event: Shell
     return shell_eval.defaultEvaluator(allocator, shell_event);
 }
 
+const hook_test_workspace = "/tmp/ryk-hook-test";
+
+/// File-policy normalize realpath-requires the workspace directory. Shared hook
+/// tests used this fixed path without creating it, so they only passed when a
+/// later feed write (or a prior suite run) left `/tmp/ryk-hook-test` behind.
+fn ensureSharedHookTestWorkspace(workspace_root: []const u8) void {
+    if (!std.mem.eql(u8, workspace_root, hook_test_workspace)) return;
+    std.Io.Dir.cwd().createDirPath(std.testing.io, hook_test_workspace) catch {};
+}
+
 fn evaluateHookForTest(
     allocator: std.mem.Allocator,
     policy_value: *const policy.schema.Policy,
@@ -1025,7 +1035,7 @@ fn evaluateHookForTest(
     payload: std.json.Value,
     ci_mode: bool,
 ) !HookResponse {
-    return evaluateHookForTestWithOptions(allocator, "/tmp/ryk-hook-test", policy_value, host, event, payload, ci_mode, null);
+    return evaluateHookForTestWithOptions(allocator, hook_test_workspace, policy_value, host, event, payload, ci_mode, null);
 }
 
 fn evaluateHookForTestWithOptions(
@@ -1038,11 +1048,12 @@ fn evaluateHookForTestWithOptions(
     ci_mode: bool,
     shell_evaluator: ?ShellCommandEvaluatorFn,
 ) !HookResponse {
+    ensureSharedHookTestWorkspace(workspace_root);
     // #region agent log
     {
         var b1: [256]u8 = undefined;
         var data: [512]u8 = undefined;
-        const dj = std.fmt.bufPrint(&data, "{{\"workspace\":\"{s}\",\"host\":\"{s}\",\"event\":\"{s}\"}}", .{
+        const dj = std.fmt.bufPrint(&data, "{{\"workspace\":\"{s}\",\"host\":\"{s}\",\"event\":\"{s}\",\"runId\":\"post-fix\"}}", .{
             agentSan(workspace_root, &b1),
             @tagName(host),
             @tagName(event),
@@ -1063,10 +1074,11 @@ fn evaluatePreToolUseForTest(
     limitations: *std.ArrayList([]const u8),
     shell_evaluator: ?ShellCommandEvaluatorFn,
 ) !HookResponse {
+    ensureSharedHookTestWorkspace(hook_test_workspace);
     return evaluatePreToolUse(
         std.testing.io,
         allocator,
-        "/tmp/ryk-hook-test",
+        hook_test_workspace,
         "claude",
         policy_value,
         payload,
@@ -2895,10 +2907,11 @@ fn runShellRouteWithMode(
     var redactions: std.ArrayList(RedactionEntry) = .empty;
     var limitations: std.ArrayList([]const u8) = .empty;
     try shellRouteSetup(allocator, &redactions, &limitations);
+    ensureSharedHookTestWorkspace(hook_test_workspace);
     return evaluateShellCommandRoute(
         std.testing.io,
         allocator,
-        "/tmp/ryk-hook-test",
+        hook_test_workspace,
         "claude",
         .{ .command = command_text, .cwd = cwd },
         mode,
