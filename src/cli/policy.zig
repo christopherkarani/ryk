@@ -257,11 +257,13 @@ fn writePolicyExplanationHuman(io: std.Io, allocator: std.mem.Allocator, stdout:
     const rule_id = if (evaluation.matched_rule) |rule| rule.id else "none";
     const matched = if (evaluation.matched_rule) |rule| rule.pattern else "none";
     try writePolicyDetailsPanel(io, allocator, stdout, evaluation.decision.reason, rule_id, matched, policy_value.mode().toString());
-    const score = evaluation.decision.risk_score orelse 0;
-    const risk_label = if (evaluation.decision.risk_score == null) "unknown" else if (score <= 25) "low" else if (score <= 50) "medium" else if (score <= 75) "high" else "critical";
-    try stdout.writeAll("  Risk  ");
-    try tui.meter(io, stdout, @as(f32, @floatFromInt(score)) / 100.0, risk_label);
-    try stdout.writeAll("\n");
+    if (evaluation.decision.risk_score) |score| {
+        const risk_label = if (score <= 25) "low" else if (score <= 50) "medium" else if (score <= 75) "high" else "critical";
+        try stdout.writeAll("  Risk  ");
+        try tui.meter(io, stdout, @as(f32, @floatFromInt(score)) / 100.0, risk_label);
+        try stdout.writeAll("\n");
+    }
+    try stdout.writeAll("Next: ryk help policy\n");
 }
 
 fn writePolicyDetailsPanel(io: std.Io, allocator: std.mem.Allocator, stdout: anytype, reason: []const u8, rule_id: []const u8, matched: []const u8, mode: []const u8) !void {
@@ -567,7 +569,8 @@ test "policy explain reports matched deny rule" {
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "[DENY]") != null);
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "files.read.deny") != null);
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "Mode") != null);
-    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "Risk") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "unknown") == null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "Next:") != null);
     try std.testing.expectEqualStrings("", stderr_writer.buffered());
 }
 

@@ -647,31 +647,21 @@ fn writeDoctorPlain(io: std.Io, allocator: std.mem.Allocator, stdout: anytype, r
     // Unified host status table (same fields as `ryk doctor`).
     try writeUnifiedHostStatusTable(io, allocator, stdout, report, target);
 
+    const dirs_found = @as(usize, @intFromBool(report.plugin_directories.common)) +
+        @as(usize, @intFromBool(report.plugin_directories.codex)) +
+        @as(usize, @intFromBool(report.plugin_directories.claude)) +
+        @as(usize, @intFromBool(report.plugin_directories.opencode)) +
+        @as(usize, @intFromBool(report.plugin_directories.openclaw)) +
+        @as(usize, @intFromBool(report.plugin_directories.hermes));
+    const bins_found = @as(usize, @intFromBool(report.host_binaries.codex)) +
+        @as(usize, @intFromBool(report.host_binaries.claude)) +
+        @as(usize, @intFromBool(report.host_binaries.opencode)) +
+        @as(usize, @intFromBool(report.host_binaries.openclaw)) +
+        @as(usize, @intFromBool(report.host_binaries.hermes));
     try stdout.writeAll("\nPlugin directories:\n");
-    try stdout.print("  integrations/common: {s}\n", .{if (report.plugin_directories.common) "found" else "missing"});
-    if (!report.plugin_directories.common) try stdout.writeAll("    → Fix: ryk doctor --fix or ryk plugin install all\n");
-    try stdout.print("  integrations/codex-plugin: {s}\n", .{if (report.plugin_directories.codex) "found" else "missing"});
-    if (!report.plugin_directories.codex) try stdout.writeAll("    → Fix: ryk doctor --fix or ryk plugin install codex\n");
-    try stdout.print("  integrations/claude-code-plugin: {s}\n", .{if (report.plugin_directories.claude) "found" else "missing"});
-    if (!report.plugin_directories.claude) try stdout.writeAll("    → Fix: ryk doctor --fix or ryk plugin install claude\n");
-    try stdout.print("  integrations/opencode-plugin: {s}\n", .{if (report.plugin_directories.opencode) "found" else "missing"});
-    if (!report.plugin_directories.opencode) try stdout.writeAll("    → Fix: ryk doctor --fix or ryk plugin install opencode\n");
-    try stdout.print("  integrations/openclaw-plugin: {s}\n", .{if (report.plugin_directories.openclaw) "found" else "missing"});
-    if (!report.plugin_directories.openclaw) try stdout.writeAll("    → Fix: ryk doctor --fix or ryk plugin install openclaw\n");
-    try stdout.print("  integrations/hermes-plugin: {s}\n", .{if (report.plugin_directories.hermes) "found" else "missing"});
-    if (!report.plugin_directories.hermes) try stdout.writeAll("    → Fix: ryk doctor --fix or ryk plugin install hermes\n");
-
+    try stdout.print("  {d}/6 found. Missing? ryk doctor --fix\n", .{dirs_found});
     try stdout.writeAll("\nHost binaries:\n");
-    try stdout.print("  codex: {s}\n", .{if (report.host_binaries.codex) "found in PATH" else "not found"});
-    if (!report.host_binaries.codex) try stdout.writeAll("    → Fix: ryk doctor --fix or ryk plugin install codex\n");
-    try stdout.print("  claude: {s}\n", .{if (report.host_binaries.claude) "found in PATH" else "not found"});
-    if (!report.host_binaries.claude) try stdout.writeAll("    → Fix: ryk doctor --fix or ryk plugin install claude\n");
-    try stdout.print("  opencode: {s}\n", .{if (report.host_binaries.opencode) "found in PATH" else "not found"});
-    if (!report.host_binaries.opencode) try stdout.writeAll("    → Fix: ryk doctor --fix or ryk plugin install opencode\n");
-    try stdout.print("  openclaw: {s}\n", .{if (report.host_binaries.openclaw) "found in PATH" else "not found"});
-    if (!report.host_binaries.openclaw) try stdout.writeAll("    → Fix: ryk doctor --fix or ryk plugin install openclaw\n");
-    try stdout.print("  hermes: {s}\n", .{if (report.host_binaries.hermes) "found in PATH" else "not found"});
-    if (!report.host_binaries.hermes) try stdout.writeAll("    → Fix: ryk doctor --fix or ryk plugin install hermes\n");
+    try stdout.print("  {d}/5 on PATH. Missing? ryk plugin install <host>\n", .{bins_found});
 
     try stdout.writeAll("\nMarketplace files:\n");
     try stdout.print("  .agents/plugins/marketplace.json: {s}\n", .{if (report.marketplace.codex_marketplace) "present" else "missing"});
@@ -1805,10 +1795,6 @@ fn installCommand(io: std.Io, argv: []const []const u8, stdout: anytype, stderr:
             }
         }
 
-        // Safety notes (always printed)
-        try stdout.writeAll("  safety: host config will not be silently overwritten\n");
-        try stdout.writeAll("  safety: no credentials or telemetry will be stored\n");
-
         // P1 install smoke: safe allow + dangerous deny on the host veto path.
         if (!dry_run and t != .all) {
             const host_name = @tagName(t);
@@ -1835,6 +1821,8 @@ fn installCommand(io: std.Io, argv: []const []const u8, stdout: anytype, stderr:
         try stdout.writeAll("  Verify: ryk doctor · process isolation: ryk run -- pi\n");
     }
 
+    try stdout.writeAll("\n  safety: host config will not be silently overwritten\n");
+    try stdout.writeAll("  safety: no credentials or telemetry will be stored\n");
     try stdout.writeAll("\n");
     // Exit non-zero only when install claimed success but deny smoke failed.
     if (smoke_deny_failed) {

@@ -187,6 +187,13 @@ fn checkDangerousDefaults(result: *Result, policy: policy_mod.schema.Policy) !vo
     try result.add("dangerous-defaults", .pass, "obvious dangerous defaults are disabled");
 }
 
+pub fn writeText(writer: anytype, result: Result) !void {
+    try writer.writeAll("ryk CI Check\n");
+    for (result.checks.items) |check| {
+        try writer.print("  {s}: {s} — {s}\n", .{ check.name, statusText(check.status), check.message });
+    }
+}
+
 pub fn writeMarkdown(writer: anytype, result: Result) !void {
     try writer.writeAll("# ryk CI Check\n\n");
     for (result.checks.items) |check| {

@@ -577,20 +577,7 @@ fn humanName(allocator: std.mem.Allocator, id: []const u8) ![]u8 {
 }
 
 fn descriptionFromKeywords(allocator: std.mem.Allocator, keywords_val: ?std.json.Value, id: []const u8) ![]u8 {
-    if (keywords_val) |kv| {
-        if (kv == .array and kv.array.items.len > 0) {
-            var parts: std.ArrayListUnmanaged([]const u8) = .empty;
-            defer parts.deinit(allocator);
-            for (kv.array.items) |item| {
-                if (item == .string) try parts.append(allocator, item.string);
-            }
-            if (parts.items.len > 0) {
-                const joined = try std.mem.join(allocator, ", ", parts.items);
-                defer allocator.free(joined);
-                return try std.fmt.allocPrint(allocator, "Keywords: {s}", .{joined});
-            }
-        }
-    }
+    _ = keywords_val;
     return try std.fmt.allocPrint(allocator, "Shell safety pack {s}", .{id});
 }
 

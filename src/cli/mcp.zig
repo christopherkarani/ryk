@@ -852,7 +852,9 @@ fn safeEnvName(value: []const u8) bool {
 
 fn usageCode(err: anyerror, stderr: anytype) !u8 {
     switch (err) {
-        error.MissingCommand => try stderr.writeAll("ryk mcp: expected --command <server>.\n"),
+        error.MissingCommand => try stderr.writeAll(
+            "ryk mcp: expected --command <server>.\nNext: ryk mcp inspect --command <server-argv>\n",
+        ),
         error.Unsupported => {},
         else => try stderr.writeAll("ryk mcp: invalid arguments.\n"),
     }
@@ -874,6 +876,19 @@ fn makeSession(io: std.Io, command_argv: []const []const u8, workspace: []const 
         .mode = mode.toCoreMode(),
         .platform = core.platform.detectOs(),
     };
+}
+
+test "mcp inspect without command includes an example" {
+    var stdout_buf: [256]u8 = undefined;
+    var stderr_buf: [512]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+
+    const code = try command(std.testing.io, &.{"inspect"}, &stdout_writer, &stderr_writer);
+    try std.testing.expectEqual(exit_codes.usage, code);
+    const err = stderr_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, err, "expected --command") != null);
+    try std.testing.expect(std.mem.indexOf(u8, err, "Next: ryk mcp inspect --command") != null);
 }
 
 test "MCP proxy session metadata omits server arguments" {

@@ -100,6 +100,7 @@ test {
     _ = setup;
     _ = quickstart;
     _ = help;
+    _ = policy;
     _ = disable;
     _ = uninstall;
     _ = update;
@@ -551,8 +552,8 @@ fn runWithCwdUsing(
     if (std.mem.eql(u8, command, "dashboard")) return dashboard_command.command(io, argv[1..], stdout, stderr);
     if (std.mem.eql(u8, command, "report")) return report.command(io, argv[1..], stdout, stderr);
     if (std.mem.eql(u8, command, "ci")) return ci.command(io, argv[1..], stdout, stderr);
-    if (std.mem.eql(u8, command, "stop")) return disable.command(io, argv[1..], stdout, stderr);
-    if (std.mem.eql(u8, command, "disable")) return disable.command(io, argv[1..], stdout, stderr);
+    if (std.mem.eql(u8, command, "stop")) return disable.commandAs(io, argv[1..], stdout, stderr, "stop");
+    if (std.mem.eql(u8, command, "disable")) return disable.commandAs(io, argv[1..], stdout, stderr, "disable");
     if (std.mem.eql(u8, command, "uninstall")) return uninstall.command(io, argv[1..], stdout, stderr);
     if (std.mem.eql(u8, command, "update")) return update.command(io, argv[1..], stdout, stderr);
     if (std.mem.eql(u8, command, "feedback")) return feedback.command(io, environ_map, argv[1..], stdout, stderr);
@@ -2190,6 +2191,28 @@ test "agents is the only public unattended workflow command" {
     const old_code = try testRun(&.{"unattended"}, &stdout_writer, &stderr_writer);
     try std.testing.expectEqual(exit_codes.usage, old_code);
     try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "ryk agents") != null);
+}
+
+test "telemetry --help writes help to stdout" {
+    var stdout_buf: [4096]u8 = undefined;
+    var stderr_buf: [256]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+    const code = try testRun(&.{ "telemetry", "--help" }, &stdout_writer, &stderr_writer);
+    try std.testing.expectEqual(exit_codes.success, code);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "telemetry") != null);
+    try std.testing.expectEqualStrings("", stderr_writer.buffered());
+}
+
+test "disable confirmation names the invoked command" {
+    var stdout_buf: [2048]u8 = undefined;
+    var stderr_buf: [256]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+    const code = try testRun(&.{"disable"}, &stdout_writer, &stderr_writer);
+    try std.testing.expectEqual(exit_codes.usage, code);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "ryk disable:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "ryk stop:") == null);
 }
 
 test "stop dispatch is the public disable command" {
