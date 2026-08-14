@@ -1080,7 +1080,7 @@ fn evaluateHookForTestWithOptions(
     shell_evaluator: ?ShellCommandEvaluatorFn,
 ) !HookResponse {
     if (std.fs.path.isAbsolute(workspace_root)) {
-        std.fs.makeDirAbsolute(workspace_root) catch {};
+        std.Io.Dir.cwd().createDirPath(std.testing.io, workspace_root) catch {};
     }
     return evaluateHook(std.testing.io, allocator, workspace_root, @tagName(host), policy_value, host, event, payload, ci_mode, shell_evaluator);
 }
