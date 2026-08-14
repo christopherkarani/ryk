@@ -32,13 +32,14 @@ GitHub Actions `release.yml` remains a **manual backup** (`workflow_dispatch`). 
 
 ### Release stages
 
-`preflight` → `version` → `notes` → `gate` → `bump` → `build` → `verify` → `publish-git` → `done`
+`preflight` → `version` → `notes` → `gate` → `bump` → `build` → `verify` → `sign` → `publish-git` → `done`
 
 | Stage | What it does |
 |-------|----------------|
 | `gate` | `./scripts/verify-pre-merge.sh` |
 | `build` | Dashboard UI, Linux via Docker, and curl installer archives |
-| `publish-git` | Push branch; `gh release create` **with assets** (tag + checksums) |
+| `sign` | Detached minisign over `checksums.txt`; a live cut with no key stops here. See [release signing](../release-signing.md) |
+| `publish-git` | Push branch; `gh release create` **with assets** (tag + checksums + `checksums.txt.minisig`) |
 
 Logs: `dist/cut-release-vX.Y.Z.log`  
 State: `.release-cut/state.env` (gitignored)
@@ -50,7 +51,7 @@ State: `.release-cut/state.env` (gitignored)
 | `RYK_RELEASE_BRANCHES` | `main master` |
 | `RYK_DIST_DIR` | `dist` |
 | `RYK_CLI_ARTIFACT_DIR` | `.release-cli-bins` (outside `dist/` — build-release wipes `dist/`) |
-| `RYK_SIGNING_ENABLED` | `0` (optional signing hook; not required for v1) |
+| `RYK_MINISIGN_SECRET_KEY` | Path to the offline minisign secret; required for a live cut. Never commit this file |
 | `RYK_POSTHOG_PROJECT_TOKEN` | Required for release telemetry; this is a public project token |
 | `RYK_TELEMETRY_BUILD_DISABLED` | `0`; set to `1` only for local dry-runs that must disable transport |
 

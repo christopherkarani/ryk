@@ -61,6 +61,33 @@ The installers print a step-based receipt (brand header, phases, activation hero
 
 Windows (`scripts/install.ps1`) shares the same core contracts (checksum verify, binary + runtime install, structured failures, quiet mode, activation handoff) with a smaller surface: it does not manage `PATH` (use your profile / user PATH) and does not soft-warn on a missing dashboard UI bundle.
 
+## Verifying a release
+
+Every release publishes `checksums.txt` (SHA-256 for each artifact) and
+`checksums.txt.minisig`, an Ed25519 signature over that file in
+[minisign](https://jedisct1.github.io/minisign/) format. One signature over the
+checksums authenticates every artifact.
+
+```sh
+V=X.Y.Z
+B="https://github.com/christopherkarani/ryk/releases/download/v$V"
+curl -fsSLO "$B/checksums.txt" -O "$B/checksums.txt.minisig"
+minisign -V -p keys/ryk-release-minisign.pub -x checksums.txt.minisig -m checksums.txt
+shasum -a 256 -c checksums.txt --ignore-missing
+```
+
+The installer does this for you and **refuses to install** a release whose
+signature is missing or does not verify. If neither `minisign` nor `rsign` is
+installed it stops with instructions rather than skipping the check; you can
+explicitly accept checksum-only trust with `RYK_INSTALL_ALLOW_UNSIGNED=1`, which
+prints a visible `SKIPPED` line.
+
+Signature enforcement activates once the release signing key is provisioned;
+until then the installer reports `not yet active for this release` and verifies
+SHA-256 as before. What signing does and does not protect — in particular that
+`curl … | sh` still trusts whoever served the script — is spelled out in
+[`release-signing.md`](release-signing.md).
+
 ## Release channel
 
 The supported install path is the checksum-verified curl installer:

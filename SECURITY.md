@@ -20,6 +20,18 @@ ryk protects local agent runs that go through ryk-managed wrappers, shims, stagi
 
 ryk does not make arbitrary malicious code safe, and it does not provide universal transparent filesystem or network enforcement on every operating system. Use `ryk doctor` for local capability status and read the [compatibility matrix](docs/compatibility.md) before making an enforcement claim.
 
+## Release integrity
+
+Releases publish `checksums.txt` and a detached Ed25519 signature over it,
+`checksums.txt.minisig`. `scripts/install.sh` verifies the signature before it
+trusts any digest and refuses to install a release it cannot authenticate.
+
+Verifying by hand is the strongest path, because `curl … | sh` trusts whoever
+served the script. [Release signing](docs/release-signing.md) documents the key,
+the verification commands, and precisely which attacks signing does and does not
+stop. Report a suspected key compromise through the process above; rotation
+happens before anything else signed by that key is published.
+
 ## Regression checks
 
 ```sh

@@ -26,7 +26,10 @@ What it does:
 3. Runs `./scripts/verify-pre-merge.sh`.
 4. Builds the macOS, Linux, and Windows CLI archives.
 5. Verifies checksums, SBOM, telemetry contract, and release manifest.
-6. Creates the GitHub Release with the assets required by `curl | sh`.
+6. Signs `checksums.txt` (see [release signing](../release-signing.md)). A live
+   cut with no key stops here, having pushed nothing.
+7. Creates the GitHub Release with the assets required by `curl | sh`, including
+   `checksums.txt.minisig`.
 
 CI `release.yml` is a backup path. It skips when the complete curl installer
 asset set is already attached to the tag's GitHub Release.
