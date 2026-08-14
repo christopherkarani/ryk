@@ -20,6 +20,25 @@ ryk protects local agent runs that go through ryk-managed wrappers, shims, stagi
 
 ryk does not make arbitrary malicious code safe, and it does not provide universal transparent filesystem or network enforcement on every operating system. Use `ryk doctor` for local capability status and read the [compatibility matrix](docs/compatibility.md) before making an enforcement claim.
 
+## Release integrity
+
+Signing is not yet active. The published public key is the sentinel
+`RYK_RELEASE_PUBKEY_UNPROVISIONED`, so installers are checksum-only
+(fail-open on signatures) until a real key is provisioned.
+
+`scripts/install.sh` reports `not yet active for this release` and verifies
+SHA-256. `scripts/install.ps1` is checksum-only (Windows unsigned) and does
+not consume `checksums.txt.minisig`.
+
+After provisioning, releases will publish `checksums.txt.minisig` and the
+POSIX installer will verify it before trusting any digest.
+
+Verifying by hand is the strongest path, because `curl … | sh` trusts whoever
+served the script. [Release signing](docs/release-signing.md) documents the key,
+the verification commands, and precisely which attacks signing does and does not
+stop. Report a suspected key compromise through the process above; rotation
+happens before anything else signed by that key is published.
+
 ## Regression checks
 
 ```sh

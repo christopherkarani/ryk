@@ -202,6 +202,11 @@ jobs:
       # Without this step the artifacts only land in the workflow run and never
       # reach the release page, so install.sh's checksum download 404s.
       # Hard-gate on checksums.txt so a release can never publish without it.
+      #
+      # CI backup still does not attach checksums.txt.minisig. Mac cut-release.sh
+      # is the signing path; this workflow must not grow a CI signing pipeline
+      # or store a secret key. While the public key is the UNPROVISIONED sentinel,
+      # installers are checksum-only anyway.
       - name: Attach assets to GitHub Release
         if: env.SKIP_RELEASE != '1'
         shell: bash

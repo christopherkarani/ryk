@@ -25,6 +25,13 @@ else
   echo "[verify-pre-merge] skip openclaw release assets (plugin node_modules/.bin/tsc missing)"
 fi
 
+# Dispatcher contract always runs (sign) arm). Crypto installer tests skip only
+# when no minisign/rsign is installed; a skip must not bypass the dispatcher check.
+echo "[verify-pre-merge] Release signing contract"
+./scripts/test-release-signing.sh
+grep -qE '^[[:space:]]*sign\)[[:space:]]+phase_sign' scripts/cut-release.sh \
+  || { echo "cut-release.sh run_phase is missing sign) phase_sign" >&2; exit 1; }
+
 echo "[verify-pre-merge] First-user install and uninstall regressions"
 ./scripts/install-first-user-regression-test.sh
 ./scripts/uninstall-first-user-regression-test.sh

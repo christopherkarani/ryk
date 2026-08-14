@@ -17,6 +17,8 @@ set -eu
 #   RYK_INSTALL_FORCE=1 Allow overwriting a non-product file at the destination
 #   RYK_INSTALL_QUIET=1 Suppress non-error UI (still installs; prints activation line)
 #   RYK_INSTALL_SKIP_ONBOARD=1  Skip post-install ensure
+#   RYK_RELEASE_PUBKEY   Override the release signing key (testing only)
+#   RYK_INSTALL_ALLOW_UNSIGNED=1  Accept checksum-only trust (announced, not silent)
 #   NO_COLOR             Disable ANSI color even on a TTY
 #
 # Ensure door (release/install contract):
@@ -175,6 +177,25 @@ reject_symlink_parents() {
 print_activation() {
   printf '    eval "$(%s env)"\n' "$1"
 }
+
+# ── Release signing ──────────────────────────────────────────────────────────
+# checksums.txt covers every artifact, so one detached signature over it
+# authenticates the whole release. Verifying it here splits the trust that the
+# audit flagged: the archive and checksums come from GitHub Releases, while this
+# script (and the key below) come from rykanv.com, so compromising the release
+# host alone no longer ships attacker code.
+#
+# It does not defend against a compromised copy of this script — `curl | sh`
+# trusts whoever served the script. Manual downloaders should verify against the
+# key published in-repo (keys/ryk-release-minisign.pub) and in docs/install.md.
+#
+# Replace the sentinel with the real base64 minisign public key to turn
+# enforcement on; until then the installer says signing is not yet active
+# instead of pretending a missing signature is fine. cut-release keeps this line
+# in sync with keys/ryk-release-minisign.pub.
+RELEASE_PUBKEY="${RYK_RELEASE_PUBKEY:-RYK_RELEASE_PUBKEY_UNPROVISIONED}"
+SIGNATURE_NAME="checksums.txt.minisig"
+SIGNATURE_STATE="unverified"
 
 # ── Version resolution ───────────────────────────────────────────────────────
 # cut-release rewrites INSTALL_FALLBACK_VERSION when shipping; do not hand-edit
@@ -388,6 +409,19 @@ download() {
 	Retry: RYK_VERSION=${VERSION} curl -fsSL https://rykanv.com/install | sh"
 }
 
+# Fetch a file whose absence is not fatal here. Callers must still decide whether
+# the missing file is acceptable — this only keeps a 404 from aborting the run.
+download_optional() {
+  _opt_url="$1"
+  _opt_out="$2"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL --max-time 30 "$_opt_url" -o "$_opt_out" 2>/dev/null || rm -f "$_opt_out"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q "$_opt_url" -O "$_opt_out" 2>/dev/null || rm -f "$_opt_out"
+  fi
+  return 0
+}
+
 sha256_file() {
   file="$1"
   if command -v sha256sum >/dev/null 2>&1; then
@@ -401,6 +435,80 @@ sha256_file() {
 
 shell_quote() {
   printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
+# Print the name of an available minisign-format verifier, or fail. rsign is the
+# Rust implementation of the same format and the same signatures verify under it,
+# so accepting it means fewer users hit the fail-closed path below.
+signature_verifier() {
+  if command -v minisign >/dev/null 2>&1; then
+    printf 'minisign'
+    return 0
+  fi
+  if command -v rsign >/dev/null 2>&1; then
+    printf 'rsign'
+    return 0
+  fi
+  return 1
+}
+
+# Verify the detached signature over checksums.txt before any digest is trusted.
+# Fails closed on a missing signature, a failed verification, or no verifier
+# present: an unverifiable release is ambiguous state, not an implicit pass.
+verify_signature() {
+  signed_path="$1"
+  signature_path="$2"
+
+  case "$RELEASE_PUBKEY" in
+    RYK_RELEASE_PUBKEY_UNPROVISIONED)
+      SIGNATURE_STATE="not-yet-active"
+      return 0
+      ;;
+  esac
+
+  if [ "${RYK_INSTALL_ALLOW_UNSIGNED:-0}" = "1" ]; then
+    # Explicit user downgrade to checksum-only trust. A compromised release host
+    # cannot set this; only the person running the installer can.
+    SIGNATURE_STATE="skipped-by-user"
+    return 0
+  fi
+
+  [ -f "$signature_path" ] || fail "release signature not found: $(basename "$signature_path")" \
+    "This release did not publish a signature, or it failed to download.
+Refuse to install a release that cannot be authenticated.
+	Verify by hand: https://github.com/christopherkarani/ryk/blob/main/docs/install.md
+	Checksum-only:  RYK_INSTALL_ALLOW_UNSIGNED=1 (not recommended)"
+
+  verifier="$(signature_verifier)" || fail "no signature verifier found (minisign or rsign)" \
+    "Install one, then re-run:
+	macOS:   brew install minisign
+	Debian:  sudo apt install minisign
+	Cargo:   cargo install rsign2
+	Checksum-only: RYK_INSTALL_ALLOW_UNSIGNED=1 (not recommended)"
+
+  case "$verifier" in
+    minisign)
+      # Output is discarded rather than passing a quiet flag: an unsupported flag
+      # would look identical to a bad signature and reject a valid release.
+      minisign -V -P "$RELEASE_PUBKEY" -x "$signature_path" -m "$signed_path" >/dev/null 2>&1 \
+        || signature_failed "$verifier"
+      ;;
+    rsign)
+      rsign verify -P "$RELEASE_PUBKEY" -x "$signature_path" "$signed_path" >/dev/null 2>&1 \
+        || signature_failed "$verifier"
+      ;;
+  esac
+
+  SIGNATURE_STATE="verified"
+}
+
+signature_failed() {
+  fail "release signature verification FAILED (${1})" \
+    "checksums.txt is not signed by the ryk release key.
+Someone may be serving a modified release, or the download is corrupt.
+Nothing was installed.
+	Re-run:  RYK_VERSION=${VERSION} curl -fsSL https://rykanv.com/install | sh
+	Report:  https://github.com/christopherkarani/ryk/security"
 }
 
 verify_checksum() {
@@ -796,13 +904,26 @@ if [ -n "$ARTIFACT_DIR" ]; then
   [ -f "$ARTIFACT_DIR/checksums.txt" ] || fail "checksums.txt not found in $ARTIFACT_DIR" \
     "Place checksums.txt next to the archive for offline install."
   cp "$ARTIFACT_DIR/checksums.txt" "$TMP_DIR/checksums.txt"
+  if [ -f "$ARTIFACT_DIR/$SIGNATURE_NAME" ]; then
+    cp "$ARTIFACT_DIR/$SIGNATURE_NAME" "$TMP_DIR/$SIGNATURE_NAME"
+  fi
   step_done "Use local artifacts" "$ARTIFACT_DIR"
 else
   step_active "Download archive"
   download "$BASE_URL/$ARTIFACT" "$TMP_DIR/$ARTIFACT"
   download "$BASE_URL/checksums.txt" "$TMP_DIR/checksums.txt"
+  # Optional at the transport layer only: verify_signature decides whether a
+  # missing signature is fatal, so a 404 here cannot silently disable checking.
+  download_optional "$BASE_URL/$SIGNATURE_NAME" "$TMP_DIR/$SIGNATURE_NAME"
   step_done "Download archive" "$ARTIFACT"
 fi
+
+verify_signature "$TMP_DIR/checksums.txt" "$TMP_DIR/$SIGNATURE_NAME"
+case "$SIGNATURE_STATE" in
+  verified) step_done "Verify signature" "ok · minisign over checksums.txt" ;;
+  not-yet-active) step_done "Verify signature" "not yet active for this release" ;;
+  skipped-by-user) step_done "Verify signature" "SKIPPED (RYK_INSTALL_ALLOW_UNSIGNED=1)" ;;
+esac
 
 verify_checksum "$ARTIFACT" "$TMP_DIR/$ARTIFACT" "$TMP_DIR/checksums.txt"
 step_done "Verify SHA-256" "ok"

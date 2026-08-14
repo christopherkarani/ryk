@@ -16,6 +16,22 @@ The package hashes in `build.zig.zon` are part of the build contract. Do not rep
 
 Run `npm ci` and `npm test` in `ryk-dashboard-ui/` when changing the dashboard. Do not commit `node_modules/`, `.next/`, or generated release output.
 
+## Release signing (maintainer tooling)
+
+[minisign](https://jedisct1.github.io/minisign/) signs release artifacts. It is a
+maintainer-side tool invoked by `scripts/cut-release.sh`, not a build or runtime
+dependency, and nothing links against it. Chosen over sigstore/cosign because the
+verification side runs inside a POSIX `sh` installer on the user's machine, where a
+single small Ed25519 signature check is the whole requirement — cosign would pull
+an OIDC/transparency-log stack into that path for no gain at this scale.
+
+Signing is not yet active (sentinel `RYK_RELEASE_PUBKEY_UNPROVISIONED`). After
+provisioning, `scripts/install.sh` will verify with `minisign`, or `rsign` (Rust
+implementation of the same format) if minisign is absent, and fail closed when
+neither exists. `scripts/install.ps1` remains checksum-only (Windows unsigned).
+The public key lives in `keys/ryk-release-minisign.pub`; the secret key must never
+be in this repo or in CI. See [`../release-signing.md`](../release-signing.md).
+
 ## macOS FM steward
 
 The macOS FM steward uses the pinned Wax package in `macos/fm-steward/Package.swift` for local few-shot retrieval. It is an assistive classifier, not a policy authority. Policy and shell decisions remain on the Zig path.

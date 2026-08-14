@@ -59,7 +59,43 @@ ryk update --yes    # non-interactive
 
 The installers print a step-based receipt (brand header, phases, activation hero). They honor `NO_COLOR` and `RYK_INSTALL_QUIET=1` (non-error silence; activation line still printed) and run the canonical `doctor --fix --from-install` setup door.
 
-Windows (`scripts/install.ps1`) shares the same core contracts (checksum verify, binary + runtime install, structured failures, quiet mode, activation handoff) with a smaller surface: it does not manage `PATH` (use your profile / user PATH) and does not soft-warn on a missing dashboard UI bundle.
+Windows (`scripts/install.ps1`) is **checksum-only (unsigned)**: it verifies
+SHA-256 against `checksums.txt` and does not consume `checksums.txt.minisig`.
+It shares the other core contracts (binary + runtime install, structured
+failures, quiet mode, activation handoff) with a smaller surface: it does not
+manage `PATH` (use your profile / user PATH) and does not soft-warn on a missing
+dashboard UI bundle.
+
+## Verifying a release
+
+Signing is not yet active. `keys/ryk-release-minisign.pub` ships the sentinel
+`RYK_RELEASE_PUBKEY_UNPROVISIONED`. Until a real key is provisioned,
+`scripts/install.sh` reports `not yet active for this release` and continues on
+SHA-256 only. `scripts/install.ps1` is checksum-only (Windows unsigned).
+
+After provisioning, every release will publish `checksums.txt` (SHA-256 for each
+artifact) and `checksums.txt.minisig`, an Ed25519 signature over that file in
+[minisign](https://jedisct1.github.io/minisign/) format. One signature over the
+checksums authenticates every artifact. Manual verification:
+
+```sh
+V=X.Y.Z
+B="https://github.com/christopherkarani/ryk/releases/download/v$V"
+curl -fsSLO "$B/checksums.txt" -O "$B/checksums.txt.minisig"
+minisign -V -p keys/ryk-release-minisign.pub -x checksums.txt.minisig -m checksums.txt
+shasum -a 256 -c checksums.txt --ignore-missing
+```
+
+Once the key is provisioned, `scripts/install.sh` will refuse a release whose
+signature is missing or does not verify. If neither `minisign` nor `rsign` is
+installed it will stop with instructions rather than skipping the check; you can
+explicitly accept checksum-only trust with `RYK_INSTALL_ALLOW_UNSIGNED=1`, which
+prints a visible `SKIPPED` line. That fail-closed path is **not** current
+shipping behavior.
+
+What signing does and does not protect — in particular that `curl … | sh` still
+trusts whoever served the script — is spelled out in
+[`release-signing.md`](release-signing.md).
 
 ## Release channel
 
@@ -92,5 +128,8 @@ Linux builds use backend detection for namespace, seccomp, Landlock, cgroup, and
 ryk is macOS/Linux-first. Windows sessions run at **wrapper/hook grade** with **no OS sandbox**. There is no Seatbelt, Landlock, AppContainer, or Windows Filtering Platform session-attach backend; `src/sandbox/windows.zig` reports `strong_sandbox` unavailable. Doctor cannot promote a Windows session to `OS-enforced`. MCP stdio is **proxy** grade.
 
 Windows builds use `ryk.exe`, PowerShell scripts, path normalization, command wrappers, staged writes, and process cleanup support where implemented. Transparent filesystem enforcement is unavailable (ryk-mediated staging and protected-path matching still run). Transparent network enforcement and proxy-mediated HTTP are unavailable (no loopback proxy).
+
+`scripts/install.ps1` is checksum-only (Windows unsigned): it verifies SHA-256
+against `checksums.txt` and does not read `checksums.txt.minisig`.
 
 See the [compatibility matrix](compatibility.md) and [Windows platform notes](platform-windows.md). WinGet and Scoop are not published; they stay deferred pending a Windows story ([packaging/README.md](../packaging/README.md)).
