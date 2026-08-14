@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const exit_codes = @import("ryk").cli.exit_codes;
 
 const ryk_bin = "./zig-out/bin/ryk";
@@ -300,6 +301,53 @@ test "phase2e Codex PreToolUse invalid JSON fails closed with exit 2 and sentine
     try std.testing.expectEqual(codex_deny_exit_code, result.code);
     try std.testing.expectEqual(@as(usize, 0), result.stdout.len);
     try std.testing.expect(std.mem.indexOf(u8, result.stderr, "[[RYKAN-V-GUARD]]") != null);
+}
+
+fn nowNs() i96 {
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    return std.Io.Timestamp.now(threaded.io(), .awake).toNanoseconds();
+}
+
+test "product hook process stays under 5ms for typical events" {
+    if (!fileExists(ryk_bin)) return;
+    if (builtin.mode != .ReleaseFast and builtin.mode != .ReleaseSmall) return;
+
+    const allocator = std.testing.allocator;
+    const cases = [_]struct { host: []const u8, event: []const u8, payload: []const u8 }{
+        .{ .host = "claude", .event = "SessionStart", .payload = "{\"version\":1,\"host\":\"claude\",\"event\":\"SessionStart\",\"payload\":{}}" },
+        .{ .host = "claude", .event = "PostToolUse", .payload = "{\"version\":1,\"host\":\"claude\",\"event\":\"PostToolUse\",\"payload\":{}}" },
+        .{ .host = "claude", .event = "UserPromptSubmit", .payload = "{\"version\":1,\"host\":\"claude\",\"event\":\"UserPromptSubmit\",\"payload\":{\"prompt\":\"hello\"}}" },
+        .{ .host = "claude", .event = "PreToolUse", .payload = "{\"version\":1,\"host\":\"claude\",\"event\":\"PreToolUse\",\"payload\":{\"tool\":\"Bash\",\"command\":\"git status\"}}" },
+        .{ .host = "claude", .event = "PreToolUse", .payload = "{\"version\":1,\"host\":\"claude\",\"event\":\"PreToolUse\",\"payload\":{\"tool\":\"Bash\",\"command\":\"echo hello\"}}" },
+        .{ .host = "claude", .event = "PreToolUse", .payload = "{\"version\":1,\"host\":\"claude\",\"event\":\"PreToolUse\",\"payload\":{\"tool\":\"Bash\",\"command\":\"rm -rf /\"}}" },
+        .{ .host = "claude", .event = "PreToolUse", .payload = "{\"version\":1,\"host\":\"claude\",\"event\":\"PreToolUse\",\"payload\":{\"toolName\":\"Read\",\"toolInput\":{\"file_path\":\"README.md\"}}}" },
+        .{ .host = "codex", .event = "SessionStart", .payload = "{\"version\":1,\"host\":\"codex\",\"event\":\"SessionStart\",\"payload\":{}}" },
+        .{ .host = "codex", .event = "PreToolUse", .payload = "{\"version\":1,\"host\":\"codex\",\"event\":\"PreToolUse\",\"payload\":{\"tool\":\"Bash\",\"command\":\"ls\"}}" },
+    };
+
+    const budget_ns: u64 = 5 * std.time.ns_per_ms;
+    for (cases) |case| {
+        // Warm the binary and page cache; the budget is per hook, not first-fault.
+        {
+            const warm = try runRyk(allocator, &.{ ryk_bin, "hook", case.host, case.event }, case.payload, null);
+            allocator.free(warm.stdout);
+            allocator.free(warm.stderr);
+        }
+        const started = nowNs();
+        const result = try runRyk(allocator, &.{ ryk_bin, "hook", case.host, case.event }, case.payload, null);
+        const ended = nowNs();
+        defer allocator.free(result.stdout);
+        defer allocator.free(result.stderr);
+        const elapsed: u64 = if (ended > started) @intCast(ended - started) else 0;
+        if (elapsed > budget_ns) {
+            std.debug.print("hook {s} {s} took {d}µs (budget 5000µs)\n", .{
+                case.host,
+                case.event,
+                elapsed / 1000,
+            });
+        }
+        try std.testing.expect(elapsed <= budget_ns);
+    }
 }
 
 test "phase2e Claude PreToolUse invalid JSON fails closed with block JSON" {

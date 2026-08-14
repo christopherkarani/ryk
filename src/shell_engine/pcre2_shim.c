@@ -6,6 +6,8 @@
 
 typedef struct {
     pcre2_code *code;
+    /* Reused across matches. Hook evaluation is single-threaded per process. */
+    pcre2_match_data *md;
 } ryk_regex;
 
 ryk_regex *ryk_regex_compile(const char *pattern, size_t len, int *err_code, size_t *err_offset) {
@@ -19,17 +21,25 @@ ryk_regex *ryk_regex_compile(const char *pattern, size_t len, int *err_code, siz
         if (err_offset) *err_offset = (size_t)eo;
         return NULL;
     }
+    pcre2_match_data *md = pcre2_match_data_create_from_pattern(code, NULL);
+    if (!md) {
+        pcre2_code_free(code);
+        return NULL;
+    }
     ryk_regex *re = (ryk_regex *)malloc(sizeof(ryk_regex));
     if (!re) {
+        pcre2_match_data_free(md);
         pcre2_code_free(code);
         return NULL;
     }
     re->code = code;
+    re->md = md;
     return re;
 }
 
 void ryk_regex_free(ryk_regex *re) {
     if (!re) return;
+    if (re->md) pcre2_match_data_free(re->md);
     pcre2_code_free(re->code);
     free(re);
 }
@@ -40,12 +50,11 @@ int ryk_regex_match_span(
     size_t len,
     size_t *out_start,
     size_t *out_end) {
-    if (!re || !re->code) return -1;
+    if (!re || !re->code || !re->md) return -1;
     /* Empty subject is valid (no-match or match of empty patterns); never read past len. */
     if (!text && len != 0) return -1;
 
-    pcre2_match_data *md = pcre2_match_data_create_from_pattern(re->code, NULL);
-    if (!md) return -2;
+    pcre2_match_data *md = re->md;
 
     const PCRE2_SPTR subject = text ? (PCRE2_SPTR)text : (PCRE2_SPTR)"";
     int rc = pcre2_match(re->code, subject, (PCRE2_SIZE)len, 0, 0, md, NULL);
@@ -57,10 +66,8 @@ int ryk_regex_match_span(
                 if (out_end) *out_end = (size_t)ovector[1];
             }
         }
-        pcre2_match_data_free(md);
         return 1;
     }
-    pcre2_match_data_free(md);
     if (rc == PCRE2_ERROR_NOMATCH) return 0;
     /* Preserve negative PCRE2 error codes for diagnostics; all mean fail-closed. */
     return rc < 0 ? rc : -3;

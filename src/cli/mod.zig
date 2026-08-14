@@ -365,6 +365,19 @@ fn runWithCwdUsing(
     const global_args = try parseGlobalArgs(allocator, argv_input);
     defer if (global_args.owned) allocator.free(global_args.argv);
     const argv = global_args.argv;
+    // Host hooks are a new process per event and must stay under 5ms. Skip
+    // banner/theme/color setup that the machine path never uses.
+    if (argv.len > 0 and std.mem.eql(u8, argv[0], "hook")) {
+        return hook.command(io, argv[1..], stdout, stderr);
+    }
+    if (argv.len == 0 and agent_hook.shouldEnter(io)) {
+        if (agent_hook.command(io, stdout, stderr)) |code| {
+            return code;
+        } else |err| switch (err) {
+            error.NotAgentHookInput => {},
+            else => return err,
+        }
+    }
     const no_rich_env = tui.output_policy.envDisablesRich(
         environ_map.get("RYK_NO_RICH"),
     );

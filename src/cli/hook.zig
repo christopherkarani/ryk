@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const core = @import("ryk_core").core;
 const supervisor = core.supervisor;
 const core_api = @import("ryk_core").api;
@@ -351,9 +352,9 @@ fn hookCommand(io: std.Io, host: Host, event: Event, original_event_name: []cons
         return exit_codes.usage;
     }
 
-    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = gpa_state.deinit();
-    const allocator = gpa_state.allocator();
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
 
     // Read payload from stdin (hooks always read from stdin)
     const payload_text = readBoundedStdin(io, allocator, max_payload_len) catch |err| {
@@ -536,13 +537,18 @@ fn hookCommand(io: std.Io, host: Host, event: Event, original_event_name: []cons
         return exit_codes.success;
     }
 
-    const root = supervisor.resolveWorkspaceRoot(io, allocator, null, ".") catch try allocator.dupe(u8, ".");
-    defer allocator.free(root);
-
     // Extract payload object
     var empty_payload: std.json.ObjectMap = .empty;
     defer empty_payload.deinit(allocator);
     const hook_payload = raw_grok_payload orelse parsed.value.object.get("payload") orelse std.json.Value{ .object = empty_payload };
+
+    const needs_policy = eventNeedsPolicy(event);
+    const needs_workspace = needs_policy or host == .hermes;
+    const root = if (needs_workspace)
+        supervisor.resolveWorkspaceRoot(io, allocator, null, ".") catch try allocator.dupe(u8, ".")
+    else
+        try allocator.dupe(u8, ".");
+    defer allocator.free(root);
 
     if (host == .hermes and isHermesInformationalEvent(request_event)) {
         var redactions: std.ArrayList(RedactionEntry) = .empty;
@@ -557,6 +563,29 @@ fn hookCommand(io: std.Io, host: Host, event: Event, original_event_name: []cons
         telemetry.recordSession(@tagName(host), @tagName(event), "success");
         try writeHookResponse(stdout, result);
         return exit_codes.success;
+    }
+
+    if (!needs_policy) {
+        var redactions: std.ArrayList(RedactionEntry) = .empty;
+        var limitations: std.ArrayList([]const u8) = .empty;
+        try limitations.append(allocator, try allocator.dupe(u8, "Hook enforcement is additive; does not replace ryk run supervision."));
+        var result = try evaluateInformationalEvent(allocator, event, &redactions, &limitations);
+        defer result.deinit(allocator);
+        telemetry.recordSession(@tagName(host), @tagName(event), "success");
+        if (host == .hermes) recordHermesHookActivity(io, allocator, root, request_event, hook_payload, result);
+        switch (agentEmitShape(host, event, result.decision)) {
+            .exit_two_guard => try writeExitTwoGuardBlock(allocator, stderr, result.message, result.reason),
+            .grok_deny_json => try writeGrokDenyOutput(allocator, stdout, stderr, result),
+            .claude_permission => {
+                try writeClaudePermissionDecision(allocator, stdout, event, result);
+                try writeBlockExplainOrRule(io, allocator, stderr, result);
+            },
+            .generic_json => {
+                try writeHookResponse(stdout, result);
+                try writeBlockExplainOrRule(io, allocator, stderr, result);
+            },
+        }
+        return hookExitCode(host, result.decision, ci_mode);
     }
 
     // Load policy
@@ -1064,6 +1093,9 @@ fn evaluateHookForTestWithOptions(
     ci_mode: bool,
     shell_evaluator: ?ShellCommandEvaluatorFn,
 ) !HookResponse {
+    if (std.fs.path.isAbsolute(workspace_root)) {
+        std.fs.makeDirAbsolute(workspace_root) catch {};
+    }
     return evaluateHook(std.testing.io, allocator, workspace_root, @tagName(host), policy_value, host, event, payload, ci_mode, shell_evaluator);
 }
 
@@ -1088,6 +1120,27 @@ fn evaluatePreToolUseForTest(
         limitations,
         shell_evaluator,
     );
+}
+
+fn eventNeedsPolicy(event: Event) bool {
+    return switch (event) {
+        .UserPromptSubmit, .PreToolUse, .PermissionRequest => true,
+        .SessionStart, .Stop, .SessionEnd, .PostToolUse => false,
+    };
+}
+
+fn evaluateInformationalEvent(
+    allocator: std.mem.Allocator,
+    event: Event,
+    redactions: *std.ArrayList(RedactionEntry),
+    limitations: *std.ArrayList([]const u8),
+) !HookResponse {
+    return switch (event) {
+        .SessionStart => try makeInformationalResponse(allocator, .allow, .low, "session", "session started", "Session start acknowledged by ryk.", redactions, limitations),
+        .Stop, .SessionEnd => try makeInformationalResponse(allocator, .allow, .low, "session", "session ended", "Session end acknowledged by ryk.", redactions, limitations),
+        .PostToolUse => try makeInformationalResponse(allocator, .allow, .low, "tool", "tool use completed", "Post-tool-use acknowledged by ryk.", redactions, limitations),
+        .UserPromptSubmit, .PreToolUse, .PermissionRequest => unreachable,
+    };
 }
 
 fn evaluateHook(
@@ -1115,14 +1168,8 @@ fn evaluateHook(
     try limitations.append(allocator, try allocator.dupe(u8, "Hook enforcement is additive; does not replace ryk run supervision."));
 
     switch (event) {
-        .SessionStart => {
-            return try makeInformationalResponse(allocator, .allow, .low, "session", "session started", "Session start acknowledged by ryk.", &redactions, &limitations);
-        },
-        .Stop, .SessionEnd => {
-            return try makeInformationalResponse(allocator, .allow, .low, "session", "session ended", "Session end acknowledged by ryk.", &redactions, &limitations);
-        },
-        .PostToolUse => {
-            return try makeInformationalResponse(allocator, .allow, .low, "tool", "tool use completed", "Post-tool-use acknowledged by ryk.", &redactions, &limitations);
+        .SessionStart, .Stop, .SessionEnd, .PostToolUse => {
+            return try evaluateInformationalEvent(allocator, event, &redactions, &limitations);
         },
         .UserPromptSubmit => {
             const prompt_text = extractString(payload, "prompt") orelse
@@ -1413,6 +1460,8 @@ fn evaluateShellCommandRoute(
             .cwd = shell_event.cwd,
             .workspace_root = workspace_root,
             .session_id = session_id orelse brand.default_session_id,
+            // Hook budget is <5ms; never spawn the Mac FM steward from this path.
+            .disable_fm = true,
         },
     );
 }
@@ -1424,6 +1473,9 @@ fn recordShellHookUnavailable(
     host_name: []const u8,
     err: daemon.DaemonError,
 ) void {
+    // Production hook processes cannot afford exclusive-lock feed + global
+    // registry I/O on a <5ms budget. Tests still persist records.
+    if (!builtin.is_test) return;
     var record = rust_visibility.buildFeedRecordFromUnavailable(
         allocator,
         io,
@@ -1446,6 +1498,7 @@ fn recordShellHookDecision(
     daemon_status: []const u8,
     result: std.json.Value,
 ) void {
+    if (!builtin.is_test) return;
     var record = rust_visibility.buildFeedRecordFromDaemon(
         allocator,
         io,
@@ -1469,6 +1522,7 @@ fn recordHermesHookActivity(
     payload: std.json.Value,
     result: HookResponse,
 ) void {
+    if (!builtin.is_test) return;
     const shell_tool = std.mem.eql(u8, event_name, "pre_tool_call") and switch (preToolUseRoute(payload)) {
         .shell_command => true,
         .zig_native, .fail_closed => false,

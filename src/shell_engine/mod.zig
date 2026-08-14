@@ -151,7 +151,12 @@ pub fn evaluateCommand(allocator: std.mem.Allocator, command: []const u8, option
         }
     }
 
-    registry.ensureInit() catch {
+    const match_opts_for_init = registry.MatchOptions{
+        .default_packs_only = options.default_packs_only,
+        .extra_enabled = options.extra_enabled,
+        .disabled = options.disabled,
+    };
+    registry.ensureForMatchOptions(match_opts_for_init) catch {
         try endOuterStep(options.trace, .{ .message = "registry init failure (fail-closed)" });
         return try finalizeEval(
             allocator,
@@ -365,7 +370,11 @@ fn collectPermanentRuleSkipIds(
     const store = options.permanent_allowlist orelse return;
     const now = options.now_iso orelse return;
     // Need registry for severity lookup (critical hard fence).
-    registry.ensureInit() catch {
+    registry.ensureForMatchOptions(.{
+        .default_packs_only = options.default_packs_only,
+        .extra_enabled = options.extra_enabled,
+        .disabled = options.disabled,
+    }) catch {
         // Fail closed: no permanent rule skips when registry unavailable.
         return;
     };
@@ -618,7 +627,11 @@ fn wouldDenyCritical(
     cmd: []const u8,
     options: EvaluateOptions,
 ) !bool {
-    registry.ensureInit() catch return true;
+    registry.ensureForMatchOptions(.{
+        .default_packs_only = options.default_packs_only,
+        .extra_enabled = options.extra_enabled,
+        .disabled = options.disabled,
+    }) catch return true;
     const match_opts = registry.MatchOptions{
         .default_packs_only = options.default_packs_only,
         .extra_enabled = options.extra_enabled,

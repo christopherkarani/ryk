@@ -585,6 +585,7 @@ fn recordInvocationInner(
     argv: []const []const u8,
     exit_code: u8,
 ) !void {
+    if (isHookHotPath(argv)) return;
     var summaries = takePendingSummaries();
     if (internalWorkerEnabled(environ_map)) return;
     if (contract.classifyFeatureInvocation(argv, exit_code)) |summary| summaries.addFeature(summary);
@@ -598,6 +599,11 @@ fn recordInvocationInner(
     if (!transportConfigured() or hardDisabled(environ_map)) return;
 
     spawnBatch(io, environ_map, allocator, invocation, summaries) catch {};
+}
+
+fn isHookHotPath(argv: []const []const u8) bool {
+    if (argv.len == 0) return true;
+    return std.mem.eql(u8, argv[0], "hook");
 }
 
 fn recordWorker(
