@@ -156,28 +156,7 @@ pub fn normalizePath(io: std.Io, allocator: std.mem.Allocator, workspace_root_ra
     if (!std.unicode.utf8ValidateSlice(raw_path)) return error.InvalidUtf8;
     if (isWindowsAbsolutePath(raw_path)) return error.OutsideWorkspace;
 
-    const workspace_root = realPathOwned(io, allocator, workspace_root_raw) catch |err| {
-        // #region agent log
-        {
-            const fp = std.c.fopen("/opt/cursor/logs/debug.log", "a");
-            if (fp) |f| {
-                defer _ = std.c.fclose(f);
-                var cwd_raw: [4096]u8 = undefined;
-                const cwd_c = std.c.getcwd(&cwd_raw, cwd_raw.len);
-                const cwd = if (cwd_c) |p| std.mem.sliceTo(p, 0) else "GETCWD_FAIL";
-                var line: [2048]u8 = undefined;
-                const written = std.fmt.bufPrint(&line, "{{\"id\":\"log_ws_realpath\",\"hypothesisId\":\"A\",\"location\":\"files.zig:normalizePath\",\"message\":\"workspace realPathOwned failed\",\"data\":{{\"err\":\"{s}\",\"cwd\":\"{s}\",\"ws_access\":{s}}},\"timestamp\":{d}}}\n", .{
-                    @errorName(err),
-                    cwd,
-                    if (std.c.access("/tmp/ryk-hook-test", 0) == 0) "true" else "false",
-                    0,
-                }) catch "";
-                if (written.len > 0) _ = std.c.fwrite(written.ptr, 1, written.len, f);
-            }
-        }
-        // #endregion
-        return err;
-    };
+    const workspace_root = try realPathOwned(io, allocator, workspace_root_raw);
     errdefer allocator.free(workspace_root);
 
     const expanded = try expandHome(allocator, raw_path);

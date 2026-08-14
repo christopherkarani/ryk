@@ -13,23 +13,7 @@ pub fn normalizeFilePolicyPath(io: std.Io, allocator: std.mem.Allocator, workspa
     if (!std.mem.startsWith(u8, lexical, "./")) return lexical;
     defer allocator.free(lexical);
 
-    var normalized = file_intercept.normalizePath(io, allocator, workspace_root_raw, raw_path) catch |err| {
-        // #region agent log
-        {
-            const fp = std.c.fopen("/opt/cursor/logs/debug.log", "a");
-            if (fp) |f| {
-                defer _ = std.c.fclose(f);
-                var line: [1024]u8 = undefined;
-                const written = std.fmt.bufPrint(&line, "{{\"id\":\"log_norm_intercept\",\"hypothesisId\":\"B\",\"location\":\"file_policy_path.zig:normalizeFilePolicyPath\",\"message\":\"intercept normalizePath failed\",\"data\":{{\"err\":\"{s}\",\"lexical_ok\":true}},\"timestamp\":{d}}}\n", .{
-                    @errorName(err),
-                    0,
-                }) catch "";
-                if (written.len > 0) _ = std.c.fwrite(written.ptr, 1, written.len, f);
-            }
-        }
-        // #endregion
-        return err;
-    };
+    var normalized = try file_intercept.normalizePath(io, allocator, workspace_root_raw, raw_path);
     defer normalized.deinit(allocator);
     return allocator.dupe(u8, normalized.policy_path);
 }
