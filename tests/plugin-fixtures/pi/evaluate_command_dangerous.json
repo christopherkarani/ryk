@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "request_id": "ryk-fixture-danger",
+  "kind": "shell_command",
+  "command": "rm -rf /",
+  "cwd": "/tmp",
+  "source": {
+    "host": "pi",
+    "tool_name": "bash",
+    "mode": "tui",
+    "session_id": "ryk-fixture"
+  }
+}

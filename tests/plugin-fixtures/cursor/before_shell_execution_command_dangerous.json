@@ -1,0 +1,4 @@
+{
+  "command": "rm -rf /",
+  "cwd": "/tmp"
+}

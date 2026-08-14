@@ -32,6 +32,8 @@ The release scripts write archives and generated metadata under ignored `dist/` 
 - `check-fixture-secrets.sh` rejects non-synthetic secret patterns.
 - `validate-docs.sh` checks documentation links, example policies, and the deterministic demo.
 - `os-sandbox-adversarial-e2e.sh` runs the OS sandbox fixture probes when the platform can attach the backend.
+- `host-live-e2e.sh` exercises every supported host veto path (`ryk hook` / `evaluate` / bare stdin). Host CLIs are optional.
+- `harness-stress.sh` prints allow/deny wire shapes for every host, including the blocked command.
 - `quick-install-dx-verify.sh` exercises the first-run CLI setup matrix.
 - `test-openclaw-release-assets.sh` proves committed OpenClaw `dist/` matches TypeScript. `agent-gate` runs it when `integrations/openclaw-plugin/**` is dirty (plugin gate); release packaging also runs it.
 - `test-homebrew-formula.sh` checks the Homebrew formula offline (pins `VERSION`, digest markers intact, automation fails closed without mutating the formula). Runs inside `verify-pre-merge.sh`.

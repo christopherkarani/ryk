@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "request_id": "ryk-fixture-safe",
+  "kind": "shell_command",
+  "command": "git status",
+  "cwd": "/tmp",
+  "source": {
+    "host": "pi",
+    "tool_name": "bash",
+    "mode": "tui",
+    "session_id": "ryk-fixture"
+  }
+}

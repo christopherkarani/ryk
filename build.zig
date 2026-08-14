@@ -304,6 +304,8 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_hook_host_matrix_tests = addRunTestTerminal(b, hook_host_matrix_tests);
+    // Matrix and dispatch spawn `./zig-out/bin/ryk`; install first so they cannot skip.
+    run_hook_host_matrix_tests.step.dependOn(&install_ryk.step);
 
     const hook_dispatch_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -316,6 +318,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_hook_dispatch_tests = addRunTestTerminal(b, hook_dispatch_tests);
+    run_hook_dispatch_tests.step.dependOn(&install_ryk.step);
 
     const hook_validation_tests = b.addTest(.{
         .root_module = b.createModule(.{

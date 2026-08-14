@@ -223,38 +223,79 @@ pub fn interpretSmokeOutcome(
     if (std.mem.eql(u8, expected, "allow")) {
         if (exit_code != 0) return false;
         const decision = extractDecision(stdout) orelse return false;
-        return std.mem.eql(u8, decision, "allow");
+        return isAllowDecision(decision);
     }
     if (std.mem.eql(u8, expected, "block")) {
         // Codex and Grok deny with exit 2; stdout JSON may be intentionally empty.
         if (std.mem.eql(u8, host, "codex") or std.mem.eql(u8, host, "grok")) {
             if (exit_code == 2) return true;
-            // Defensive: accept decision=block JSON if a host version emits it.
+            // Defensive: accept decision=block/deny JSON if a host version emits it.
             if (exit_code == 0) {
-                if (extractDecision(stdout)) |d| return std.mem.eql(u8, d, "block");
+                if (extractDecision(stdout)) |d| return isBlockDecision(d);
             }
             return false;
         }
         _ = stderr;
+        // Pi evaluate denies with exit 2 + decision deny; Cursor/Claude stay exit 0.
+        if (std.mem.eql(u8, host, "pi") and exit_code == 2) {
+            if (extractDecision(stdout)) |d| return isBlockDecision(d);
+            return true;
+        }
         if (exit_code != 0) return false;
         const decision = extractDecision(stdout) orelse return false;
-        return std.mem.eql(u8, decision, "block");
+        return isBlockDecision(decision);
     }
     return false;
 }
 
+fn isAllowDecision(decision: []const u8) bool {
+    return std.mem.eql(u8, decision, "allow");
+}
+
+fn isBlockDecision(decision: []const u8) bool {
+    return std.mem.eql(u8, decision, "block") or std.mem.eql(u8, decision, "deny");
+}
+
+/// Lightweight scan of host-shaped JSON. Prefer live wire keys so doctor smoke
+/// matches Claude (`permissionDecision`), Cursor (`permission`), Grok/Pi/generic
+/// (`decision`). `"permission"` is an exact key and does not match
+/// `"permissionDecision"`.
 fn extractDecision(stdout: []const u8) ?[]const u8 {
     const trimmed = std.mem.trim(u8, stdout, " \t\r\n");
     if (trimmed.len == 0) return null;
-    // Lightweight scan avoids full JSON parse in the pure helper path.
-    const key = "\"decision\"";
-    const idx = std.mem.indexOf(u8, trimmed, key) orelse return null;
-    var i = idx + key.len;
-    while (i < trimmed.len and (trimmed[i] == ' ' or trimmed[i] == '\t' or trimmed[i] == ':' or trimmed[i] == '\n' or trimmed[i] == '\r')) : (i += 1) {}
-    if (i >= trimmed.len or trimmed[i] != '"') return null;
-    const start = i + 1;
-    const end = std.mem.indexOfScalarPos(u8, trimmed, start, '"') orelse return null;
-    return trimmed[start..end];
+    if (scanJsonStringField(trimmed, "permissionDecision")) |value| return value;
+    if (scanJsonStringField(trimmed, "permission")) |value| return value;
+    if (scanJsonStringField(trimmed, "decision")) |value| return value;
+    return null;
+}
+
+fn scanJsonStringField(text: []const u8, key: []const u8) ?[]const u8 {
+    var needle_buf: [48]u8 = undefined;
+    if (key.len + 2 > needle_buf.len) return null;
+    needle_buf[0] = '"';
+    @memcpy(needle_buf[1 .. 1 + key.len], key);
+    needle_buf[1 + key.len] = '"';
+    const needle = needle_buf[0 .. key.len + 2];
+
+    var start: usize = 0;
+    while (std.mem.indexOfPos(u8, text, start, needle)) |idx| {
+        var i = idx + needle.len;
+        while (i < text.len and (text[i] == ' ' or text[i] == '\t' or text[i] == '\n' or text[i] == '\r')) : (i += 1) {}
+        if (i >= text.len or text[i] != ':') {
+            start = idx + 1;
+            continue;
+        }
+        i += 1;
+        while (i < text.len and (text[i] == ' ' or text[i] == '\t' or text[i] == '\n' or text[i] == '\r')) : (i += 1) {}
+        if (i >= text.len or text[i] != '"') {
+            start = idx + 1;
+            continue;
+        }
+        const val_start = i + 1;
+        const val_end = std.mem.indexOfScalarPos(u8, text, val_start, '"') orelse return null;
+        return text[val_start..val_end];
+    }
+    return null;
 }
 
 /// Minimal shell veto fixtures matching each host envelope (command in payload).
@@ -266,6 +307,16 @@ pub fn buildHookFixture(allocator: std.mem.Allocator, host: []const u8, event: [
         return try std.fmt.allocPrint(allocator,
             \\{{"hookEventName":"{s}","sessionId":"ryk-smoke","cwd":"/tmp","workspaceRoot":"/tmp","toolName":"run_terminal_cmd","toolUseId":"smoke-1","toolInput":{{"command":"{s}"}},"toolInputTruncated":false}}
         , .{ grok_event, command });
+    }
+    if (std.mem.eql(u8, host, "cursor")) {
+        return try std.fmt.allocPrint(allocator,
+            \\{{"command":"{s}","cwd":"/tmp"}}
+        , .{command});
+    }
+    if (std.mem.eql(u8, host, "pi")) {
+        return try std.fmt.allocPrint(allocator,
+            \\{{"schema_version":1,"request_id":"ryk-smoke","kind":"shell_command","command":"{s}","cwd":"/tmp","source":{{"host":"pi","tool_name":"bash","mode":"tui","session_id":"ryk-smoke"}}}}
+        , .{command});
     }
     if (std.mem.eql(u8, host, "hermes")) {
         return try std.fmt.allocPrint(allocator,
@@ -669,6 +720,35 @@ test "interpretSmokeOutcome block for flexible hosts uses decision JSON" {
     try std.testing.expect(!interpretSmokeOutcome("openclaw", "block", 0, "{\"decision\":\"allow\"}", ""));
 }
 
+test "interpretSmokeOutcome claude uses live permissionDecision wire" {
+    const allow_wire =
+        \\{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","permissionDecisionReason":"command allowed by ryk policy."}}
+    ;
+    const deny_wire =
+        \\{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"command blocked by ryk policy."},"systemMessage":"command blocked by ryk policy."}
+    ;
+    try std.testing.expect(interpretSmokeOutcome("claude", "allow", 0, allow_wire, ""));
+    try std.testing.expect(interpretSmokeOutcome("claude", "block", 0, deny_wire, ""));
+    try std.testing.expect(!interpretSmokeOutcome("claude", "allow", 0, deny_wire, ""));
+    try std.testing.expect(!interpretSmokeOutcome("claude", "block", 0, allow_wire, ""));
+}
+
+test "interpretSmokeOutcome cursor uses permission wire and pi uses decision deny" {
+    try std.testing.expect(interpretSmokeOutcome("cursor", "allow", 0, "{\"permission\":\"allow\",\"continue\":true}", ""));
+    try std.testing.expect(interpretSmokeOutcome("cursor", "block", 0, "{\"permission\":\"deny\",\"continue\":false}", ""));
+    try std.testing.expect(!interpretSmokeOutcome("cursor", "allow", 0, "{\"permission\":\"deny\"}", ""));
+    try std.testing.expect(interpretSmokeOutcome("pi", "block", 2, "{\"decision\":\"deny\"}", ""));
+    try std.testing.expect(interpretSmokeOutcome("pi", "allow", 0, "{\"decision\":\"allow\"}", ""));
+    // Exact key: permissionDecision must not be read as permission.
+    try std.testing.expect(interpretSmokeOutcome(
+        "claude",
+        "block",
+        0,
+        "{\"permissionDecision\":\"deny\",\"decision\":\"allow\"}",
+        "",
+    ));
+}
+
 test "Grok host status uses raw PreToolUse fixtures and exit-two deny" {
     try std.testing.expectEqualStrings("PreToolUse", shellGate("grok"));
     try std.testing.expect(interpretSmokeOutcome("grok", "block", 2, "", ""));
@@ -698,6 +778,16 @@ test "buildHookFixture embeds host event and command" {
     try std.testing.expect(std.mem.indexOf(u8, fixture, "\"event\":\"PreToolUse\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, fixture, "git status") != null);
     try std.testing.expect(std.mem.indexOf(u8, fixture, "tool_input") != null);
+
+    const cursor = try buildHookFixture(allocator, "cursor", "beforeShellExecution", "rm -rf /");
+    defer allocator.free(cursor);
+    try std.testing.expect(std.mem.indexOf(u8, cursor, "\"command\":\"rm -rf /\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cursor, "\"cwd\":\"/tmp\"") != null);
+
+    const pi = try buildHookFixture(allocator, "pi", "evaluate", "git status");
+    defer allocator.free(pi);
+    try std.testing.expect(std.mem.indexOf(u8, pi, "\"kind\":\"shell_command\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pi, "\"host\":\"pi\"") != null);
 }
 
 test "shellGate and failStance cover all P1 hosts" {
