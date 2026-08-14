@@ -745,8 +745,13 @@ fn writeTempFileSyncedAt(
 
 fn syncDirectory(io: std.Io, directory: std.Io.Dir) !void {
     if (builtin.os.tag == .windows) return;
+    // Linux `openDir` without `.iterate` sets O_PATH. fsync(2) on an O_PATH
+    // fd returns EBADF, and Zig 0.16 File.sync treats that as a panic.
+    // Re-open "." from the already-held dirfd to get a syncable handle.
+    var syncable = try directory.openDir(io, ".", .{ .iterate = true, .follow_symlinks = false });
+    defer syncable.close(io);
     const parent_as_file: std.Io.File = .{
-        .handle = directory.handle,
+        .handle = syncable.handle,
         .flags = .{ .nonblocking = false },
     };
     try parent_as_file.sync(io);

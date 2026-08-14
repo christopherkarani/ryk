@@ -302,8 +302,12 @@ fn syncParentDirectory(io: std.Io, destination_path: []const u8) !void {
     const parent_path = std.fs.path.dirname(destination_path) orelse return error.InvalidDestinationPath;
     var parent = try std.Io.Dir.openDirAbsolute(io, parent_path, .{ .follow_symlinks = false });
     defer parent.close(io);
+    // Linux `openDir` without `.iterate` sets O_PATH. fsync(2) on an O_PATH
+    // fd returns EBADF, and Zig 0.16 File.sync treats that as a panic.
+    var syncable = try parent.openDir(io, ".", .{ .iterate = true, .follow_symlinks = false });
+    defer syncable.close(io);
     const parent_as_file: std.Io.File = .{
-        .handle = parent.handle,
+        .handle = syncable.handle,
         .flags = .{ .nonblocking = false },
     };
     try parent_as_file.sync(io);
