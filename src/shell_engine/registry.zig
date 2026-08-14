@@ -171,6 +171,18 @@ fn patternMightMatch(regex_source: []const u8, cmd: []const u8) bool {
     return std.ascii.indexOfIgnoreCase(cmd, lit) != null;
 }
 
+/// Safe-list only. Patterns that only authorize `/tmp` or `$TMPDIR` cannot
+/// match a command that never mentions those tokens. Skipping them is
+/// fail-closed: a false skip can only deny, never allow.
+fn safePatternMightMatch(regex_source: []const u8, cmd: []const u8) bool {
+    if (!patternMightMatch(regex_source, cmd)) return false;
+    const mentions_tmp = std.ascii.indexOfIgnoreCase(regex_source, "/tmp") != null or
+        std.mem.indexOf(u8, regex_source, "TMPDIR") != null;
+    if (!mentions_tmp) return true;
+    return std.ascii.indexOfIgnoreCase(cmd, "tmp") != null or
+        std.mem.indexOf(u8, cmd, "TMPDIR") != null;
+}
+
 fn initOnce(load_all: bool) !void {
     // Process-lifetime arena (not testing allocator — avoids leak noise).
     g_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -473,7 +485,7 @@ pub fn matchCommandDetailedOpts(cmd: []const u8, opts: MatchOptions) MatchResult
 
         var pack_safe = false;
         for (pack.safe) |*pat| {
-            if (!patternMightMatch(pat.regex_source, cmd)) continue;
+            if (!safePatternMightMatch(pat.regex_source, cmd)) continue;
             ensurePatternCompiled(pat) catch return matchInfraDeny();
             const matched = pat.regex.?.isMatch(cmd) catch return matchInfraDeny();
             if (matched) {
@@ -765,6 +777,8 @@ test "required prefix literal skips impossible regex compiles" {
     try std.testing.expect(!patternMightMatch("^find\\s+", "rm -rf /"));
     try std.testing.expect(patternMightMatch("^rm\\s+", "rm -rf /"));
     try std.testing.expect(patternMightMatch("rm\\s+-[a-zA-Z]*[rR]", "rm -rf /"));
+    try std.testing.expect(!safePatternMightMatch("^rm\\s+/tmp/", "rm -rf /"));
+    try std.testing.expect(safePatternMightMatch("^rm\\s+/tmp/", "rm -rf /tmp/foo"));
 }
 
 test "match infrastructure error hit is deny not allow_miss" {
