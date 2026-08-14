@@ -105,7 +105,13 @@ fn argvFor(case: HostCase) []const []const u8 {
     };
 }
 
-fn runRyk(allocator: std.mem.Allocator, args: []const []const u8, stdin_data: ?[]const u8) !struct { stdout: []u8, stderr: []u8, code: u8 } {
+const HookRun = struct {
+    stdout: []u8,
+    stderr: []u8,
+    code: u8,
+};
+
+fn runRyk(allocator: std.mem.Allocator, args: []const []const u8, stdin_data: ?[]const u8) !HookRun {
     const io = std.testing.io;
     var child = try std.process.spawn(io, .{
         .argv = args,
@@ -180,7 +186,7 @@ fn isBlocked(decision: []const u8) bool {
         std.mem.eql(u8, decision, "warn");
 }
 
-fn expectSafeAllow(allocator: std.mem.Allocator, case: HostCase, result: struct { stdout: []u8, stderr: []u8, code: u8 }) !void {
+fn expectSafeAllow(allocator: std.mem.Allocator, case: HostCase, result: HookRun) !void {
     try std.testing.expectEqual(exit_codes.success, result.code);
     const decision = parseDecision(allocator, result.stdout) catch |err| {
         std.debug.print("host {s} safe: parse failed ({s}) stdout={s} stderr={s}\n", .{
@@ -198,7 +204,7 @@ fn expectSafeAllow(allocator: std.mem.Allocator, case: HostCase, result: struct 
     try std.testing.expect(isAllow(decision));
 }
 
-fn expectDangerBlock(allocator: std.mem.Allocator, case: HostCase, result: struct { stdout: []u8, stderr: []u8, code: u8 }) !void {
+fn expectDangerBlock(allocator: std.mem.Allocator, case: HostCase, result: HookRun) !void {
     if (std.mem.eql(u8, case.host, "codex")) {
         try std.testing.expectEqual(@as(u8, 2), result.code);
         try std.testing.expect(result.stdout.len == 0);
