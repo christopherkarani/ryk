@@ -23,6 +23,8 @@
 ### Fixed
 
 * **`ryk pi` launch under OS sandbox:** `#!/usr/bin/env node` host scripts (Pi, npm-global agents) no longer die with `ryk shim exec: real command not found after removing shim path: node`. After attach, PATH honesty drops Homebrew and Seatbelt no-bare-home EPERMs `~/.local` / nvm / Hermes node, so the session `node` shim cannot resolve a real interpreter. The product path now expands env shebangs to absolute interpreter + script before spawn (same rewrite Codex MCP already used). Host MCP plans that keep bare `pi` are included.
+* **Pi exits on ryk block/ask cards (`child.render is not a function`).** The `rykanv-decision` message renderer returned a themed string. Pi's `CustomMessageComponent` treats a truthy return as a TUI child and calls `.render()`, so the session died as soon as a decision card was sent (for example `cat .env`). The renderer now returns a `{ render(width) }` component. Reinstall the Pi extension (`ryk doctor --fix`) so `~/.pi/agent/extensions/ryk/runtime.ts` is replaced.
+* **Pi exits at session start with `EPERM` mkdir on `~/.local/state/ryk/pi-ask/...`.** Under the OS sandbox, parent-ask IPC cannot create its HOME state dir. That `mkdirSync` was uncaught and killed Pi before any tool ran. mkdir is now best-effort; parent-ask degrades (subagent asks still fail closed) and the TUI stays up.
 
 ### Added
 

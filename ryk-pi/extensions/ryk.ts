@@ -156,7 +156,7 @@ type PiAPI = {
 				fg: (name: string, text: string) => string;
 				bg?: (name: string, text: string) => string;
 			},
-		) => unknown,
+		) => TuiComponentLike | undefined,
 	) => void;
 };
 
@@ -1116,6 +1116,20 @@ export function formatAgentBlockReason(
 	return truncate(reason, AGENT_BLOCK_REASON_MAX);
 }
 
+/** Pi requires `{ render(width) => string[] }`; a string is truthy and crashes the TUI. */
+export type TuiComponentLike = {
+	render: (width: number) => string[];
+};
+
+export function tuiTextComponent(text: string): TuiComponentLike {
+	return {
+		render(_width: number): string[] {
+			if (text.length === 0) return [""];
+			return text.split("\n");
+		},
+	};
+}
+
 export function installRykExtension(
 	pi: PiAPI,
 	extensionOptions: RykExtensionOptions = {},
@@ -1141,7 +1155,7 @@ export function installRykExtension(
 								summary: "Decision",
 							},
 					  ).join("\n");
-			return theme.fg(tone, body);
+			return tuiTextComponent(theme.fg(tone, body));
 		});
 	} catch {
 		// Older hosts without registerMessageRenderer — plain text content still works.

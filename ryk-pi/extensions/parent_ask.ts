@@ -160,9 +160,25 @@ export function parentAskDir(
 	return dir;
 }
 
+/** Seatbelt EPERM on lstat/mkdir must not escape — Pi exits on uncaughtException. */
+function safeExists(path: string, fsApi: ParentAskFs): boolean {
+	try {
+		return fsApi.existsSync(path);
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Best-effort 0700 mkdir. Seatbelt/empty-backpack EPERM must not throw:
+ * Pi treats an uncaught mkdir as uncaughtException and exits.
+ */
 function ensureDir(path: string, fsApi: ParentAskFs): void {
-	if (!fsApi.existsSync(path)) {
+	if (safeExists(path, fsApi)) return;
+	try {
 		fsApi.mkdirSync(path, { recursive: true, mode: 0o700 });
+	} catch {
+		// Caller treats a missing dir as empty / write-fail-closed.
 	}
 }
 
@@ -209,7 +225,7 @@ export function writeAskResponse(
 	atomicWriteJson(path, response, fsApi);
 	// Tombstone request so parent does not re-prompt.
 	const req = requestPath(dir, response.id);
-	if (fsApi.existsSync(req)) {
+	if (safeExists(req, fsApi)) {
 		try {
 			fsApi.rmSync(req, { force: true });
 		} catch {
@@ -225,7 +241,7 @@ export function readAskResponse(
 	fsApi: ParentAskFs = DEFAULT_FS,
 ): ParentAskResponse | null {
 	const path = responsePath(dir, id);
-	if (!fsApi.existsSync(path)) return null;
+	if (!safeExists(path, fsApi)) return null;
 	try {
 		const raw = fsApi.readFileSync(path, "utf8");
 		const parsed = JSON.parse(raw) as ParentAskResponse;
@@ -243,7 +259,7 @@ export function listPendingRequests(
 	dir: string,
 	fsApi: ParentAskFs = DEFAULT_FS,
 ): ParentAskRequest[] {
-	if (!fsApi.existsSync(dir)) return [];
+	if (!safeExists(dir, fsApi)) return [];
 	let names: string[];
 	try {
 		names = fsApi.readdirSync(dir);
@@ -260,7 +276,7 @@ export function listPendingRequests(
 			if (typeof parsed.tool !== "string") continue;
 			if (typeof parsed.parent_session !== "string") continue;
 			// Skip if response already present (race).
-			if (fsApi.existsSync(responsePath(dir, parsed.id))) continue;
+			if (safeExists(responsePath(dir, parsed.id), fsApi)) continue;
 			out.push(parsed);
 		} catch {
 			// skip malformed
@@ -307,7 +323,7 @@ export function readGrants(
 	fsApi: ParentAskFs = DEFAULT_FS,
 ): SessionGrants {
 	const path = grantsPath(dir);
-	if (!fsApi.existsSync(path)) return { tools: [], updated_at_ms: 0 };
+	if (!safeExists(path, fsApi)) return { tools: [], updated_at_ms: 0 };
 	try {
 		const raw = fsApi.readFileSync(path, "utf8");
 		const parsed = JSON.parse(raw) as SessionGrants;
@@ -340,10 +356,14 @@ export function addSessionGrant(
 ): void {
 	const name = toolName.trim();
 	if (!name) return;
-	const current = readGrants(dir, fsApi);
-	if (!current.tools.includes(name)) current.tools.push(name);
-	current.updated_at_ms = nowMs;
-	writeGrants(dir, current, fsApi);
+	try {
+		const current = readGrants(dir, fsApi);
+		if (!current.tools.includes(name)) current.tools.push(name);
+		current.updated_at_ms = nowMs;
+		writeGrants(dir, current, fsApi);
+	} catch {
+		// Sandbox EPERM: grant is not persisted. Caller already decided this turn.
+	}
 }
 
 export function hasSessionGrant(
@@ -361,7 +381,7 @@ export function cleanupParentAskDir(
 	dir: string,
 	fsApi: ParentAskFs = DEFAULT_FS,
 ): void {
-	if (!fsApi.existsSync(dir)) return;
+	if (!safeExists(dir, fsApi)) return;
 	try {
 		fsApi.rmSync(dir, { recursive: true, force: true });
 	} catch {

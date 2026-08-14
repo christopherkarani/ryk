@@ -68,6 +68,25 @@ Run `ryk doctor`. If a feature is `limited`, `wrapper-only`, `observe-only`, or 
 
 Protocol failures (timeout, malformed JSON, spawn failure, inconsistent exit) **fail closed for that tool call only**. Pi retries decide/evaluate **once** only for *transient* classes (`timeout`, `malformed_json`, `spawn_failed`, `output_too_large`, `inconsistent_exit`); schema-valid `decision: "error"` is not retried. Messages include a failure **class** token (e.g. `[malformed_json]`). After several consecutive protocol failures, Pi notifies **protocol degraded** once — still fail-closed per call, never silent allow. `allow-with-warning` soft-allows only `spawn_failed` (binary missing); other protocol classes still block. Retry the tool; if it persists, `/ryk-setup` then `/ryk-doctor`. Do not pass blanket `--ci` to interactive decide.
 
+## Pi exits with `child.render is not a function`
+
+A ryk block/ask card was sent and the installed Pi extension returned a colored **string** from `registerMessageRenderer`. Pi's TUI requires a component with `.render(width)`. The session then throws `TypeError: child.render is not a function` and exits.
+
+**Fix:** update ryk-pi so the decision renderer returns `{ render(width) => string[] }`, then replace the installed copy:
+
+```sh
+ryk doctor --fix
+# confirm ~/.pi/agent/extensions/ryk/runtime.ts is newer than the crash
+```
+
+Restart `ryk pi`. A stale `runtime.ts` from a previous install will keep crashing until it is replaced.
+
+## Pi exits with `EPERM` mkdir `~/.local/state/ryk/pi-ask`
+
+Under an attached OS sandbox (empty backpack), writes to `$HOME/.local/state` are denied. The ryk Pi extension used to `mkdirSync` that tree on `session_start` for parent-ask IPC. An uncaught `EPERM` exits Pi with code 1 after sandbox attach.
+
+**Fix:** update ryk-pi so parent-ask mkdir is best-effort (no throw). Policy ask/block on the main TUI still works. Subagent parent-forward stays fail-closed if the IPC dir cannot be created. Replace `~/.pi/agent/extensions/ryk/parent_ask.ts` and `runtime.ts`, then restart `ryk pi`.
+
 ## Sandbox stress regression (P1–4)
 
 After OS sandbox or network changes on a matrix host:
