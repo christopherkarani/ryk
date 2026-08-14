@@ -494,14 +494,18 @@ fn proxy(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: anytype)
     if (approval_writer_storage) |*writer| writer.interface.flush() catch {};
     var completed_session = session;
     completed_session.ended_at = core.time.Timestamp.now(io);
+    const final_hash = session_writer.finalHash() orelse "";
     try core_api.writeAuditSummary(allocator, session_writer.session_dir_path, .{
         .session = completed_session,
         .status = .{ .exited = 0 },
         .event_count = session_writer.event_count,
-        .final_event_hash = session_writer.finalHash() orelse "",
+        .final_event_hash = final_hash,
         .policy = loaded.path,
         .product_label = brand.product_display,
     });
+    if (final_hash.len != 0) {
+        try stderr.print("ryk mcp proxy: audit chain {s}\n", .{final_hash});
+    }
     return exit_codes.success;
 }
 

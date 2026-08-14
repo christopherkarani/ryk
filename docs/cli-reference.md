@@ -253,7 +253,7 @@ ryk replay --session last --verify
 ryk replay --session last --only denied
 ~~~
 
---verify checks the session hash chain. report produces a summary and export:
+--verify checks the session hash chain. Session end also prints `Audit chain: <sha256>` (same value as `final_event_hash` in the summary) so you can copy it out of band. A local rewrite of both the event log and the summary is out of scope. report produces a summary and export:
 
 ~~~sh
 ryk report --session last --format json

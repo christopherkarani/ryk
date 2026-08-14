@@ -31,6 +31,7 @@
 * **Shell effect classification is exhaustive:** `curl`/`wget`/`open` bypass classifiers tokenize the full command instead of silently dropping tokens after 48, so a long header list cannot hide a `comms.publish` URL.
 * **Audit redactor covers more secret shapes:** standard base64 values that contain `/` no longer skip the entropy heuristic; compact JWTs (4+ character parts, `eyJ` header) and shorter provider prefixes (`ghp_` / `sk-` at 12+ characters) are classified; query-embedded forms of those fixtures are redacted. Path-shaped strings, `sk-learn`, and dotted rule ids (`files.read.deny`) stay unredacted. URL userinfo (`scheme://user:pw@host`) was already closed.
 * **MCP Always-this-session lasts for the proxy process:** `ryk mcp proxy` keeps an "always / session" approval for its lifetime instead of prompting again on the next identical call. Once still applies to a single call; `ask` is never treated as allow.
+* **Session-end audit chain hash:** `ryk run` prints `Audit chain: <sha256>` when the session ends (also on `ryk mcp proxy` stderr). The same value was already stored as `final_event_hash` in `summary.json` / `summary.md`. A local rewrite of both the event log and the summary remains out of scope; copy the printed hash out of band if you need an external check.
 
 ### Security (OS sandbox audit 2026-08-13)
 

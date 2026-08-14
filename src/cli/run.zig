@@ -1441,6 +1441,8 @@ fn commandWithStdioAndEnv(io: std.Io, argv: []const []const u8, stdout: anytype,
         }
     }
 
+    var chain_hash_buf: [64]u8 = undefined;
+    var chain_hash: ?[]const u8 = null;
     if (audit_context.writer) |*writer| {
         if (audit_context.session) |session| {
             if (proxy_runtime) |runtime| {
@@ -1519,6 +1521,10 @@ fn commandWithStdioAndEnv(io: std.Io, argv: []const []const u8, stdout: anytype,
             .product_label = brand.product_display,
         });
         try writer.writeLastPointer();
+        if (final_hash.len == chain_hash_buf.len) {
+            @memcpy(&chain_hash_buf, final_hash);
+            chain_hash = &chain_hash_buf;
+        }
     }
 
     const protected_session =
@@ -1528,7 +1534,7 @@ fn commandWithStdioAndEnv(io: std.Io, argv: []const []const u8, stdout: anytype,
         .signal, .stopped, .unknown => false,
     };
     if (protected_run_succeeded) telemetry.recordActivation(trusted_host_key);
-    try printSessionEnd(io, stdout, result, is_first_session, protected_session);
+    try printSessionEnd(io, stdout, result, is_first_session, protected_session, chain_hash);
 
     if (required_proxy_failed) {
         try stderr.writeAll("ryk run: required proxy backend failed during child run; child was terminated.\n");
@@ -2280,6 +2286,7 @@ fn printSessionEnd(
     result: supervisor.SessionResult,
     is_first_session: bool,
     protected_session: bool,
+    chain_hash: ?[]const u8,
 ) !void {
     const code = result.exitCode();
     if (code == 0) {
@@ -2295,6 +2302,9 @@ fn printSessionEnd(
         }
     } else {
         try stdout.print("\n{s} Session ended with exit code {d}\n", .{ style.Glyph.cross, code });
+    }
+    if (chain_hash) |hash| {
+        try stdout.print("Audit chain: {s}\n", .{hash});
     }
     if (is_first_session and protected_session and code == 0) {
         // Phase 7: elevate the first-run celebration into a branded moment.
@@ -5416,6 +5426,44 @@ test "boundary-off runs do not print protected celebration" {
     try std.testing.expect(std.mem.indexOf(u8, out, "first protected session complete") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "Next steps") == null);
     try std.testing.expectEqualStrings("", stderr_writer.buffered());
+}
+
+test "session end prints final audit chain hash matching summary" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+
+    var stdout_buf: [4096]u8 = undefined;
+    var stderr_buf: [2048]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+
+    const code = try commandForGuardTestWithShellEvaluator(
+        &.{ "--workspace", root, "--os-sandbox", "off", "--", "true" },
+        &stdout_writer,
+        &stderr_writer,
+        .inherit,
+        shell_eval.mockDaemonAllowEvaluator,
+    );
+    try std.testing.expectEqual(exit_codes.success, code);
+    const out = stdout_writer.buffered();
+    const prefix = "Audit chain: ";
+    const start = std.mem.indexOf(u8, out, prefix) orelse return error.TestExpectedEqual;
+    const hash_start = start + prefix.len;
+    try std.testing.expect(out.len >= hash_start + 64);
+    const printed = out[hash_start .. hash_start + 64];
+    for (printed) |byte| try std.testing.expect(std.ascii.isHex(byte));
+
+    const session_id = try readLastSessionId(std.testing.allocator, root);
+    defer std.testing.allocator.free(session_id);
+    const summary_path = try std.fs.path.join(std.testing.allocator, &.{ root, ".ryk", "sessions", session_id, "summary.json" });
+    defer std.testing.allocator.free(summary_path);
+    const summary = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, summary_path, std.testing.allocator, .limited(64 * 1024));
+    defer std.testing.allocator.free(summary);
+    var needle_buf: [96]u8 = undefined;
+    const needle = try std.fmt.bufPrint(&needle_buf, "\"final_event_hash\":\"{s}\"", .{printed});
+    try std.testing.expect(std.mem.indexOf(u8, summary, needle) != null);
 }
 
 // ---------------------------------------------------------------------------

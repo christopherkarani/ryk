@@ -25,7 +25,7 @@ Effect output never includes raw argument values. For interactive classification
 python3 fixtures/mcp/fake_client.py | ./zig-out/bin/ryk mcp proxy --name demo --policy policies/presets/mcp-dev.yaml --command python3 -- fixtures/mcp/fake_server.py
 ```
 
-The proxy reads client JSON-RPC from stdin and writes protocol responses to stdout. Ryk human diagnostics use stderr, but child-server stderr is discarded because it is attacker-controlled and may contain credentials; this does not affect the separate stdout JSON-RPC channel. Running `ryk mcp proxy` without a client input stream waits for JSON-RPC on stdin.
+The proxy reads client JSON-RPC from stdin and writes protocol responses to stdout. Ryk human diagnostics use stderr, but child-server stderr is discarded because it is attacker-controlled and may contain credentials; this does not affect the separate stdout JSON-RPC channel. Running `ryk mcp proxy` without a client input stream waits for JSON-RPC on stdin. When the proxy session ends, stderr prints the final audit chain hash for out-of-band comparison; detecting a local rewrite of both the event log and the summary is out of scope.
 
 ## Manifest Support
 

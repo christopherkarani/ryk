@@ -439,6 +439,7 @@ The audit log uses hash-chain verification:
 - Each event includes a hash of the previous event
 - Modifying the log breaks the chain
 - Replay verification detects tampering
+- A complete local rewrite of `events.jsonl` and `summary.json` together is out of scope (no signing). Session end prints the final chain hash so it can be checked out of band.
 
 ### Summary Redaction
 

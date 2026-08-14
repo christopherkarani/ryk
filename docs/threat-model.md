@@ -59,5 +59,6 @@ Strict and CI modes reject invalid policies, malformed untrusted input, unsuppor
 - Privileged users can bypass user-space controls.
 - A user can approve an unsafe action.
 - A host can treat hook output as advisory rather than blocking.
+- A local actor who rewrites both the audit event log and the session summary can produce a new internally consistent hash chain. Detecting that rewrite is out of scope; copy the printed session-end chain hash out of band if you need an external check.
 
 For implementation-specific residuals, read the platform notes and run `ryk doctor` on the machine that will run the agent.

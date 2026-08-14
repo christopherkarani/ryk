@@ -31,6 +31,8 @@ Bare `ryk replay` loads the **last** session and highlights denied actions. No s
 
 Each event includes previous and current hashes. `--verify` detects modified, deleted, reordered, or malformed events and summary hash mismatches.
 
+A local actor who rewrites both `events.jsonl` and `summary.json` together can produce a new internally consistent chain. Detecting that rewrite is out of scope (ryk does not sign audit files). Session end prints the final chain hash (`Audit chain: …`) and records it in `summary.json` / `summary.md` so you can copy it out of band and compare later.
+
 ## Redaction
 
 Secret-like values are redacted before persistence, not only during replay. Replay should not be used as a raw terminal transcript.
