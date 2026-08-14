@@ -23,6 +23,8 @@
 ### Fixed
 
 * **`ryk pi` launch under OS sandbox:** `#!/usr/bin/env node` host scripts (Pi, npm-global agents) no longer die with `ryk shim exec: real command not found after removing shim path: node`. After attach, PATH honesty drops Homebrew and Seatbelt no-bare-home EPERMs `~/.local` / nvm / Hermes node, so the session `node` shim cannot resolve a real interpreter. The product path now expands env shebangs to absolute interpreter + script before spawn (same rewrite Codex MCP already used). Host MCP plans that keep bare `pi` are included.
+* **Pi exits on ryk block/ask cards (`child.render is not a function`).** The `rykanv-decision` message renderer returned a themed string. Pi's `CustomMessageComponent` treats a truthy return as a TUI child and calls `.render()`, so the session died as soon as a decision card was sent (for example `cat .env`). The renderer now returns a `{ render(width) }` component. Reinstall the Pi extension (`ryk doctor --fix`) so `~/.pi/agent/extensions/ryk/runtime.ts` is replaced.
+* **Pi exits at session start with `EPERM` mkdir on `~/.local/state/ryk/pi-ask/...`.** Under the OS sandbox, parent-ask IPC cannot create its HOME state dir. That `mkdirSync` was uncaught and killed Pi before any tool ran. mkdir is now best-effort; parent-ask degrades (subagent asks still fail closed) and the TUI stays up.
 
 ### Added
 
@@ -34,10 +36,6 @@
 * **Windows positioning:** public docs and `ryk doctor` now match backend truth. Windows sessions have no OS sandbox and run at wrapper/hook grade (MCP stdio is proxy). Doctor reports cmd/PowerShell wrappers as wrapper-only, and transparent filesystem plus proxy-mediated HTTP as unavailable (no loopback proxy). WinGet and Scoop stay deferred pending a Windows story (decision 2026-08-13).
 * **Homebrew formula is real, not a template.** `packaging/homebrew/Formula/ryk.rb` carries published release URLs and per-platform SHA-256 digests, caveats that point at `ryk doctor`, and a `brew test` block. `scripts/cut-release.sh` gained a `publish-brew` phase that regenerates the formula from the release's `checksums.txt`. A missing tap is a preflight warning and skips `--live` tap push rather than surprising after publish-git. The bump phase does not write a version-only formula (old digests). `brew upgrade` replaces the binary only; `ryk doctor --fix` wires hosts. `scripts/update-homebrew-tap.sh` fails closed (writes nothing) on a missing or malformed digest, a missing marker, missing ruby, or a `--live` tap clone failure.
 * **Packaging channel decisions recorded** in `packaging/README.md`: Homebrew ready / tap not published yet (blocked), npm deferred until a demand trigger fires, WinGet and Scoop deferred pending a Windows story. Nothing new is published.
-
-### Fixed
-
-* **Pi exits on ryk block/ask cards (`child.render is not a function`).** The `rykanv-decision` message renderer returned a themed string. Pi's `CustomMessageComponent` treats a truthy return as a TUI child and calls `.render()`, so the session died as soon as a decision card was sent (for example `cat .env`). The renderer now returns a `{ render(width) }` component. Reinstall the Pi extension (`ryk doctor --fix`) so `~/.pi/agent/extensions/ryk/runtime.ts` is replaced.
 
 ### Door A — deadlock-free coding sessions (P2-1)
 

@@ -79,7 +79,13 @@ ryk doctor --fix
 # confirm ~/.pi/agent/extensions/ryk/runtime.ts is newer than the crash
 ```
 
-Restart `ryk pi`. A stale `runtime.ts` (especially an older `installOrcaExtension` drop) will keep crashing until it is replaced.
+Restart `ryk pi`. A stale `runtime.ts` from a previous install will keep crashing until it is replaced.
+
+## Pi exits with `EPERM` mkdir `~/.local/state/ryk/pi-ask`
+
+Under an attached OS sandbox (empty backpack), writes to `$HOME/.local/state` are denied. The ryk Pi extension used to `mkdirSync` that tree on `session_start` for parent-ask IPC. An uncaught `EPERM` exits Pi with code 1 after sandbox attach.
+
+**Fix:** update ryk-pi so parent-ask mkdir is best-effort (no throw). Policy ask/block on the main TUI still works. Subagent parent-forward stays fail-closed if the IPC dir cannot be created. Replace `~/.pi/agent/extensions/ryk/parent_ask.ts` and `runtime.ts`, then restart `ryk pi`.
 
 ## Sandbox stress regression (P1–4)
 

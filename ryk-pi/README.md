@@ -63,6 +63,11 @@ Decision cards must return a TUI component from `registerMessageRenderer`
 `child.render is not a function`. After updating ryk-pi, run `ryk doctor --fix`
 so `~/.pi/agent/extensions/ryk/runtime.ts` is replaced.
 
+Parent-ask IPC mkdir is best-effort. Under an attached OS sandbox, creating
+`~/.local/state/ryk/pi-ask/<session>` can EPERM; the extension must not throw.
+Main-TUI ask/block still works. Subagent parent-forward stays fail-closed if
+the IPC dir cannot be created.
+
 Auto-deny records a transcript audit event (`ryk_ask_auto_deny`) when the host
 supports `sendMessage`, and still blocks if audit is unavailable. Subagent policy
 `ask` and protocol recovery are forwarded to the parent via file IPC

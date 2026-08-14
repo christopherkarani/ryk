@@ -10,7 +10,10 @@ import {
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import test from "node:test";
-import { writeAskRequest } from "../extensions/parent_ask.ts";
+import {
+	writeAskRequest,
+	type ParentAskFs,
+} from "../extensions/parent_ask.ts";
 import {
 	allowOnceBypassEnabled,
 	askOptionsFor,
@@ -2889,8 +2892,6 @@ test("decision message renderer returns a TUI component with render()", () => {
 		makeThemeStub(),
 	);
 
-	// Pi CustomMessageComponent.addChild requires Component.render(width).
-	// Returning a themed string crashes the TUI: child.render is not a function.
 	assert.notEqual(typeof result, "string");
 	assert.equal(typeof result, "object");
 	assert.ok(result !== null);
@@ -2971,4 +2972,148 @@ test("decision message renderer wait variant and empty content stay renderable",
 	assert.ok(Array.isArray(emptyLines));
 	assert.ok(emptyLines.every((line) => typeof line === "string"));
 	assert.ok(emptyLines.some((line) => line.includes(DISPLAY_BRAND)));
+});
+
+function makeEpermFs(): ParentAskFs {
+	const err = Object.assign(new Error("EPERM: operation not permitted, mkdir"), {
+		code: "EPERM",
+		errno: -1,
+		syscall: "mkdir",
+	});
+	const deny = (): never => {
+		throw err;
+	};
+	return {
+		existsSync: deny,
+		mkdirSync: deny,
+		writeFileSync: deny,
+		readFileSync: deny,
+		readdirSync: deny,
+		renameSync: deny,
+		rmSync: deny,
+	};
+}
+
+test("parent-ask mkdir EPERM does not throw from resolvePiAskRoot or parentAskDir", () => {
+	const fsApi = makeEpermFs();
+	const root = resolvePiAskRoot(
+		{
+			HOME: "/Users/nobody",
+			TMPDIR: "/tmp/ryk-session-tmp",
+			RYK_PI_ASK_ROOT: "",
+		},
+		fsApi,
+	);
+	assert.equal(root, "/Users/nobody/.local/state/ryk/pi-ask");
+	assert.doesNotThrow(() =>
+		parentAskDir("/Users/nobody/.local/state/ryk/pi-ask", "session-a", fsApi),
+	);
+	assert.doesNotThrow(() =>
+		addSessionGrant("/Users/nobody/.local/state/ryk/pi-ask/session-a", "bash", 1, fsApi),
+	);
+	assert.equal(
+		hasSessionGrant("/Users/nobody/.local/state/ryk/pi-ask/session-a", "bash", fsApi),
+		false,
+	);
+});
+
+test("session_start survives parent-ask mkdir EPERM", async () => {
+	const { pi, handlers } = makePi();
+	const { spawn } = makeSpawn([{ code: 0, stdout: "healthy" }]);
+	installRykExtension(pi, {
+		spawn,
+		rykBin: "ryk",
+		piAskFs: makeEpermFs(),
+		piAskRoot: "/Users/nobody/.local/state/ryk/pi-ask",
+		parentAskPollMs: 0,
+	});
+	const { ctx } = makeCtx({
+		sessionManager: {
+			getSessionId: () => "01a001e5-fa69-7b13-bcf0-c77f24c77f82",
+		},
+	});
+	const rejections: unknown[] = [];
+	const onReject = (reason: unknown) => {
+		rejections.push(reason);
+	};
+	process.on("unhandledRejection", onReject);
+	try {
+		assert.doesNotThrow(() => handlers.get("session_start")![0]({}, ctx));
+		await flushAsyncWork();
+	} finally {
+		process.off("unhandledRejection", onReject);
+	}
+	assert.equal(rejections.length, 0, String(rejections[0]));
+});
+
+test("tool_call survives parent-ask mkdir EPERM", async () => {
+	const { pi, handlers } = makePi();
+	const { spawn } = makeSpawn([
+		{
+			code: 0,
+			stdout: JSON.stringify({
+				version: 1,
+				decision: "allow",
+				risk: "low",
+				category: "shell",
+				reason: "ok",
+			}),
+		},
+	]);
+	installRykExtension(pi, {
+		spawn,
+		rykBin: "ryk",
+		piAskFs: makeEpermFs(),
+		piAskRoot: "/Users/nobody/.local/state/ryk/pi-ask",
+		parentAskPollMs: 0,
+	});
+	const { ctx } = makeCtx({
+		sessionManager: {
+			getSessionId: () => "01a001e5-fa69-7b13-bcf0-c77f24c77f82",
+		},
+	});
+	await handlers.get("session_start")![0]({}, ctx);
+	await flushAsyncWork();
+	await assert.doesNotReject(() =>
+		fireToolCall(handlers.get("tool_call")![0], ctx, "git status"),
+	);
+});
+
+test("subagent policy ask fails closed when parent-ask FS is EPERM", async () => {
+	const previous = process.env.PI_SUBAGENT_PARENT_SESSION;
+	process.env.PI_SUBAGENT_PARENT_SESSION = "parent-eperm";
+	try {
+		const { pi, handlers } = makePi();
+		const { spawn } = makeSpawn([
+			{ code: 7, stdout: decideJson("ask", "file.write") },
+		]);
+		installRykExtension(pi, {
+			spawn,
+			rykBin: "ryk",
+			piAskFs: makeEpermFs(),
+			piAskRoot: "/Users/nobody/.local/state/ryk/pi-ask",
+			parentAskPollMs: 0,
+		});
+		const { ctx } = makeCtx({
+			hasUI: true,
+			mode: "tui",
+			sessionManager: {
+				getSessionId: () => "child-eperm",
+			},
+		});
+		(ctx.ui as { select?: () => Promise<string> }).select = async () => {
+			throw new Error("child must not call select");
+		};
+		const result = await fireToolCall(
+			handlers.get("tool_call")![0],
+			ctx,
+			"",
+			"write",
+			{ path: "src/main.ts", content: "x" },
+		);
+		assert.equal(result?.block, true);
+	} finally {
+		if (previous === undefined) delete process.env.PI_SUBAGENT_PARENT_SESSION;
+		else process.env.PI_SUBAGENT_PARENT_SESSION = previous;
+	}
 });

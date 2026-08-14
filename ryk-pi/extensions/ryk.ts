@@ -1116,12 +1116,7 @@ export function formatAgentBlockReason(
 	return truncate(reason, AGENT_BLOCK_REASON_MAX);
 }
 
-/**
- * Pi `registerMessageRenderer` must return a TUI component (`render(width)`),
- * never a string. A themed string is truthy, so CustomMessageComponent.addChild
- * accepts it, then Container.render throws `child.render is not a function`
- * and Pi exits.
- */
+/** Pi requires `{ render(width) => string[] }`; a string is truthy and crashes the TUI. */
 export type TuiComponentLike = {
 	render: (width: number) => string[];
 };
