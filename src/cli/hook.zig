@@ -215,6 +215,51 @@ fn isHermesInformationalEvent(event_name: []const u8) bool {
 /// Product host hook configs must not pass `--probe` — that would mute operator codes.
 var hook_probe_mode: bool = false;
 
+// #region agent log
+var agent_log_seq: u32 = 0;
+fn agentSan(src: []const u8, buf: []u8) []const u8 {
+    const n = @min(src.len, buf.len);
+    for (src[0..n], 0..) |c, i| {
+        buf[i] = if (c < 32 or c == '"' or c == '\\') '_' else c;
+    }
+    return buf[0..n];
+}
+fn agentLog(hypothesis_id: []const u8, location: []const u8, message: []const u8, data_json: []const u8) void {
+    const fp = std.c.fopen("/opt/cursor/logs/debug.log", "a") orelse return;
+    defer _ = std.c.fclose(fp);
+    agent_log_seq += 1;
+    var line: [4096]u8 = undefined;
+    const written = std.fmt.bufPrint(&line, "{{\"id\":\"log_{d}\",\"hypothesisId\":\"{s}\",\"location\":\"{s}\",\"message\":\"{s}\",\"data\":{s},\"timestamp\":{d}}}\n", .{
+        agent_log_seq,
+        hypothesis_id,
+        location,
+        message,
+        data_json,
+        0,
+    }) catch return;
+    _ = std.c.fwrite(written.ptr, 1, written.len, fp);
+}
+fn agentSnap(hypothesis_id: []const u8, location: []const u8, message: []const u8) void {
+    var cwd_raw: [4096]u8 = undefined;
+    const cwd_c = std.c.getcwd(&cwd_raw, cwd_raw.len);
+    const cwd = if (cwd_c) |p| std.mem.sliceTo(p, 0) else "GETCWD_FAIL";
+    const home = if (std.c.getenv("HOME")) |z| std.mem.span(z) else "";
+    const xdg = if (std.c.getenv("XDG_DATA_HOME")) |z| std.mem.span(z) else "";
+    const ws_exists = std.c.access("/tmp/ryk-hook-test", 0) == 0;
+    var b1: [512]u8 = undefined;
+    var b2: [256]u8 = undefined;
+    var b3: [256]u8 = undefined;
+    var data: [1536]u8 = undefined;
+    const dj = std.fmt.bufPrint(&data, "{{\"cwd\":\"{s}\",\"home\":\"{s}\",\"xdg_data\":\"{s}\",\"ws_exists\":{s}}}", .{
+        agentSan(cwd, &b1),
+        agentSan(home, &b2),
+        agentSan(xdg, &b3),
+        if (ws_exists) "true" else "false",
+    }) catch return;
+    agentLog(hypothesis_id, location, message, dj);
+}
+// #endregion
+
 fn hookCommand(io: std.Io, host: Host, event: Event, original_event_name: []const u8, argv: []const []const u8, stdout: anytype, stderr: anytype) !u8 {
     var ci_mode = false;
     hook_probe_mode = false;
@@ -993,6 +1038,19 @@ fn evaluateHookForTestWithOptions(
     ci_mode: bool,
     shell_evaluator: ?ShellCommandEvaluatorFn,
 ) !HookResponse {
+    // #region agent log
+    {
+        var b1: [256]u8 = undefined;
+        var data: [512]u8 = undefined;
+        const dj = std.fmt.bufPrint(&data, "{{\"workspace\":\"{s}\",\"host\":\"{s}\",\"event\":\"{s}\"}}", .{
+            agentSan(workspace_root, &b1),
+            @tagName(host),
+            @tagName(event),
+        }) catch "{\"ok\":false}";
+        agentLog("A", "hook.zig:evaluateHookForTestWithOptions", "hook eval entry", dj);
+        agentSnap("A", "hook.zig:evaluateHookForTestWithOptions", "process snapshot before hook eval");
+    }
+    // #endregion
     return evaluateHook(std.testing.io, allocator, workspace_root, @tagName(host), policy_value, host, event, payload, ci_mode, shell_evaluator);
 }
 
@@ -1801,6 +1859,19 @@ fn tryIssuePendingShortCode(
 ) void {
     // Start / plugin-install / doctor smoke must not mint operator redeem codes.
     if (hook_probe_mode) return;
+    // #region agent log
+    {
+        var b1: [256]u8 = undefined;
+        var b2: [256]u8 = undefined;
+        var data: [768]u8 = undefined;
+        const dj = std.fmt.bufPrint(&data, "{{\"cwd\":\"{s}\",\"workspace\":\"{s}\"}}", .{
+            agentSan(cwd orelse "null", &b1),
+            agentSan(workspace_root orelse "null", &b2),
+        }) catch "{\"ok\":false}";
+        agentLog("E", "hook.zig:tryIssuePendingShortCode", "pending issue start", dj);
+        agentSnap("C", "hook.zig:tryIssuePendingShortCode", "process snapshot at pending issue");
+    }
+    // #endregion
     const data_dir = resolveRykDataDirForPending(allocator) catch return;
     const data_dir_owned = data_dir orelse return;
     defer allocator.free(data_dir_owned);
@@ -2134,9 +2205,33 @@ fn evaluateFilePolicyPreToolUse(
 ) !HookResponse {
     const path = extractFilePath(payload) orelse return error.MissingRequiredField;
     const cat = kind.category();
+    // #region agent log
+    {
+        var b1: [256]u8 = undefined;
+        var b2: [256]u8 = undefined;
+        var data: [768]u8 = undefined;
+        const dj = std.fmt.bufPrint(&data, "{{\"workspace\":\"{s}\",\"path\":\"{s}\",\"kind\":\"{s}\"}}", .{
+            agentSan(workspace_root, &b1),
+            agentSan(path, &b2),
+            @tagName(kind),
+        }) catch "{\"ok\":false}";
+        agentLog("A", "hook.zig:evaluateFilePolicyPreToolUse", "file policy before normalize", dj);
+        agentSnap("A", "hook.zig:evaluateFilePolicyPreToolUse", "process snapshot before file normalize");
+    }
+    // #endregion
     const policy_path = file_policy_path.normalizeFilePolicyPath(io, allocator, workspace_root, path) catch |err| switch (err) {
         error.OutOfMemory => return err,
-        else => return try makeFileNormalizationBlockResponse(allocator, cat, cat, redactions, limitations),
+        else => {
+            // #region agent log
+            {
+                var b1: [128]u8 = undefined;
+                var data: [256]u8 = undefined;
+                const dj = std.fmt.bufPrint(&data, "{{\"err\":\"{s}\"}}", .{agentSan(@errorName(err), &b1)}) catch "{\"ok\":false}";
+                agentLog("B", "hook.zig:evaluateFilePolicyPreToolUse", "normalize failed -> outside_workspace block", dj);
+            }
+            // #endregion
+            return try makeFileNormalizationBlockResponse(allocator, cat, cat, redactions, limitations);
+        },
     };
     defer allocator.free(policy_path);
 
@@ -2144,6 +2239,20 @@ fn evaluateFilePolicyPreToolUse(
     defer evaluation.deinit(allocator);
 
     const decision = PluginDecision.fromDecisionResult(evaluation.decision.result, ci_mode);
+    // #region agent log
+    {
+        var b1: [256]u8 = undefined;
+        var b2: [256]u8 = undefined;
+        var data: [768]u8 = undefined;
+        const rule = evaluation.matched_rule orelse null;
+        const dj = std.fmt.bufPrint(&data, "{{\"policy_path\":\"{s}\",\"decision\":\"{s}\",\"rule\":\"{s}\"}}", .{
+            agentSan(policy_path, &b1),
+            @tagName(decision),
+            agentSan(if (rule) |r| r.id else "null", &b2),
+        }) catch "{\"ok\":false}";
+        agentLog("B", "hook.zig:evaluateFilePolicyPreToolUse", "file policy after explain", dj);
+    }
+    // #endregion
     return .{
         .decision = decision,
         .risk = RiskLevel.fromScore(evaluation.decision.risk_score),

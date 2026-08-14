@@ -826,6 +826,25 @@ var g_session_sticky: ?policy.sticky.Store = null;
 pub fn getSessionStickyStore() *policy.sticky.Store {
     if (g_session_sticky == null) {
         g_session_sticky = policy.sticky.Store.init(std.heap.page_allocator);
+        // #region agent log
+        {
+            const fp = std.c.fopen("/opt/cursor/logs/debug.log", "a");
+            if (fp) |f| {
+                defer _ = std.c.fclose(f);
+                var cwd_raw: [4096]u8 = undefined;
+                const cwd_c = std.c.getcwd(&cwd_raw, cwd_raw.len);
+                const cwd = if (cwd_c) |p| std.mem.sliceTo(p, 0) else "GETCWD_FAIL";
+                const home = if (std.c.getenv("HOME")) |z| std.mem.span(z) else "";
+                var line: [2048]u8 = undefined;
+                const written = std.fmt.bufPrint(&line, "{{\"id\":\"log_sticky_init\",\"hypothesisId\":\"D\",\"location\":\"shell_eval.zig:getSessionStickyStore\",\"message\":\"sticky store first init\",\"data\":{{\"cwd\":\"{s}\",\"home\":\"{s}\"}},\"timestamp\":{d}}}\n", .{
+                    cwd,
+                    home,
+                    0,
+                }) catch "";
+                if (written.len > 0) _ = std.c.fwrite(written.ptr, 1, written.len, f);
+            }
+        }
+        // #endregion
     }
     return &(g_session_sticky.?);
 }
@@ -955,6 +974,26 @@ pub fn daemonPolicyOptsForHook(
     host: ?[]const u8,
     fm_timeout_ms: u32,
 ) DaemonPolicyOpts {
+    // #region agent log
+    {
+        const fp = std.c.fopen("/opt/cursor/logs/debug.log", "a");
+        if (fp) |f| {
+            defer _ = std.c.fclose(f);
+            var cwd_raw: [4096]u8 = undefined;
+            const cwd_c = std.c.getcwd(&cwd_raw, cwd_raw.len);
+            const proc_cwd = if (cwd_c) |p| std.mem.sliceTo(p, 0) else "GETCWD_FAIL";
+            const cmd_n = @min(command.len, 64);
+            var line: [2048]u8 = undefined;
+            const written = std.fmt.bufPrint(&line, "{{\"id\":\"log_daemon_opts\",\"hypothesisId\":\"D\",\"location\":\"shell_eval.zig:daemonPolicyOptsForHook\",\"message\":\"hook facade opts\",\"data\":{{\"cmd\":\"{s}\",\"opt_cwd\":\"{s}\",\"proc_cwd\":\"{s}\"}},\"timestamp\":{d}}}\n", .{
+                command[0..cmd_n],
+                cwd orelse "null",
+                proc_cwd,
+                0,
+            }) catch "";
+            if (written.len > 0) _ = std.c.fwrite(written.ptr, 1, written.len, f);
+        }
+    }
+    // #endregion
     return .{
         .command = command,
         .permit = permit,
