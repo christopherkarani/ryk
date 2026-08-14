@@ -174,7 +174,7 @@ const self_banner_commands = [_][]const u8{ "version", "--version", "help", "run
 /// Commands whose output is always machine/raw (JSON, generated scripts, export
 /// lines, long-running servers) — never receive the human brand banner.
 const always_machine_commands = [_][]const u8{
-    "evaluate", "hook", "shim", "completions", "env", "dashboard", "telemetry", "--print-install-env",
+    "evaluate", "hook", "shim", "completions", "env", "dashboard", "cloud", "telemetry", "--print-install-env",
     // Zig-native shell tools (formerly daemon-proxied): keep machine/banner-free.
     // `explain` is human pretty by default (DCG-class colors); machine only via
     // `--format json` (isMachineArgv). Own header is `RYK EXPLAIN` (no brand banner).
@@ -549,6 +549,7 @@ fn runWithCwdUsing(
     if (std.mem.eql(u8, command, "evaluate")) return evaluate.command(io, argv[1..], stdout, stderr);
     if (std.mem.eql(u8, command, "hook")) return hook.command(io, argv[1..], stdout, stderr);
     if (std.mem.eql(u8, command, "dashboard")) return dashboard_command.command(io, argv[1..], stdout, stderr);
+    if (std.mem.eql(u8, command, "cloud")) return dashboard_command.commandCloud(io, argv[1..], stdout, stderr);
     if (std.mem.eql(u8, command, "report")) return report.command(io, argv[1..], stdout, stderr);
     if (std.mem.eql(u8, command, "ci")) return ci.command(io, argv[1..], stdout, stderr);
     if (std.mem.eql(u8, command, "stop")) return disable.command(io, argv[1..], stdout, stderr);

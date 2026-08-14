@@ -1,0 +1,7 @@
+{
+  "id": "ryk-cloud",
+  "name": "ryk Cloud Terminal",
+  "version": "1.0.0",
+  "description": "Vercel-style terminal for blocked ryk agent and ryk cloud commands.",
+  "ui": "ui/index.html"
+}

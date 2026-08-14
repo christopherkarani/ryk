@@ -20,6 +20,14 @@ import {
   filterActionsByHost,
   remediationCommandsFor,
 } from "../components/ActivityControls.ts";
+import {
+  DEMO_TERMINAL_EVENTS,
+  filterTerminalEvents,
+  inferSource,
+  isBlockedDecision,
+  reasonForRule,
+  toTerminalEvents,
+} from "./terminal-events.ts";
 
 function renderInMode(mode: "machine" | "workspace", child: React.ReactNode): string {
   return renderToStaticMarkup(
@@ -41,9 +49,10 @@ test("session identity includes its workspace", () => {
 test("machine navigation renders only global-safe destinations", () => {
   const machineLabels = visibleNavigation("machine").map((tab) => tab.label);
   const workspaceLabels = visibleNavigation("workspace").map((tab) => tab.label);
-  assert.deepEqual(machineLabels, ["Overview", "Activity", "Integrations"]);
+  assert.deepEqual(machineLabels, ["Overview", "Activity", "Terminal", "Integrations"]);
   assert.ok(workspaceLabels.includes("Policy"));
   assert.ok(workspaceLabels.includes("Secretless"));
+  assert.ok(workspaceLabels.includes("Terminal"));
 });
 
 test("command palette renders only actions and views allowed by dashboard mode", () => {
@@ -51,6 +60,7 @@ test("command palette renders only actions and views allowed by dashboard mode",
   const workspace = renderInMode("workspace", React.createElement(CommandPaletteItems));
 
   assert.match(machine, /Overview/);
+  assert.match(machine, /Terminal/);
   assert.match(machine, /Run Doctor/);
   assert.doesNotMatch(machine, /Policy/);
   assert.doesNotMatch(machine, /Secretless/);
@@ -131,6 +141,38 @@ test("legacy fallback suppresses workspace remediation markup in machine mode", 
   );
   assert.equal(context.workspaceResult, "<button>workspace</button>");
   assert.equal(context.machineResult, "");
+});
+
+test("cloud terminal maps plugin denials and keeps command text visible", () => {
+  const events = toTerminalEvents(blockedActions);
+  assert.equal(events[0].blocked, true);
+  assert.equal(events[0].target, "shell command (redacted)");
+  assert.equal(inferSource("cursor-cloud"), "ryk cloud");
+  assert.equal(inferSource("ryk-agent"), "ryk agent");
+  assert.equal(isBlockedDecision("deny"), true);
+  assert.match(reasonForRule("core.shell:curl-pipe-shell"), /remote script/);
+  assert.ok(filterTerminalEvents(DEMO_TERMINAL_EVENTS, "cursor-cloud").every((event) => event.host === "cursor-cloud"));
+  assert.ok(DEMO_TERMINAL_EVENTS.some((event) => event.target.includes("install.sh") && event.blocked));
+});
+
+test("cloud terminal page and component keep blocked command copy visible", () => {
+  const page = readFileSync(new URL("../terminal/page.tsx", import.meta.url), "utf8");
+  const component = readFileSync(new URL("../components/CloudTerminal.tsx", import.meta.url), "utf8");
+  assert.match(page, /Cloud Terminal/);
+  assert.match(page, /ryk cloud/);
+  assert.match(component, /data-ryk-cloud-terminal/);
+  assert.match(component, /blocked command stream/);
+  assert.match(component, /✗ blocked/);
+});
+
+test("legacy dashboard ships a cloud terminal renderer for blocked commands", () => {
+  const source = readFileSync(new URL("../../../src/dashboard/assets/app.js", import.meta.url), "utf8");
+  const html = readFileSync(new URL("../../../src/dashboard/assets/index.html", import.meta.url), "utf8");
+  assert.match(source, /function renderCloudTerminal/);
+  assert.match(source, /cursor-cloud/);
+  assert.match(source, /ryk-agent/);
+  assert.match(html, /data-view="terminal"/);
+  assert.match(html, /blocked command stream/);
 });
 
 test("legacy fallback never builds commands from hostile persisted remediation", () => {

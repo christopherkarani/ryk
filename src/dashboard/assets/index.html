@@ -23,6 +23,7 @@
           <button class="nav-item active" type="button" data-view="overview">Overview</button>
           <button class="nav-item" type="button" data-view="secretless" data-workspace-only>Secretless</button>
           <button class="nav-item" type="button" data-view="activity">Activity</button>
+          <button class="nav-item" type="button" data-view="terminal">Terminal</button>
           <button class="nav-item" type="button" data-view="policy" data-workspace-only>Policy</button>
           <button class="nav-item" type="button" data-view="integrations" data-workspace-only>Integrations</button>
         </nav>
@@ -236,6 +237,26 @@
               <span class="caption">Sessions, prompt reviews, tool vetoes, and subagents</span>
             </div>
             <div class="timeline" id="hermesActivity"></div>
+          </section>
+        </section>
+
+        <section class="view" data-view-panel="terminal" aria-labelledby="terminal-title">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">Cursor Cloud · ryk agent</p>
+              <h3 id="terminal-title" class="section-title">Cloud Terminal</h3>
+            </div>
+            <span class="status-pill ok" id="terminalLivePill">demo</span>
+          </div>
+          <div class="metric-grid" id="terminalStats"></div>
+          <div class="host-filter" id="terminalHostFilter" role="toolbar" aria-label="Filter terminal by host"></div>
+          <section class="cloud-terminal" aria-labelledby="cloud-terminal-stream-title">
+            <div class="cloud-terminal-chrome">
+              <div class="cloud-terminal-dots" aria-hidden="true"><span></span><span></span><span></span></div>
+              <h4 id="cloud-terminal-stream-title">ryk@cloud — blocked command stream</h4>
+              <span class="caption" id="terminalChromeStatus">idle</span>
+            </div>
+            <div class="cloud-terminal-body" id="cloudTerminalStream" tabindex="0"></div>
           </section>
         </section>
 

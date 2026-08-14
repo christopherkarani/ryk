@@ -732,6 +732,79 @@ textarea {
   }
 }
 
+.cloud-terminal {
+  margin-top: 16px;
+  overflow: hidden;
+  border: 1px solid #1f1f1f;
+  border-radius: 14px;
+  background: #000;
+  color: #ededed;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.18);
+}
+
+.cloud-terminal-chrome {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 44px;
+  padding: 0 14px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  background: #0c0c0c;
+}
+
+.cloud-terminal-chrome h4 {
+  margin: 0;
+  color: #a1a1a1;
+  font-size: 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-weight: 500;
+}
+
+.cloud-terminal-dots {
+  display: flex;
+  gap: 6px;
+}
+
+.cloud-terminal-dots span {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #2a2a2a;
+}
+
+.cloud-terminal-dots span:nth-child(1) { background: #ff5f57; }
+.cloud-terminal-dots span:nth-child(2) { background: #febc2e; }
+.cloud-terminal-dots span:nth-child(3) { background: #28c840; }
+
+.cloud-terminal-body {
+  min-height: 420px;
+  max-height: 64vh;
+  overflow: auto;
+  padding: 16px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px;
+}
+
+.cloud-line {
+  display: grid;
+  grid-template-columns: 96px 128px minmax(0, 1fr);
+  gap: 12px;
+  padding: 10px 8px;
+  border-radius: 8px;
+}
+
+.cloud-line + .cloud-line { margin-top: 4px; }
+.cloud-line.blocked { background: linear-gradient(90deg, rgba(255, 77, 77, 0.12), transparent 72%); }
+.cloud-line.ask { background: linear-gradient(90deg, rgba(245, 166, 35, 0.12), transparent 72%); }
+.cloud-line .time { color: #737373; }
+.cloud-line .host { color: #0070f3; }
+.cloud-line .cmd { color: #ededed; word-break: break-word; }
+.cloud-line .decision { margin-top: 6px; font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; }
+.cloud-line .decision.deny { color: #ff4d4d; }
+.cloud-line .decision.ask { color: #f5a623; }
+.cloud-line .decision.allow { color: #50e3c2; }
+.cloud-line .why { margin-top: 6px; color: #a1a1a1; font-size: 12px; }
+
 @media (prefers-reduced-motion: no-preference) {
   .button,
   .icon-button,

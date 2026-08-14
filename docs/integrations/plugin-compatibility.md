@@ -48,6 +48,7 @@ Official marketplace or registry availability is not recorded here. Check the re
 - OpenCode: `integrations/opencode-plugin/`
 - OpenClaw: `integrations/openclaw-plugin/`
 - Hermes: `integrations/hermes-plugin/`
+- Cursor Cloud Terminal: `integrations/cursor-cloud-plugin/`
 
 Start with the host-specific guides:
 

@@ -1,7 +1,7 @@
 import type { LucideIcon } from "lucide-react";
-import { Activity, FileCode, LayoutDashboard, Plug, ShieldCheck } from "lucide-react";
+import { Activity, FileCode, LayoutDashboard, Plug, ShieldCheck, Terminal } from "lucide-react";
 
-export type NavTabId = "overview" | "secretless" | "activity" | "policy" | "integrations";
+export type NavTabId = "overview" | "secretless" | "activity" | "terminal" | "policy" | "integrations";
 
 export interface NavTab {
   id: NavTabId;
@@ -15,6 +15,7 @@ export const NAV_TABS: NavTab[] = [
   { id: "overview", label: "Overview", shortLabel: "Home", href: "/", icon: LayoutDashboard },
   { id: "secretless", label: "Secretless", shortLabel: "Secrets", href: "/secretless/", icon: ShieldCheck },
   { id: "activity", label: "Activity", shortLabel: "Activity", href: "/activity/", icon: Activity },
+  { id: "terminal", label: "Terminal", shortLabel: "Term.", href: "/terminal/", icon: Terminal },
   { id: "policy", label: "Policy", shortLabel: "Policy", href: "/policy/", icon: FileCode },
   { id: "integrations", label: "Integrations", shortLabel: "Integr.", href: "/integrations/", icon: Plug },
 ];

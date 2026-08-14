@@ -803,15 +803,34 @@ pub const commands =
             "  ryk hook hermes on_session_end",
             "Hook responses include host_limitations to honestly report enforcement limits.",
         } },
-        .{ .name = "dashboard", .summary = "Start the local ryk dashboard", .usage = "ryk dashboard [--machine | --workspace PATH] [--host 127.0.0.1] [--port 7742] [--once]", .category = .diagnostics, .details = &.{
+        .{ .name = "dashboard", .summary = "Start the local ryk dashboard", .usage = "ryk dashboard [--machine | --workspace PATH] [--host 127.0.0.1] [--port 7742] [--view overview|activity|terminal] [--demo] [--once]", .category = .diagnostics, .details = &.{
             "Starts a localhost-only machine-wide dashboard by default; the view is not tied to shell cwd.",
             "Use --workspace PATH or RYK_DASHBOARD_WORKSPACE for policy, integrations, and workspace-scoped actions.",
             "The dashboard calls existing ryk CLI/Core paths and does not replace policy evaluation.",
             "Mutation routes use a per-run browser token and only expose fixed ryk actions; arbitrary shell commands are not accepted.",
             "Defaults to http://127.0.0.1:7742.",
             "LAN and non-loopback binds (for example 0.0.0.0) are rejected; the dashboard is intentionally localhost-only.",
+            "Use --view terminal to open the Cloud Terminal blocked-command stream.",
             "Use --once to serve one request for smoke tests and automation.",
         } },
+        .{
+            .name = "cloud",
+            .summary = "Open the local Cloud Terminal for blocked ryk agent commands",
+            .usage = "ryk cloud [--machine | --workspace PATH] [--host 127.0.0.1] [--port 7742] [--demo] [--once]",
+            .category = .diagnostics,
+            .public = true,
+            .examples = &.{
+                "ryk cloud",
+                "ryk cloud --demo",
+                "ryk cloud --workspace /path/to/project",
+            },
+            .details = &.{
+                "Local-only Cloud Terminal for blocked commands from ryk agent, Cursor Cloud, and host plugins.",
+                "This is not a hosted control plane: it binds localhost and reads the same local evidence as ryk dashboard.",
+                "Opens the terminal view at http://127.0.0.1:7742/#terminal by default.",
+                "Use --demo to load the plugin fixture stream when no live denials are recorded yet.",
+            },
+        },
         .{ .name = "help", .summary = "Show help", .usage = "ryk help [command|--all]", .category = .getting_started, .details = &.{
             "Shows Safe Launch help by default (public verbs only).",
             "Use `ryk help --all` for the full command surface.",
@@ -823,7 +842,7 @@ pub const commands =
 const public_help_prefix = [_][]const u8{ "start", "agents", "stop" };
 /// Suffix of Safe Launch teaching order (after host aliases).
 /// Day-2 loop: doctor → packs → allowlist, then review/forensics/explain/update.
-const public_help_suffix = [_][]const u8{ "doctor", "packs", "allowlist", "replay", "scan", "explain", "update", "telemetry" };
+const public_help_suffix = [_][]const u8{ "doctor", "packs", "allowlist", "replay", "scan", "explain", "cloud", "update", "telemetry" };
 
 pub const WriteMode = enum {
     /// Safe Launch surface only (default `ryk` / `ryk help`).
@@ -1193,6 +1212,7 @@ test "default root help shows only public Safe Launch verbs" {
     try std.testing.expect(helpListsPeerCommand(top, "replay"));
     try std.testing.expect(helpListsPeerCommand(top, "scan"));
     try std.testing.expect(helpListsPeerCommand(top, "explain"));
+    try std.testing.expect(helpListsPeerCommand(top, "cloud"));
     try std.testing.expect(helpListsPeerCommand(top, "update"));
     for (host_launch.host_launch_aliases) |host| {
         try std.testing.expect(helpListsPeerCommand(top, host));
@@ -1245,6 +1265,8 @@ test "help --all lists full advanced command surface" {
     try std.testing.expect(helpListsPeerCommand(all, "init"));
     try std.testing.expect(helpListsPeerCommand(all, "mcp"));
     try std.testing.expect(helpListsPeerCommand(all, "env"));
+    try std.testing.expect(helpListsPeerCommand(all, "cloud"));
+    try std.testing.expect(helpListsPeerCommand(all, "dashboard"));
     // Live Zig daemon-stop remains on the advanced surface.
     try std.testing.expect(helpListsPeerCommand(all, "shutdown"));
     // Hard-removed peers: not listed as live usage on help --all

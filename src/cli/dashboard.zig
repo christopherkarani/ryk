@@ -171,6 +171,9 @@ const DashboardOptions = struct {
     port: u16 = default_port,
     once: bool = false,
     workspace: ?[]const u8 = null,
+    view: []const u8 = "overview",
+    demo: bool = false,
+    cloud: bool = false,
 };
 
 const DashboardContext = struct {
@@ -199,6 +202,22 @@ pub fn command(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: an
 
 pub fn commandForTest(argv: []const []const u8, stdout: anytype, stderr: anytype) !u8 {
     return command(std.testing.io, argv, stdout, stderr);
+}
+
+pub fn commandCloud(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: anytype) !u8 {
+    if (comptime builtin.os.tag == .windows) return exit_codes.unsupported;
+    if (argv.len > 0 and (std.mem.eql(u8, argv[0], "--help") or std.mem.eql(u8, argv[0], "-h"))) {
+        _ = try help.writeCommand(io, stdout, "cloud");
+        return exit_codes.success;
+    }
+    var options = parseOptions(io, argv, stdout, stderr) catch |err| switch (err) {
+        error.HelpShown => return exit_codes.success,
+        error.Usage => return exit_codes.usage,
+        else => return err,
+    };
+    options.cloud = true;
+    if (std.mem.eql(u8, options.view, "overview")) options.view = "terminal";
+    return serve(io, options, stdout, stderr);
 }
 
 fn parseOptions(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: anytype) !DashboardOptions {
@@ -243,13 +262,26 @@ fn parseOptions(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: a
             explicit_workspace = argv[index];
         } else if (std.mem.eql(u8, arg, "--machine")) {
             explicit_machine = true;
+        } else if (std.mem.eql(u8, arg, "--view")) {
+            index += 1;
+            if (index >= argv.len or argv[index].len == 0) {
+                try stderr.writeAll("ryk dashboard: --view requires overview, activity, or terminal.\n");
+                return error.Usage;
+            }
+            if (!std.mem.eql(u8, argv[index], "overview") and !std.mem.eql(u8, argv[index], "activity") and !std.mem.eql(u8, argv[index], "terminal")) {
+                try stderr.writeAll("ryk dashboard: --view must be overview, activity, or terminal.\n");
+                return error.Usage;
+            }
+            options.view = argv[index];
+        } else if (std.mem.eql(u8, arg, "--demo")) {
+            options.demo = true;
         } else {
             const suggestions = @import("suggestions.zig");
             suggestions.writeUnknownOption(
                 stderr,
                 "ryk dashboard",
                 arg,
-                &.{ "--host", "--port", "--once", "--workspace", "--machine", "--help" },
+                &.{ "--host", "--port", "--once", "--workspace", "--machine", "--view", "--demo", "--help" },
                 "dashboard",
             ) catch {};
             return error.Usage;
@@ -283,7 +315,29 @@ fn serve(io: std.Io, options: DashboardOptions, stdout: anytype, stderr: anytype
     };
     defer server.deinit(io);
     const mode_label: []const u8 = if (options.workspace != null) "workspace" else "machine";
-    try stdout.print("ryk dashboard listening at http://{s}:{d} ({s} mode)\n", .{ options.host, options.port, mode_label });
+    const view = if (options.cloud and std.mem.eql(u8, options.view, "overview")) "terminal" else options.view;
+    const query: []const u8 = if (options.demo) "?demo=1" else "";
+    const hash: []const u8 = if (std.mem.eql(u8, view, "overview")) "" else view;
+    if (options.cloud) {
+        try stdout.print("ryk cloud listening at http://{s}:{d}{s}{s}{s} ({s} mode)\n", .{
+            options.host,
+            options.port,
+            query,
+            if (hash.len == 0) "" else "#",
+            hash,
+            mode_label,
+        });
+        try stdout.writeAll("Blocked commands from ryk agent, ryk cloud, and host plugins appear in this terminal.\n");
+    } else {
+        try stdout.print("ryk dashboard listening at http://{s}:{d}{s}{s}{s} ({s} mode)\n", .{
+            options.host,
+            options.port,
+            query,
+            if (hash.len == 0) "" else "#",
+            hash,
+            mode_label,
+        });
+    }
     try flushIfSupported(stdout);
 
     var gpa_state: std.heap.DebugAllocator(.{}) = .init;
@@ -1106,6 +1160,10 @@ test "dashboard parses machine and workspace flags" {
     const machine = try parseOptions(std.testing.io, &.{"--machine"}, &stdout, &stderr);
     try std.testing.expect(machine.workspace == null);
     try std.testing.expectError(error.Usage, parseOptions(std.testing.io, &.{ "--workspace", "/tmp/project", "--machine" }, &stdout, &stderr));
+    const terminal = try parseOptions(std.testing.io, &.{ "--view", "terminal", "--demo" }, &stdout, &stderr);
+    try std.testing.expectEqualStrings("terminal", terminal.view);
+    try std.testing.expect(terminal.demo);
+    try std.testing.expectError(error.Usage, parseOptions(std.testing.io, &.{ "--view", "remote" }, &stdout, &stderr));
 }
 
 test "machine dashboard actions exclude workspace-scoped commands" {

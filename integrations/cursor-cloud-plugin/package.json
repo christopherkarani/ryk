@@ -1,0 +1,11 @@
+{
+  "name": "ryk-cursor-cloud-plugin",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Vercel-style Cloud Terminal UI for ryk blocked commands in Cursor Cloud and ryk agent sessions.",
+  "scripts": {
+    "test": "node --test test/terminal.test.mjs",
+    "serve": "python3 -m http.server 7743 --directory ui"
+  }
+}

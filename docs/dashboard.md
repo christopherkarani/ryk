@@ -45,6 +45,7 @@ Machine-wide mode reads ryk's local workspace registry and global decision feed.
 - Recent shell / policy decisions across Pi, Codex, Claude, OpenCode, `ryk run`, and other hook paths
 - Sessions merged from registered workspace `.ryk/sessions` directories and feed-backed agent sessions such as Pi
 - Denied shell decisions with `workspace_root`, `host`, and recording source
+- Cloud Terminal stream (`ryk cloud` or `ryk dashboard --view terminal`) for blocked commands from ryk agent, Cursor Cloud, and host plugins
 - Machine-wide daemon health
 
 Decision writers continue to store the existing per-workspace feed and also append a redacted record to `$HOME/.ryk/dashboard/events.jsonl`. `$HOME/.ryk/dashboard/workspaces.json` indexes recently active workspaces for session aggregation. Feed writes are best-effort and do not change hook, run, or evaluate exit behavior. Crafted feed `session_id` or `workspace_root` values (`..`, extra separators) are skipped before any filesystem join; that is a loader skip, not a fail-closed policy deny.

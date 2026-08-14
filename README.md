@@ -158,9 +158,10 @@ Start the localhost dashboard:
 
 ```sh
 ryk dashboard
+ryk cloud --demo
 ```
 
-Open [http://127.0.0.1:7742](http://127.0.0.1:7742). The server is localhost-only by default and uses the existing ryk policy and CLI paths.
+Open [http://127.0.0.1:7742](http://127.0.0.1:7742) for the dashboard, or [http://127.0.0.1:7742/#terminal](http://127.0.0.1:7742/#terminal) for the Cloud Terminal. Blocked commands from `ryk agent`, Cursor Cloud, and host plugins appear in that stream. The server is localhost-only by default and uses the existing ryk policy and CLI paths.
 
 For smoke tests and automation, `--once` serves one request and then exits:
 

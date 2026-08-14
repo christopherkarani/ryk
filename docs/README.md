@@ -29,6 +29,7 @@ The docs describe the current CLI and its limits. When a platform detail matters
 - [Claude Code](integrations/claude-code.md)
 - [OpenCode](integrations/opencode.md)
 - [OpenClaw](integrations/openclaw.md)
+- [Cursor Cloud Terminal](integrations/cursor-cloud.md)
 - [Plugin compatibility](integrations/plugin-compatibility.md)
 - [Plugin security model](integrations/plugin-security-model.md)
 - [Plugin troubleshooting](integrations/plugin-troubleshooting.md)

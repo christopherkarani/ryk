@@ -92,7 +92,7 @@ The top-level --print-install-env route emits the same activation exports for in
 | Shell decisions | test, explain, packs, allowlist, allow, unallow, allow-once, policy | Inspect or change shell and policy decisions |
 | Evidence | replay, report, scan, diff, apply, discard | Inspect sessions, findings, and staged file changes |
 | Integrations | plugin, hook, evaluate, decide, mcp, tools, credentials | Connect host events and machine callers to ryk |
-| Operations | dashboard, ci, redteam, telemetry, stop, disable, shutdown, uninstall | Operate, verify, disable, or remove local integrations |
+| Operations | dashboard, cloud, ci, redteam, telemetry, stop, disable, shutdown, uninstall | Operate, verify, disable, or remove local integrations |
 
 The inventory describes the public working surface. ryk help <command> remains the authoritative usage string for each entry.
 
@@ -369,9 +369,11 @@ The dashboard is local and loopback-only:
 ryk dashboard --workspace .
 ryk dashboard --workspace . --port 7742
 ryk dashboard --workspace . --once
+ryk dashboard --view terminal
+ryk cloud --demo
 ~~~
 
-The default bind is 127.0.0.1:7742. Non-loopback binds are rejected. Mutation routes use a per-run browser token and fixed ryk actions. The dashboard calls existing CLI and core paths; it is not a separate policy evaluator.
+The default bind is 127.0.0.1:7742. Non-loopback binds are rejected. Mutation routes use a per-run browser token and fixed ryk actions. The dashboard calls existing CLI and core paths; it is not a separate policy evaluator. `ryk cloud` is the same localhost server focused on the blocked-command terminal.
 
 ci runs local readiness checks:
 

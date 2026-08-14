@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>ryk Cloud Terminal</title>
+    <link rel="stylesheet" href="./terminal.css">
+  </head>
+  <body>
+    <a class="skip-link" href="#terminal-stream">Skip to terminal</a>
+    <div class="app" data-ryk-cloud-terminal="1">
+      <header class="topbar">
+        <div class="brand">
+          <span class="mark" aria-hidden="true">R</span>
+          <div>
+            <p class="eyebrow">ryk · local guardrails</p>
+            <h1>Cloud Terminal</h1>
+          </div>
+        </div>
+        <div class="topbar-meta" aria-live="polite">
+          <span class="pill live" id="livePill"><span class="pulse" aria-hidden="true"></span>Live</span>
+          <span class="pill" id="envPill">cursor-cloud</span>
+          <span class="pill" id="modePill">ask</span>
+        </div>
+        <div class="topbar-actions">
+          <button type="button" class="ghost" id="replayButton">Replay stream</button>
+          <button type="button" class="primary" id="demoButton">Load demo</button>
+        </div>
+      </header>
+
+      <section class="stats" aria-label="Session summary">
+        <article class="stat">
+          <span class="stat-label">Blocked</span>
+          <strong class="stat-value danger" id="statBlocked">0</strong>
+          <span class="stat-detail" id="statBlockedDetail">denied plugin decisions</span>
+        </article>
+        <article class="stat">
+          <span class="stat-label">Attention</span>
+          <strong class="stat-value warn" id="statAsk">0</strong>
+          <span class="stat-detail">ask / approval required</span>
+        </article>
+        <article class="stat">
+          <span class="stat-label">Hosts</span>
+          <strong class="stat-value" id="statHosts">0</strong>
+          <span class="stat-detail" id="statHostList">waiting for events</span>
+        </article>
+        <article class="stat">
+          <span class="stat-label">Session</span>
+          <strong class="stat-value mono" id="statSession">—</strong>
+          <span class="stat-detail" id="statWorkspace">local evidence only</span>
+        </article>
+      </section>
+
+      <div class="toolbar">
+        <div class="filters" id="hostFilter" role="toolbar" aria-label="Filter by host"></div>
+        <p class="hint">Blocked commands from <code>ryk agent</code> and <code>ryk cloud</code> appear here through host plugins.</p>
+      </div>
+
+      <section class="terminal" aria-labelledby="terminal-title">
+        <div class="terminal-chrome">
+          <div class="dots" aria-hidden="true"><span></span><span></span><span></span></div>
+          <h2 id="terminal-title">ryk@cloud — blocked command stream</h2>
+          <span class="chrome-right" id="chromeStatus">idle</span>
+        </div>
+        <div class="terminal-body" id="terminal-stream" tabindex="0"></div>
+      </section>
+    </div>
+    <script src="./terminal.js" defer></script>
+  </body>
+</html>
