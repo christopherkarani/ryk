@@ -93,6 +93,7 @@ test {
     _ = grok_install;
     _ = plugin_install;
     _ = plugin;
+    _ = @import("plugin_hermes_install.zig");
     _ = @import("openclaw_status.zig");
     _ = start;
     _ = unattended;
