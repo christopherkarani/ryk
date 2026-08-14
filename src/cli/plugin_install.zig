@@ -975,7 +975,7 @@ test "installDirectoryIfSafe upgrades a managed destination without removing unr
 }
 
 test "marketplace atomic write revalidates concurrent changes and removes its temp file" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "marketplace.json", .data = "raced" });
