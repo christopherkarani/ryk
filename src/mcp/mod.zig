@@ -12,4 +12,5 @@ pub const manifests = @import("manifests.zig");
 test {
     _ = transport;
     _ = manifests;
+    _ = proxy;
 }

@@ -221,6 +221,7 @@ fn loadBoundedSessions(
     }
     for (feed) |item| {
         const session_id = item.record.session_id orelse continue;
+        if (core.session.validateSessionIdText(session_id)) |_| {} else |_| continue;
         if (findSession(loaded.sessions.items, item.record.workspace_root, session_id)) |index| {
             const session = &loaded.sessions.items[index];
             if (std.mem.order(u8, item.record.timestamp, session.timestamp) == .gt) {
@@ -324,6 +325,9 @@ fn retainNewestSession(
 }
 
 fn sessionDirectoryExists(io: std.Io, allocator: std.mem.Allocator, workspace_root: []const u8, session_id: []const u8) !bool {
+    core.session.validateSessionIdText(session_id) catch return false;
+    if (std.mem.indexOf(u8, workspace_root, "..") != null) return false;
+    if (std.mem.indexOf(u8, workspace_root, "//") != null) return false;
     const path = try std.fs.path.join(allocator, &.{ workspace_root, ".ryk", "sessions", session_id });
     defer allocator.free(path);
     var dir = std.Io.Dir.cwd().openDir(io, path, .{}) catch return false;

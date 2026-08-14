@@ -518,6 +518,7 @@ fn parseFeedRecord(allocator: std.mem.Allocator, line: []const u8, fallback_work
     errdefer allocator.free(timestamp);
     const workspace_root = try dupWorkspaceRoot(allocator, object, fallback_workspace_root);
     errdefer allocator.free(workspace_root);
+    validateFeedWorkspaceRoot(workspace_root) catch return error.InvalidFeedRecord;
     const event_type = try dupRequiredString(allocator, object, "event_type");
     errdefer allocator.free(event_type);
     const decision = try dupRequiredString(allocator, object, "decision");
@@ -544,6 +545,11 @@ fn parseFeedRecord(allocator: std.mem.Allocator, line: []const u8, fallback_work
     errdefer allocator.free(target_summary);
     const session_id = try dupOptionalString(allocator, object, "session_id");
     errdefer if (session_id) |value| allocator.free(value);
+    if (session_id) |value| {
+        // Reject path segments before aggregate joins session_id into a filesystem
+        // path (directory-existence oracle via ../). Same alphabet as audit writers.
+        core.session.validateSessionIdText(value) catch return error.InvalidFeedRecord;
+    }
     return .{
         .timestamp = timestamp,
         .workspace_root = workspace_root,
@@ -568,6 +574,23 @@ fn dupWorkspaceRoot(allocator: std.mem.Allocator, object: std.json.ObjectMap, fa
     if (try dupOptionalString(allocator, object, "workspace_root")) |root| return root;
     if (fallback) |root| return allocator.dupe(u8, root);
     return error.InvalidFeedRecord;
+}
+
+/// Skip-before-join: reject `..` / `.` segments and extra separators so a
+/// crafted feed `workspace_root` cannot be opened as a directory oracle.
+/// This is a loader skip, not a fail-closed policy deny.
+fn validateFeedWorkspaceRoot(value: []const u8) !void {
+    if (value.len == 0) return error.InvalidFeedRecord;
+    if (std.mem.indexOfScalar(u8, value, 0) != null) return error.InvalidFeedRecord;
+    var it = std.mem.splitAny(u8, value, "/\\");
+    var idx: usize = 0;
+    while (it.next()) |part| : (idx += 1) {
+        if (part.len == 0) {
+            if (idx == 0) continue;
+            return error.InvalidFeedRecord;
+        }
+        if (std.mem.eql(u8, part, "..") or std.mem.eql(u8, part, ".")) return error.InvalidFeedRecord;
+    }
 }
 
 fn dupRequiredString(allocator: std.mem.Allocator, object: std.json.ObjectMap, field: []const u8) ![]u8 {
@@ -687,6 +710,64 @@ test "feed loader accepts legacy records without rule" {
     defer record.deinit(std.testing.allocator);
 
     try std.testing.expect(record.rule == null);
+}
+
+test "feed parse rejects path-traversal workspace_root" {
+    const line =
+        \\{"timestamp":"2026-07-13T00:00:00Z","workspace_root":"/tmp/../outside","event_type":"command_denied","decision":"deny","decision_source":"rust-daemon","event_source":"hook","host":"codex","daemon_status":"healthy","pack_id":"core.shell","severity":"high","reason":"blocked","remediation":null,"target_summary":"shell command (redacted)","session_id":"valid-session","verified":false}
+    ;
+    try std.testing.expectError(error.InvalidFeedRecord, parseFeedRecord(std.testing.allocator, line, null));
+}
+
+test "feed parse rejects path-traversal session_id" {
+    const line =
+        \\{"timestamp":"2026-07-13T00:00:00Z","workspace_root":"/tmp/legacy","event_type":"command_denied","decision":"deny","decision_source":"rust-daemon","event_source":"hook","host":"codex","daemon_status":"healthy","pack_id":"core.shell","severity":"high","reason":"blocked","remediation":null,"target_summary":"shell command (redacted)","session_id":"../outside","verified":false}
+    ;
+    try std.testing.expectError(error.InvalidFeedRecord, parseFeedRecord(std.testing.allocator, line, null));
+}
+
+test "feed loader skips crafted path-traversal session_id line" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+
+    var record = try rust_visibility.buildFeedRecordFromHookDecision(
+        std.testing.allocator,
+        std.testing.io,
+        root,
+        "codex",
+        "healthy",
+        "deny",
+        "blocked",
+        null,
+        null,
+        null,
+        null,
+        "valid-session",
+    );
+    defer record.deinit(std.testing.allocator);
+    try appendRecord(std.testing.io, std.testing.allocator, root, record);
+
+    const path = try feedPath(std.testing.allocator, root);
+    defer std.testing.allocator.free(path);
+    const file = try std.Io.Dir.cwd().createFile(std.testing.io, path, .{ .read = true, .truncate = false });
+    defer file.close(std.testing.io);
+    var buffer: [256]u8 = undefined;
+    var writer = file.writer(std.testing.io, &buffer);
+    try writer.seekToUnbuffered((try file.stat(std.testing.io)).size);
+    try writer.interface.writeAll(
+        \\{"timestamp":"2026-07-13T00:00:00Z","workspace_root":"/tmp/oracle","event_type":"command_denied","decision":"deny","decision_source":"rust-daemon","event_source":"hook","host":"codex","daemon_status":"healthy","pack_id":"core.shell","severity":"high","reason":"blocked","remediation":null,"target_summary":"shell command (redacted)","session_id":"../outside","verified":false}
+        \\
+    );
+    try writer.interface.flush();
+
+    var loaded = try loadRecentWithHealth(std.testing.io, std.testing.allocator, root, 8);
+    defer loaded.deinit(std.testing.allocator);
+    try std.testing.expectEqual(FeedLoadHealth.degraded, loaded.health);
+    try std.testing.expectEqual(@as(usize, 1), loaded.skipped_lines);
+    try std.testing.expectEqual(@as(usize, 1), loaded.records.len);
+    try std.testing.expectEqualStrings("valid-session", loaded.records[0].record.session_id.?);
 }
 
 test "feed loader skips malformed records and reports degraded health" {

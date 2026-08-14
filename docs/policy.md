@@ -261,6 +261,14 @@ audit:
   tamper_evident: true
 ```
 
+**Command glob matching:** `commands.allow` / `commands.deny` globs collapse
+runs of space, tab, and newline to a single space and strip a leading `./`
+or `.//` (or `.\\`) from each word before matching. This is matcher-local
+(whitespace + leading `./`); it is not shell-engine normalization. `cat  .env`,
+`cat<TAB>.env`, and `cat ./.env` therefore still hit a `cat .env` deny.
+Neighbor paths (`cat .env.example`, `cat secrets/.env`) do not. If normalize
+cannot fit the 16KiB bound, evaluation fails closed (deny).
+
 **`.git` / `.ryk` write deny and OS attach:** policy and builtins deny
 `files.write` under `./.git/**` and `./.ryk/**`. When OS sandbox session-attach
 succeeds, those paths are also default **control roots** (write-deny on disk,
@@ -328,7 +336,9 @@ deny into allow. Explicit MCP allow does not override an effect deny.
    (including `open -a Mail mailto:…`), multi-URL `curl` to tagged hosts, and
    command-position matching (including wrappers such as `sudo`/`env`/`xargs`)
    map to `comms.message` / `comms.publish` (matcher `shell_bypass.…`) on Zig
-   `command` / `ryk policy explain command` evaluation.
+   `command` / `ryk policy explain command` evaluation. Tokenization is
+   exhaustive (no 48-token cap): a long `curl -H …` list cannot hide a
+   tagged publish URL past the classifier.
 
 Example residual opt-in (block-style lists):
 

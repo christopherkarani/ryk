@@ -6,6 +6,11 @@ const redact_bridge = @import("redact_bridge.zig");
 pub const hex_hash_len = 64;
 pub const HashHex = [hex_hash_len]u8;
 
+// The chain detects mid-file edits and forks. A complete rewrite of events.jsonl
+// plus summary.json can produce a new internally consistent chain. Detecting that
+// local rewrite is out of scope — no signing. Session end prints the final hash
+// so an operator can copy it out of band and compare later.
+
 pub fn eventHash(previous_hash: ?[]const u8, canonical_event_without_hash: []const u8) HashHex {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     if (previous_hash) |hash| hasher.update(hash);

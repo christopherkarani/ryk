@@ -79,7 +79,8 @@ fn findStructuredSecret(value: []const u8, from: usize) ?SecretSpan {
             if (startsWithIgnoreCase(value[i..], prefix)) {
                 var end = i + prefix.len;
                 while (end < value.len and isTokenChar(value[end])) : (end += 1) {}
-                if (end - i >= 20) return .{ .start = i, .end = end };
+                // 12 catches short provider tokens without matching `sk-learn` (8).
+                if (end - i >= 12) return .{ .start = i, .end = end };
             }
         }
 
@@ -644,25 +645,30 @@ fn looksLikeGithubToken(value: []const u8) bool {
         std.mem.startsWith(u8, value, "gho_") or
         std.mem.startsWith(u8, value, "ghu_") or
         std.mem.startsWith(u8, value, "ghs_") or
-        std.mem.startsWith(u8, value, "ghr_")) and value.len >= 20) or
-        (std.mem.startsWith(u8, value, "github_pat_") and value.len >= 30);
+        std.mem.startsWith(u8, value, "ghr_")) and value.len >= 12) or
+        (std.mem.startsWith(u8, value, "github_pat_") and value.len >= 20);
 }
 
 fn looksLikeOpenAiKey(value: []const u8) bool {
-    return std.mem.startsWith(u8, value, "sk-") and value.len >= 20;
+    return std.mem.startsWith(u8, value, "sk-") and value.len >= 12;
 }
 
 fn looksLikeAnthropicKey(value: []const u8) bool {
-    return std.mem.startsWith(u8, value, "sk-ant-") and value.len >= 24;
+    return std.mem.startsWith(u8, value, "sk-ant-") and value.len >= 16;
 }
 
 fn looksLikeJwt(value: []const u8) bool {
+    // Standard JWT headers are base64url(`{…}`) and therefore start with `eyJ`.
+    // Without that prefix, dotted identifiers (`files.read.deny`,
+    // `classifier.local.prototype`) become false positives once part length
+    // drops below 8.
+    if (!std.mem.startsWith(u8, value, "eyJ")) return false;
     var parts: usize = 0;
     var start: usize = 0;
     while (start <= value.len) {
         const dot = std.mem.indexOfScalarPos(u8, value, start, '.') orelse value.len;
         const part = value[start..dot];
-        if (part.len < 8) return false;
+        if (part.len < 4) return false;
         for (part) |char| {
             if (!(std.ascii.isAlphanumeric(char) or char == '-' or char == '_')) return false;
         }
@@ -675,7 +681,12 @@ fn looksLikeJwt(value: []const u8) bool {
 
 fn looksHighEntropy(value: []const u8) bool {
     if (value.len < 32 or value.len > 512) return false;
-    if (std.mem.indexOfAny(u8, value, "/\\:") != null) return false;
+    // `\` and `:` still skip (Windows paths, URLs, host:port). `/` is in the
+    // standard base64 alphabet, so rejecting it let padded secrets evade.
+    // Absolute/home/relative path prefixes stay out to keep the FP rate sane.
+    if (std.mem.indexOfAny(u8, value, "\\:") != null) return false;
+    if (value[0] == '/' or value[0] == '~') return false;
+    if (std.mem.indexOf(u8, value, "./") != null or std.mem.indexOf(u8, value, ".\\") != null) return false;
     var classes: u8 = 0;
     var unique = [_]bool{false} ** 256;
     var unique_count: usize = 0;
@@ -757,6 +768,17 @@ test "secret value detection covers synthetic examples" {
     try std.testing.expect(classifySecretValue("Aa0Bb1Cc2Dd3Ee4Ff5Gg6Hh7Ii8Jj9Kk") != null);
     try std.testing.expect(classifySecretValue("{\"type\":\"service_account\",\"private_key\":\"FAKE\"}") != null);
     try std.testing.expect(classifySecretValue("/Users/fake/ryk/path/with/mixed/Chars123") == null);
+    // Standard base64 `/` must not skip the entropy heuristic.
+    try std.testing.expect(classifySecretValue("Aa0Bb1Cc2Dd3Ee4Ff5Gg6Hh7/Ii8Jj9Kk") != null);
+    // Compact JWT parts under 8 chars (same alphabet as the fixture above).
+    try std.testing.expect(classifySecretValue("eyJhbGc.eyJzdWI.c2lnbmF0dXJl") != null);
+    try std.testing.expect(classifySecretValue("1.2.3") == null);
+    try std.testing.expect(classifySecretValue("files.read.deny") == null);
+    try std.testing.expect(classifySecretValue("classifier.local.prototype") == null);
+    // Provider prefixes shorter than the old 20-char floor.
+    try std.testing.expect(classifySecretValue("ghp_fakeSynthetic") != null);
+    try std.testing.expect(classifySecretValue("sk-fakeSynthetic") != null);
+    try std.testing.expect(classifySecretValue("sk-learn") == null);
 }
 
 test "redaction labels are stable and do not include raw value" {
@@ -1184,6 +1206,51 @@ test "triple percent and base64-of-percent secrets redact on alloc and bounded p
         const bounded = redactStringBounded(value, &buffer);
         try std.testing.expectEqualStrings(redacted_value, bounded);
         try std.testing.expect(std.mem.indexOf(u8, bounded, "correct-horse") == null);
+    }
+}
+
+test "redactor closes base64 slash short jwt prefix and url-embedded classes" {
+    // Extend existing synthetic fixtures only — no invented raw secrets.
+    const cases = [_][]const u8{
+        "Aa0Bb1Cc2Dd3Ee4Ff5Gg6Hh7/Ii8Jj9Kk",
+        "eyJhbGc.eyJzdWI.c2lnbmF0dXJl",
+        "ghp_fakeSynthetic",
+        "sk-fakeSynthetic",
+        // Query-embedded forms (userinfo `scheme://user:pw@host` is already closed).
+        "https://example.invalid/?q=ghp_fakeSynthetic",
+        "https://example.invalid/?state=Aa0Bb1Cc2Dd3Ee4Ff5Gg6Hh7/Ii8Jj9Kk",
+    };
+    const raw_markers = [_][]const u8{
+        "Aa0Bb1Cc2Dd3Ee4Ff5Gg6Hh7/Ii8Jj9Kk",
+        "eyJhbGc.eyJzdWI.c2lnbmF0dXJl",
+        "ghp_fakeSynthetic",
+        "sk-fakeSynthetic",
+        "ghp_fakeSynthetic",
+        "Aa0Bb1Cc2Dd3Ee4Ff5Gg6Hh7/Ii8Jj9Kk",
+    };
+    for (cases, raw_markers) |value, secret| {
+        const owned = try redactAlloc(std.testing.allocator, value);
+        defer std.testing.allocator.free(owned);
+        try std.testing.expect(std.mem.indexOf(u8, owned, secret) == null);
+        try std.testing.expect(std.mem.indexOf(u8, owned, redacted_value) != null or std.mem.indexOf(u8, owned, "[REDACTED:") != null);
+
+        var buffer: [256]u8 = undefined;
+        const bounded = redactStringBounded(value, &buffer);
+        try std.testing.expect(std.mem.indexOf(u8, bounded, secret) == null);
+    }
+
+    // Path-shaped, short-prefix, and dotted rule/matcher ids must stay unredacted.
+    const benign = [_][]const u8{
+        "/Users/fake/ryk/path/with/mixed/Chars123",
+        "sk-learn",
+        "https://example.invalid/health",
+        "files.read.deny",
+        "comms.message [medium classifier.local.prototype]",
+    };
+    for (benign) |value| {
+        const unchanged = try redactAlloc(std.testing.allocator, value);
+        defer std.testing.allocator.free(unchanged);
+        try std.testing.expectEqualStrings(value, unchanged);
     }
 }
 

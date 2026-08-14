@@ -63,6 +63,9 @@ pub fn runWithServer(
     client_writer: anytype,
     server: ServerIo,
 ) !void {
+    var session_approvals = intercept.approvals.SessionApprovals.init(allocator);
+    defer session_approvals.deinit();
+
     var metadata_gates = std.StringHashMap(MetadataGate).init(allocator);
     defer {
         var it = metadata_gates.iterator();
@@ -126,13 +129,13 @@ pub fn runWithServer(
         }
 
         if (std.mem.eql(u8, method, "tools/call")) {
-            try handleToolsCall(allocator, config, client_reader, client_writer, server, owned_line, message.value(), &metadata_gates);
+            try handleToolsCall(allocator, config, client_reader, client_writer, server, owned_line, message.value(), &metadata_gates, &session_approvals);
         } else if (std.mem.eql(u8, method, "resources/read")) {
-            try handleResourceRead(allocator, config, client_reader, client_writer, server, owned_line, message.value());
+            try handleResourceRead(allocator, config, client_reader, client_writer, server, owned_line, message.value(), &session_approvals);
         } else if (std.mem.eql(u8, method, "prompts/get")) {
-            try handlePromptGet(allocator, config, client_reader, client_writer, server, owned_line, message.value());
+            try handlePromptGet(allocator, config, client_reader, client_writer, server, owned_line, message.value(), &session_approvals);
         } else if (sampling.isSamplingMethod(method)) {
-            try handleSamplingRequest(allocator, config, client_reader, client_writer, server, owned_line, message.value());
+            try handleSamplingRequest(allocator, config, client_reader, client_writer, server, owned_line, message.value(), &session_approvals);
         } else {
             // Deny-default (P1-3): only allowlisted side-effect-free methods
             // forward without policy gating. Unknown, vendor-namespaced, or
@@ -147,7 +150,7 @@ pub fn runWithServer(
                 try jsonrpc.writeErrorResponse(client_writer, message.id(), .policy_denied, "MCP method denied by ryk policy proxy (unknown method)");
                 continue;
             }
-            const response = try requestServerForClient(allocator, config, client_reader, client_writer, server, owned_line);
+            const response = try requestServerForClient(allocator, config, client_reader, client_writer, server, owned_line, &session_approvals);
             defer allocator.free(response);
             var parsed_response = jsonrpc.parseLine(allocator, response) catch {
                 try jsonrpc.writeErrorResponse(client_writer, message.id(), .internal_error, "MCP server emitted invalid JSON-RPC");
@@ -236,13 +239,15 @@ fn handleToolsCall(
     request_line: []const u8,
     request_value: std.json.Value,
     metadata_gates: *std.StringHashMap(MetadataGate),
+    session_approvals: *intercept.approvals.SessionApprovals,
 ) !void {
     const tool_name = jsonrpc.toolCallName(request_value) orelse {
         try jsonrpc.writeErrorResponse(client_writer, jsonrpc.idOf(request_value), .invalid_params, "tools/call missing params.name");
         return;
     };
-    const target = try toolTargetDisplay(allocator, config.server_name, tool_name, jsonrpc.toolCallArguments(request_value));
-    defer allocator.free(target);
+    const fingerprint = try approvalFingerprint(allocator, "tools/call", config.server_name, tool_name, jsonrpc.toolCallArguments(request_value));
+    defer fingerprint.deinit(allocator);
+    const target = fingerprint.display;
 
     // Option A: MCPToolAction stays name-only; structural args flow through mcpToolCallWithArgs.
     var owned_args: ?policy_mod.effects.OwnedArgsView = null;
@@ -290,16 +295,13 @@ fn handleToolsCall(
             try jsonrpc.writeErrorResponse(client_writer, jsonrpc.idOf(request_value), .policy_denied, "MCP tool call denied by flagged metadata");
             return;
         }
-        const choice = try intercept.approvals.prompt(config.approval_reader.?, config.approval_writer.?, .{
+        const final = try applyInteractiveApproval(allocator, config, session_approvals, fingerprint.persist_key, metadata_decision, .{
             .command = target,
             .risk_class = gate.risk.toString(),
             .risk_reason = gate.reason,
             .policy_reason = "MCP tool metadata was flagged during tools/list",
             .matched_rule = null,
         });
-        var session_approvals = intercept.approvals.SessionApprovals.init(allocator);
-        defer session_approvals.deinit();
-        const final = try intercept.approvals.applyApproval(allocator, metadata_decision, target, &session_approvals, choice);
         defer allocator.free(final.reason);
         if (!final.allowsExecution(config.mode == .ci)) {
             try appendAudit(config.audit_writer, .user_denial, .approval, target, final);
@@ -326,16 +328,13 @@ fn handleToolsCall(
             return;
         }
 
-        const choice = try intercept.approvals.prompt(config.approval_reader.?, config.approval_writer.?, .{
+        const final = try applyInteractiveApproval(allocator, config, session_approvals, fingerprint.persist_key, policy_decision, .{
             .command = target,
             .risk_class = "mcp_tool",
             .risk_reason = policy_decision.reason,
             .policy_reason = eval.explanation,
             .matched_rule = if (eval.matched_rule) |rule| rule.id else null,
         });
-        var session_approvals = intercept.approvals.SessionApprovals.init(allocator);
-        defer session_approvals.deinit();
-        const final = try intercept.approvals.applyApproval(allocator, policy_decision, target, &session_approvals, choice);
         defer allocator.free(final.reason);
         if (!final.allowsExecution(config.mode == .ci)) {
             try appendAudit(config.audit_writer, .user_denial, .approval, target, final);
@@ -351,7 +350,7 @@ fn handleToolsCall(
     }
 
     try appendAudit(config.audit_writer, .mcp_tool_call_allowed, .mcp_tool, target, policy_decision);
-    const response = try requestServerForClient(allocator, config, client_reader, client_writer, server, request_line);
+    const response = try requestServerForClient(allocator, config, client_reader, client_writer, server, request_line, session_approvals);
     defer allocator.free(response);
     var parsed_response = jsonrpc.parseLine(allocator, response) catch {
         try jsonrpc.writeErrorResponse(client_writer, jsonrpc.idOf(request_value), .internal_error, "MCP server emitted invalid JSON-RPC");
@@ -428,6 +427,7 @@ fn requestServerForClient(
     client_writer: anytype,
     server: ServerIo,
     request_line: []const u8,
+    session_approvals: *intercept.approvals.SessionApprovals,
 ) ![]u8 {
     var response = try server.request(server.context, allocator, request_line);
     while (true) {
@@ -435,7 +435,7 @@ fn requestServerForClient(
         const method = parsed.method();
         if (method) |method_name| {
             if (jsonrpc.idOf(parsed.value()) != null and sampling.isSamplingMethod(method_name)) {
-                try handleServerOriginatedSampling(allocator, config, client_reader, client_writer, server, parsed.value(), response);
+                try handleServerOriginatedSampling(allocator, config, client_reader, client_writer, server, parsed.value(), response, session_approvals);
                 parsed.deinit();
                 allocator.free(response);
                 const read = server.read orelse return error.McpServerOriginatedSamplingRequiresReadableTransport;
@@ -456,10 +456,13 @@ fn handleServerOriginatedSampling(
     server: ServerIo,
     request_value: std.json.Value,
     request_line: []const u8,
+    session_approvals: *intercept.approvals.SessionApprovals,
 ) !void {
     const model_name = sampling.model(request_value);
-    const target = try sampling.targetDisplay(allocator, config.server_name, model_name, sampling.params(request_value));
-    defer allocator.free(target);
+    const sampling_method = jsonrpc.methodOf(request_value) orelse "sampling/createMessage";
+    const fingerprint = try approvalFingerprint(allocator, sampling_method, config.server_name, model_name orelse "sampling", sampling.params(request_value));
+    defer fingerprint.deinit(allocator);
+    const target = fingerprint.display;
 
     var eval = try policy_mod.evaluate.action(
         config.policy,
@@ -495,16 +498,13 @@ fn handleServerOriginatedSampling(
             try sendServerSamplingError(allocator, server, request_value, "MCP sampling request denied by policy");
             return;
         }
-        const choice = try intercept.approvals.prompt(config.approval_reader.?, config.approval_writer.?, .{
+        const final = try applyInteractiveApproval(allocator, config, session_approvals, fingerprint.persist_key, decision, .{
             .command = target,
             .risk_class = "mcp_sampling",
             .risk_reason = decision.reason,
             .policy_reason = decision.reason,
             .matched_rule = decision.rule_id,
         });
-        var session_approvals = intercept.approvals.SessionApprovals.init(allocator);
-        defer session_approvals.deinit();
-        const final = try intercept.approvals.applyApproval(allocator, decision, target, &session_approvals, choice);
         defer allocator.free(final.reason);
         if (!final.allowsExecution(config.mode == .ci)) {
             try appendAudit(config.audit_writer, .user_denial, .approval, target, final);
@@ -622,13 +622,15 @@ fn handleResourceRead(
     server: ServerIo,
     request_line: []const u8,
     request_value: std.json.Value,
+    session_approvals: *intercept.approvals.SessionApprovals,
 ) !void {
     const uri = resources.readUri(request_value) orelse {
         try jsonrpc.writeErrorResponse(client_writer, jsonrpc.idOf(request_value), .invalid_params, "resources/read missing params.uri");
         return;
     };
-    const target = try resources.targetDisplay(allocator, config.server_name, uri);
-    defer allocator.free(target);
+    const fingerprint = try approvalFingerprint(allocator, "resources/read", config.server_name, uri, null);
+    defer fingerprint.deinit(allocator);
+    const target = fingerprint.display;
 
     var eval = try policy_mod.evaluate.action(
         config.policy,
@@ -655,9 +657,9 @@ fn handleResourceRead(
         };
     }
     try appendAudit(config.audit_writer, .mcp_resource_read, .mcp_resource, target, decision);
-    if (!try enforceDecision(allocator, config, client_writer, jsonrpc.idOf(request_value), .mcp_resource_read, .mcp_resource, target, decision, "MCP resource read denied by policy")) return;
+    if (!try enforceDecision(allocator, config, client_writer, jsonrpc.idOf(request_value), .mcp_resource_read, .mcp_resource, target, fingerprint.persist_key, decision, "MCP resource read denied by policy", session_approvals)) return;
 
-    const response = try requestServerForClient(allocator, config, client_reader, client_writer, server, request_line);
+    const response = try requestServerForClient(allocator, config, client_reader, client_writer, server, request_line, session_approvals);
     defer allocator.free(response);
     if (resources.responseTooLarge(response)) {
         try appendAudit(config.audit_writer, .mcp_resource_read, .mcp_resource, target, .{
@@ -689,13 +691,15 @@ fn handlePromptGet(
     server: ServerIo,
     request_line: []const u8,
     request_value: std.json.Value,
+    session_approvals: *intercept.approvals.SessionApprovals,
 ) !void {
     const prompt_name = prompts.getName(request_value) orelse {
         try jsonrpc.writeErrorResponse(client_writer, jsonrpc.idOf(request_value), .invalid_params, "prompts/get missing params.name");
         return;
     };
-    const target = try prompts.targetDisplay(allocator, config.server_name, prompt_name, prompts.arguments(request_value));
-    defer allocator.free(target);
+    const fingerprint = try approvalFingerprint(allocator, "prompts/get", config.server_name, prompt_name, prompts.arguments(request_value));
+    defer fingerprint.deinit(allocator);
+    const target = fingerprint.display;
 
     var eval = try policy_mod.evaluate.action(
         config.policy,
@@ -709,9 +713,9 @@ fn handlePromptGet(
     defer influenced.deinit(allocator);
     const decision = influenced.decision;
     try appendAudit(config.audit_writer, .mcp_prompt_get, .mcp_prompt, target, decision);
-    if (!try enforceDecision(allocator, config, client_writer, jsonrpc.idOf(request_value), .mcp_prompt_get, .mcp_prompt, target, decision, "MCP prompt get denied by policy")) return;
+    if (!try enforceDecision(allocator, config, client_writer, jsonrpc.idOf(request_value), .mcp_prompt_get, .mcp_prompt, target, fingerprint.persist_key, decision, "MCP prompt get denied by policy", session_approvals)) return;
 
-    const response = try requestServerForClient(allocator, config, client_reader, client_writer, server, request_line);
+    const response = try requestServerForClient(allocator, config, client_reader, client_writer, server, request_line, session_approvals);
     defer allocator.free(response);
     if (response.len > core.limits.max_event_field_len) {
         try jsonrpc.writeErrorResponse(client_writer, jsonrpc.idOf(request_value), .message_too_large, "MCP prompt response too large");
@@ -737,10 +741,13 @@ fn handleSamplingRequest(
     server: ServerIo,
     request_line: []const u8,
     request_value: std.json.Value,
+    session_approvals: *intercept.approvals.SessionApprovals,
 ) !void {
     const model_name = sampling.model(request_value);
-    const target = try sampling.targetDisplay(allocator, config.server_name, model_name, sampling.params(request_value));
-    defer allocator.free(target);
+    const sampling_method = jsonrpc.methodOf(request_value) orelse "sampling/createMessage";
+    const fingerprint = try approvalFingerprint(allocator, sampling_method, config.server_name, model_name orelse "sampling", sampling.params(request_value));
+    defer fingerprint.deinit(allocator);
+    const target = fingerprint.display;
 
     var eval = try policy_mod.evaluate.action(
         config.policy,
@@ -762,9 +769,9 @@ fn handleSamplingRequest(
         };
     }
     try appendAudit(config.audit_writer, .mcp_sampling_request, .mcp_sampling, target, decision);
-    if (!try enforceDecision(allocator, config, client_writer, jsonrpc.idOf(request_value), .mcp_sampling_request, .mcp_sampling, target, decision, "MCP sampling request denied by policy")) return;
+    if (!try enforceDecision(allocator, config, client_writer, jsonrpc.idOf(request_value), .mcp_sampling_request, .mcp_sampling, target, fingerprint.persist_key, decision, "MCP sampling request denied by policy", session_approvals)) return;
 
-    const response = try requestServerForClient(allocator, config, client_reader, client_writer, server, request_line);
+    const response = try requestServerForClient(allocator, config, client_reader, client_writer, server, request_line, session_approvals);
     defer allocator.free(response);
     if (response.len > core.limits.max_event_field_len) {
         try jsonrpc.writeErrorResponse(client_writer, jsonrpc.idOf(request_value), .message_too_large, "MCP sampling response too large");
@@ -782,6 +789,43 @@ fn handleSamplingRequest(
     try @import("stdio.zig").writeRawMessage(client_writer, response);
 }
 
+fn applyInteractiveApproval(
+    allocator: std.mem.Allocator,
+    config: Config,
+    session_approvals: *intercept.approvals.SessionApprovals,
+    persist_key: ?[]const u8,
+    decision: core.decision.Decision,
+    request: intercept.approvals.PromptRequest,
+) !core.decision.Decision {
+    if (decision.result != .ask) {
+        const reason = try allocator.dupe(u8, decision.reason);
+        return .{
+            .result = decision.result,
+            .rule_id = decision.rule_id,
+            .reason = reason,
+            .risk_score = decision.risk_score,
+            .requires_user = decision.requires_user,
+            .ci_may_proceed = decision.ci_may_proceed,
+        };
+    }
+    if (persist_key) |key| {
+        if (session_approvals.contains(key)) {
+            const reason = try std.fmt.allocPrint(allocator, "session approval matched command: {s}", .{key});
+            return .{
+                .result = .allow,
+                .reason = reason,
+                .risk_score = decision.risk_score,
+                .ci_may_proceed = true,
+            };
+        }
+    }
+    const choice = try intercept.approvals.prompt(config.approval_reader.?, config.approval_writer.?, request);
+    if (choice == .allow_session and persist_key == null) {
+        return intercept.approvals.applyApproval(allocator, decision, request.command, session_approvals, .allow_once);
+    }
+    return intercept.approvals.applyApproval(allocator, decision, persist_key orelse request.command, session_approvals, choice);
+}
+
 fn enforceDecision(
     allocator: std.mem.Allocator,
     config: Config,
@@ -790,8 +834,10 @@ fn enforceDecision(
     event_type: core.event.EventType,
     target_kind: core.types.TargetKind,
     target: []const u8,
+    persist_key: ?[]const u8,
     decision: core.decision.Decision,
     error_message: []const u8,
+    session_approvals: *intercept.approvals.SessionApprovals,
 ) !bool {
     if (decision.result == .ask) {
         if (config.mode == .ci or config.approval_reader == null or config.approval_writer == null) {
@@ -806,16 +852,13 @@ fn enforceDecision(
             try jsonrpc.writeErrorResponse(client_writer, id, .policy_denied, error_message);
             return false;
         }
-        const choice = try intercept.approvals.prompt(config.approval_reader.?, config.approval_writer.?, .{
+        const final = try applyInteractiveApproval(allocator, config, session_approvals, persist_key, decision, .{
             .command = target,
             .risk_class = @tagName(target_kind),
             .risk_reason = decision.reason,
             .policy_reason = decision.reason,
             .matched_rule = decision.rule_id,
         });
-        var session_approvals = intercept.approvals.SessionApprovals.init(allocator);
-        defer session_approvals.deinit();
-        const final = try intercept.approvals.applyApproval(allocator, decision, target, &session_approvals, choice);
         defer allocator.free(final.reason);
         if (!final.allowsExecution(config.mode == .ci)) {
             try appendAudit(config.audit_writer, .user_denial, .approval, target, final);
@@ -874,14 +917,42 @@ fn appendAudit(
     try writer.appendEvent(ev);
 }
 
-fn toolTargetDisplay(allocator: std.mem.Allocator, server_name: []const u8, tool_name: []const u8, args: ?std.json.Value) ![]u8 {
-    if (args) |arguments| {
-        const arg_text = jsonrpc.stringifyAlloc(allocator, arguments, 16 * 1024) catch
-            return std.fmt.allocPrint(allocator, "{s}.{s} args=[arguments omitted]", .{ server_name, tool_name });
-        defer allocator.free(arg_text);
-        return std.fmt.allocPrint(allocator, "{s}.{s} args={s}", .{ server_name, tool_name, arg_text });
+const ApprovalFingerprint = struct {
+    display: []u8,
+    persist_key: ?[]u8,
+
+    fn deinit(self: ApprovalFingerprint, allocator: std.mem.Allocator) void {
+        if (self.persist_key) |key| {
+            if (key.ptr != self.display.ptr) allocator.free(key);
+        }
+        allocator.free(self.display);
     }
-    return std.fmt.allocPrint(allocator, "{s}.{s}", .{ server_name, tool_name });
+};
+
+/// Always-this-session key: JSON-RPC method + canonical args.
+/// Stringify overflow is not persistable — never store `args=[arguments omitted]`.
+fn approvalFingerprint(
+    allocator: std.mem.Allocator,
+    method: []const u8,
+    server_name: []const u8,
+    name: []const u8,
+    args: ?std.json.Value,
+) !ApprovalFingerprint {
+    if (args) |arguments| {
+        const arg_text = jsonrpc.stringifyAlloc(allocator, arguments, 16 * 1024) catch {
+            const display = try std.fmt.allocPrint(
+                allocator,
+                "{s} {s}.{s} args=[arguments omitted]",
+                .{ method, server_name, name },
+            );
+            return .{ .display = display, .persist_key = null };
+        };
+        defer allocator.free(arg_text);
+        const key = try std.fmt.allocPrint(allocator, "{s} {s}.{s} args={s}", .{ method, server_name, name, arg_text });
+        return .{ .display = key, .persist_key = key };
+    }
+    const key = try std.fmt.allocPrint(allocator, "{s} {s}.{s}", .{ method, server_name, name });
+    return .{ .display = key, .persist_key = key };
 }
 
 fn errorCodeForParseError(err: anyerror) jsonrpc.ErrorCode {
@@ -903,6 +974,7 @@ const FakeServer = struct {
     allocator: std.mem.Allocator,
     saw_initialize: bool = false,
     saw_safe_call: bool = false,
+    tool_call_count: usize = 0,
     saw_notification: bool = false,
     saw_policy_notification: bool = false,
     saw_resource_read: bool = false,
@@ -922,6 +994,7 @@ const FakeServer = struct {
             return allocator.dupe(u8, "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"search_issues\",\"description\":\"Search issues\",\"inputSchema\":{\"type\":\"object\"}},{\"name\":\"delete_repository\",\"description\":\"Delete repository\",\"inputSchema\":{\"type\":\"object\"}}]}}");
         }
         if (std.mem.eql(u8, method, "tools/call")) {
+            self.tool_call_count += 1;
             if (std.mem.eql(u8, jsonrpc.toolCallName(parsed.value()).?, "search_issues")) self.saw_safe_call = true;
             return allocator.dupe(u8, "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]}}");
         }
@@ -1050,6 +1123,172 @@ test "proxy allows safe tool and blocks denied tool with json-rpc error" {
     try std.testing.expect(std.mem.indexOf(u8, output_writer.buffered(), "\"result\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, output_writer.buffered(), "\"error\"") != null);
     try std.testing.expect(try @import("stdio.zig").isProtocolCleanOutput(output_writer.buffered(), std.testing.allocator));
+}
+
+test "session always approval persists across two tool calls" {
+    const load = policy_mod.load;
+    var policy = try load.parseFromSlice(std.testing.allocator,
+        \\version: 1
+        \\mode: strict
+        \\mcp:
+        \\  default: ask
+    , "test.yaml");
+    defer policy.deinit();
+    var server = FakeServer{ .allocator = std.testing.allocator };
+    var input: std.Io.Reader = .fixed("{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"create_issue\"}}\n" ++
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"create_issue\"}}\n");
+    var output_buf: [2048]u8 = undefined;
+    var output_writer: std.Io.Writer = .fixed(&output_buf);
+    var approval_input: std.Io.Reader = .fixed("A\n");
+    var approval_out_buf: [4096]u8 = undefined;
+    var approval_out: std.Io.Writer = .fixed(&approval_out_buf);
+    try runWithServer(std.testing.allocator, .{
+        .server_name = "fake",
+        .server_command_display = "fake",
+        .policy = &policy,
+        .mode = .strict,
+        .approval_reader = &approval_input,
+        .approval_writer = &approval_out,
+    }, &input, &output_writer, .{ .context = &server, .request = FakeServer.request, .notify = FakeServer.notify });
+    try std.testing.expectEqual(@as(usize, 2), server.tool_call_count);
+    try std.testing.expect(std.mem.indexOf(u8, output_writer.buffered(), "\"error\"") == null);
+    const prompt = approval_out.buffered();
+    const first = std.mem.indexOf(u8, prompt, "ryk wants your approval") orelse return error.TestExpectedEqual;
+    try std.testing.expect(std.mem.indexOf(u8, prompt[first + 1 ..], "ryk wants your approval") == null);
+}
+
+test "session always approval does not reuse different args" {
+    const load = policy_mod.load;
+    var policy = try load.parseFromSlice(std.testing.allocator,
+        \\version: 1
+        \\mode: strict
+        \\mcp:
+        \\  default: ask
+    , "test.yaml");
+    defer policy.deinit();
+    var server = FakeServer{ .allocator = std.testing.allocator };
+    var input: std.Io.Reader = .fixed("{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"create_issue\",\"arguments\":{\"title\":\"a\"}}}\n" ++
+        "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"create_issue\",\"arguments\":{\"title\":\"b\"}}}\n");
+    var output_buf: [2048]u8 = undefined;
+    var output_writer: std.Io.Writer = .fixed(&output_buf);
+    var approval_input: std.Io.Reader = .fixed("A\n");
+    var approval_out_buf: [4096]u8 = undefined;
+    var approval_out: std.Io.Writer = .fixed(&approval_out_buf);
+    try runWithServer(std.testing.allocator, .{
+        .server_name = "fake",
+        .server_command_display = "fake",
+        .policy = &policy,
+        .mode = .strict,
+        .approval_reader = &approval_input,
+        .approval_writer = &approval_out,
+    }, &input, &output_writer, .{ .context = &server, .request = FakeServer.request, .notify = FakeServer.notify });
+    try std.testing.expectEqual(@as(usize, 1), server.tool_call_count);
+    const prompt = approval_out.buffered();
+    const first = std.mem.indexOf(u8, prompt, "ryk wants your approval") orelse return error.TestExpectedEqual;
+    try std.testing.expect(std.mem.indexOf(u8, prompt[first + 1 ..], "ryk wants your approval") != null);
+}
+
+test "session once approval does not persist" {
+    const load = policy_mod.load;
+    var policy = try load.parseFromSlice(std.testing.allocator,
+        \\version: 1
+        \\mode: strict
+        \\mcp:
+        \\  default: ask
+    , "test.yaml");
+    defer policy.deinit();
+    var server = FakeServer{ .allocator = std.testing.allocator };
+    var input: std.Io.Reader = .fixed("{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"create_issue\"}}\n" ++
+        "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"create_issue\"}}\n");
+    var output_buf: [2048]u8 = undefined;
+    var output_writer: std.Io.Writer = .fixed(&output_buf);
+    var approval_input: std.Io.Reader = .fixed("a\n");
+    var approval_out_buf: [4096]u8 = undefined;
+    var approval_out: std.Io.Writer = .fixed(&approval_out_buf);
+    try runWithServer(std.testing.allocator, .{
+        .server_name = "fake",
+        .server_command_display = "fake",
+        .policy = &policy,
+        .mode = .strict,
+        .approval_reader = &approval_input,
+        .approval_writer = &approval_out,
+    }, &input, &output_writer, .{ .context = &server, .request = FakeServer.request, .notify = FakeServer.notify });
+    try std.testing.expectEqual(@as(usize, 1), server.tool_call_count);
+    const prompt = approval_out.buffered();
+    const first = std.mem.indexOf(u8, prompt, "ryk wants your approval") orelse return error.TestExpectedEqual;
+    try std.testing.expect(std.mem.indexOf(u8, prompt[first + 1 ..], "ryk wants your approval") != null);
+}
+
+test "session always omit-collapse does not reuse" {
+    const load = policy_mod.load;
+    var policy = try load.parseFromSlice(std.testing.allocator,
+        \\version: 1
+        \\mode: strict
+        \\mcp:
+        \\  default: ask
+    , "test.yaml");
+    defer policy.deinit();
+    var blob_a: [17 * 1024]u8 = undefined;
+    @memset(&blob_a, 'a');
+    var blob_b: [17 * 1024]u8 = undefined;
+    @memset(&blob_b, 'b');
+    const line_a = try std.fmt.allocPrint(std.testing.allocator, "{{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{{\"name\":\"create_issue\",\"arguments\":{{\"blob\":\"{s}\"}}}}}}\n", .{blob_a[0..]});
+    defer std.testing.allocator.free(line_a);
+    const line_b = try std.fmt.allocPrint(std.testing.allocator, "{{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{{\"name\":\"create_issue\",\"arguments\":{{\"blob\":\"{s}\"}}}}}}\n", .{blob_b[0..]});
+    defer std.testing.allocator.free(line_b);
+    const combined = try std.mem.concat(std.testing.allocator, u8, &.{ line_a, line_b });
+    defer std.testing.allocator.free(combined);
+    var server = FakeServer{ .allocator = std.testing.allocator };
+    var input: std.Io.Reader = .fixed(combined);
+    var output_buf: [4096]u8 = undefined;
+    var output_writer: std.Io.Writer = .fixed(&output_buf);
+    var approval_input: std.Io.Reader = .fixed("A\n");
+    var approval_out_buf: [8192]u8 = undefined;
+    var approval_out: std.Io.Writer = .fixed(&approval_out_buf);
+    try runWithServer(std.testing.allocator, .{
+        .server_name = "fake",
+        .server_command_display = "fake",
+        .policy = &policy,
+        .mode = .strict,
+        .approval_reader = &approval_input,
+        .approval_writer = &approval_out,
+    }, &input, &output_writer, .{ .context = &server, .request = FakeServer.request, .notify = FakeServer.notify });
+    try std.testing.expectEqual(@as(usize, 1), server.tool_call_count);
+    const prompt = approval_out.buffered();
+    const first = std.mem.indexOf(u8, prompt, "ryk wants your approval") orelse return error.TestExpectedEqual;
+    try std.testing.expect(std.mem.indexOf(u8, prompt[first + 1 ..], "ryk wants your approval") != null);
+}
+
+test "tool vs prompt name collision still prompts" {
+    const load = policy_mod.load;
+    var policy = try load.parseFromSlice(std.testing.allocator,
+        \\version: 1
+        \\mode: strict
+        \\mcp:
+        \\  default: ask
+    , "test.yaml");
+    defer policy.deinit();
+    var server = FakeServer{ .allocator = std.testing.allocator };
+    var input: std.Io.Reader = .fixed("{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"review\"}}\n" ++
+        "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"prompts/get\",\"params\":{\"name\":\"review\"}}\n");
+    var output_buf: [2048]u8 = undefined;
+    var output_writer: std.Io.Writer = .fixed(&output_buf);
+    var approval_input: std.Io.Reader = .fixed("A\n");
+    var approval_out_buf: [4096]u8 = undefined;
+    var approval_out: std.Io.Writer = .fixed(&approval_out_buf);
+    try runWithServer(std.testing.allocator, .{
+        .server_name = "fake",
+        .server_command_display = "fake",
+        .policy = &policy,
+        .mode = .strict,
+        .approval_reader = &approval_input,
+        .approval_writer = &approval_out,
+    }, &input, &output_writer, .{ .context = &server, .request = FakeServer.request, .notify = FakeServer.notify });
+    try std.testing.expectEqual(@as(usize, 1), server.tool_call_count);
+    try std.testing.expect(!server.saw_prompt_get);
+    const prompt = approval_out.buffered();
+    const first = std.mem.indexOf(u8, prompt, "ryk wants your approval") orelse return error.TestExpectedEqual;
+    try std.testing.expect(std.mem.indexOf(u8, prompt[first + 1 ..], "ryk wants your approval") != null);
 }
 
 test "ask tool denies in ci mode without approval prompt" {

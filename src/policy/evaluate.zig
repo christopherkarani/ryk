@@ -609,6 +609,9 @@ fn evaluateRuleSet(
     rules: schema.RuleSet,
     value: []const u8,
 ) !schema.Evaluation {
+    if (surface == .command and matchers.commandGlobNormalizeOverflows(value)) {
+        return commandNormalizeOverflowDeny(allocator, label);
+    }
     if (findMatch(surface, rules.deny, value)) |match| return explicit(allocator, mode, .deny, try std.fmt.allocPrint(allocator, "{s}.deny", .{label}), match.index, match.pattern);
     if (try builtinHardDeny(allocator, surface, value)) |evaluation| return evaluation;
     if (findMatch(surface, rules.allow, value)) |match| return explicit(allocator, mode, .allow, try std.fmt.allocPrint(allocator, "{s}.allow", .{label}), match.index, match.pattern);
@@ -724,6 +727,23 @@ fn explicitOwnedLabel(
 ) !schema.Evaluation {
     const owned_label = try allocator.dupe(u8, label);
     return explicit(allocator, mode, decision_value, owned_label, match.index, match.pattern);
+}
+
+fn commandNormalizeOverflowDeny(allocator: std.mem.Allocator, label: []const u8) !schema.Evaluation {
+    const rule_id = try std.fmt.allocPrint(allocator, "{s}.normalize_overflow", .{label});
+    errdefer allocator.free(rule_id);
+    const explanation = try allocator.dupe(u8, "command glob normalize overflow (fail closed)");
+    return .{
+        .decision = .{
+            .result = .deny,
+            .rule_id = rule_id,
+            .reason = explanation,
+            .ci_may_proceed = false,
+        },
+        .matched_rule = .{ .id = rule_id, .pattern = "" },
+        .explanation = explanation,
+        .owned_rule_id = rule_id,
+    };
 }
 
 fn riskDecision(allocator: std.mem.Allocator, mode: schema.Mode, risk: Risk) !schema.Evaluation {
@@ -944,6 +964,62 @@ test "deny priority beats allow for file paths" {
     defer result.deinit(std.testing.allocator);
     try std.testing.expectEqual(core.decision.DecisionResult.deny, result.decision.result);
     try std.testing.expectEqualStrings("files.read.deny[0]", result.matched_rule.?.id);
+}
+
+test "preset command denies survive whitespace tab and dot-slash evasions" {
+    const load = @import("load.zig");
+    var policy = try load.parseFromSlice(std.testing.allocator,
+        \\version: 1
+        \\mode: strict
+        \\commands:
+        \\  default: allow
+        \\  deny:
+        \\    - "cat .env"
+        \\    - "cat ~/.ssh/*"
+    , "command-deny-normalize.yaml");
+    defer policy.deinit();
+
+    const evasions = [_][]const u8{
+        "cat  .env",
+        "cat\t.env",
+        "cat ./.env",
+        "cat .//.env",
+        "cat  ~/.ssh/id_rsa",
+        "cat\t~/.ssh/id_rsa",
+        "cat ./~/.ssh/id_rsa",
+    };
+    for (evasions) |cmd| {
+        var result = try command(&policy, cmd, std.testing.allocator);
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqual(core.decision.DecisionResult.deny, result.decision.result);
+        try std.testing.expect(std.mem.startsWith(u8, result.matched_rule.?.id, "commands.deny"));
+    }
+
+    var neighbor = try command(&policy, "cat .env.example", std.testing.allocator);
+    defer neighbor.deinit(std.testing.allocator);
+    try std.testing.expectEqual(core.decision.DecisionResult.allow, neighbor.decision.result);
+}
+
+test "command glob normalize overflow fails closed deny" {
+    const load = @import("load.zig");
+    var policy = try load.parseFromSlice(std.testing.allocator,
+        \\version: 1
+        \\mode: strict
+        \\commands:
+        \\  default: allow
+        \\  allow:
+        \\    - "*"
+    , "command-overflow-deny.yaml");
+    defer policy.deinit();
+
+    var huge: [16 * 1024 + 8]u8 = undefined;
+    @memset(huge[0..4], 'e');
+    huge[4] = ' ';
+    @memset(huge[5..], 'x');
+    var result = try command(&policy, &huge, std.testing.allocator);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(core.decision.DecisionResult.deny, result.decision.result);
+    try std.testing.expectEqualStrings("commands.normalize_overflow", result.matched_rule.?.id);
 }
 
 test "rule matching covers env command network and mcp" {

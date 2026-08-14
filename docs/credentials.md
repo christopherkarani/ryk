@@ -57,14 +57,14 @@ ryk inspects values and classifies them into specific secret types:
 | Secret Type | Pattern | Example |
 |-------------|---------|---------|
 | **AWS Access Key** | `AKIA` or `ASIA` prefix, 20 chars | `AKIAIOSFODNN7EXAMPLE` |
-| **GitHub Token** | `ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_` prefix (20+ chars) or `github_pat_` (30+ chars) | `ghp_xxxxxxxxxxxxxxxxxxxx` |
-| **OpenAI API Key** | `sk-` prefix, 20+ chars | `sk-xxxxxxxxxxxxxxxxxxxx` |
-| **Anthropic API Key** | `sk-ant-` prefix, 24+ chars | `sk-ant-xxxxxxxxxxxxxxxx` |
-| **JWT** | Three base64 parts separated by dots | `eyJhbG...eyJzdWI...c2lnbmF0dXJl` |
+| **GitHub Token** | `ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_` prefix (12+ chars) or `github_pat_` (20+ chars) | `ghp_xxxxxxxxxxxxxxxxxxxx` |
+| **OpenAI API Key** | `sk-` prefix, 12+ chars | `sk-xxxxxxxxxxxxxxxxxxxx` |
+| **Anthropic API Key** | `sk-ant-` prefix, 16+ chars | `sk-ant-xxxxxxxxxxxxxxxx` |
+| **JWT** | Three base64url parts separated by dots (each part 4+ chars); first part starts with `eyJ` so dotted rule ids are not classified | `eyJhbG...eyJzdWI...c2lnbmF0dXJl` |
 | **PEM Private Key** | `-----BEGIN PRIVATE KEY-----` | RSA/EC private keys |
 | **SSH Private Key** | `-----BEGIN OPENSSH PRIVATE KEY-----` | Ed25519/RSA keys |
 | **Cloud Credentials JSON** | Contains `"type"` + `"service_account"` or `"private_key"` | Google service account |
-| **High-Entropy String** | 32-512 chars, 3+ character classes, 16+ unique chars | Generic API keys |
+| **High-Entropy String** | 32-512 chars, 3+ character classes, 16+ unique chars; `/` allowed (standard base64). Absolute/home/relative path prefixes, `\`, and `:` still skip. | Generic API keys |
 
 ### Redaction Format
 
@@ -439,6 +439,7 @@ The audit log uses hash-chain verification:
 - Each event includes a hash of the previous event
 - Modifying the log breaks the chain
 - Replay verification detects tampering
+- A complete local rewrite of `events.jsonl` and `summary.json` together is out of scope (no signing). Session end prints the final chain hash so it can be checked out of band.
 
 ### Summary Redaction
 

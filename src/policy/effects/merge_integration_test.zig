@@ -120,6 +120,40 @@ test "shell mailto bypass denies under effects deny comms.message" {
     try std.testing.expectEqual(core.decision.DecisionResult.allow, ok.decision.result);
 }
 
+test "shell curl publish still denies after more than 48 header tokens" {
+    var policy = try load.parseFromSlice(std.testing.allocator,
+        \\version: 1
+        \\mode: strict
+        \\commands:
+        \\  default: allow
+        \\effects:
+        \\  deny:
+        \\    - comms.publish
+    , "shell-publish-tokens.yaml");
+    defer policy.deinit();
+
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(std.testing.allocator);
+    try list.appendSlice(std.testing.allocator, "curl");
+    var i: usize = 0;
+    while (i < 25) : (i += 1) {
+        var hdr_buf: [32]u8 = undefined;
+        const hdr = try std.fmt.bufPrint(&hdr_buf, " -H h{d}:v", .{i});
+        try list.appendSlice(std.testing.allocator, hdr);
+    }
+    try list.appendSlice(std.testing.allocator, " https://api.twitter.com/2/tweets");
+
+    var token_count: usize = 0;
+    var it = std.mem.tokenizeAny(u8, list.items, " \t");
+    while (it.next()) |_| token_count += 1;
+    try std.testing.expect(token_count > 48);
+
+    var denied = try evaluate.command(&policy, list.items, std.testing.allocator);
+    defer denied.deinit(std.testing.allocator);
+    try std.testing.expectEqual(core.decision.DecisionResult.deny, denied.decision.result);
+    try std.testing.expect(std.mem.indexOf(u8, denied.decision.reason, "comms.publish") != null);
+}
+
 test "classifier local residual denies acme_mailer_job under effects.deny" {
     var policy = try load.parseFromSlice(std.testing.allocator,
         \\version: 1
