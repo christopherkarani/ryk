@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 const env_util = @import("../env_util.zig");
 const env_schema = @import("env_schema.zig");
@@ -197,13 +198,14 @@ test "empty backpack env schema passes declared public and omits unknown and sen
     try std.testing.expectEqualStrings("/usr/bin", filtered.env_map.get("PATH").?);
 }
 
-test "empty backpack keeps Windows CreateProcess-required keys" {
+test "empty backpack Windows CreateProcess keys stay host-gated" {
     var current = std.process.Environ.Map.init(std.testing.allocator);
     defer current.deinit();
     try current.put("PATH", "C:\\Windows\\System32");
     try current.put("SystemRoot", "C:\\Windows");
     try current.put("COMSPEC", "C:\\Windows\\System32\\cmd.exe");
     try current.put("USERPROFILE", "C:\\Users\\dev");
+    try current.put("APPDATA", "C:\\Users\\dev\\AppData\\Roaming");
     try current.put("OPENAI_API_KEY", "sk-test");
 
     var selected = policy.schema.Policy{ .allocator = std.testing.allocator };
@@ -215,10 +217,17 @@ test "empty backpack keeps Windows CreateProcess-required keys" {
         .{ .secret_boundary = .empty_backpack },
     );
     defer filtered.deinit();
-    try std.testing.expectEqualStrings("C:\\Windows", filtered.env_map.get("SystemRoot").?);
-    try std.testing.expectEqualStrings("C:\\Windows\\System32\\cmd.exe", filtered.env_map.get("COMSPEC").?);
-    try std.testing.expectEqualStrings("C:\\Users\\dev", filtered.env_map.get("USERPROFILE").?);
+    try std.testing.expect(filtered.env_map.get("USERPROFILE") == null);
+    try std.testing.expect(filtered.env_map.get("APPDATA") == null);
     try std.testing.expect(filtered.env_map.get("OPENAI_API_KEY") == null);
+    try std.testing.expectEqualStrings("C:\\Windows\\System32", filtered.env_map.get("PATH").?);
+    if (builtin.os.tag == .windows) {
+        try std.testing.expectEqualStrings("C:\\Windows", filtered.env_map.get("SystemRoot").?);
+        try std.testing.expectEqualStrings("C:\\Windows\\System32\\cmd.exe", filtered.env_map.get("COMSPEC").?);
+    } else {
+        try std.testing.expect(filtered.env_map.get("SystemRoot") == null);
+        try std.testing.expect(filtered.env_map.get("COMSPEC") == null);
+    }
 }
 
 test "no-secrets retains benign AWS and key configuration but removes unknown credential aliases" {
