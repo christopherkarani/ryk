@@ -149,10 +149,16 @@
     session: null,
     source: "demo",
   };
+  state.host = hostFromLocation();
 
   function wantsDemo() {
     const params = new URLSearchParams(location.search);
     return params.has("demo") || params.get("view") === "demo" || location.hash === "#demo";
+  }
+
+  function hostFromLocation() {
+    const params = new URLSearchParams(location.search);
+    return params.get("host") || "all";
   }
 
   function loadDemo() {
