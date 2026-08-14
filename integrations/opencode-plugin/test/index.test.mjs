@@ -6,7 +6,12 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
-import rykPlugin, { findRyk, parseHookResponse } from '../dist/index.js';
+import rykPlugin from '../dist/index.js';
+import tuiModule from '../dist/tui.js';
+
+// Helpers are attached to the default function. Named function exports would be
+// loaded as extra plugins by OpenCode 1.18's legacy loader.
+const { findRyk, parseHookResponse } = rykPlugin;
 
 
 function toastPayload(input) {
@@ -331,6 +336,49 @@ test('missing binary permission.ask toasts error and denies', async () => {
     else process.env.RYK_BIN = originalRykBin;
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test('tool.execute.before pins host tool after args.tool (shell not classified as read)', async () => {
+  // Model/schema may put `tool: "read"` in args. Flattened payload must still
+  // identify bash so shell policy applies (not a README read allow).
+  await withFakeRyk(
+    async (plugin) => {
+      const before = plugin['tool.execute.before'];
+      assert.ok(before);
+      await assert.rejects(
+        before(
+          { tool: 'bash', sessionID: 'session-1', callID: 'call-1' },
+          {
+            args: {
+              command: 'rm -rf build',
+              tool: 'read',
+              path: 'README.md',
+            },
+          }
+        ),
+        (err) => {
+          assertShortBlockThrow(err, /ryk blocked tool execution: command blocked/);
+          return true;
+        }
+      );
+    },
+    `#!/bin/sh
+payload=$(cat)
+printf '%s\\n' "$payload" | node -e '
+let s = "";
+process.stdin.on("data", (d) => { s += d; });
+process.stdin.on("end", () => {
+  const parsed = JSON.parse(s);
+  const tool = parsed && parsed.payload && parsed.payload.tool;
+  if (tool === "bash") {
+    process.stdout.write("{\\"decision\\":\\"block\\",\\"message\\":\\"command blocked\\"}\\n");
+  } else {
+    process.stdout.write("{\\"decision\\":\\"allow\\"}\\n");
+  }
+});
+'
+`
+  );
 });
 
 test('tool.execute.before still hard-blocks ryk ask (no resume on that path)', async () => {
@@ -782,13 +830,163 @@ test('ryk.ts is a single-source sync of src/index.ts', async () => {
   );
 });
 
-test('package metadata publishes the canonical OpenCode drop-in', async () => {
+test('package metadata publishes the canonical OpenCode drop-ins', async () => {
   const packageJson = JSON.parse(await readFile(join(pluginRoot, 'package.json'), 'utf8'));
   assert.deepEqual(
     packageJson.files.filter((file) => file.endsWith('.ts')),
-    ['ryk.ts']
+    ['ryk.ts', 'ryk-tui.ts']
   );
-  assert.equal(packageJson.scripts.build, 'tsc -p tsconfig.json && cp src/index.ts ryk.ts');
+  assert.equal(
+    packageJson.scripts.build,
+    'tsc -p tsconfig.json && cp src/index.ts ryk.ts && cp src/tui.ts ryk-tui.ts'
+  );
+});
+
+test('drop-in has no extra named function exports (OpenCode 1.18 legacy loader)', async () => {
+  const mod = await import('../dist/index.js');
+  const namedFns = Object.entries(mod)
+    .filter(([name, value]) => name !== 'default' && typeof value === 'function')
+    .map(([name]) => name);
+  assert.deepEqual(namedFns, [], `named function exports become extra plugins: ${namedFns.join(', ')}`);
+  assert.equal(typeof mod.default, 'function');
+  assert.equal(typeof mod.default.parseHookResponse, 'function');
+  assert.equal(typeof mod.default.findRyk, 'function');
+});
+
+test('TUI host module is a v1 { id, tui } export', () => {
+  assert.equal(tuiModule.id, 'ryk');
+  assert.equal(typeof tuiModule.tui, 'function');
+  assert.equal(tuiModule.server, undefined);
+});
+
+test('TUI host toasts on session.error that mentions ryk', async () => {
+  const toasts = [];
+  await tuiModule.tui({
+    ui: {
+      toast: (input) => {
+        toasts.push(input);
+      },
+    },
+    event: {
+      on: (type, handler) => {
+        if (type === 'session.error') {
+          handler({ message: '[ryk] ryk blocked tool execution: core.git:push-force-long' });
+        }
+      },
+    },
+  });
+  assert.ok(toasts.length >= 2, 'startup toast + error toast');
+  assert.equal(toasts[0].variant, 'info');
+  assert.match(toasts[0].title, /ryk/i);
+  assert.equal(toasts[0].message, 'ryk TUI loaded');
+  assert.ok(!/guardrails active/i.test(toasts[0].message));
+  const errorToast = toasts.find((t) => t.variant === 'error');
+  assert.ok(errorToast, 'error toast for ryk session.error');
+  assert.match(errorToast.message, /push-force-long/);
+});
+
+test('TUI status command uses hook-grade-honest copy', async () => {
+  const toasts = [];
+  let commands = [];
+  await tuiModule.tui({
+    ui: {
+      toast: (input) => {
+        toasts.push(input);
+      },
+    },
+    command: {
+      register: (cb) => {
+        commands = cb();
+      },
+    },
+  });
+  const status = commands.find((c) => c.value === 'ryk.status');
+  assert.ok(status, 'ryk.status command registered');
+  assert.ok(!/guardrails/i.test(String(status.description ?? '')));
+  status.onSelect();
+  const statusToast = toasts.find((t) => t.variant === 'info' && t.message !== 'ryk TUI loaded');
+  assert.ok(statusToast, 'status toast after onSelect');
+  assert.match(statusToast.message, /OpenCode host plugin loaded/i);
+  assert.match(statusToast.message, /ryk\.ts/);
+  assert.ok(!/guarding this OpenCode session/i.test(statusToast.message));
+});
+
+test('TUI does not toast session.error that is only a repo path containing ryk', async () => {
+  const toasts = [];
+  await tuiModule.tui({
+    ui: {
+      toast: (input) => {
+        toasts.push(input);
+      },
+    },
+    event: {
+      on: (type, handler) => {
+        if (type === 'session.error') {
+          handler({
+            message: 'ENOENT: /Users/dev/CodingProjects/ryk/README.md',
+          });
+        }
+      },
+    },
+  });
+  const errorToasts = toasts.filter((t) => t.variant === 'error');
+  assert.equal(errorToasts.length, 0, 'path-only ryk must not toast as blocked');
+});
+
+test('TUI does not toast error.data or nested properties as ryk blocks', async () => {
+  const toasts = [];
+  await tuiModule.tui({
+    ui: {
+      toast: (input) => {
+        toasts.push(input);
+      },
+    },
+    event: {
+      on: (type, handler) => {
+        if (type === 'session.error') {
+          handler({
+            error: {
+              data: '[ryk] ryk blocked leaked payload',
+            },
+            properties: {
+              message: '[ryk] ryk blocked via properties',
+            },
+          });
+        }
+      },
+    },
+  });
+  const errorToasts = toasts.filter((t) => t.variant === 'error');
+  assert.equal(errorToasts.length, 0, 'must not toast from error.data or properties');
+});
+
+test('TUI toasts session.error from error.message only when event.message is absent', async () => {
+  const toasts = [];
+  await tuiModule.tui({
+    ui: {
+      toast: (input) => {
+        toasts.push(input);
+      },
+    },
+    event: {
+      on: (type, handler) => {
+        if (type === 'session.error') {
+          handler({
+            error: { message: 'ryk blocked tool execution: core.git:push-force-long' },
+          });
+        }
+      },
+    },
+  });
+  const errorToast = toasts.find((t) => t.variant === 'error');
+  assert.ok(errorToast, 'error.message with ryk blocked still toasts');
+  assert.match(errorToast.message, /push-force-long/);
+});
+
+test('ryk-tui.ts is a single-source sync of src/tui.ts', async () => {
+  const src = await readFile(join(pluginRoot, 'src/tui.ts'), 'utf8');
+  const dropIn = await readFile(join(pluginRoot, 'ryk-tui.ts'), 'utf8');
+  assert.equal(dropIn, src, 'ryk-tui.ts must match src/tui.ts (npm run build copies src → ryk-tui.ts)');
 });
 
 test('missing binary registers fail-closed veto hooks', async () => {
@@ -923,6 +1121,95 @@ printf '%s\\n' '{"decision":"block","message":"command blocked"}'
       },
     }
   );
+});
+
+test('toast timeout is logged as timeout not as success', async () => {
+  const errors = [];
+  const originalError = console.error;
+  const originalDebug = process.env.RYK_OPENCODE_TOAST_DEBUG;
+  console.error = (...args) => {
+    errors.push(args.map(String).join(' '));
+  };
+  process.env.RYK_OPENCODE_TOAST_DEBUG = '1';
+  try {
+    await withFakeRyk(
+      async (plugin) => {
+        const before = plugin['tool.execute.before'];
+        assert.ok(before);
+        await assert.rejects(
+          before(
+            { tool: 'bash', sessionID: 'session-1', callID: 'call-1' },
+            { args: { command: 'rm -rf build' } }
+          ),
+          (err) => {
+            assertShortBlockThrow(err, /ryk blocked/);
+            return true;
+          }
+        );
+        const joined = errors.join('\n');
+        assert.match(joined, /toast timeout/i, `timeout must be distinguishable, got: ${JSON.stringify(joined)}`);
+      },
+      `#!/bin/sh
+printf '%s\\n' '{"decision":"block","message":"command blocked"}'
+`,
+      {
+        client: {
+          tui: {
+            showToast: () => new Promise(() => {}),
+          },
+        },
+      }
+    );
+  } finally {
+    console.error = originalError;
+    if (originalDebug === undefined) delete process.env.RYK_OPENCODE_TOAST_DEBUG;
+    else process.env.RYK_OPENCODE_TOAST_DEBUG = originalDebug;
+  }
+});
+
+test('late toast rejection after timeout is not an unhandled rejection', async () => {
+  const unhandled = [];
+  const onUnhandled = (err) => {
+    unhandled.push(err);
+  };
+  process.on('unhandledRejection', onUnhandled);
+  let settleLate;
+  const lateFail = new Promise((_, reject) => {
+    settleLate = () => reject(new Error('late toast transport failed'));
+  });
+  try {
+    await withFakeRyk(
+      async (plugin) => {
+        const before = plugin['tool.execute.before'];
+        assert.ok(before);
+        await assert.rejects(
+          before(
+            { tool: 'bash', sessionID: 'session-1', callID: 'call-1' },
+            { args: { command: 'rm -rf build' } }
+          ),
+          (err) => {
+            assertShortBlockThrow(err, /ryk blocked/);
+            return true;
+          }
+        );
+        settleLate();
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        assert.equal(unhandled.length, 0, `late toast reject must be caught, got: ${unhandled}`);
+      },
+      `#!/bin/sh
+printf '%s\\n' '{"decision":"block","message":"command blocked"}'
+`,
+      {
+        client: {
+          tui: {
+            showToast: () => lateFail,
+          },
+        },
+      }
+    );
+  } finally {
+    process.off('unhandledRejection', onUnhandled);
+  }
 });
 
 test('findRyk rejects an existing non-ryk absolute RYK_BIN', () => {

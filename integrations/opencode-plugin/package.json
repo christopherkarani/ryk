@@ -8,6 +8,7 @@
   "files": [
     "dist",
     "ryk.ts",
+    "ryk-tui.ts",
     "README.md",
     "package.json"
   ],
@@ -24,7 +25,7 @@
     "node": ">=18.0.0"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json && cp src/index.ts ryk.ts",
+    "build": "tsc -p tsconfig.json && cp src/index.ts ryk.ts && cp src/tui.ts ryk-tui.ts",
     "test": "npm run build && node --test test/index.test.mjs",
     "pack:dry-run": "npm pack --dry-run"
   },

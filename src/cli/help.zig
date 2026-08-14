@@ -575,7 +575,7 @@ pub const commands =
             "Removes ryk plugin registrations from host agents without removing the ryk binary or policy files.",
             "Hosts: codex, claude, cursor, opencode, openclaw, hermes, grok. Defaults to all if no host is specified.",
             "Cursor: removes the ryk shell hook wrapper and disables simple ryk-only hooks.json files.",
-            "OpenCode: removes .opencode/plugins/ryk.ts and ~/.config/opencode/plugins/ryk.ts",
+            "OpenCode: removes .opencode/plugins/ryk.ts, ryk-tui.ts and ~/.config/opencode/plugins/ryk.ts, ryk-tui.ts",
             "OpenClaw: runs 'openclaw plugins uninstall ryk'",
             "Hermes: runs 'hermes plugins disable ryk' and removes ~/.hermes/plugins/ryk/",
             "Grok: removes ~/.grok/hooks/ryk.json and strips ryk PreToolUse from ~/.grok/user-settings.json (restart Grok to reload).",
