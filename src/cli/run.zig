@@ -1381,7 +1381,7 @@ fn commandWithStdioAndEnv(io: std.Io, argv: []const []const u8, stdout: anytype,
                 }
                 return exit_codes.unsupported;
             }
-            try stderr.print("ryk run: failed to launch child: {s}\n", .{@errorName(launch_err)});
+            try stderr.print("ryk run: failed to launch child: {s}\n", .{core.process.childLaunchFailureMessage(launch_err)});
             return exit_codes.general;
         },
     };

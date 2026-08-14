@@ -343,7 +343,7 @@ pub fn createShimDirectory(
     }
     inline for (shim_names) |name| {
         if (builtin.os.tag == .windows) {
-            try writeWindowsExecutableShim(io, allocator, shim_dir, name, ryk_executable);
+            try writeWindowsCmdShim(io, allocator, shim_dir, name, ryk_executable);
         } else {
             try writePosixShim(io, allocator, shim_dir, name, ryk_executable);
         }
@@ -502,12 +502,44 @@ fn writePosixShim(io: std.Io, allocator: std.mem.Allocator, shim_dir: []const u8
     if (comptime builtin.os.tag != .windows) try file.setPermissions(io, shim_mode);
 }
 
-fn writeWindowsExecutableShim(io: std.Io, allocator: std.mem.Allocator, shim_dir: []const u8, name: []const u8, ryk_executable: []const u8) !void {
-    const filename = try std.fmt.allocPrint(allocator, "{s}.exe", .{name});
+/// Batch wrapper for a PATH shim. Copies of `ryk.exe` named `cmd.exe` are
+/// blocked by Windows (CreateProcess/copy AccessDenied) and contradict the
+/// documented `.cmd` shim surface.
+pub fn formatWindowsCmdShim(allocator: std.mem.Allocator, ryk_executable: []const u8, name: []const u8) ![]u8 {
+    const quoted = try quoteWindowsCmdArg(allocator, ryk_executable);
+    defer allocator.free(quoted);
+    return std.fmt.allocPrint(allocator,
+        \\@echo off
+        \\{s} shim exec -- {s} %*
+        \\
+    , .{ quoted, name });
+}
+
+fn quoteWindowsCmdArg(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.append(allocator, '"');
+    for (value) |byte| {
+        if (byte == '"') {
+            try out.appendSlice(allocator, "\"\"");
+        } else {
+            try out.append(allocator, byte);
+        }
+    }
+    try out.append(allocator, '"');
+    return try out.toOwnedSlice(allocator);
+}
+
+fn writeWindowsCmdShim(io: std.Io, allocator: std.mem.Allocator, shim_dir: []const u8, name: []const u8, ryk_executable: []const u8) !void {
+    const filename = try std.fmt.allocPrint(allocator, "{s}.cmd", .{name});
     defer allocator.free(filename);
     const path = try std.fs.path.join(allocator, &.{ shim_dir, filename });
     defer allocator.free(path);
-    try std.Io.Dir.copyFileAbsolute(ryk_executable, path, io, .{});
+    const script = try formatWindowsCmdShim(allocator, ryk_executable, name);
+    defer allocator.free(script);
+    const file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
+    defer file.close(io);
+    try file.writeStreamingAll(io, script);
 }
 
 pub fn shimAliasFromExecutablePath(executable_path: []const u8) ?[]const u8 {
@@ -1452,12 +1484,38 @@ test "Windows shim directory includes executable cmd PowerShell and PATH shims" 
     const shim_dir = try createShimDirectory(std.testing.io, std.testing.allocator, root, "windows-wrapper-test", self_exe);
     defer std.testing.allocator.free(shim_dir);
 
-    const wrappers = [_][]const u8{ "cmd.exe", "powershell.exe", "pwsh.exe", "git.exe" };
+    const wrappers = [_][]const u8{ "cmd.cmd", "powershell.cmd", "pwsh.cmd", "git.cmd" };
     for (wrappers) |wrapper| {
         const shim_path = try std.fs.path.join(std.testing.allocator, &.{ shim_dir, wrapper });
         defer std.testing.allocator.free(shim_path);
         try std.Io.Dir.cwd().access(std.testing.io, shim_path, .{});
+        const script = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, shim_path, std.testing.allocator, .limited(4096));
+        defer std.testing.allocator.free(script);
+        try std.testing.expect(std.mem.indexOf(u8, script, "shim exec --") != null);
+        try std.testing.expect(std.mem.indexOf(u8, script, self_exe) != null);
     }
+}
+
+test "Windows cmd shim script quotes the ryk path and does not copy an exe" {
+    const script = try formatWindowsCmdShim(std.testing.allocator, "C:\\Program Files\\ryk\\ryk.exe", "cmd");
+    defer std.testing.allocator.free(script);
+    try std.testing.expect(std.mem.indexOf(u8, script, "\"C:\\Program Files\\ryk\\ryk.exe\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "shim exec -- cmd %*") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "@echo off") != null);
+}
+
+test "Windows cmd shim can be written without copying ryk.exe" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const script = try formatWindowsCmdShim(allocator, "C:\\ryk\\ryk.exe", "cmd");
+    defer allocator.free(script);
+    try tmp.dir.writeFile(io, .{ .sub_path = "cmd.cmd", .data = script });
+    const written = try tmp.dir.readFileAlloc(io, "cmd.cmd", allocator, .limited(4096));
+    defer allocator.free(written);
+    try std.testing.expectEqualStrings(script, written);
+    try std.testing.expect(std.mem.indexOf(u8, written, "cmd.exe") == null);
 }
 
 test "Windows executable shim aliases route extension-qualified invocations" {

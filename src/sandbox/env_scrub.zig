@@ -221,8 +221,33 @@ pub fn isKeepClass(name: []const u8) bool {
     return false;
 }
 
+/// Windows CreateProcess / loader keys. Missing SYSTEMROOT is a documented
+/// source of ERROR_ACCESS_DENIED (5) even for `cmd.exe`. Case-insensitive
+/// because the PEB block uses `SystemRoot` / `SYSTEMROOT` interchangeably.
+pub fn isWindowsProcessRequiredEnv(name: []const u8) bool {
+    const keys = [_][]const u8{
+        "SYSTEMROOT",
+        "WINDIR",
+        "SYSTEMDRIVE",
+        "COMSPEC",
+        "PATHEXT",
+        "USERPROFILE",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "PROGRAMDATA",
+        "NUMBER_OF_PROCESSORS",
+        "PROCESSOR_ARCHITECTURE",
+        "PROCESSOR_IDENTIFIER",
+    };
+    for (keys) |key| {
+        if (std.ascii.eqlIgnoreCase(name, key)) return true;
+    }
+    return false;
+}
+
 /// True when `name` is retained by the launch allowlist.
 pub fn isLaunchAllowlisted(name: []const u8) bool {
+    if (isWindowsProcessRequiredEnv(name)) return true;
     for (launch_allow_exact) |key| {
         if (std.mem.eql(u8, name, key)) return true;
     }
@@ -671,6 +696,30 @@ test "launch allowlist keeps TLS trust and strips SSH_AUTH_SOCK" {
     try std.testing.expect(isLaunchAllowlisted("DEVELOPER_DIR"));
     // Host SSH agent socket is not on the default attach allowlist (M-10).
     try std.testing.expect(!isLaunchAllowlisted("SSH_AUTH_SOCK"));
+}
+
+test "launch allowlist keeps Windows CreateProcess-required host keys" {
+    try std.testing.expect(isWindowsProcessRequiredEnv("SYSTEMROOT"));
+    try std.testing.expect(isWindowsProcessRequiredEnv("SystemRoot"));
+    try std.testing.expect(isWindowsProcessRequiredEnv("windir"));
+    try std.testing.expect(isWindowsProcessRequiredEnv("ComSpec"));
+    try std.testing.expect(isWindowsProcessRequiredEnv("PATHEXT"));
+    try std.testing.expect(isWindowsProcessRequiredEnv("USERPROFILE"));
+    try std.testing.expect(isLaunchAllowlisted("SYSTEMROOT"));
+    try std.testing.expect(isLaunchAllowlisted("SystemRoot"));
+    try std.testing.expect(isLaunchAllowlisted("COMSPEC"));
+    try std.testing.expect(!isWindowsProcessRequiredEnv("OPENAI_API_KEY"));
+
+    var env_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer env_map.deinit();
+    try env_map.put("PATH", "C:\\Windows\\System32");
+    try env_map.put("SystemRoot", "C:\\Windows");
+    try env_map.put("COMSPEC", "C:\\Windows\\System32\\cmd.exe");
+    try env_map.put("OPENAI_API_KEY", "sk-test");
+    _ = try applyLaunchAllowlistInPlace(&env_map);
+    try std.testing.expectEqualStrings("C:\\Windows", env_map.get("SystemRoot").?);
+    try std.testing.expectEqualStrings("C:\\Windows\\System32\\cmd.exe", env_map.get("COMSPEC").?);
+    try std.testing.expect(env_map.get("OPENAI_API_KEY") == null);
 }
 
 test "shouldRetainLaunchEnv is allowlist-only (value shape ignored)" {

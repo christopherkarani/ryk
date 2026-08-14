@@ -125,7 +125,7 @@ pub const PreparedChild = struct {
     fn spawnPlain(self: *PreparedChild) !void {
         const child = try std.process.spawn(self.io, .{
             .argv = self.argv,
-            .cwd = .{ .path = self.workspace_root },
+            .cwd = .{ .path = spawnWorkingDirectory(self.workspace_root) },
             .environ_map = self.env_map,
             .stdin = mapStdio(self.stdio),
             .stdout = mapStdio(self.stdio),
@@ -302,6 +302,30 @@ pub fn prepareChild(io: std.Io, allocator: std.mem.Allocator, request: PrepareRe
     return prepared;
 }
 
+/// CreateProcess `lpCurrentDirectory` rejects NT prefixes (`\\?\`, `\??\`).
+/// Workspace roots from some realpath paths still carry them.
+pub fn spawnWorkingDirectory(workspace_root: []const u8) []const u8 {
+    return stripWindowsNtPrefix(workspace_root);
+}
+
+pub fn stripWindowsNtPrefix(path: []const u8) []const u8 {
+    if (std.mem.startsWith(u8, path, "\\\\?\\")) return path[4..];
+    if (std.mem.startsWith(u8, path, "\\??\\")) return path[4..];
+    return path;
+}
+
+/// Human launch failure for `ryk run`. Windows AccessDenied is not a sandbox
+/// deny and must not be printed as a bare error name.
+pub fn childLaunchFailureMessage(err: anyerror) []const u8 {
+    if (comptime builtin.os.tag == .windows) {
+        return switch (err) {
+            error.AccessDenied, error.PermissionDenied => "Windows child spawn was denied. Check the command path and working directory; this is not an OS sandbox deny (Windows has no Seatbelt/Landlock attach).",
+            else => @errorName(err),
+        };
+    }
+    return @errorName(err);
+}
+
 fn mapStdio(behavior: StdioBehavior) std.process.SpawnOptions.StdIo {
     return switch (behavior) {
         .inherit => .inherit,
@@ -405,6 +429,27 @@ test "child status exit code mapping" {
     try std.testing.expectEqual(@as(i32, 0), (ChildStatus{ .exited = 0 }).exitCode());
     try std.testing.expectEqual(@as(i32, 7), (ChildStatus{ .exited = 7 }).exitCode());
     try std.testing.expectEqual(@as(i32, 1), (ChildStatus{ .signal = 9 }).exitCode());
+}
+
+test "stripWindowsNtPrefix drops CreateProcess-unsafe prefixes" {
+    try std.testing.expectEqualStrings("C:\\repo", stripWindowsNtPrefix("\\\\?\\C:\\repo"));
+    try std.testing.expectEqualStrings("C:\\repo", stripWindowsNtPrefix("\\??\\C:\\repo"));
+    try std.testing.expectEqualStrings("C:\\repo", stripWindowsNtPrefix("C:\\repo"));
+    try std.testing.expectEqualStrings("/tmp/ryk", stripWindowsNtPrefix("/tmp/ryk"));
+}
+
+test "spawnWorkingDirectory is the stripped workspace root" {
+    try std.testing.expectEqualStrings("D:\\work", spawnWorkingDirectory("\\\\?\\D:\\work"));
+}
+
+test "childLaunchFailureMessage is not a bare AccessDenied on Windows" {
+    const msg = childLaunchFailureMessage(error.AccessDenied);
+    if (builtin.os.tag == .windows) {
+        try std.testing.expect(!std.mem.eql(u8, msg, "AccessDenied"));
+        try std.testing.expect(std.mem.indexOf(u8, msg, "Windows child spawn") != null);
+    } else {
+        try std.testing.expectEqualStrings("AccessDenied", msg);
+    }
 }
 
 test "prepareChild defaults to no OS child apply" {

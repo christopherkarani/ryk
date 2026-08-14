@@ -197,6 +197,30 @@ test "empty backpack env schema passes declared public and omits unknown and sen
     try std.testing.expectEqualStrings("/usr/bin", filtered.env_map.get("PATH").?);
 }
 
+test "empty backpack keeps Windows CreateProcess-required keys" {
+    var current = std.process.Environ.Map.init(std.testing.allocator);
+    defer current.deinit();
+    try current.put("PATH", "C:\\Windows\\System32");
+    try current.put("SystemRoot", "C:\\Windows");
+    try current.put("COMSPEC", "C:\\Windows\\System32\\cmd.exe");
+    try current.put("USERPROFILE", "C:\\Users\\dev");
+    try current.put("OPENAI_API_KEY", "sk-test");
+
+    var selected = policy.schema.Policy{ .allocator = std.testing.allocator };
+    var filtered = try filterMap(
+        std.testing.allocator,
+        &current,
+        &selected,
+        .observe,
+        .{ .secret_boundary = .empty_backpack },
+    );
+    defer filtered.deinit();
+    try std.testing.expectEqualStrings("C:\\Windows", filtered.env_map.get("SystemRoot").?);
+    try std.testing.expectEqualStrings("C:\\Windows\\System32\\cmd.exe", filtered.env_map.get("COMSPEC").?);
+    try std.testing.expectEqualStrings("C:\\Users\\dev", filtered.env_map.get("USERPROFILE").?);
+    try std.testing.expect(filtered.env_map.get("OPENAI_API_KEY") == null);
+}
+
 test "no-secrets retains benign AWS and key configuration but removes unknown credential aliases" {
     var current = std.process.Environ.Map.init(std.testing.allocator);
     defer current.deinit();
@@ -284,6 +308,7 @@ fn isBoundaryPublicHostEnv(name: []const u8) bool {
     {
         return false;
     }
+    if (sandbox_env.isWindowsProcessRequiredEnv(name)) return true;
     for (sandbox_env.launch_allow_exact) |allowed| {
         if (std.mem.eql(u8, name, allowed)) return true;
     }
