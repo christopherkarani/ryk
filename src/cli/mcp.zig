@@ -1102,9 +1102,12 @@ test "Codex inventory refresh restores exact in-memory argv and environment" {
         .sub_path = "codex",
         .data = script,
     });
-    var file = try tmp.dir.openFile(io, "codex", .{ .mode = .read_write });
-    defer file.close(io);
-    try file.setPermissions(io, .executable_file);
+    // Close before exec: Linux ETXTBSY if the script stays open for write.
+    {
+        var file = try tmp.dir.openFile(io, "codex", .{ .mode = .read_write });
+        defer file.close(io);
+        try file.setPermissions(io, .executable_file);
+    }
     const codex_bin = try tmp.dir.realPathFileAlloc(io, "codex", allocator);
     defer allocator.free(codex_bin);
     const expected_server: sandbox.mcp_runtime_grants.Server = .{

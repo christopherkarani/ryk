@@ -36,13 +36,13 @@ pub fn marketplaceHostInstallSpec(
     return switch (target) {
         .codex => .{
             .host_label = "Codex",
-            .plugin_dest = try std.fs.path.join(allocator, &.{ workspace_root, ".agents", "plugins", "ryk"}),
+            .plugin_dest = try std.fs.path.join(allocator, &.{ workspace_root, ".agents", "plugins", "ryk" }),
             .marketplace_path = try std.fs.path.join(allocator, &.{ workspace_root, ".agents", "plugins", "marketplace.json" }),
             .marketplace_json = marketplace_json,
         },
         .claude => .{
             .host_label = "Claude Code",
-            .plugin_dest = try std.fs.path.join(allocator, &.{ workspace_root, ".claude", "plugins", "ryk"}),
+            .plugin_dest = try std.fs.path.join(allocator, &.{ workspace_root, ".claude", "plugins", "ryk" }),
             .marketplace_path = try std.fs.path.join(allocator, &.{ workspace_root, ".claude-plugin", "marketplace.json" }),
             .marketplace_json = marketplace_json,
         },
@@ -744,18 +744,40 @@ fn writeTempFileSyncedAt(
 }
 
 fn syncDirectory(io: std.Io, directory: std.Io.Dir) !void {
+    _ = io;
     if (builtin.os.tag == .windows) return;
-    const parent_as_file: std.Io.File = .{
-        .handle = directory.handle,
-        .flags = .{ .nonblocking = false },
-    };
-    try parent_as_file.sync(io);
+    // Zig Io Dir handles are O_PATH. Linux fsync(2) on O_PATH returns EBADF,
+    // and Zig 0.16 File.sync treats that as a programmer-bug panic.
+    const fd = std.posix.openat(directory.handle, ".", .{
+        .ACCMODE = .RDONLY,
+        .DIRECTORY = true,
+        .CLOEXEC = true,
+    }, 0) catch return;
+    defer _ = std.c.close(fd);
+    // Zig 0.16 has no posix.fsync; File.sync on an O_PATH dir panics BADF.
+    if (builtin.os.tag == .linux) {
+        const rc = std.os.linux.fsync(fd);
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => {},
+            .IO => return error.InputOutput,
+            else => {},
+        }
+    } else {
+        _ = std.c.fsync(fd);
+    }
 }
 
 fn dirExists(io: std.Io, path: []const u8) bool {
     var dir = std.Io.Dir.openDirAbsolute(io, path, .{}) catch return false;
     dir.close(io);
     return true;
+}
+
+test "syncDirectory fsyncs via a non-O_PATH fd and does not panic" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "leaf.txt", .data = "ok\n" });
+    try syncDirectory(std.testing.io, tmp.dir);
 }
 
 test "directoriesEquivalent rejects destination with extra stale file" {

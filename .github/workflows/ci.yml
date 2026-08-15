@@ -22,34 +22,37 @@ jobs:
         run: ./scripts/zig build test-shell-engine
       - name: Token-enabled telemetry release contract
         run: ./scripts/test-telemetry-release-contract.sh
-  # Landlock (ubuntu) / Seatbelt (macos-14) attach + adversarial e2e.
+  # Landlock attach + adversarial e2e on Linux. Seatbelt proof is local (macOS
+  # hosted runners are billed; do not add macos-* here without a spend decision).
   # --require-attach is single authority (packaged ryk_run + profile_hash + evidence.zig rules).
   # Thin jq checks packaged primary detail only — no third copy of unit dual-proof greps.
   os-sandbox:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runs-on: ubuntu-latest
-            case_id: ci-linux
-            artifact_name: os-sandbox-evidence-linux
-          - runs-on: macos-14
-            case_id: ci-macos
-            artifact_name: os-sandbox-evidence-macos
-    runs-on: ${{ matrix.runs-on }}
+    runs-on: ubuntu-latest
+    env:
+      CASE_ID: ci-linux
     steps:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
       # PCRE2 is Zig-built from source via build.zig.zon (static link).
+      - name: Enable FUSE for Linux workspace-view attach
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y fuse3
+          sudo modprobe fuse || true
+          test -e /dev/fuse
+          # Allow the unprivileged FUSE mount the workspace-view bootstrap uses.
+          if ! grep -q '^user_allow_other' /etc/fuse.conf 2>/dev/null; then
+            echo 'user_allow_other' | sudo tee -a /etc/fuse.conf >/dev/null
+          fi
       - name: Build ryk
         run: ./scripts/zig build
       - name: Secret boundary adversarial canary
         run: ./scripts/adversarial/secret-boundary-canary.sh --binary ./zig-out/bin/ryk
       - name: Adversarial OS sandbox e2e + evidence (require attach)
-        env:
-          CASE_ID: ${{ matrix.case_id }}
         run: |
           mkdir -p planning/security/evidence
           ./scripts/os-sandbox-adversarial-e2e.sh \
@@ -70,47 +73,23 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact_name }}
+          name: os-sandbox-evidence-linux
           path: planning/security/evidence/
           if-no-files-found: error
 
   # Release signing is a dry run on purpose: the secret key must never exist in
-  # CI, so this proves the *verification* contract with a throwaway keypair. The
-  # matrix covers both verifier implementations the installer accepts, and runs on
-  # both platforms because the installer's shell is what differs between them.
+  # CI, so this proves the *verification* contract with a throwaway keypair.
+  # Linux minisign only — macOS installer-shell + rsign stay local (hosted macOS
+  # runners are billed).
   release-signing:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runs-on: ubuntu-latest
-            verifier: minisign
-          - runs-on: macos-14
-            verifier: minisign
-          - runs-on: macos-14
-            verifier: rsign
-    runs-on: ${{ matrix.runs-on }}
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install ${{ matrix.verifier }}
-        env:
-          VERIFIER: ${{ matrix.verifier }}
+      - name: Install minisign
         run: |
           set -euo pipefail
-          case "$VERIFIER" in
-            minisign)
-              if [ "$RUNNER_OS" = "Linux" ]; then
-                sudo apt-get update && sudo apt-get install -y minisign
-              else
-                brew install minisign
-              fi
-              minisign -v
-              ;;
-            rsign)
-              cargo install rsign2 --locked
-              echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-              ;;
-          esac
+          sudo apt-get update && sudo apt-get install -y minisign
+          minisign -v
       - name: Signature contract (fail-closed boundary)
         run: ./scripts/test-release-signing.sh
       - name: Refuse to skip when a verifier is present
@@ -125,45 +104,11 @@ jobs:
           fi
           grep -q 'test-release-signing: passed' /tmp/signing.log
 
-  # Prove the formula in this checkout. Always install from a local tap built
-  # here — do not `brew tap "$TAP" 2>/dev/null` (that hides a 404 and fail-opens
-  # onto a stale published formula). brew installs the binary only;
-  # `ryk doctor --fix` wires host plugins.
-  homebrew-tap:
-    runs-on: macos-14
-    env:
-      HOMEBREW_NO_AUTO_UPDATE: 1
-      HOMEBREW_NO_INSTALL_CLEANUP: 1
-      HOMEBREW_NO_ANALYTICS: 1
-      TAP: christopherkarani/ryk
+  # Offline formula contract only. `brew install` from a local tap needs a
+  # macOS runner — that stays a local proof (hosted macOS is billed).
+  homebrew-formula:
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Formula contract (offline)
         run: ./scripts/test-homebrew-formula.sh
-      - name: Tap the formula from this checkout
-        run: |
-          set -euo pipefail
-          echo "tap_source=local" >> "$GITHUB_ENV"
-          brew tap-new "$TAP"
-          tap_dir="$(brew --repository "$TAP")"
-          mkdir -p "${tap_dir}/Formula"
-          cp packaging/homebrew/Formula/ryk.rb "${tap_dir}/Formula/ryk.rb"
-      - name: brew install from the tap
-        run: brew install --verbose "${TAP}/ryk"
-      - name: Installed-binary smoke
-        run: |
-          set -euo pipefail
-          command -v ryk
-          ryk --version
-          ryk doctor
-          ryk redteam --ci
-      - name: brew test (formula test block)
-        run: brew test "${TAP}/ryk"
-      - name: brew uninstall leaves nothing behind
-        run: |
-          set -euo pipefail
-          brew uninstall "${TAP}/ryk"
-          if command -v ryk >/dev/null 2>&1; then
-            echo "::error::ryk still on PATH after brew uninstall"
-            exit 1
-          fi

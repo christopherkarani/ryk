@@ -2776,10 +2776,10 @@ test "OpenClaw config binding is exact, idempotent, read-back verified, and fail
         "if [ \"$1\" = config ] && [ \"$2\" = set ]; then printf '%s' \"$*\" > \"$(dirname \"$0\")/argv\"; printf '%s' \"$4\" > \"$state\"; exit 0; fi\n" ++
         "if [ \"$1\" = config ] && [ \"$2\" = get ]; then printf '\\\"%s\\\"\\n' \"$(cat \"$state\")\"; exit 0; fi\n" ++
         "exit 23\n";
-    var file = try std.Io.Dir.cwd().createFile(std.testing.io, script, .{});
-    try file.writeStreamingAll(std.testing.io, script_body);
-    if (builtin.os.tag != .windows) try file.setPermissions(std.testing.io, .executable_file);
-    file.close(std.testing.io);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "openclaw", .data = script_body });
+    if (builtin.os.tag != .windows) {
+        try tmp.dir.setFilePermissions(std.testing.io, "openclaw", .executable_file, .{});
+    }
 
     try std.testing.expectEqual(@as(u8, 0), try runOpenClawConfigureWorkspace(std.testing.allocator, script, root));
     try std.testing.expect(try runOpenClawWorkspaceBindingMatches(std.testing.allocator, script, root));
@@ -2801,10 +2801,10 @@ test "OpenClaw config binding is exact, idempotent, read-back verified, and fail
 
     const failing = try std.fs.path.join(std.testing.allocator, &.{ root, "openclaw-fail" });
     defer std.testing.allocator.free(failing);
-    var failing_file = try std.Io.Dir.cwd().createFile(std.testing.io, failing, .{});
-    try failing_file.writeStreamingAll(std.testing.io, "#!/bin/sh\nexit 23\n");
-    if (builtin.os.tag != .windows) try failing_file.setPermissions(std.testing.io, .executable_file);
-    failing_file.close(std.testing.io);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "openclaw-fail", .data = "#!/bin/sh\nexit 23\n" });
+    if (builtin.os.tag != .windows) {
+        try tmp.dir.setFilePermissions(std.testing.io, "openclaw-fail", .executable_file, .{});
+    }
     try std.testing.expectEqual(@as(u8, 23), try runOpenClawConfigureWorkspace(std.testing.allocator, failing, root));
 }
 

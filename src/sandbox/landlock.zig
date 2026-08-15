@@ -77,6 +77,25 @@ pub const ACCESS_FS_TRUNCATE: u64 = 1 << 14;
 /// ABI ≥ 5
 pub const ACCESS_FS_IOCTL_DEV: u64 = 1 << 15;
 
+/// Directory-only FS rights. `landlock_add_rule(PATH_BENEATH)` returns `EINVAL`
+/// if any of these bits are set on a non-directory `parent_fd`.
+pub const FS_RIGHTS_DIRECTORY_ONLY: u64 = ACCESS_FS_READ_DIR |
+    ACCESS_FS_REMOVE_DIR |
+    ACCESS_FS_REMOVE_FILE |
+    ACCESS_FS_MAKE_CHAR |
+    ACCESS_FS_MAKE_DIR |
+    ACCESS_FS_MAKE_REG |
+    ACCESS_FS_MAKE_SOCK |
+    ACCESS_FS_MAKE_FIFO |
+    ACCESS_FS_MAKE_BLOCK |
+    ACCESS_FS_MAKE_SYM |
+    ACCESS_FS_REFER;
+
+/// Drop directory-only bits so a file PATH_BENEATH grant is accepted.
+pub fn fileCompatibleRights(rights: u64) u64 {
+    return rights & ~FS_RIGHTS_DIRECTORY_ONLY;
+}
+
 // LANDLOCK_ACCESS_NET_* (uapi/linux/landlock.h), ABI >= 4.
 pub const ACCESS_NET_BIND_TCP: u64 = 1 << 0;
 pub const ACCESS_NET_CONNECT_TCP: u64 = 1 << 1;
@@ -557,18 +576,29 @@ fn addPathBeneathRuleInner(
         };
     defer _ = linux.close(path_fd);
 
-    if (file_only) {
-        var stx = std.mem.zeroes(linux.Statx);
-        const stx_rc = linux.statx(path_fd, "", linux.AT.EMPTY_PATH, .{ .TYPE = true }, &stx);
-        if (linux.errno(stx_rc) != .SUCCESS or !stx.mask.TYPE) {
-            // Cannot prove regular file — refuse exec tree widen.
-            return error.ApplyFailed;
+    var stx = std.mem.zeroes(linux.Statx);
+    const stx_rc = linux.statx(path_fd, "", linux.AT.EMPTY_PATH, .{ .TYPE = true }, &stx);
+    if (linux.errno(stx_rc) != .SUCCESS or !stx.mask.TYPE) {
+        if (file_only or required) return error.ApplyFailed;
+        return false;
+    }
+    if (file_only and !linux.S.ISREG(stx.mode)) return error.ApplyFailed;
+
+    // File/device FDs reject directory-only (and IOCTL-on-non-device) bits.
+    var effective = allowed;
+    if (!linux.S.ISDIR(stx.mode)) {
+        effective = fileCompatibleRights(allowed);
+        if (!linux.S.ISCHR(stx.mode) and !linux.S.ISBLK(stx.mode)) {
+            effective &= ~ACCESS_FS_IOCTL_DEV;
         }
-        if (!linux.S.ISREG(stx.mode)) return error.ApplyFailed;
+    }
+    if (effective == 0) {
+        if (required) return error.ApplyFailed;
+        return false;
     }
 
     var beneath = PathBeneathAttr{
-        .allowed_access = allowed,
+        .allowed_access = effective,
         .parent_fd = path_fd,
     };
     const add_rc = linux.syscall4(
@@ -819,6 +849,21 @@ test "pure allowedAccessForMode RO is subset of RW and of handled mask" {
         try std.testing.expect((ro & ACCESS_FS_READ_FILE) != 0);
         try std.testing.expect((ex & ACCESS_FS_EXECUTE) != 0);
     }
+}
+
+test "fileCompatibleRights drops directory-only bits and keeps file RW/exec" {
+    const rw = allowedAccessForMode(.rw, 5);
+    const file_rw = fileCompatibleRights(rw);
+    try std.testing.expect((file_rw & ACCESS_FS_WRITE_FILE) != 0);
+    try std.testing.expect((file_rw & ACCESS_FS_READ_FILE) != 0);
+    try std.testing.expect((file_rw & ACCESS_FS_TRUNCATE) != 0);
+    try std.testing.expect((file_rw & FS_RIGHTS_DIRECTORY_ONLY) == 0);
+
+    const ex = allowedAccessForMode(.exec, 5);
+    const file_ex = fileCompatibleRights(ex);
+    try std.testing.expect((file_ex & ACCESS_FS_EXECUTE) != 0);
+    try std.testing.expect((file_ex & ACCESS_FS_READ_FILE) != 0);
+    try std.testing.expect((file_ex & ACCESS_FS_READ_DIR) == 0);
 }
 
 test "probeAbi is null on non-Linux; applySelf unsupported off Linux" {

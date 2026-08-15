@@ -56,7 +56,7 @@ pub fn main(init: std.process.Init) !u8 {
         ryk.cli.run(io, init.environ_map, argv[1..], &stdout_writer.interface, &stderr_writer.interface) catch |err| {
             stdout_writer.interface.flush() catch {};
             stderr_writer.interface.flush() catch {};
-            if (!hook_hot_path) ryk.telemetry.recordInvocation(io, init.environ_map, allocator, argv[1..], ryk.cli.exit_codes.general);
+            ryk.telemetry.recordInvocation(io, init.environ_map, allocator, argv[1..], ryk.cli.exit_codes.general);
             return err;
         };
     try stdout_writer.interface.flush();
@@ -64,7 +64,9 @@ pub fn main(init: std.process.Init) !u8 {
     if (shim_alias) |alias| {
         const telemetry_argv = [_][]const u8{alias};
         ryk.telemetry.recordInvocation(io, init.environ_map, allocator, &telemetry_argv, code);
-    } else if (!hook_hot_path) {
+    } else {
+        // Hook hot path still flushes in-memory summaries (enforcement/session).
+        // Named `ryk hook` does not emit a CLI invocation event.
         ryk.telemetry.recordInvocation(io, init.environ_map, allocator, argv[1..], code);
     }
     return code;

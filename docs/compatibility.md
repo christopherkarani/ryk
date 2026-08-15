@@ -26,7 +26,7 @@ Doctor / platform reports are **not** a second taxonomy. Map them to grades:
 | doctor `wrapper-only` (command guard / PATH shims) | `wrapper` | Not transparent OS enforcement |
 | doctor sandbox / strong sandbox `partial` (API present) | probe only | Capability evidence; **not** a live session claim |
 | doctor sandbox / transparent FS or network `active` | `OS-enforced` | Rare; doctor never marks session active from probe alone |
-| Protected agent launch + successful child attach | `OS-enforced` (FS, that session) | `ryk <agent>` uses the run engine; advanced `ryk run --os-sandbox` exposes explicit attach flags. Landlock ABI ≥ 3 (kernel 6.2+; ABI 1/2 lack truncation mediation) or Seatbelt majors 14–26 (capability gate; CI attach evidence: linux amd64 + macos-14) |
+| Protected agent launch + successful child attach | `OS-enforced` (FS, that session) | `ryk <agent>` uses the run engine; advanced `ryk run --os-sandbox` exposes explicit attach flags. Landlock ABI ≥ 3 (kernel 6.2+; ABI 1/2 lack truncation mediation) or Seatbelt majors 14–26 (capability gate; CI attach evidence: linux amd64. Seatbelt attach is local.) |
 | doctor `observe-only` / `limited` / `unavailable` | no enforcement claim | Decision or partial path only |
 | MCP stdio proxy `active` | `proxy` (MCP path) | Only for mediated MCP traffic |
 | `ryk start` default (**Ask on risk**) | multi-grade aspirational (`hook` + `wrapper` when available) | Public path has no `--protection` flag; wires host hooks + policy; not `OS-enforced` from doctor probes alone |
@@ -71,4 +71,4 @@ Reserve marketing “firewall” / “maximum protection” for a **verified** m
 
 **In-shim audit under OS attach (evidence honesty):** when a session attaches Seatbelt/Landlock, the control root (`.ryk`) is write-denied to the child *by design*, so PATH shims cannot append to the session audit log. The parent records this as an `audit_degraded` event at session end, and `ryk replay` / `ryk doctor` surface degraded sessions. If a shim instead finds the audit file unwritable while the control root is writable (tamper-shaped, e.g. `chmod 000 events.jsonl`), the shim **fails closed**: the allowed exec is denied rather than run unaudited.
 
-**Capability matrix vs CI attach evidence:** Landlock/Seatbelt version gates (Linux ABI ≥ 1; macOS product majors 14–26) describe **where attach may run**. Continuous **CI attach evidence** today is **linux amd64** and **macos-14** only; other OS/arch/major cells are local until freeze jobs exist — do not treat every gated major as CI-proven.
+**Capability matrix vs CI attach evidence:** Landlock/Seatbelt version gates (Linux ABI ≥ 1; macOS product majors 14–26) describe **where attach may run**. Continuous **CI attach evidence** today is **linux amd64** only; Seatbelt and other OS/arch/major cells are local — do not treat every gated major as CI-proven.

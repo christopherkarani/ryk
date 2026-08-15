@@ -1347,6 +1347,10 @@ fn collectShellWrapperAbsoluteTargets(
             if (std.mem.eql(u8, candidate, home)) continue;
         }
         if (!isRegularFile(io, candidate)) continue;
+        // `exec /bin/true` is a fixture/no-op, not a runtime interpreter. Collecting
+        // it would replace the wrapper argv0 and drop the script identity.
+        const base = std.fs.path.basename(candidate);
+        if (std.mem.eql(u8, base, "true") or std.mem.eql(u8, base, "false")) continue;
         // Dedup against already collected.
         var dup = false;
         for (out[0..count]) |existing| {
