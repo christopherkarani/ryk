@@ -1842,6 +1842,14 @@ async function applyToolDecision(
 	if (decision.kind === "deny") {
 		if (session) session.protocolFailures = 0;
 		const card = buildRykDecisionCard(decision.response, "block");
+		const previewSource = askIpc?.commandOrName;
+		if (
+			previewSource &&
+			previewSource !== toolLabel &&
+			previewSource.trim().length > 0
+		) {
+			card.preview = truncate(sanitizeVisibleText(previewSource), 96);
+		}
 		showRykDecision(pi, ctx, card);
 		// Agent reason: short + structured Next; walls stripped.
 		const agentReason = formatAgentBlockReason(card, toolLabel);

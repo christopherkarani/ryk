@@ -1960,6 +1960,7 @@ test("bash dangerous command with ryk deny returns block", async () => {
 	);
 	assert.match(inlineDecision, /destructive filesystem command/);
 	assert.match(inlineDecision, /Why\s+destructive filesystem command/);
+	assert.match(inlineDecision, /Cmd\s+rm -rf \//);
 	assert.match(
 		inlineDecision,
 		/Meta\s+core\.filesystem:destructive-rm/,
