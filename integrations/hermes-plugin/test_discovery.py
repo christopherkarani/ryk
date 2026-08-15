@@ -215,6 +215,34 @@ class HermesPluginDiscoveryTests(unittest.TestCase):
                 os.environ.pop("RYK_ALLOW_WORKSPACE_BIN", None)
                 self.assertEqual(_PLUGIN._find_ryk(), str(binary.resolve()))
 
+    def test_ryk_bin_managed_local_bin_found_without_provenance(self) -> None:
+        """Explicit RYK_BIN to ~/.local/bin/ryk works with no .ryk-provenance receipt."""
+        with _non_tmp_dir() as home, tempfile.TemporaryDirectory() as qa_cwd:
+            for rel in ((".local", "bin"), (".ryk", "bin")):
+                _PLUGIN._ryk_cache_env = None
+                _PLUGIN._ryk_cache_path = None
+                binary = _write_identity_ryk(home.joinpath(*rel) / "ryk")
+                self.assertFalse((binary.parent / ".ryk-provenance").exists())
+                with _chdir(qa_cwd), mock.patch.dict(
+                    os.environ,
+                    {"HOME": str(home), "PATH": "", "RYK_BIN": str(binary)},
+                    clear=True,
+                ):
+                    os.environ.pop("RYK_ALLOW_WORKSPACE_BIN", None)
+                    self.assertTrue(_PLUGIN._candidate_is_trusted(binary))
+                    self.assertEqual(_PLUGIN._find_ryk(), str(binary.resolve()))
+                _PLUGIN._ryk_cache_env = None
+                _PLUGIN._ryk_cache_path = None
+                with _chdir(qa_cwd), mock.patch.dict(
+                    os.environ,
+                    {"HOME": str(home), "PATH": str(binary.parent)},
+                    clear=True,
+                ):
+                    os.environ.pop("RYK_BIN", None)
+                    os.environ.pop("RYK_ALLOW_WORKSPACE_BIN", None)
+                    self.assertFalse(_PLUGIN._candidate_is_trusted(binary))
+                    self.assertIsNone(_PLUGIN._find_ryk())
+
     def test_path_source_build_outside_cwd_is_found(self) -> None:
         with _non_tmp_dir() as source, tempfile.TemporaryDirectory() as qa_cwd:
             binary = _write_identity_ryk(source / "zig-out" / "bin" / "ryk")

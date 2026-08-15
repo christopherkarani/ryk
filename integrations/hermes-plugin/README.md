@@ -109,7 +109,7 @@ Only regular files that are executable, identify as `product: ryk` via `ryk vers
 Environment:
 
 - `RYK_BIN` — operator pin to an absolute executable. Must be user-owned and not group/world-writable, and must not live under `node_modules/.bin` or a tmp plant. No installer `.ryk-provenance` receipt is required. Identity (`ryk version --json`) and a Hermes `pre_tool_call` smoke test still run. This pin is not skipped as a cwd plant.
-- Managed `~/.local/bin` / `~/.ryk/bin` installs still require the installer's adjacent path-bound `.ryk-provenance` SHA-256 receipt, re-attested before each policy call. This is integrity evidence rather than a cryptographic signature, so same-user binary-and-receipt replacement is outside the trust claim.
+- Managed auto-discovery of `~/.local/bin` / `~/.ryk/bin` still requires the installer's adjacent path-bound `.ryk-provenance` SHA-256 receipt, re-attested before each policy call. An explicit `RYK_BIN` pin to those same paths does not need a receipt. This is integrity evidence rather than a cryptographic signature, so same-user binary-and-receipt replacement is outside the trust claim.
 - `PATH` — a `ryk` that is not a cwd-planted `./zig-out` or `node_modules/.bin` binary, not under tmp, and that passes the same permission / identity / smoke checks is accepted (source-builds outside cwd included).
 - `RYK_ALLOW_WORKSPACE_BIN=1` — opt into repo-local `zig-out/bin/ryk` discovery for development/testing. Without this flag, planted `./zig-out` does not win over a managed install.
 - `RYK_HERMES_FAIL_OPEN` — only recognized truthy tokens (`1`, `true`, `yes`, `on`, `fail-open`, `open`) enable degraded fail-open behavior in attended mode; unattended/CI signals override it.

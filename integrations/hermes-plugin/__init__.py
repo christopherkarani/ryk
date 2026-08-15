@@ -639,12 +639,15 @@ def _passes_owner_and_mode(stat: os.stat_result) -> bool:
 
 
 def _candidate_is_trusted(path: Path) -> bool:
-    """Trust managed installs, explicit RYK_BIN, then non-cwd PATH binaries.
+    """Trust explicit RYK_BIN, managed installs with provenance, then PATH.
 
     Order:
-    1. Managed roots (``~/.local/bin``, ``~/.ryk/bin``) with provenance.
-    2. Explicit ``RYK_BIN`` operator pin (no provenance; still reject
-       node_modules, group/world-writable, and tmp plants).
+    1. Explicit ``RYK_BIN`` operator pin (no provenance; still reject
+       node_modules, group/world-writable, and tmp plants that are not a
+       managed-root path). A pin to ``~/.local/bin/ryk`` / ``~/.ryk/bin/ryk``
+       does not need a receipt.
+    2. Managed roots (``~/.local/bin``, ``~/.ryk/bin``) auto-discovery
+       still requires provenance.
     3. ``RYK_ALLOW_WORKSPACE_BIN=1`` cwd/source zig-out.
     4. PATH / other absolute binaries that are not tmp and not cwd plants.
 
@@ -678,18 +681,21 @@ def _candidate_is_trusted(path: Path) -> bool:
         and _path_is_within(canonical, workspace)
     )
     explicit_pin = _is_explicit_ryk_bin(canonical)
-    # Managed install roots win over temp and workspace-plant rejects so
-    # cwd=$HOME (or a test HOME under /tmp) does not discard ~/.local/bin/ryk.
+    # Operator pin before managed provenance: RYK_BIN=$HOME/.local/bin/ryk
+    # without a receipt must work. Bare tmp plants stay rejected.
+    if explicit_pin:
+        if in_tmp and not in_managed:
+            return False
+        return True
+    # Managed auto-discovery (no RYK_BIN) still requires the receipt.
+    # Roots win over temp/workspace-plant rejects so cwd=$HOME (or a test
+    # HOME under /tmp) does not discard ~/.local/bin/ryk.
     if in_managed:
         return _installer_provenance_valid(canonical)
     if workspace_override:
         return True
     if in_tmp:
         return False
-    if explicit_pin:
-        # Operator override: no provenance receipt. Identity + Hermes smoke
-        # still run in ``_find_ryk``.
-        return True
     if _path_is_within(canonical, workspace):
         return False
     return True
