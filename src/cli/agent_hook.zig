@@ -7,9 +7,10 @@
 //! Invariants:
 //! - Interactive TTY with no args still shows help (not hook mode).
 //! - Shell commands route through the Zig shell_engine by default (fail-closed when unavailable).
-//! - Invalid hook input fails closed: malformed/oversized/unknown-format payloads emit
-//!   dual-contract deny JSON on stdout and exit 2 (the Cursor/Claude hook block code).
-//!   Recognized non-shell tool hooks (Read/Edit/…) still pass through with empty stdout.
+//! - Invalid hook input fails closed: empty/whitespace, malformed, oversized, or
+//!   unknown-format payloads emit dual-contract deny JSON on stdout and exit 2
+//!   (the Cursor/Claude hook block code). Recognized non-shell tool hooks
+//!   (Read/Edit/…) still pass through with empty stdout.
 
 const std = @import("std");
 const build_options = @import("build_options");
@@ -37,13 +38,18 @@ pub const InputFormat = enum {
 
 pub const ShellCommandEvaluatorFn = shell_eval.ShellCommandEvaluatorFn;
 
-/// True when `ryk` was invoked with no subcommand and stdin is piped (non-TTY).
-pub fn shouldEnter(io: std.Io) bool {
-    const stdin_tty = std.Io.File.stdin().isTty(io) catch true;
-    return !stdin_tty;
+/// True when stdin is not a TTY. Probe failure is treated as non-TTY so a
+/// closed or unprobeable fd still enters hook mode (empty/unreadable stdin
+/// already fail-closes inside `command`). A TTY stays on help.
+pub fn shouldEnterFromStdinTty(stdin_is_tty: bool) bool {
+    return !stdin_is_tty;
 }
 
-pub const NotAgentHookInput = error.NotAgentHookInput;
+/// True when `ryk` was invoked with no subcommand and stdin is piped (non-TTY).
+pub fn shouldEnter(io: std.Io) bool {
+    const stdin_tty = std.Io.File.stdin().isTty(io) catch false;
+    return shouldEnterFromStdinTty(stdin_tty);
+}
 
 pub fn command(io: std.Io, stdout: anytype, stderr: anytype) !u8 {
     return commandWithEvaluator(io, stdout, stderr, null);
@@ -72,10 +78,6 @@ pub fn commandWithEvaluator(
         return fail_closed_deny_exit_code;
     };
     defer allocator.free(payload);
-
-    if (std.mem.trim(u8, payload, " \t\r\n").len == 0) {
-        return error.NotAgentHookInput;
-    }
 
     return evaluatePayload(allocator, payload, stdout, evaluator);
 }
@@ -174,7 +176,8 @@ pub fn evaluatePayloadWithModeOpts(
     opts: EvaluatePayloadOpts,
 ) !u8 {
     if (std.mem.trim(u8, payload, " \t\r\n").len == 0) {
-        return exit_codes.success;
+        try writeFailClosedDeny(stdout, "ryk: hook payload was empty; denied fail-closed");
+        return fail_closed_deny_exit_code;
     }
 
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, payload, .{}) catch {
@@ -591,6 +594,31 @@ test "evaluatePayload fails closed on daemon evaluate failures" {
         const out = stdout.buffered();
         try std.testing.expect(std.mem.indexOf(u8, out, "\"permissionDecision\":\"deny\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, out, case.reason_sub) != null);
+    }
+}
+
+test "shouldEnter treats TTY as help and non-TTY or probe failure as hook entry" {
+    try std.testing.expect(!shouldEnterFromStdinTty(true));
+    try std.testing.expect(shouldEnterFromStdinTty(false));
+}
+
+test "empty and whitespace hook payloads fail closed with dual-contract deny" {
+    // Same contract as garbage JSON: deny + exit 2, not success / empty stdout.
+    const allocator = std.testing.allocator;
+    const cases = [_][]const u8{ "", "   ", "\n", "\t\r\n  ", " \n\t " };
+    for (cases) |payload| {
+        var stdout_buf: [2048]u8 = undefined;
+        var stdout: std.Io.Writer = .fixed(&stdout_buf);
+        const code = try evaluatePayload(allocator, payload, &stdout, shell_eval.mockDaemonAllowEvaluator);
+        try std.testing.expectEqual(fail_closed_deny_exit_code, code);
+        const out = stdout.buffered();
+        try std.testing.expect(std.mem.indexOf(u8, out, "\"permission\":\"deny\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "\"permissionDecision\":\"deny\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "\"continue\":false") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "hook payload was empty") != null);
+        var reparsed = try std.json.parseFromSlice(std.json.Value, allocator, std.mem.trim(u8, out, "\n"), .{});
+        defer reparsed.deinit();
+        try std.testing.expect(reparsed.value == .object);
     }
 }
 

@@ -328,6 +328,8 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_hook_validation_tests = addRunTestTerminal(b, hook_validation_tests);
+    // Bare-`ryk` stdin tests exec ./zig-out/bin/ryk; missing binary must not skip.
+    run_hook_validation_tests.step.dependOn(&install_ryk.step);
 
     const dashboard_feed_redaction_tests = b.addTest(.{
         .root_module = b.createModule(.{
