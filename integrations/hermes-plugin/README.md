@@ -104,12 +104,14 @@ The plugin resolves ryk once per process (cached until `RYK_BIN` changes), probi
 3. `ryk` on `PATH`
 4. `./zig-out/bin/ryk` (current repo and parents — only when `RYK_ALLOW_WORKSPACE_BIN=1`)
 
-Only regular files that are executable, identify as `product: ryk` via `ryk version --json`, and pass a Hermes `pre_tool_call` smoke test are selected (exit 0 and hook decision is not `block`, matching `tests/fixtures/hook-safe.json`). Workspace candidates require the explicit `RYK_ALLOW_WORKSPACE_BIN=1` development opt-in. `ryk plugin doctor` uses a stricter allow-only check on the running ryk binary.
+Only regular files that are executable, identify as `product: ryk` via `ryk version --json`, and pass a Hermes `pre_tool_call` smoke test are selected (exit 0 and hook decision is not `block`, matching `tests/fixtures/hook-safe.json`). Automatic cwd `./zig-out` discovery requires `RYK_ALLOW_WORKSPACE_BIN=1`. `ryk plugin doctor` uses a stricter allow-only check on the running ryk binary.
 
 Environment:
 
-- `RYK_BIN` — select an absolute Ryk executable under `~/.local/bin` or `~/.ryk/bin`; managed binaries also require the installer's adjacent path-bound `.ryk-provenance` SHA-256 receipt, which is re-attested before each policy call. This is integrity evidence rather than a cryptographic signature, so same-user binary-and-receipt replacement is outside the trust claim. Repository-local binaries additionally require the development override below.
-- `RYK_ALLOW_WORKSPACE_BIN=1` — opt into repo-local `zig-out/bin/ryk` discovery for development/testing.
+- `RYK_BIN` — operator pin to an absolute executable. Must be user-owned and not group/world-writable, and must not live under `node_modules/.bin` or a tmp plant. No installer `.ryk-provenance` receipt is required. Identity (`ryk version --json`) and a Hermes `pre_tool_call` smoke test still run. This pin is not skipped as a cwd plant.
+- Managed `~/.local/bin` / `~/.ryk/bin` installs still require the installer's adjacent path-bound `.ryk-provenance` SHA-256 receipt, re-attested before each policy call. This is integrity evidence rather than a cryptographic signature, so same-user binary-and-receipt replacement is outside the trust claim.
+- `PATH` — a `ryk` that is not a cwd-planted `./zig-out` or `node_modules/.bin` binary, not under tmp, and that passes the same permission / identity / smoke checks is accepted (source-builds outside cwd included).
+- `RYK_ALLOW_WORKSPACE_BIN=1` — opt into repo-local `zig-out/bin/ryk` discovery for development/testing. Without this flag, planted `./zig-out` does not win over a managed install.
 - `RYK_HERMES_FAIL_OPEN` — only recognized truthy tokens (`1`, `true`, `yes`, `on`, `fail-open`, `open`) enable degraded fail-open behavior in attended mode; unattended/CI signals override it.
 - `CI` / `RYK_CI` / `RYK_NONINTERACTIVE` / `RYK_UNATTENDED` / `RYK_HERMES_UNATTENDED` — when truthy, harden ryk `ask` on tools to Hermes `block`, pass `--ci` to the hook CLI, and keep degraded execution fail-closed.
 - `RYK_HERMES_WORKSPACE` — optional absolute policy workspace for `ryk hook` subprocess cwd (pins policy discovery when the Hermes daemon cwd is not the setup tree).
