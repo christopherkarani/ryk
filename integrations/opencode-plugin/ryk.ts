@@ -527,30 +527,103 @@ function firstLine(text: string): string {
   return '';
 }
 
+/** Strip Recourse/Next walls and keep the first line only. */
+function sanitizeToastPart(text: string): string {
+  let detail = firstLine(text);
+  detail = detail.replace(/\s*Recourse:\s*.*$/i, '').replace(/\s*Next:\s*.*$/i, '').trim();
+  return detail;
+}
+
+function clipToastPart(text: string, max: number): string {
+  if (text.length <= max) return text;
+  return `${text.slice(0, Math.max(0, max - 3))}...`;
+}
+
+function commandFromArgs(args: Record<string, unknown> | undefined): string | undefined {
+  if (!args) return undefined;
+  for (const key of ['command', 'cmd', 'shell_command']) {
+    const value = args[key];
+    if (typeof value === 'string' && value.trim()) return value;
+  }
+  return undefined;
+}
+
 /**
- * Short one-line tool/toast copy for hard blocks.
+ * Short one-line tool-card / Error.message for hard blocks.
  * Prefer rule → reason → first line of message. Never embed Recourse/Next walls.
  */
 function formatShortBlock(response: RykResponse, context: string): string {
   let detail = '';
   if (typeof response.rule === 'string' && response.rule.trim()) {
-    detail = firstLine(response.rule);
+    detail = sanitizeToastPart(response.rule);
   } else if (typeof response.reason === 'string' && response.reason.trim()) {
-    detail = firstLine(response.reason);
+    detail = sanitizeToastPart(response.reason);
   } else if (typeof response.message === 'string' && response.message.trim()) {
-    detail = firstLine(response.message);
+    detail = sanitizeToastPart(response.message);
   }
   if (!detail) {
     detail = 'blocked by policy';
   }
-  // Belt-and-suspenders: strip same-line Recourse/Next if CLI ever packs them.
-  detail = detail.replace(/\s*Recourse:\s*.*$/i, '').replace(/\s*Next:\s*.*$/i, '').trim() || detail;
   // Prefer ~120-char tool lines; keep room for the "ryk blocked …: " prefix.
-  const maxDetail = 90;
-  if (detail.length > maxDetail) {
-    detail = `${detail.slice(0, maxDetail - 3)}...`;
-  }
+  return `ryk blocked ${context}: ${clipToastPart(detail, 90)}`;
+}
+
+/**
+ * Human reason for the TUI toast. Drops the rule id when it is already shown
+ * separately, and prefers the distinctive part of `message` over a generic
+ * "blocked by ryk policy" reason.
+ */
+function formatToastReason(response: RykResponse): string {
+  const rule = typeof response.rule === 'string' ? sanitizeToastPart(response.rule) : '';
+  const reason = typeof response.reason === 'string' ? sanitizeToastPart(response.reason) : '';
+  const message = typeof response.message === 'string' ? sanitizeToastPart(response.message) : '';
+
+  const stripKnown = (text: string): string => {
+    let out = text;
+    if (rule) out = out.split(rule).join(' ');
+    out = out
+      .replace(/^command blocked by ryk policy:?\s*/i, '')
+      .replace(/^blocked by ryk (?:rule|policy):?\s*/i, '')
+      .replace(/\s+/g, ' ')
+      .replace(/^[:.—–-]\s*/, '')
+      .trim();
+    return out;
+  };
+
+  const fromReason = reason ? stripKnown(reason) : '';
+  const fromMessage = message ? stripKnown(message) : '';
+  const generic = /^(blocked by (?:ryk )?policy|blocked by policy)?$/i;
+
+  if (fromReason && !generic.test(fromReason)) return fromReason;
+  if (fromMessage) return fromMessage;
+  if (fromReason) return fromReason;
+  if (reason) return reason;
+  if (message) return message;
+  return 'blocked by policy';
+}
+
+/**
+ * Toast body: prefix + optional command + rule + em-dash reason.
+ * Stays one line, no Recourse/Next, ≤280 (maybeToast also slices).
+ */
+function formatToastBlock(
+  response: RykResponse,
+  context: string,
+  command?: string
+): string {
+  const rule = typeof response.rule === 'string' ? sanitizeToastPart(response.rule) : '';
+  const reason = formatToastReason(response);
+  const cmd = command ? clipToastPart(sanitizeToastPart(command).replace(/\s+/g, ' '), 40) : '';
+  const identity = [cmd, rule].filter(Boolean).join(' · ');
+  const detail = identity ? `${identity} — ${reason}` : reason;
   return `ryk blocked ${context}: ${detail}`;
+}
+
+function toastTitleForRisk(risk?: RykResponse['risk']): string {
+  if (risk === 'high' || risk === 'critical' || risk === 'medium') {
+    return `ryk blocked · ${risk}`;
+  }
+  return 'ryk blocked';
 }
 
 /**
@@ -686,7 +759,7 @@ async function maybeToast(
     title,
     message: message.slice(0, 280),
     variant,
-    duration: variant === 'error' ? 8000 : 5000,
+    duration: variant === 'error' ? 12000 : 5000,
   };
   const toastPromise = invokeShowToast(ctx, payload);
   // Late reject after timeout must not become an unhandled rejection.
@@ -718,9 +791,11 @@ async function maybeToast(
 async function hardBlockWithToast(
   ctx: PluginContext,
   shortMsg: string,
-  operatorDetail?: string
+  operatorDetail?: string,
+  toastMsg?: string,
+  risk?: RykResponse['risk']
 ): Promise<never> {
-  await maybeToast(ctx, 'error', 'ryk blocked', shortMsg);
+  await maybeToast(ctx, 'error', toastTitleForRisk(risk), toastMsg ?? shortMsg);
   if (process.env.RYK_OPENCODE_VERBOSE === '1') {
     console.error(`[ryk] ${shortMsg}`);
     if (operatorDetail && operatorDetail !== shortMsg) {
@@ -734,7 +809,8 @@ async function hardBlockWithToast(
 async function applyBlockingDecision(
   response: RykResponse,
   context: string,
-  ctx: PluginContext
+  ctx: PluginContext,
+  command?: string
 ): Promise<void> {
   if (response.decision === 'warn') {
     return;
@@ -748,7 +824,9 @@ async function applyBlockingDecision(
   await hardBlockWithToast(
     ctx,
     formatShortBlock(response, context),
-    formatOperatorDetail(response, context)
+    formatOperatorDetail(response, context),
+    formatToastBlock(response, context, command),
+    response.risk
   );
 }
 
@@ -940,7 +1018,12 @@ async function rykPlugin(ctx: PluginContext): Promise<PluginHooks> {
           response.message || response.reason || 'policy warning'
         );
       }
-      await applyBlockingDecision(response, 'tool execution', ctx);
+      await applyBlockingDecision(
+        response,
+        'tool execution',
+        ctx,
+        commandFromArgs(output.args)
+      );
     },
 
     'tool.execute.after': async (input, output) => {
@@ -972,8 +1055,8 @@ async function rykPlugin(ctx: PluginContext): Promise<PluginHooks> {
         await maybeToast(
           ctx,
           'error',
-          'ryk blocked',
-          formatShortBlock(response, 'permission')
+          toastTitleForRisk(response.risk),
+          formatToastBlock(response, 'permission', commandFromArgs(input))
         );
       } else if (response.decision === 'warn' || response.decision === 'ask') {
         await maybeToast(
@@ -1007,7 +1090,12 @@ async function rykPlugin(ctx: PluginContext): Promise<PluginHooks> {
           response.message || response.reason || 'policy warning'
         );
       }
-      await applyBlockingDecision(response, 'command', ctx);
+      await applyBlockingDecision(
+        response,
+        'command',
+        ctx,
+        [input.command, input.arguments].filter(Boolean).join(' ').trim() || undefined
+      );
     },
 
     'shell.env': async (input, output) => {
@@ -1052,6 +1140,8 @@ async function rykPlugin(ctx: PluginContext): Promise<PluginHooks> {
 const plugin = Object.assign(rykPlugin, {
   parseHookResponse,
   findRyk,
+  formatShortBlock,
+  formatToastBlock,
 });
 
 export default plugin;

@@ -138,6 +138,8 @@ cat tests/plugin-fixtures/opencode/tool_execute_before_command_safe.json \
 
 Expected: `allow` decision in valid JSON.
 
+When a blocking hook vetoes a tool, the OpenCode TUI shows a toast with the command, matched rule, and reason. See the live clip in [`integrations/opencode-plugin/README.md`](../integrations/opencode-plugin/README.md#block-toast).
+
 ### Example decision command
 
 ```bash

@@ -98,7 +98,7 @@ if [ "$1" = "version" ] && [ "$2" = "--json" ]; then
   printf '%s\\n' '{"product":"ryk","version":"0.0.0"}'
   exit 0
 fi
-printf '%s\\n' '{"decision":"block","rule":"core.filesystem:rm-rf-root-home","message":"command blocked by ryk policy"}'
+printf '%s\\n' '{"decision":"block","risk":"critical","rule":"core.filesystem:rm-rf-root-home","reason":"blocked by ryk policy","message":"command blocked by ryk policy: Matched destructive pattern core.filesystem:rm-rf-root-home."}'
 `
   );
   await chmod(rykBin, 0o755);

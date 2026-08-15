@@ -11,7 +11,7 @@ import tuiModule from '../dist/tui.js';
 
 // Helpers are attached to the default function. Named function exports would be
 // loaded as extra plugins by OpenCode 1.18's legacy loader.
-const { findRyk, parseHookResponse } = rykPlugin;
+const { findRyk, parseHookResponse, formatShortBlock, formatToastBlock } = rykPlugin;
 
 
 function toastPayload(input) {
@@ -706,6 +706,110 @@ printf '%s\\n' '{"decision":"block","message":"command blocked"}'
         tui: {
           publish: async (event) => {
             published.push(event);
+          },
+        },
+      },
+    }
+  );
+});
+
+test('formatToastBlock appends a human reason after the rule', () => {
+  assert.ok(typeof formatToastBlock === 'function', 'formatToastBlock is attached to the default export');
+  const toast = formatToastBlock(
+    {
+      decision: 'block',
+      rule: 'core.filesystem:rm-rf-root-home',
+      reason: 'blocked by ryk policy',
+      message: 'command blocked by ryk policy: Matched destructive pattern core.filesystem:rm-rf-root-home.',
+      risk: 'critical',
+    },
+    'tool execution',
+    'rm -rf /'
+  );
+  assert.match(toast, /^ryk blocked tool execution:/);
+  assert.match(toast, /rm -rf \//);
+  assert.match(toast, /core\.filesystem:rm-rf-root-home/);
+  assert.match(toast, /Matched destructive pattern/i);
+  assert.ok(!toast.includes('\n'));
+  assert.ok(!toast.includes('Recourse:'));
+  assert.ok(toast.length <= 280);
+
+  const thrown = formatShortBlock(
+    {
+      decision: 'block',
+      rule: 'core.filesystem:rm-rf-root-home',
+      reason: 'blocked by ryk policy',
+      message: 'command blocked by ryk policy: Matched destructive pattern core.filesystem:rm-rf-root-home.',
+    },
+    'tool execution'
+  );
+  assert.match(thrown, /core\.filesystem:rm-rf-root-home/);
+  assert.ok(
+    !thrown.includes('Matched destructive'),
+    'Error.message stays rule-only when a rule is present'
+  );
+});
+
+test('formatToastBlock strips Recourse walls from reason and message', () => {
+  const toast = formatToastBlock(
+    {
+      decision: 'block',
+      rule: 'core.credentials:cat-env',
+      reason: 'blocked by ryk rule: core.credentials:cat-env',
+      message: 'reading .env is blocked\nRecourse: ryk allow-once ABC\nNext: ryk explain',
+    },
+    'tool execution',
+    'cat .env'
+  );
+  assert.match(toast, /cat \.env/);
+  assert.match(toast, /core\.credentials:cat-env/);
+  assert.match(toast, /reading \.env is blocked/);
+  assert.ok(!toast.includes('Recourse:'));
+  assert.ok(!toast.includes('Next:'));
+  assert.ok(!toast.includes('allow-once'));
+});
+
+test('hard block toast includes rule and reason; throw stays short', async () => {
+  const toasts = [];
+  await withFakeRyk(
+    async (plugin) => {
+      const before = plugin['tool.execute.before'];
+      assert.ok(before);
+      await assert.rejects(
+        before(
+          { tool: 'bash', sessionID: 'session-1', callID: 'call-1' },
+          { args: { command: 'rm -rf /' } }
+        ),
+        (err) => {
+          assertShortBlockThrow(err, /ryk blocked tool execution: core\.filesystem:rm-rf-root-home/);
+          assert.ok(
+            !err.message.includes('Matched destructive'),
+            'throw must not carry the toast reason'
+          );
+          return true;
+        }
+      );
+      assert.equal(toasts.length, 1);
+      const body = toastPayload(toasts[0]);
+      assert.equal(body.variant, 'error');
+      assert.match(body.title, /ryk blocked/);
+      assert.match(body.title, /critical/);
+      assert.match(body.message, /rm -rf \//);
+      assert.match(body.message, /core\.filesystem:rm-rf-root-home/);
+      assert.match(body.message, /Matched destructive pattern/i);
+      assert.ok(!body.message.includes('\n'));
+      assert.ok(body.message.length <= 280);
+    },
+    `#!/bin/sh
+cat <<'EOF'
+{"decision":"block","risk":"critical","rule":"core.filesystem:rm-rf-root-home","reason":"blocked by ryk policy","message":"command blocked by ryk policy: Matched destructive pattern core.filesystem:rm-rf-root-home."}
+EOF
+`,
+    {
+      client: {
+        tui: {
+          showToast: async (input) => {
+            toasts.push(input);
           },
         },
       },

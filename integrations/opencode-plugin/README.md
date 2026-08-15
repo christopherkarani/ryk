@@ -139,6 +139,21 @@ Example response:
 
 If the decision is `block`, the server hook throws a **single-line** `Error` so the tool does not run. The companion `ryk-tui.ts` host (`id: "ryk"`) is what vanilla OpenCode lists as a plugin and is what shows the toast — a server-only file cannot also export `tui` on OpenCode 1.18. Set `RYK_OPENCODE_VERBOSE=1` to also log full operator detail (Next / remediation) to stderr. Do not `console.log` from the plugin: OpenCode dumps that into the prompt.
 
+## Block toast
+
+When ryk vetoes a tool, OpenCode shows an error toast. The **title** includes the risk (`ryk blocked · critical`). The **message** keeps a short prefix, then the command, the matched rule, and a human reason:
+
+```text
+ryk blocked · critical
+ryk blocked tool execution: rm -rf / · core.filesystem:rm-rf-root-home — Matched destructive pattern
+```
+
+The thrown `Error` stays rule-only so the tool card does not grow a Recourse/Next wall. Remediation stays on stderr when `RYK_OPENCODE_VERBOSE=1`.
+
+Live OpenCode 1.18.18 — `rm -rf /`, `cat .env`, then `curl | sh`:
+
+![ryk blocked toast for dangerous commands](docs/opencode-block-toast.gif)
+
 ## Run redteam
 
 ```bash
