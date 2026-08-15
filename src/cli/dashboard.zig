@@ -208,9 +208,11 @@ pub fn commandForTest(argv: []const []const u8, stdout: anytype, stderr: anytype
 
 pub fn commandCloud(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: anytype) !u8 {
     if (comptime builtin.os.tag == .windows) return exit_codes.unsupported;
-    if (argv.len > 0 and (std.mem.eql(u8, argv[0], "--help") or std.mem.eql(u8, argv[0], "-h"))) {
-        _ = try help.writeCommand(io, stdout, "cloud");
-        return exit_codes.success;
+    for (argv) |arg| {
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            _ = try help.writeCommand(io, stdout, "cloud");
+            return exit_codes.success;
+        }
     }
     var options = parseOptions(io, argv, stdout, stderr) catch |err| switch (err) {
         error.HelpShown => return exit_codes.success,
@@ -223,7 +225,7 @@ pub fn commandCloud(io: std.Io, argv: []const []const u8, stdout: anytype, stder
 
 fn applyCloudAlias(options: *DashboardOptions) void {
     options.cloud = true;
-    if (std.mem.eql(u8, options.view, "overview")) options.view = "terminal";
+    options.view = "terminal";
 }
 
 fn effectiveView(options: DashboardOptions) []const u8 {
@@ -1440,6 +1442,11 @@ test "ryk cloud is a localhost dashboard alias for the terminal view" {
     try std.testing.expect(demo.demo);
     try std.testing.expectEqualStrings("terminal", effectiveView(demo));
 
+    var activity = try parseOptions(std.testing.io, &.{ "--view", "activity" }, &stdout, &stderr);
+    applyCloudAlias(&activity);
+    try std.testing.expectEqualStrings("terminal", activity.view);
+    try std.testing.expectEqualStrings("terminal", effectiveView(activity));
+
     var href_buf: [128]u8 = undefined;
     try std.testing.expectEqualStrings(
         "http://127.0.0.1:7742/terminal/",
@@ -1452,4 +1459,13 @@ test "ryk cloud is a localhost dashboard alias for the terminal view" {
     const overview = try parseOptions(std.testing.io, &.{}, &stdout, &stderr);
     try std.testing.expectEqualStrings("http://127.0.0.1:7742/", try formatListenUrl(&href_buf, overview));
     try std.testing.expect(std.mem.indexOf(u8, try formatListenUrl(&href_buf, options), "demo") == null);
+
+    var help_out: [4096]u8 = undefined;
+    var help_err: [256]u8 = undefined;
+    var help_stdout: std.Io.Writer = .fixed(&help_out);
+    var help_stderr: std.Io.Writer = .fixed(&help_err);
+    const help_code = try commandCloud(std.testing.io, &.{ "--workspace", ".", "--help" }, &help_stdout, &help_stderr);
+    try std.testing.expectEqual(exit_codes.success, help_code);
+    try std.testing.expect(std.mem.indexOf(u8, help_stdout.buffered(), "ryk dashboard --view terminal") != null);
+    try std.testing.expectEqualStrings("", help_stderr.buffered());
 }

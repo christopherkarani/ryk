@@ -56,7 +56,9 @@ function TerminalContent() {
             ? { text: "DEMO fixture", variant: "warning" }
             : source === "live"
               ? { text: "Live", variant: "success" }
-              : { text: "Empty", variant: "neutral" }
+              : source === "error"
+                ? { text: "Unavailable", variant: "error" }
+                : { text: "Empty", variant: "neutral" }
         }
       />
       <BlockedTerminal

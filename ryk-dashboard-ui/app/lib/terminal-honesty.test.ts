@@ -104,6 +104,13 @@ test("BlockedTerminal demo chrome is labeled fixture, not Live", () => {
   assert.doesNotMatch(source, /ryk@cloud/);
 });
 
+test("legacy resolveTerminalFeed returns empty events when the live list is empty", () => {
+  const source = readFileSync(join(root, "../../../src/dashboard/assets/app.js"), "utf8");
+  assert.match(source, /if \(!events\.length\) return \{ events: \[\], source: "empty" \}/);
+  assert.match(source, /if \(!state\.status\) return \{ events: \[\], source: "error" \}/);
+  assert.match(source, /if \(state\.terminalDemo\) return \{ events: TERMINAL_FIXTURES, source: "demo" \}/);
+});
+
 test("dashboard UIs do not silent-demo on empty feed or fetch failure", () => {
   const files = [
     join(root, "terminal-events.ts"),
