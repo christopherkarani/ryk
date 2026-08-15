@@ -376,7 +376,7 @@ ryk cloud --demo
 
 The default bind is 127.0.0.1:7742. Non-loopback binds are rejected. Mutation routes use a per-run browser token and fixed ryk actions. The dashboard calls existing CLI and core paths; it is not a separate policy evaluator.
 
-`ryk cloud` is a thin alias for `ryk dashboard --view terminal` on the same localhost port. It prints a localhost URL and shows real blocked commands from the local API. An empty feed stays empty. `--demo` (or `?demo=1`) is the only automatic fixture path; the chrome labels that stream DEMO / fixture. This UI is not started by install. Use `ryk replay --only denied` for the CLI equivalent.
+`ryk cloud` is a thin alias for `ryk dashboard --view terminal` on the same localhost port. It prints a localhost URL and shows real blocked commands from the local API. An empty feed stays empty. `--demo` (or `?demo=1`) is the only automatic fixture path; the chrome labels that stream DEMO / fixture. This UI is not started by install. The alias is documented on `ryk help --all` and `ryk cloud --help`; default `ryk` / `ryk help` do not teach a new cloud verb. Use `ryk replay --only denied` for the CLI equivalent.
 
 ci runs local readiness checks:
 

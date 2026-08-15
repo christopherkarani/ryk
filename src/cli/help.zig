@@ -831,7 +831,7 @@ pub const commands =
             .summary = "Open the local dashboard Terminal view of blocked commands",
             .usage = "ryk cloud [--machine | --workspace PATH] [--host 127.0.0.1] [--port 7742] [--demo] [--once]",
             .category = .diagnostics,
-            .public = true,
+            .public = false,
             .additional_completion_flags = &.{ "--view", "--demo" },
             .examples = &.{
                 "ryk cloud",
@@ -843,6 +843,7 @@ pub const commands =
                 "Shows real blocked_actions from the local dashboard API. An empty feed stays empty.",
                 "Use --demo only to load a labeled fixture stream. Demo is never loaded because the feed is empty or /api/status failed.",
                 "This is not a hosted control plane and not a remote product. Install does not start this UI.",
+                "Documented on `ryk help --all` and `ryk cloud --help`. Default `ryk` / `ryk help` do not teach this alias.",
                 "Policy still belongs to the CLI and host plugins. `ryk replay --only denied` is the CLI equivalent.",
             },
         },
@@ -857,7 +858,7 @@ pub const commands =
 const public_help_prefix = [_][]const u8{ "start", "agents", "stop" };
 /// Suffix of Safe Launch teaching order (after host aliases).
 /// Day-2 loop: doctor → packs → allowlist, then review/forensics/explain/update.
-const public_help_suffix = [_][]const u8{ "doctor", "packs", "allowlist", "replay", "scan", "explain", "cloud", "update", "telemetry" };
+const public_help_suffix = [_][]const u8{ "doctor", "packs", "allowlist", "replay", "scan", "explain", "update", "telemetry" };
 
 pub const WriteMode = enum {
     /// Safe Launch surface only (default `ryk` / `ryk help`).
@@ -1247,7 +1248,6 @@ test "default root help shows only public Safe Launch verbs" {
     try std.testing.expect(helpListsPeerCommand(top, "replay"));
     try std.testing.expect(helpListsPeerCommand(top, "scan"));
     try std.testing.expect(helpListsPeerCommand(top, "explain"));
-    try std.testing.expect(helpListsPeerCommand(top, "cloud"));
     try std.testing.expect(helpListsPeerCommand(top, "update"));
     for (host_launch.host_launch_aliases) |host| {
         try std.testing.expect(helpListsPeerCommand(top, host));
@@ -1285,6 +1285,7 @@ test "default root help shows only public Safe Launch verbs" {
     try std.testing.expect(!helpListsPeerCommand(top, "allow"));
     try std.testing.expect(!helpListsPeerCommand(top, "unallow"));
     try std.testing.expect(!helpListsPeerCommand(top, "allow-once"));
+    try std.testing.expect(!helpListsPeerCommand(top, "cloud"));
 }
 
 test "help --all lists full advanced command surface" {
@@ -1518,7 +1519,7 @@ test "public Safe Launch: packs and allowlist help details mention TTY browse an
 
 test "cloud help is a localhost dashboard alias and does not sell a control plane" {
     const info = findCommand("cloud") orelse return error.TestUnexpectedResult;
-    try std.testing.expect(info.public);
+    try std.testing.expect(!info.public);
     try std.testing.expect(!info.hidden);
     try std.testing.expect(std.mem.indexOf(u8, info.usage, "ryk cloud") != null);
     try std.testing.expect(std.mem.indexOf(u8, info.usage, "--demo") != null);
@@ -1536,6 +1537,7 @@ test "cloud help is a localhost dashboard alias and does not sell a control plan
     try std.testing.expect(std.mem.indexOf(u8, text, "--demo") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "empty") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "control plane") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "help --all") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "SIEM") == null);
     try std.testing.expect(std.mem.indexOf(u8, text, "SSO") == null);
     try std.testing.expect(std.mem.indexOf(u8, text, "$999") == null);
