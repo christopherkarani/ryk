@@ -223,6 +223,9 @@ fn forkApplyWorkspaceViewAndExec(
 ) SpawnError!SpawnLease {
     const constructed_env = env_map orelse return error.ApplyFailed;
     const target_cwd = cwd orelse compiled.workspace_root;
+    // Same precreate as the Landlock-only path: bootstrap expand needs a
+    // directory RW leaf or applySelf fails closed (empty box).
+    _ = session_tmp.ensureWorkspaceSessionTmp(compiled.workspace_root);
     const spawned = linux_workspace_view_spawn.spawnWorkspaceView(.{
         .io = io,
         .allocator = std.heap.page_allocator,
