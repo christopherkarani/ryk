@@ -2219,6 +2219,22 @@ test "evaluateCommand denies force-equivalent git push and allows plain push" {
     }
 }
 
+test "force-push Why does not recommend lease as an allowed rewrite" {
+    const cases = [_][]const u8{
+        "git push --force",
+        "git push -f",
+    };
+    for (cases) |cmd| {
+        var eval = try evaluateCommand(std.testing.allocator, cmd, .{});
+        defer eval.deinit(std.testing.allocator);
+        try std.testing.expect(eval.decision == .deny);
+        try std.testing.expect(std.mem.indexOf(u8, eval.reason, "Use --force-with-lease if necessary") == null);
+        try std.testing.expect(std.mem.indexOf(u8, eval.reason, "Use --force-with-lease") == null);
+        try std.testing.expect(std.mem.indexOf(u8, eval.reason, "fast-forward") != null);
+        try std.testing.expect(std.mem.indexOf(u8, eval.reason, "git push") != null);
+    }
+}
+
 test "evaluateCommand pipe-to-shell source fence has no false positives on data" {
     const cases = [_][]const u8{
         "echo 'curl is a tool' | sh", // quoted data, not a fetch
