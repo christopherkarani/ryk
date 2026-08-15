@@ -1235,7 +1235,7 @@ fn isForceEquivalentGitPush(value: []const u8) bool {
     if (std.ascii.indexOfIgnoreCase(value, "git") == null) return false;
     if (std.ascii.indexOfIgnoreCase(value, "push") == null) return false;
 
-    var it = std.mem.tokenizeAny(u8, value, " \t");
+    var it = std.mem.tokenizeAny(u8, value, " \t\n\r");
     var seen_push = false;
     while (it.next()) |raw| {
         const tok = unwrapGitToken(raw);
@@ -1243,10 +1243,12 @@ fn isForceEquivalentGitPush(value: []const u8) bool {
             if (std.ascii.eqlIgnoreCase(tok, "push")) seen_push = true;
             continue;
         }
-        if (std.ascii.eqlIgnoreCase(tok, "--force") or std.ascii.startsWithIgnoreCase(tok, "--force-")) return true;
+        if (std.ascii.eqlIgnoreCase(tok, "--force") or
+            std.ascii.startsWithIgnoreCase(tok, "--force-") or
+            std.ascii.startsWithIgnoreCase(tok, "--force=")) return true;
         if (isShortOptCluster(tok, 'f')) return true;
         if (std.ascii.eqlIgnoreCase(tok, "--delete") or std.mem.eql(u8, tok, "-d")) return true;
-        if (std.ascii.eqlIgnoreCase(tok, "--mirror")) return true;
+        if (std.ascii.eqlIgnoreCase(tok, "--mirror") or std.ascii.startsWithIgnoreCase(tok, "--mirror=")) return true;
         if (isForceRefspec(tok) or isDeleteRefspec(tok)) return true;
     }
     return false;
@@ -2178,6 +2180,12 @@ test "evaluateCommand denies force-equivalent git push and allows plain push" {
         "git push --mirror",
         "git push origin :old-branch",
         "git push --force origin main",
+        "git push --force-with-lease origin main",
+        "git push --force-if-includes",
+        "git push -uf origin main",
+        "git -C /tmp/repo push -f",
+        "git\npush\n-f",
+        "git push --force=true origin main",
     };
     for (deny_cases) |cmd| {
         var eval = try evaluateCommand(std.testing.allocator, cmd, .{});

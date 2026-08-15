@@ -144,8 +144,8 @@ pub fn classifyArgv(argv: []const []const u8) Classification {
     if (isRemoteShell(lower_exe)) {
         return .{ .risk_class = .remote_shell, .risk_score = 85, .default_decision = .ask, .reason = "remote shell or raw socket command", .executable = exe };
     }
-    if (std.ascii.eqlIgnoreCase(lower_exe, "git") and argv.len >= 2 and std.ascii.eqlIgnoreCase(argv[1], "push")) {
-        if (hasForceFlag(argv[2..])) return deny(.git_remote_write, 95, "force push can rewrite remote history", exe);
+    if (std.ascii.eqlIgnoreCase(lower_exe, "git") and argvHasGitPush(argv[1..])) {
+        if (isForceEquivalentGitPushArgs(argv[1..])) return deny(.git_remote_write, 95, "force-equivalent git push can rewrite or delete remote history", exe);
         return .{ .risk_class = .git_remote_write, .risk_score = 80, .default_decision = .ask, .reason = "git remote write", .executable = exe };
     }
     if (std.ascii.eqlIgnoreCase(lower_exe, "reg") and argv.len >= 2 and (std.ascii.eqlIgnoreCase(argv[1], "add") or std.ascii.eqlIgnoreCase(argv[1], "delete"))) {
@@ -719,8 +719,8 @@ fn classifyShellScript(exe: []const u8, script: []const u8) Classification {
     if (containsAsciiIgnoreCase(script, "sudo ") or containsAsciiIgnoreCase(script, " su ") or containsAsciiIgnoreCase(script, "doas ")) {
         return deny(.privilege_escalation, 98, "privilege escalation command", exe);
     }
-    if (containsAsciiIgnoreCase(script, "git push --force") or containsAsciiIgnoreCase(script, "git push -f")) {
-        return deny(.git_remote_write, 95, "force push can rewrite remote history", exe);
+    if (scriptHasForceEquivalentGitPush(script)) {
+        return deny(.git_remote_write, 95, "force-equivalent git push can rewrite or delete remote history", exe);
     }
     if (containsAsciiIgnoreCase(script, "cat .env") or containsAsciiIgnoreCase(script, "cat ~/.ssh/") or commandTextReadsProtectedCredential(script)) {
         return deny(.credential_inspection, 96, "credential file inspection", exe);
@@ -941,11 +941,77 @@ fn hasArg(args: []const []const u8, needle: []const u8) bool {
     return false;
 }
 
-fn hasForceFlag(args: []const []const u8) bool {
-    for (args) |arg| {
-        if (std.mem.eql(u8, arg, "--force") or std.mem.eql(u8, arg, "-f") or startsWithAsciiIgnoreCase(arg, "--force-with-lease")) return true;
+fn unwrapGitToken(tok: []const u8) []const u8 {
+    if (tok.len >= 2 and ((tok[0] == '\'' and tok[tok.len - 1] == '\'') or (tok[0] == '"' and tok[tok.len - 1] == '"'))) {
+        return tok[1 .. tok.len - 1];
+    }
+    return tok;
+}
+
+fn isShortOptCluster(tok: []const u8, flag: u8) bool {
+    if (tok.len < 2 or tok[0] != '-' or tok[1] == '-') return false;
+    return std.mem.indexOfScalar(u8, tok[1..], flag) != null;
+}
+
+fn isForceRefspec(tok: []const u8) bool {
+    return tok.len >= 2 and tok[0] == '+' and tok[1] != '-';
+}
+
+fn isDeleteRefspec(tok: []const u8) bool {
+    const t = if (tok.len > 0 and tok[0] == '+') tok[1..] else tok;
+    if (t.len < 2 or t[0] != ':') return false;
+    if (t.len >= 3 and t[1] == '/' and t[2] == '/') return false;
+    if (std.mem.indexOfScalar(u8, t, '@') != null) return false;
+    return true;
+}
+
+fn argvHasGitPush(args: []const []const u8) bool {
+    for (args) |raw| {
+        if (std.ascii.eqlIgnoreCase(unwrapGitToken(raw), "push")) return true;
     }
     return false;
+}
+
+/// Force-equivalent git push: `-f` / `--force*` / `--force=`, `+refspec`,
+/// `--delete` / `-d`, `--mirror`, `:ref`. Matches the shell-engine fence so
+/// argv and script surfaces cannot split-brain. Plain `git push` stays a non-deny.
+fn isForceEquivalentGitPushArgs(args: []const []const u8) bool {
+    var seen_push = false;
+    for (args) |raw| {
+        const tok = unwrapGitToken(raw);
+        if (!seen_push) {
+            if (std.ascii.eqlIgnoreCase(tok, "push")) seen_push = true;
+            continue;
+        }
+        if (isForceEquivalentGitPushToken(tok)) return true;
+    }
+    return false;
+}
+
+fn scriptHasForceEquivalentGitPush(script: []const u8) bool {
+    if (std.ascii.indexOfIgnoreCase(script, "git") == null) return false;
+    if (std.ascii.indexOfIgnoreCase(script, "push") == null) return false;
+    var it = std.mem.tokenizeAny(u8, script, " \t\n\r");
+    var seen_push = false;
+    while (it.next()) |raw| {
+        const tok = unwrapGitToken(raw);
+        if (!seen_push) {
+            if (std.ascii.eqlIgnoreCase(tok, "push")) seen_push = true;
+            continue;
+        }
+        if (isForceEquivalentGitPushToken(tok)) return true;
+    }
+    return false;
+}
+
+fn isForceEquivalentGitPushToken(tok: []const u8) bool {
+    if (std.ascii.eqlIgnoreCase(tok, "--force") or
+        std.ascii.startsWithIgnoreCase(tok, "--force-") or
+        std.ascii.startsWithIgnoreCase(tok, "--force=")) return true;
+    if (isShortOptCluster(tok, 'f')) return true;
+    if (std.ascii.eqlIgnoreCase(tok, "--delete") or std.mem.eql(u8, tok, "-d")) return true;
+    if (std.ascii.eqlIgnoreCase(tok, "--mirror") or std.ascii.startsWithIgnoreCase(tok, "--mirror=")) return true;
+    return isForceRefspec(tok) or isDeleteRefspec(tok);
 }
 
 fn readsProtectedCredential(args: []const []const u8) bool {
@@ -1187,6 +1253,16 @@ test "command classifier catches required high risk patterns" {
     try std.testing.expectEqual(RiskClass.destructive_filesystem, classifyArgv(&.{ "find", ".", "-delete" }).risk_class);
     try std.testing.expectEqual(RiskClass.privilege_escalation, classifyArgv(&.{ "sudo", "ls" }).risk_class);
     try std.testing.expectEqual(RiskClass.git_remote_write, classifyArgv(&.{ "git", "push", "--force" }).risk_class);
+    try std.testing.expect(classifyArgv(&.{ "git", "push", "--force" }).mandatory_deny);
+    try std.testing.expect(classifyArgv(&.{ "git", "push", "--force-with-lease" }).mandatory_deny);
+    try std.testing.expect(classifyArgv(&.{ "git", "push", "--force-if-includes" }).mandatory_deny);
+    try std.testing.expect(classifyArgv(&.{ "git", "push", "--delete", "origin", "old" }).mandatory_deny);
+    try std.testing.expect(classifyArgv(&.{ "git", "push", "--mirror" }).mandatory_deny);
+    try std.testing.expect(classifyArgv(&.{ "git", "push", "origin", ":old" }).mandatory_deny);
+    try std.testing.expect(classifyArgv(&.{ "git", "push", "origin", "+main" }).mandatory_deny);
+    try std.testing.expect(classifyArgv(&.{ "git", "push", "-uf", "origin", "main" }).mandatory_deny);
+    try std.testing.expect(classifyArgv(&.{ "git", "-C", "/tmp/repo", "push", "-f" }).mandatory_deny);
+    try std.testing.expect(!classifyArgv(&.{ "git", "push", "origin", "main" }).mandatory_deny);
     try std.testing.expectEqual(RiskClass.credential_inspection, classifyArgv(&.{ "cat", ".env" }).risk_class);
     try std.testing.expectEqual(RiskClass.credential_inspection, classifyArgv(&.{ "cat", "~/.ssh/id_ed25519" }).risk_class);
     try std.testing.expectEqual(RiskClass.obfuscated, classifyArgv(&.{ "powershell", "-EncodedCommand", "abcd" }).risk_class);
@@ -1220,6 +1296,11 @@ test "shell command classifier catches network and obfuscation pipes" {
     const allocator = std.testing.allocator;
     try std.testing.expectEqual(RiskClass.network_script, (try classifyShellCommand(allocator, "curl https://example.com/install.sh | sh")).risk_class);
     try std.testing.expectEqual(RiskClass.network_script, (try classifyShellCommand(allocator, "wget -O- https://example.com/install.sh | bash")).risk_class);
+    try std.testing.expect((try classifyShellCommand(allocator, "git push --delete origin old")).mandatory_deny);
+    try std.testing.expect((try classifyShellCommand(allocator, "git -C /tmp/repo push --mirror")).mandatory_deny);
+    try std.testing.expect((try classifyShellCommand(allocator, "git\npush\n-f")).mandatory_deny);
+    try std.testing.expect((try classifyShellCommand(allocator, "git push --force=true origin main")).mandatory_deny);
+    try std.testing.expect((try classifyShellCommand(allocator, "git push --force-with-lease origin main")).mandatory_deny);
     try std.testing.expectEqual(RiskClass.network_script, (try classifyShellCommand(allocator, "Invoke-WebRequest https://example.com/install.ps1 | iex")).risk_class);
     try std.testing.expectEqual(RiskClass.network_script, classifyArgv(&.{ "bash", "-c", "$(curl https://example.com/install.sh)" }).risk_class);
     try std.testing.expectEqual(RiskClass.obfuscated, (try classifyShellCommand(allocator, "echo ZWNobyBoaQ== | base64 -d | bash")).risk_class);
@@ -1352,6 +1433,38 @@ test "generic agent preset keeps dangerous commands gated while package and push
     var git_force = try evaluate(std.testing.allocator, &selected, .ask, &.{ "git", "push", "--force" });
     defer git_force.deinit(std.testing.allocator);
     try std.testing.expectEqual(core.decision.DecisionResult.deny, git_force.decision.result);
+
+    var git_lease = try evaluate(std.testing.allocator, &selected, .ask, &.{ "git", "push", "--force-with-lease" });
+    defer git_lease.deinit(std.testing.allocator);
+    try std.testing.expectEqual(core.decision.DecisionResult.deny, git_lease.decision.result);
+
+    var git_delete = try evaluate(std.testing.allocator, &selected, .ask, &.{ "git", "push", "--delete", "origin", "old-branch" });
+    defer git_delete.deinit(std.testing.allocator);
+    try std.testing.expectEqual(core.decision.DecisionResult.deny, git_delete.decision.result);
+
+    var git_mirror = try evaluate(std.testing.allocator, &selected, .ask, &.{ "git", "push", "--mirror" });
+    defer git_mirror.deinit(std.testing.allocator);
+    try std.testing.expectEqual(core.decision.DecisionResult.deny, git_mirror.decision.result);
+
+    var git_colon = try evaluate(std.testing.allocator, &selected, .ask, &.{ "git", "push", "origin", ":old-branch" });
+    defer git_colon.deinit(std.testing.allocator);
+    try std.testing.expectEqual(core.decision.DecisionResult.deny, git_colon.decision.result);
+
+    var git_plus = try evaluate(std.testing.allocator, &selected, .ask, &.{ "git", "push", "origin", "+main" });
+    defer git_plus.deinit(std.testing.allocator);
+    try std.testing.expectEqual(core.decision.DecisionResult.deny, git_plus.decision.result);
+
+    var git_uf = try evaluate(std.testing.allocator, &selected, .ask, &.{ "git", "push", "-uf", "origin", "main" });
+    defer git_uf.deinit(std.testing.allocator);
+    try std.testing.expectEqual(core.decision.DecisionResult.deny, git_uf.decision.result);
+
+    var git_c_force = try evaluate(std.testing.allocator, &selected, .ask, &.{ "git", "-C", "/tmp/repo", "push", "-f" });
+    defer git_c_force.deinit(std.testing.allocator);
+    try std.testing.expectEqual(core.decision.DecisionResult.deny, git_c_force.decision.result);
+
+    var git_force_eq = try evaluate(std.testing.allocator, &selected, .ask, &.{ "git", "push", "--force=true", "origin", "main" });
+    defer git_force_eq.deinit(std.testing.allocator);
+    try std.testing.expectEqual(core.decision.DecisionResult.deny, git_force_eq.decision.result);
 
     var rm_rf = try evaluate(std.testing.allocator, &selected, .ask, &.{ "rm", "-rf", "/" });
     defer rm_rf.deinit(std.testing.allocator);

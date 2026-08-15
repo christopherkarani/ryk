@@ -91,9 +91,9 @@ pub fn safeAlternatives(allocator: std.mem.Allocator, command: []const u8) ![]Al
         return list.toOwnedSlice(allocator);
     }
 
-    // `git push --force`
+    // `git push --force` / `-f` — lease is also force-equivalent and stays denied.
     if (std.mem.indexOf(u8, command, "push --force") != null or std.mem.indexOf(u8, command, "push -f") != null) {
-        try list.append(allocator, .{ .command = try allocator.dupe(u8, "git push --force-with-lease"), .note = "aborts if the remote moved" });
+        try list.append(allocator, .{ .command = try allocator.dupe(u8, "git push"), .note = "fast-forward only; force-equivalent stays denied" });
         return list.toOwnedSlice(allocator);
     }
 
@@ -179,14 +179,16 @@ test "safeAlternatives: rm -rf ./build keeps a project-scoped form" {
     try std.testing.expect(any_scoped);
 }
 
-test "safeAlternatives: git push --force suggests force-with-lease" {
+test "safeAlternatives: git push --force suggests fast-forward push not lease" {
     const alts = try safeAlternatives(std.testing.allocator, "git push --force origin main");
     defer {
         for (alts) |a| std.testing.allocator.free(a.command);
         std.testing.allocator.free(alts);
     }
     try std.testing.expect(alts.len == 1);
-    try std.testing.expect(std.mem.indexOf(u8, alts[0].command, "force-with-lease") != null);
+    try std.testing.expectEqualStrings("git push", alts[0].command);
+    try std.testing.expect(std.mem.indexOf(u8, alts[0].note, "force-equivalent stays denied") != null);
+    try std.testing.expect(std.mem.indexOf(u8, alts[0].command, "force-with-lease") == null);
 }
 
 test "safeAlternatives: curl | sh suggests inspect-first" {
