@@ -183,10 +183,13 @@ test "tryDispatch returns null for non-aliases and rewrites aliases" {
     defer environ_map.deinit();
     try environ_map.put("HOST_LAUNCH_ENV_CANARY", "forwarded");
 
-    var null_out_buf: [64]u8 = undefined;
-    var null_err_buf: [64]u8 = undefined;
-    var null_out: std.Io.Writer = .fixed(&null_out_buf);
-    var null_err: std.Io.Writer = .fixed(&null_err_buf);
+    // tryDispatch type-checks stdout.print on the help branch, so void `{}`
+    // no longer instantiates (bare --help landed in #163).
+    var stdout_buf: [64]u8 = undefined;
+    var stderr_buf: [64]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+
     const null_code = try tryDispatch(allocator, "notanagent", &.{}, struct {
         fn run(
             _: std.Io,
@@ -197,7 +200,7 @@ test "tryDispatch returns null for non-aliases and rewrites aliases" {
         ) !u8 {
             return error.ShouldNotRun;
         }
-    }.run, std.testing.io, &environ_map, &null_out, &null_err);
+    }.run, std.testing.io, &environ_map, &stdout_writer, &stderr_writer);
     try std.testing.expect(null_code == null);
 
     const Capture = struct {
@@ -227,10 +230,6 @@ test "tryDispatch returns null for non-aliases and rewrites aliases" {
     };
     Capture.seen_len = 0;
 
-    var alias_out_buf: [64]u8 = undefined;
-    var alias_err_buf: [64]u8 = undefined;
-    var alias_out: std.Io.Writer = .fixed(&alias_out_buf);
-    var alias_err: std.Io.Writer = .fixed(&alias_err_buf);
     const code = try tryDispatch(
         allocator,
         "pi",
@@ -238,8 +237,8 @@ test "tryDispatch returns null for non-aliases and rewrites aliases" {
         Capture.run,
         std.testing.io,
         &environ_map,
-        &alias_out,
-        &alias_err,
+        &stdout_writer,
+        &stderr_writer,
     );
     try std.testing.expectEqual(@as(u8, 42), code.?);
     try std.testing.expectEqual(@as(usize, 3), Capture.seen_len);

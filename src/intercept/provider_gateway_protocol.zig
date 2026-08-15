@@ -1,18 +1,8 @@
 const std = @import("std");
-const session_secrets = @import("session_secrets.zig");
+const types = @import("provider_gateway_types.zig");
 
-pub const Provider = session_secrets.Provider;
-
-pub const Limits = struct {
-    request_head: usize = 32 * 1024,
-    request_body: usize = 32 * 1024 * 1024,
-    response_head: usize = 32 * 1024,
-    response_body: usize = 64 * 1024 * 1024,
-    // Bounds downstream request framing and body reads.
-    io_timeout_ms: u32 = 5_000,
-    // Bounds the complete upstream exchange.
-    upstream_timeout_ms: u32 = 30_000,
-};
+pub const Provider = types.Provider;
+pub const Limits = types.Limits;
 
 pub const ParsedInbound = struct {
     method: std.http.Method,

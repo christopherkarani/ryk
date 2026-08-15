@@ -1,24 +1,20 @@
 const std = @import("std");
+const pcre2_slim = @import("build/pcre2_slim.zig");
 
 /// Run a test binary in terminal mode (avoiding Zig 0.16 server-mode IPC
 /// which hangs with this project's test suite).
-/// Link Zig-built static PCRE2 + C shim for shell_engine pack regex matching.
-/// Built from source so host/cross targets (linux/darwin amd64+arm64) do not need
-/// system libpcre2-dev; Windows native CI can keep using the same path later.
+/// Link one slim static PCRE2 (UNICODE/UCD/DFA/substitute dropped) + C shim.
+/// Callers must share a single `SlimPcre2` per (target, optimize) so host
+/// test binaries do not compile the same C sources three times.
+/// See `docs/dev/pcre2-slim.md`.
 fn addPcre2Shim(
     b: *std.Build,
     mod: *std.Build.Module,
-    target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    slim: pcre2_slim.SlimPcre2,
 ) void {
     mod.link_libc = true;
-    const pcre2_dep = b.dependency("pcre2", .{
-        .target = target,
-        .optimize = optimize,
-        .linkage = .static,
-    });
-    const pcre2_lib = pcre2_dep.artifact("pcre2-8");
-    mod.linkLibrary(pcre2_lib);
+    mod.linkLibrary(slim.lib);
+    mod.addIncludePath(slim.include_dir);
     mod.addIncludePath(b.path("src/shell_engine"));
     // Static PCRE2 requires PCRE2_STATIC for the public header macros on all targets.
     mod.addCSourceFile(.{
@@ -26,7 +22,10 @@ fn addPcre2Shim(
         .flags = &.{ "-std=c99", "-DPCRE2_STATIC" },
     });
     mod.addCSourceFile(.{ .file = b.path("src/shell_engine/windows_acl.c"), .flags = &.{} });
-    if (target.result.os.tag == .windows) mod.linkSystemLibrary("advapi32", .{});
+    const resolved = mod.resolved_target orelse slim.lib.root_module.resolved_target;
+    if (resolved) |rt| {
+        if (rt.result.os.tag == .windows) mod.linkSystemLibrary("advapi32", .{});
+    }
 }
 
 /// Compile-time `-fstrip` is per-module. Setting it only on `exe.root_module`
@@ -97,6 +96,14 @@ pub fn build(b: *std.Build) void {
         "posthog-project-token",
         "PostHog project token for release telemetry",
     ) orelse "";
+    // Default stays HTTP-on (PATH `ryk`, curl|sh with a live PostHog token).
+    // `-Dhttp=false` omits telemetry_transport + provider_gateway so TLS/HTTP
+    // client code is not analyzed. Empty-token dry-run does not shrink curl|sh.
+    const enable_http = b.option(
+        bool,
+        "http",
+        "Link HTTP/TLS client (telemetry transport + provider gateway; default true)",
+    ) orelse true;
     // Zig 0.16: filters are compile-time (passed to `zig test` as --test-filter), not runtime
     // argv on the terminal test runner. Use: ./scripts/zig build test-lib -Dtest-filter=Spinner
     const test_filter = b.option([]const u8, "test-filter", "Only run unit tests whose names contain this substring");
@@ -112,6 +119,7 @@ pub fn build(b: *std.Build) void {
     build_options.addOption([]const u8, "build_date", build_date);
     build_options.addOption([]const u8, "posthog_project_token", posthog_project_token);
     build_options.addOption(bool, "enable_tui", enable_tui);
+    build_options.addOption(bool, "enable_http", enable_http);
     const build_options_mod = build_options.createModule();
 
     const core_schema_documents = b.addOptions();
@@ -120,6 +128,11 @@ pub fn build(b: *std.Build) void {
     core_schema_documents.addOption([]const u8, "mcp_manifest_v1", @embedFile("schemas/mcp-manifest-v1.json"));
     const core_schema_documents_mod = core_schema_documents.createModule();
     _ = &core_schema_documents_mod;
+
+    // One slim PCRE2 per target. addPcre2Shim used to call addLibrary on every
+    // module (ryk + shell_engine tests + hook latency), compiling the same
+    // C sources three times. Windows is a second target, so a second library.
+    const host_pcre2 = pcre2_slim.addLibrary(b, target, optimize);
 
     const vaxis_mod: ?*std.Build.Module = if (enable_tui) blk: {
         // zon marks these lazy so `-Dtui=false` never fetches them. Zig 0.16
@@ -193,7 +206,7 @@ pub fn build(b: *std.Build) void {
     if (vaxis_mod) |vm| exe.root_module.addImport("vaxis", vm);
     // Attach once on the lib module (imported by the exe). Linking the same C shim on both
     // exe.root_module and ryk_mod duplicates _ryk_regex_* symbols at link time.
-    addPcre2Shim(b, ryk_mod, target, optimize);
+    addPcre2Shim(b, ryk_mod, host_pcre2);
     // Ship `ryk` only. `ryk-windows-check` is a compile probe, not the Windows
     // artifact — that is this same `exe` with `-Dtarget=x86_64-windows`.
     if (optimize == .ReleaseSafe) {
@@ -295,12 +308,37 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "ryk_core", .module = ryk_core_mod },
+                .{ .name = "build_options", .module = build_options_mod },
             },
         }),
         .filters = test_filters,
     });
     intercept_tests.root_module.link_libc = true;
     const run_intercept_tests = addRunTestTerminal(b, intercept_tests);
+
+    // Separate options so default tests stay HTTP-on. This binary is the
+    // stub-contract proof. Full CLI compile: `zig build -Dhttp=false check`.
+    const slim_http_options = b.addOptions();
+    slim_http_options.addOption([]const u8, "version", version);
+    slim_http_options.addOption([]const u8, "commit", commit);
+    slim_http_options.addOption([]const u8, "build_date", build_date);
+    slim_http_options.addOption([]const u8, "posthog_project_token", posthog_project_token);
+    slim_http_options.addOption(bool, "enable_http", false);
+    const slim_http_options_mod = slim_http_options.createModule();
+    const http_slim_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/http_slim_check.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ryk_core", .module = ryk_core_mod },
+                .{ .name = "build_options", .module = slim_http_options_mod },
+            },
+        }),
+        .filters = test_filters,
+    });
+    http_slim_tests.root_module.link_libc = true;
+    const run_http_slim_tests = addRunTestTerminal(b, http_slim_tests);
 
     const shell_engine_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -310,7 +348,7 @@ pub fn build(b: *std.Build) void {
         }),
         .filters = test_filters,
     });
-    addPcre2Shim(b, shell_engine_tests.root_module, target, optimize);
+    addPcre2Shim(b, shell_engine_tests.root_module, host_pcre2);
     const run_shell_engine_tests = addRunTestTerminal(b, shell_engine_tests);
 
     const hook_cold_latency_tests = b.addTest(.{
@@ -321,7 +359,7 @@ pub fn build(b: *std.Build) void {
         }),
         .filters = test_filters,
     });
-    addPcre2Shim(b, hook_cold_latency_tests.root_module, target, optimize);
+    addPcre2Shim(b, hook_cold_latency_tests.root_module, host_pcre2);
     const run_hook_cold_latency_tests = addRunTestTerminal(b, hook_cold_latency_tests);
 
     const cli_package_tests = b.addTest(.{
@@ -594,6 +632,7 @@ pub fn build(b: *std.Build) void {
 
     const test_intercept_step = b.step("test-intercept", "Run intercept domain unit tests only (sliced root)");
     test_intercept_step.dependOn(&run_intercept_tests.step);
+    test_intercept_step.dependOn(&run_http_slim_tests.step);
 
     const test_shell_engine_step = b.step("test-shell-engine", "Run Zig shell_engine unit + 100% oracle corpus parity tests");
     test_shell_engine_step.dependOn(&run_shell_engine_tests.step);
@@ -604,6 +643,7 @@ pub fn build(b: *std.Build) void {
 
     const compile_test_intercept_step = b.step("compile-test-intercept", "Compile intercept domain tests without running");
     compile_test_intercept_step.dependOn(&intercept_tests.step);
+    compile_test_intercept_step.dependOn(&http_slim_tests.step);
 
     const compile_test_shell_engine_step = b.step("compile-test-shell-engine", "Compile shell_engine tests without running");
     compile_test_shell_engine_step.dependOn(&shell_engine_tests.step);
@@ -626,6 +666,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_shell_engine_tests.step);
     test_step.dependOn(&run_hook_cold_latency_tests.step);
     test_step.dependOn(&run_lib_tests.step);
+    test_step.dependOn(&run_http_slim_tests.step);
     test_step.dependOn(&run_exe_tests.step);
     test_step.dependOn(&run_core_package_tests.step);
     // _only so full `test` does not wait on the test-fast lib serial chain.
@@ -690,7 +731,8 @@ pub fn build(b: *std.Build) void {
     });
     // Same as host `ryk_mod`: attach once so shell_engine regex links pcre2_shim + static
     // pcre2-8 for the Windows cross compile; do not also link on windows_exe.root_module.
-    addPcre2Shim(b, windows_mod, windows_target, optimize);
+    const windows_pcre2 = pcre2_slim.addLibrary(b, windows_target, optimize);
+    addPcre2Shim(b, windows_mod, windows_pcre2);
     const windows_exe = b.addExecutable(.{
         .name = "ryk-windows-check",
         .root_module = b.createModule(.{
@@ -706,4 +748,8 @@ pub fn build(b: *std.Build) void {
     windows_exe.root_module.link_libc = true;
     const check_windows_step = b.step("check-windows", "Compile ryk for Windows without running it");
     check_windows_step.dependOn(&windows_exe.step);
+
+    // Stub contract only (no second ryk_mod). Full CLI: `zig build -Dhttp=false check`.
+    const check_http_slim_step = b.step("check-http-slim", "Compile -Dhttp=false stub fail-closed tests");
+    check_http_slim_step.dependOn(&http_slim_tests.step);
 }

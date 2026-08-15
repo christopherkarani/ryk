@@ -7,7 +7,11 @@ const exit_codes = @import("cli/exit_codes.zig");
 const contract = @import("telemetry_contract.zig");
 const product = @import("telemetry_product.zig");
 const store = @import("telemetry_store.zig");
-const transport = @import("telemetry_transport.zig");
+const enable_http = build_options.enable_http;
+const transport = if (enable_http)
+    @import("telemetry_transport.zig")
+else
+    @import("telemetry_transport_stub.zig");
 
 pub const event_name = contract.event_name;
 pub const schema_version = contract.schema_version;
@@ -882,6 +886,7 @@ fn workerEnvironment(
 }
 
 fn transportConfigured() bool {
+    if (comptime !enable_http) return false;
     std.mem.doNotOptimizeAway(contract.transport_marker);
     return build_options.posthog_project_token.len != 0;
 }
@@ -1548,6 +1553,7 @@ test "telemetry workers receive only safe environment values" {
 }
 
 test "posthog honors endpoint no-proxy entries" {
+    if (comptime !enable_http) return error.SkipZigTest;
     var environ_map = std.process.Environ.Map.init(std.testing.allocator);
     defer environ_map.deinit();
     try environ_map.put("NO_PROXY", "localhost, .posthog.com:443");
@@ -1705,7 +1711,7 @@ test "missing telemetry state defaults to disabled with no queued events" {
     try std.testing.expectEqual(@as(usize, 0), try queueCount(std.testing.allocator, std.testing.io, &environ_map));
 
     // Empty queue short-circuits before any transport attempt.
-    try @import("telemetry_transport.zig").sendQueued(std.testing.io, &environ_map, std.testing.allocator);
+    try transport.sendQueued(std.testing.io, &environ_map, std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 0), try queueCount(std.testing.allocator, std.testing.io, &environ_map));
 }
 
