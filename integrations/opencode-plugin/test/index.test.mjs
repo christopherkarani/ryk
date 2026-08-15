@@ -506,6 +506,213 @@ printf '%s\\n' '{"decision":"block"}'
   );
 });
 
+test('OpenCode SDK app.log this._client does not abort plugin load', async () => {
+  // Live 1.18.18: pluginLog detached client.app.log → "evaluating 'this._client'"
+  // and the server never registered tool.execute.before.
+  await withFakeRyk(
+    async (plugin) => {
+      assert.equal(typeof plugin['tool.execute.before'], 'function');
+      const before = plugin['tool.execute.before'];
+      await assert.rejects(
+        before(
+          { tool: 'bash', sessionID: 'session-1', callID: 'call-1' },
+          { args: { command: 'rm -rf build' } }
+        ),
+        (err) => {
+          assertShortBlockThrow(err, /ryk blocked/);
+          return true;
+        }
+      );
+    },
+    `#!/bin/sh
+printf '%s\\n' '{"decision":"block","message":"command blocked"}'
+`,
+    {
+      client: {
+        app: {
+          _client: { post: async () => true },
+          async log(input) {
+            if (!this || !this._client) {
+              throw new TypeError("undefined is not an object (evaluating 'this._client')");
+            }
+            return input;
+          },
+        },
+      },
+    }
+  );
+});
+
+test('OpenCode SDK showToast this._client still delivers a toast', async () => {
+  const toasts = [];
+  await withFakeRyk(
+    async (plugin) => {
+      const before = plugin['tool.execute.before'];
+      assert.ok(before);
+      await assert.rejects(
+        before(
+          { tool: 'bash', sessionID: 'session-1', callID: 'call-1' },
+          { args: { command: 'rm -rf build' } }
+        ),
+        (err) => {
+          assertShortBlockThrow(err, /ryk blocked/);
+          return true;
+        }
+      );
+      assert.equal(toasts.length, 1, 'bound showToast must record a toast');
+      const body = toastPayload(toasts[0]);
+      assert.equal(body.variant, 'error');
+      assert.match(body.message, /ryk blocked/i);
+    },
+    `#!/bin/sh
+printf '%s\\n' '{"decision":"block","message":"command blocked"}'
+`,
+    {
+      client: {
+        tui: {
+          _client: { post: async () => true },
+          async showToast(options) {
+            if (!this || !this._client) {
+              throw new TypeError("undefined is not an object (evaluating 'this._client')");
+            }
+            if (options && typeof options === 'object' && options.body?.message) {
+              toasts.push(options);
+            } else if (options && typeof options.message === 'string') {
+              toasts.push(options);
+            }
+            return true;
+          },
+        },
+      },
+    }
+  );
+});
+
+test('v1 SDK silent-empty showToast still delivers body toast', async () => {
+  // Live OpenCode v1 client: showToast({ title, message }) POSTs no body, returns 200.
+  // Flat-first + early return is why the TUI never painted "ryk blocked".
+  const toasts = [];
+  await withFakeRyk(
+    async (plugin) => {
+      const before = plugin['tool.execute.before'];
+      assert.ok(before);
+      await assert.rejects(
+        before(
+          { tool: 'bash', sessionID: 'session-1', callID: 'call-1' },
+          { args: { command: 'rm -rf build' } }
+        ),
+        (err) => {
+          assertShortBlockThrow(err, /ryk blocked/);
+          return true;
+        }
+      );
+      assert.equal(toasts.length, 1, 'v1 silent-empty client must still record a body toast');
+      const body = toastPayload(toasts[0]);
+      assert.equal(body.variant, 'error');
+      assert.match(body.title, /ryk/i);
+      assert.match(body.message, /ryk blocked/i);
+    },
+    `#!/bin/sh
+printf '%s\\n' '{"decision":"block","message":"command blocked"}'
+`,
+    {
+      client: {
+        tui: {
+          showToast: async (options) => {
+            if (
+              options &&
+              typeof options === 'object' &&
+              options.body &&
+              typeof options.body.message === 'string'
+            ) {
+              toasts.push(options);
+            }
+            return true;
+          },
+        },
+      },
+    }
+  );
+});
+
+test('v2 SDK flat showToast (arity 2) delivers toast', async () => {
+  const toasts = [];
+  await withFakeRyk(
+    async (plugin) => {
+      const before = plugin['tool.execute.before'];
+      assert.ok(before);
+      await assert.rejects(
+        before(
+          { tool: 'bash', sessionID: 'session-1', callID: 'call-1' },
+          { args: { command: 'rm -rf build' } }
+        ),
+        (err) => {
+          assertShortBlockThrow(err, /ryk blocked/);
+          return true;
+        }
+      );
+      assert.equal(toasts.length, 1, 'v2 flat client must record the toast');
+      const body = toastPayload(toasts[0]);
+      assert.equal(body.variant, 'error');
+      assert.match(body.message, /ryk blocked/i);
+    },
+    `#!/bin/sh
+printf '%s\\n' '{"decision":"block","message":"command blocked"}'
+`,
+    {
+      client: {
+        tui: {
+          showToast: async (parameters, _options) => {
+            if (parameters && typeof parameters.message === 'string') {
+              toasts.push(parameters);
+              return true;
+            }
+            return true;
+          },
+        },
+      },
+    }
+  );
+});
+
+test('publish fallback uses tui.toast.show properties envelope', async () => {
+  const published = [];
+  await withFakeRyk(
+    async (plugin) => {
+      const before = plugin['tool.execute.before'];
+      assert.ok(before);
+      await assert.rejects(
+        before(
+          { tool: 'bash', sessionID: 'session-1', callID: 'call-1' },
+          { args: { command: 'rm -rf build' } }
+        ),
+        (err) => {
+          assertShortBlockThrow(err, /ryk blocked/);
+          return true;
+        }
+      );
+      assert.equal(published.length, 1);
+      assert.equal(published[0].type, 'tui.toast.show');
+      assert.equal(typeof published[0].properties?.message, 'string');
+      assert.match(published[0].properties.message, /ryk blocked/i);
+      assert.equal(published[0].properties.variant, 'error');
+      assert.equal(published[0].message, undefined, 'must not put message on the event root');
+    },
+    `#!/bin/sh
+printf '%s\\n' '{"decision":"block","message":"command blocked"}'
+`,
+    {
+      client: {
+        tui: {
+          publish: async (event) => {
+            published.push(event);
+          },
+        },
+      },
+    }
+  );
+});
+
 test('hard block shows toast error before throw when client present', async () => {
   const toasts = [];
   await withFakeRyk(
@@ -960,6 +1167,32 @@ test('TUI does not toast error.data or nested properties as ryk blocks', async (
   assert.equal(errorToasts.length, 0, 'must not toast from error.data or properties');
 });
 
+test('TUI toasts session.error wrapped in OpenCode { type, properties } envelope', async () => {
+  const toasts = [];
+  await tuiModule.tui({
+    ui: {
+      toast: (input) => {
+        toasts.push(input);
+      },
+    },
+    event: {
+      on: (type, handler) => {
+        if (type === 'session.error') {
+          handler({
+            type: 'session.error',
+            properties: {
+              error: { message: 'ryk blocked tool execution: core.git:push-force-long' },
+            },
+          });
+        }
+      },
+    },
+  });
+  const errorToast = toasts.find((t) => t.variant === 'error');
+  assert.ok(errorToast, 'SDK envelope session.error must toast');
+  assert.match(errorToast.message, /push-force-long/);
+});
+
 test('TUI toasts session.error from error.message only when event.message is absent', async () => {
   const toasts = [];
   await tuiModule.tui({
@@ -994,9 +1227,12 @@ test('missing binary registers fail-closed veto hooks', async () => {
   const originalPath = process.env.PATH;
   const originalAllow = process.env.RYK_ALLOW_WORKSPACE_BIN;
   const originalHome = process.env.HOME;
+  const originalBin = process.env.RYK_BIN;
   // Empty PATH + isolated HOME so well-known install lookup also fails.
+  // RYK_BIN must be cleared too — a host install leak would skip fail-closed.
   process.env.PATH = directory;
   process.env.HOME = directory;
+  delete process.env.RYK_BIN;
   delete process.env.RYK_ALLOW_WORKSPACE_BIN;
   try {
     const plugin = await rykPlugin({ directory, worktree: directory });
@@ -1021,6 +1257,8 @@ test('missing binary registers fail-closed veto hooks', async () => {
     process.env.HOME = originalHome;
     if (originalAllow === undefined) delete process.env.RYK_ALLOW_WORKSPACE_BIN;
     else process.env.RYK_ALLOW_WORKSPACE_BIN = originalAllow;
+    if (originalBin === undefined) delete process.env.RYK_BIN;
+    else process.env.RYK_BIN = originalBin;
     await rm(directory, { recursive: true, force: true });
   }
 });
@@ -1404,11 +1642,13 @@ test('findRyk ignores workspace zig-out without RYK_ALLOW_WORKSPACE_BIN', async 
   const originalPath = process.env.PATH;
   const originalAllow = process.env.RYK_ALLOW_WORKSPACE_BIN;
   const originalHome = process.env.HOME;
+  const originalBin = process.env.RYK_BIN;
   await mkdir(zigOutBin, { recursive: true });
   await writeFile(rykBin, '#!/bin/sh\nif [ "$1" = version ] && [ "$2" = --json ]; then printf \'%s\\n\' \'{"product":"ryk","version":"0.0.0"}\'; else echo ok; fi\n');
   await chmod(rykBin, 0o755);
   process.env.PATH = directory; // no ryk on PATH
   process.env.HOME = directory; // isolate well-known install lookup
+  delete process.env.RYK_BIN;
   delete process.env.RYK_ALLOW_WORKSPACE_BIN;
   try {
     assert.equal(findRyk(directory), null);
@@ -1417,6 +1657,8 @@ test('findRyk ignores workspace zig-out without RYK_ALLOW_WORKSPACE_BIN', async 
     process.env.HOME = originalHome;
     if (originalAllow === undefined) delete process.env.RYK_ALLOW_WORKSPACE_BIN;
     else process.env.RYK_ALLOW_WORKSPACE_BIN = originalAllow;
+    if (originalBin === undefined) delete process.env.RYK_BIN;
+    else process.env.RYK_BIN = originalBin;
     await rm(directory, { recursive: true, force: true });
   }
 });

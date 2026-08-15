@@ -39,10 +39,15 @@ type PluginContext = {
     };
     tui?: {
       /**
-       * OpenCode 1.18+ SDK: flat fields mapped into POST /tui/show-toast body.
-       * Second arg is SDK Options (`throwOnError`). Older clients wrap `{ body }`.
+       * OpenCode toast RPC:
+       * - SDK v2 (`showToast.length >= 2`): flat `{ title, message, variant, duration }`.
+       * - SDK v1 / docs (`showToast.length === 1`): `{ body: payload }`.
+       * Flat-first on v1 POSTs an empty body (HTTP 200, no TUI toast).
        */
-      showToast?: (input: ToastPayload | { body: ToastPayload }, options?: unknown) => Promise<unknown>;
+      showToast?: (
+        input: ToastPayload | { body: ToastPayload; throwOnError?: boolean },
+        options?: unknown
+      ) => Promise<unknown>;
       publish?: (input: Record<string, unknown>) => Promise<unknown>;
     };
   };
@@ -579,9 +584,15 @@ function pluginLog(
   level: 'debug' | 'info' | 'warn' | 'error',
   message: string
 ): void {
-  const log = ctx.client?.app?.log;
-  if (typeof log === 'function') {
-    void Promise.resolve(log({ body: { service: 'ryk', level, message } })).catch(() => undefined);
+  // Call as a method. Detaching `app.log` throws on OpenCode 1.18
+  // (`undefined is not an object (evaluating 'this._client')`) and aborts plugin load.
+  const app = ctx.client?.app;
+  if (app && typeof app.log === 'function') {
+    try {
+      void Promise.resolve(app.log({ body: { service: 'ryk', level, message } })).catch(() => undefined);
+    } catch {
+      // Logging must never fail plugin init or a hard-block path.
+    }
     return;
   }
   if (level === 'error' || process.env.RYK_OPENCODE_VERBOSE === '1') {
@@ -589,41 +600,80 @@ function pluginLog(
   }
 }
 
+/**
+ * OpenCode toast RPC has two live SDK shapes:
+ *
+ * - v2 (`showToast.length >= 2`): flat `{ title, message, variant, duration }`
+ *   is mapped into POST /tui/show-toast body.
+ * - v1 / public docs (`showToast.length === 1`): `{ body: payload }`. Calling
+ *   v1 with flat fields POSTs an empty body, returns 200, and the TUI never
+ *   paints a toast. Do not try flat-first on arity-1 clients.
+ *
+ * `tui.publish` must use `{ type: "tui.toast.show", properties }` — the
+ * server handler reads `payload.properties`, not top-level title/message.
+ */
 async function invokeShowToast(ctx: PluginContext, payload: ToastPayload): Promise<void> {
   const tui = ctx.client?.tui;
-  const showToast = tui?.showToast;
+  // Bind to the TUI object. OpenCode's SDK methods read `this._client` / `this.client`;
+  // a detached `const { showToast } = tui` throws and the toast never paints.
+  const showToast =
+    tui && typeof tui.showToast === 'function' ? tui.showToast.bind(tui) : undefined;
+  const publish = tui && typeof tui.publish === 'function' ? tui.publish.bind(tui) : undefined;
+  const errors: string[] = [];
+
+  const attempt = async (label: string, run: () => Promise<unknown>): Promise<boolean> => {
+    try {
+      await run();
+      toastDebug(`toast delivered via ${label}`);
+      return true;
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      errors.push(`${label}: ${msg}`);
+      toastDebug(`toast ${label} failed: ${msg}`);
+      return false;
+    }
+  };
+
   if (typeof showToast === 'function') {
-    // 1.18 SDK maps flat fields into POST /tui/show-toast. throwOnError surfaces transport misses.
-    try {
-      await showToast(payload, { throwOnError: true });
-      return;
-    } catch {
-      // older / mock clients take a single argument
+    const arity = showToast.length;
+    // Only treat documented 2-arg clients as v2. Arity 0 (rest/bound) is v1.
+    if (arity >= 2) {
+      if (await attempt('v2-flat', () => showToast(payload, { throwOnError: true }))) return;
     }
-    try {
-      await showToast(payload);
-      return;
-    } catch {
-      // pre-1.18 Options shape
+    if (await attempt('v1-body', () => showToast({ body: payload, throwOnError: true }))) return;
+    if (await attempt('v1-body-only', () => showToast({ body: payload }))) return;
+    if (arity < 2) {
+      if (await attempt('v1-flat', () => showToast(payload))) return;
     }
-    await showToast({ body: payload });
-    return;
   }
 
-  // Some TUI builds only honor published toast events, not the HTTP helper.
-  const publish = tui?.publish;
   if (typeof publish === 'function') {
-    await publish({
-      type: 'tui.toast.show',
-      title: payload.title,
-      message: payload.message,
-      variant: payload.variant,
-      duration: payload.duration,
-    });
-    return;
+    if (
+      await attempt('publish-properties', () =>
+        publish({
+          type: 'tui.toast.show',
+          properties: payload,
+        })
+      )
+    ) {
+      return;
+    }
+    if (
+      await attempt('publish-flat', () =>
+        publish({
+          type: 'tui.toast.show',
+          title: payload.title,
+          message: payload.message,
+          variant: payload.variant,
+          duration: payload.duration,
+        })
+      )
+    ) {
+      return;
+    }
   }
 
-  throw new Error('client.tui.showToast missing');
+  throw new Error(errors.length > 0 ? errors.join('; ') : 'client.tui.showToast missing');
 }
 
 async function maybeToast(
