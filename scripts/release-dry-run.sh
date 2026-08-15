@@ -64,6 +64,11 @@ report_binary_sizes() {
 }
 
 # Verifies release archive checksums through scripts/verify-release.sh.
+# Local/CI dry-run is packaging + layout only. Do not require a live PostHog
+# token; live cut-release still refuses RYK_TELEMETRY_BUILD_DISABLED=1.
+if [ -z "${RYK_POSTHOG_PROJECT_TOKEN:-}" ]; then
+  export RYK_TELEMETRY_BUILD_DISABLED="${RYK_TELEMETRY_BUILD_DISABLED:-1}"
+fi
 printf 'release dry-run: building artifacts into %s\n' "$DIST_DIR"
 RYK_RELEASE_PRODUCT=host RYK_DIST_DIR="$DIST_DIR" ./scripts/build-release.sh
 RYK_RELEASE_PRODUCT=host ./scripts/verify-release.sh "$DIST_DIR"

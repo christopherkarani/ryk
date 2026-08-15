@@ -52,9 +52,32 @@ wait_for_event() {
   local event="$1"
   local queue="$CONFIG/ryk/telemetry.queue.jsonl"
   for _ in $(seq 1 30); do
-    if [[ -s "$queue" ]] && rg -q "\"event\":\"${event}\"" "$queue"; then return 0; fi
+    if [[ -s "$queue" ]] && grep -F -q "\"event\":\"${event}\"" "$queue"; then return 0; fi
     sleep 0.1
   done
+  return 1
+}
+
+count_event() {
+  local event="$1"
+  local queue="$CONFIG/ryk/telemetry.queue.jsonl"
+  if [[ ! -f "$queue" ]]; then
+    printf '0\n'
+    return 0
+  fi
+  grep -F -c "\"event\":\"${event}\"" "$queue" || true
+}
+
+has_hook_attribution() {
+  local queue="$CONFIG/ryk/telemetry.queue.jsonl"
+  [[ -f "$queue" ]] || return 1
+  local line
+  while IFS= read -r line; do
+    [[ "$line" == *'"event":"ryk_enforcement_summary"'* ]] || continue
+    [[ "$line" == *'"host":"other"'* ]] || continue
+    [[ "$line" == *'"source":"hook"'* ]] || continue
+    return 0
+  done < "$queue"
   return 1
 }
 
@@ -88,10 +111,10 @@ ryk feedback bug >/dev/null
 wait_for_event "ryk_feedback_submitted" || fail "fixed-category feedback event was not queued"
 assert_queue_payloads
 
-integration_before="$(rg -c '"event":"ryk_integration_summary"' "$CONFIG/ryk/telemetry.queue.jsonl" || true)"
+integration_before="$(count_event "ryk_integration_summary")"
 ryk plugin doctor >/dev/null 2>/dev/null || true
 wait_for_event "ryk_integration_summary" || fail "integration summary was not queued"
-integration_after="$(rg -c '"event":"ryk_integration_summary"' "$CONFIG/ryk/telemetry.queue.jsonl" || true)"
+integration_after="$(count_event "ryk_integration_summary")"
 [[ "$integration_after" -eq $((integration_before + 1)) ]] || fail "plugin doctor emitted duplicate integration summaries"
 assert_queue_payloads
 
@@ -107,12 +130,12 @@ assert_queue_payloads
 printf '%s' '{"tool_name":"Bash","tool_input":{"command":"echo telemetry-safe"}}' |
   ryk >/dev/null 2>/dev/null || true
 for _ in $(seq 1 30); do
-  if rg -q '"event":"ryk_enforcement_summary".*"host":"other".*"source":"hook"' "$CONFIG/ryk/telemetry.queue.jsonl"; then
+  if has_hook_attribution; then
     break
   fi
   sleep 0.1
 done
-rg -q '"event":"ryk_enforcement_summary".*"host":"other".*"source":"hook"' "$CONFIG/ryk/telemetry.queue.jsonl" || fail "bare agent-hook enforcement was not attributed"
+has_hook_attribution || fail "bare agent-hook enforcement was not attributed"
 assert_queue_payloads
 
 ryk hook hermes pre_tool_call < "$REPO_ROOT/tests/fixtures/hook-safe.json" >/dev/null 2>/dev/null || true

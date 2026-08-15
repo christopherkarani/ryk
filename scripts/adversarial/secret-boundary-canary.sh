@@ -289,8 +289,10 @@ fi
 printf '%s\n' 'SECRET_BOUNDARY_CANARY=CANARY_ENVFILE_BODY_99' >"$WORKSPACE/.env"
 B_STDOUT="$OUTPUT_DIR/case-b.stdout"
 B_STDERR="$OUTPUT_DIR/case-b.stderr"
-B_CHILD_STDOUT="$WORKSPACE/.ryk-canary-cat.out"
-B_CHILD_STDERR="$WORKSPACE/.ryk-canary-cat.err"
+# Write under .ryk-tmp: Landlock expand is walk-only on the workspace root
+# (no MAKE_REG), so a new file there makes dash fail the redirect with 2.
+B_CHILD_STDOUT="$WORKSPACE/.ryk-tmp/canary-cat.out"
+B_CHILD_STDERR="$WORKSPACE/.ryk-tmp/canary-cat.err"
 if [[ "$ATTACH_STATE" == unavailable ]]; then
   skip_case 'B workspace .env denial (required OS sandbox unavailable)'
 elif [[ ! -f "$WORKSPACE/.env" || ! -r "$WORKSPACE/.env" ]]; then
@@ -304,7 +306,7 @@ else
   # post-run note. Capture cat's streams inside the sandboxed child so exit 1
   # can be causally bound to the OS permission diagnostic.
   if run_with_canaries "${COMMON_SECRETLESS[@]}" \
-    /bin/sh -c '/bin/cat .env > .ryk-canary-cat.out 2> .ryk-canary-cat.err' \
+    /bin/sh -c '/bin/cat .env > .ryk-tmp/canary-cat.out 2> .ryk-tmp/canary-cat.err' \
     >"$B_STDOUT" 2>"$B_STDERR"; then
     B_STATUS=0
   else
