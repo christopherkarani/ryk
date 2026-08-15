@@ -164,7 +164,11 @@ pub fn evaluatePayloadWithMode(
     evaluator: ?ShellCommandEvaluatorFn,
     mode: policy.schema.Mode,
 ) !u8 {
-    return evaluatePayloadWithModeOpts(allocator, payload, stdout, evaluator, mode, .{});
+    return evaluatePayloadWithModeOpts(allocator, payload, stdout, evaluator, mode, .{
+        // Live agent_hook / Cursor stdin path: do not spawn fm-steward.
+        // Tests that inject `fm_client` use evaluatePayloadWithModeOpts directly.
+        .disable_fm = true,
+    });
 }
 
 pub fn evaluatePayloadWithModeOpts(
@@ -225,9 +229,11 @@ pub fn evaluatePayloadWithModeOpts(
     };
     defer daemon_response.deinit();
 
-    // Product path: hard fence → sticky → strict refuse → mode×severity, then FM soft
-    // seatbelt via the shared choke. Bare agent-hook has no policy YAML, so
-    // permit is empty (matrix + sticky only); sticky is process-session store.
+    // Product path: hard fence → sticky → strict refuse → mode×severity.
+    // Live agent-hook sets disable_fm (no fm-steward spawn). Tests may inject
+    // `fm_client` on evaluatePayloadWithModeOpts to exercise the seatbelt.
+    // Bare agent-hook has no policy YAML, so permit is empty (matrix + sticky
+    // only); sticky is process-session store.
     // Cursor shell still maps `.ask` → deny (no ask UI); agent_hook keeps `.ask` JSON.
     const decision = try shell_eval.decisionFromDaemonResultWithPolicy(
         allocator,
