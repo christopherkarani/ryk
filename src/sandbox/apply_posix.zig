@@ -484,14 +484,20 @@ fn preflightExecTarget(path: [*:0]const u8) bool {
     switch (builtin.os.tag) {
         .windows, .wasi => return true,
         .linux => {
-            // Landlock mediates open(2), not access(2). Using access() here
-            // promoted an ungranted launch binary (handshake "ok", exec later
-            // fails). Open the target after restrict_self instead.
+            // Landlock mediates open(2), not access(2). Open after restrict_self
+            // so an ungranted path fail-closes the handshake. Then require a
+            // regular file with an execute bit (non-exec workspace payloads
+            // must not promote and later die with execve 127).
             const linux = std.os.linux;
             const fd = linux.open(path, .{ .CLOEXEC = true, .ACCMODE = .RDONLY }, 0);
             if (linux.errno(fd) != .SUCCESS) return false;
-            _ = linux.close(@intCast(fd));
-            return true;
+            const fd_i: i32 = @intCast(fd);
+            defer _ = linux.close(fd_i);
+            var stx = std.mem.zeroes(linux.Statx);
+            const stx_rc = linux.statx(fd_i, "", linux.AT.EMPTY_PATH, .{ .TYPE = true, .MODE = true }, &stx);
+            if (linux.errno(stx_rc) != .SUCCESS or !stx.mask.TYPE) return false;
+            if (!linux.S.ISREG(stx.mode)) return false;
+            return stx.mode & 0o111 != 0;
         },
         else => {
             // POSIX: R_OK=4, X_OK=1 (portable constants; libc access).

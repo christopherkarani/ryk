@@ -48,6 +48,11 @@ jobs:
           if ! grep -q '^user_allow_other' /etc/fuse.conf 2>/dev/null; then
             echo 'user_allow_other' | sudo tee -a /etc/fuse.conf >/dev/null
           fi
+          # Ubuntu 24.04 AppArmor denies unprivileged CLONE_NEWUSER for unconfined
+          # processes. Workspace-view attach needs user+mount namespaces; this is
+          # the same class of runner setup as FUSE, not a test skip.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
       - name: Build ryk
         run: ./scripts/zig build
       - name: Secret boundary adversarial canary
