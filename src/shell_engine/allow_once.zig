@@ -620,6 +620,11 @@ pub fn loadAllowOnceActive(
 /// Match exact command + scope. When `consume` is true and the entry is single_use,
 /// remove it from the store (evaluate path). When `consume` is false, leave store intact
 /// (explain / dry-run / peek before consume).
+///
+/// Product evaluate (hook/run/shim) must pass a null `allow_once_path` unless
+/// the session OS sandbox is active. Consume is "read the JSONL" — a same-UID
+/// agent on a hook-only session can append a well-formed grant if the user
+/// store is writable. Operator `ryk allow-once` redeem/list/clear is unchanged.
 pub fn matchAllowOnce(
     runtime_io: std.Io,
     gpa: std.mem.Allocator,
