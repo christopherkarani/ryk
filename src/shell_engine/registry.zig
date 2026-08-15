@@ -805,9 +805,10 @@ test "lazy compile still denies git reset and allows a keyword miss" {
     try std.testing.expect(miss != .deny);
 }
 
-test "empty inflated packs array is fail-closed (not empty-allow)" {
-    // gzip -n of "[]". Inflate succeeds (it is an array) but loads zero packs.
-    // finishInit maps g_packs.len == 0 to RegistryInitFailed → matchInfraDeny.
+test "empty inflated packs array scans to zero packs" {
+    // gzip -n of "[]". Inflate succeeds (array prefix) but the same scanner
+    // initOnce uses finds zero objects — the g_packs.len == 0 condition
+    // finishInit maps to RegistryInitFailed.
     const empty_arr_gz = [_]u8{
         0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0x8b, 0x8e,
         0x05, 0x00, 0x29, 0xbb, 0x4c, 0x0d, 0x02, 0x00, 0x00, 0x00,
@@ -815,11 +816,23 @@ test "empty inflated packs array is fail-closed (not empty-allow)" {
     const json = try oracle_embed.inflateSlice(std.testing.allocator, &empty_arr_gz);
     defer std.testing.allocator.free(json);
     try std.testing.expectEqualStrings("[]", json);
+
+    var n: usize = 0;
     var pos = skipJsonWs(json, 0);
     try std.testing.expect(json[pos] == '[');
-    pos = skipJsonWs(json, pos + 1);
-    try std.testing.expect(json[pos] == ']');
-    try std.testing.expect(matchInfraDeny() == .deny);
+    pos += 1;
+    while (true) {
+        pos = skipJsonWs(json, pos);
+        if (json[pos] == ']') break;
+        if (json[pos] == ',') {
+            pos += 1;
+            continue;
+        }
+        const end = matchingObjectEnd(json, pos) orelse return error.TestUnexpectedResult;
+        n += 1;
+        pos = end;
+    }
+    try std.testing.expectEqual(@as(usize, 0), n);
 }
 
 test "oracle json scanner finds four default packs" {

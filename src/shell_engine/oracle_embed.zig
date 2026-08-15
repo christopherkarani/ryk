@@ -30,19 +30,24 @@ pub fn inflateSlice(allocator: std.mem.Allocator, gzip_bytes: []const u8) Error!
     if (gzip_bytes.len < 10) return error.PacksInflateFailed;
 
     var input: std.Io.Reader = .fixed(gzip_bytes);
-    var output: std.Io.Writer.Allocating = .init(allocator);
-    errdefer output.deinit();
-
     var window: [std.compress.flate.max_window_len]u8 = undefined;
     var decompress: std.compress.flate.Decompress = .init(&input, .gzip, &window);
-    _ = decompress.reader.streamRemaining(&output.writer) catch return error.PacksInflateFailed;
-    if (decompress.err != null) return error.PacksInflateFailed;
 
-    const json = output.written();
+    // Cap during the stream. A post-hoc length check after streamRemaining
+    // would still allocate a gzip bomb. +1 so a catalog of exactly
+    // max_inflated_len is accepted; StreamTooLong then means at least one
+    // byte over the cap.
+    const json = decompress.reader.allocRemaining(allocator, .limited(max_inflated_len + 1)) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.PacksInflateFailed,
+    };
+    errdefer allocator.free(json);
+
+    if (decompress.err != null) return error.PacksInflateFailed;
     if (json.len == 0 or json.len > max_inflated_len) return error.PacksInflateFailed;
     if (!looksLikePacksArray(json)) return error.PacksInflateFailed;
 
-    return output.toOwnedSlice();
+    return json;
 }
 
 fn looksLikePacksArray(json: []const u8) bool {
@@ -63,6 +68,8 @@ test "embedded gzip inflates to byte-identical oracle_packs.json" {
     defer std.testing.allocator.free(inflated);
     try std.testing.expectEqualSlices(u8, raw, inflated);
     try std.testing.expect(std.mem.startsWith(u8, inflated, "[{\"id\":\""));
+    // Fail the gate before a growing catalog silently hits the hard cap.
+    try std.testing.expect(inflated.len + 64 * 1024 <= max_inflated_len);
 }
 
 test "corrupt or truncated gzip fails closed (not empty json)" {
@@ -90,4 +97,23 @@ test "gzip of empty or non-array payload fails closed" {
     };
     try std.testing.expectError(error.PacksInflateFailed, inflateSlice(std.testing.allocator, &empty_gz));
     try std.testing.expectError(error.PacksInflateFailed, inflateSlice(std.testing.allocator, &obj_gz));
+}
+
+fn gzipAlloc(allocator: std.mem.Allocator, payload: []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = try .initCapacity(allocator, 256);
+    errdefer out.deinit();
+    var window: [std.compress.flate.max_window_len]u8 = undefined;
+    var comp = try std.compress.flate.Compress.init(&out.writer, &window, .gzip, .fastest);
+    try comp.writer.writeAll(payload);
+    try comp.finish();
+    return out.toOwnedSlice();
+}
+
+test "oversize inflate fails closed without keeping the stream" {
+    const payload = try std.testing.allocator.alloc(u8, max_inflated_len + 1);
+    defer std.testing.allocator.free(payload);
+    @memset(payload, 0);
+    const gz = try gzipAlloc(std.testing.allocator, payload);
+    defer std.testing.allocator.free(gz);
+    try std.testing.expectError(error.PacksInflateFailed, inflateSlice(std.testing.allocator, gz));
 }

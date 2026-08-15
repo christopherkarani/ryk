@@ -235,6 +235,7 @@ pub fn queryPacksSummaryInProcess(io: std.Io, allocator: std.mem.Allocator) !Pac
     };
     defer parsed.deinit();
     if (parsed.value != .array) return unknownPacksSummary();
+    if (parsed.value.array.items.len == 0) return unknownPacksSummary();
 
     const onboarding = @import("onboarding.zig");
     const workspace_root = onboarding.resolveWorkspaceRoot(io, allocator) catch null;
@@ -280,6 +281,8 @@ pub fn queryPacksSummaryInProcess(io: std.Io, allocator: std.mem.Allocator) !Pac
         errdefer allocator.free(owned);
         try opt_in.append(allocator, owned);
     }
+    // Only synthetic packs (e.g. test.deadline): eval denies on g_packs.len == 0.
+    if (total_available == 0) return unknownPacksSummary();
     std.mem.sort([]const u8, opt_in.items, {}, struct {
         fn less(_: void, a: []const u8, b: []const u8) bool {
             return std.mem.order(u8, a, b) == .lt;
