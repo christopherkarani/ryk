@@ -687,7 +687,15 @@ if [[ $BIN_RC -eq 0 ]]; then
   TRUE_BIN="/usr/bin/true"
   [[ -x "$TRUE_BIN" ]] || TRUE_BIN="/bin/true"
   if [[ -x "$TRUE_BIN" ]]; then
-    "$BINARY" run --workspace "$PACK_WS" --os-sandbox on -- "$TRUE_BIN" >"$PACK_OUT" 2>&1
+    PACK_POLICY="$REPO_ROOT/policies/observe.yaml"
+    # Same packaged attach surface the secret-boundary canary just proved:
+    # explicit policy + OS sandbox on. An empty workspace has no policy file.
+    "$BINARY" run \
+      --workspace "$PACK_WS" \
+      --policy "$PACK_POLICY" \
+      --os-sandbox on \
+      --network off \
+      -- "$TRUE_BIN" >"$PACK_OUT" 2>&1
     PACK_RC=$?
     if [[ $PACK_RC -eq 0 ]] && grep -q 'OS sandbox: active' "$PACK_OUT"; then
       packaged_banner_active=true
@@ -711,6 +719,9 @@ if [[ $BIN_RC -eq 0 ]]; then
           echo "WARN: packaged attach active but profile_hash not found in audit; keeping unit dual-proof attach if any" >&2
         fi
       fi
+    elif [[ "$REQUIRE_ATTACH" == true ]]; then
+      echo "WARN: packaged ryk run attach did not report active (rc=$PACK_RC)" >&2
+      tail -20 "$PACK_OUT" >&2 || true
     fi
   fi
   set -e
