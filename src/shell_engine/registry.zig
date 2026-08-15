@@ -129,26 +129,20 @@ fn matchingObjectEnd(src: []const u8, start: usize) ?usize {
     return null;
 }
 
+/// Compact `{"id":"..."` only. A nested `"id"` must not select the pack —
+/// callers fall back to a full JSON parse (fail closed on error).
 fn packIdFromObject(obj: []const u8) ?[]const u8 {
     const compact = "{\"id\":\"";
-    if (std.mem.startsWith(u8, obj, compact)) {
-        const start = compact.len;
-        const end = std.mem.indexOfScalarPos(u8, obj, start, '"') orelse return null;
-        return obj[start..end];
-    }
-    const key = "\"id\"";
-    const key_idx = std.mem.indexOf(u8, obj, key) orelse return null;
-    var i = skipJsonWs(obj, key_idx + key.len);
-    if (i >= obj.len or obj[i] != ':') return null;
-    i = skipJsonWs(obj, i + 1);
-    if (i >= obj.len or obj[i] != '"') return null;
-    const start = i + 1;
+    if (!std.mem.startsWith(u8, obj, compact)) return null;
+    const start = compact.len;
     const end = std.mem.indexOfScalarPos(u8, obj, start, '"') orelse return null;
     return obj[start..end];
 }
 
 /// Leading required literal after an optional `^`. Used to skip PCRE compile
-/// when the subject cannot contain that prefix. Never used to allow a command.
+/// when the subject cannot contain that prefix. Skipping a *destructive*
+/// pattern is an allow if nothing else hits — `patternMightMatch` must not
+/// skip when a depth-0 `|` follows the prefix.
 fn requiredPrefixLiteral(regex_source: []const u8) ?[]const u8 {
     var i: usize = 0;
     if (i < regex_source.len and regex_source[i] == '^') i += 1;
@@ -165,9 +159,41 @@ fn requiredPrefixLiteral(regex_source: []const u8) ?[]const u8 {
     return if (i > start) regex_source[start..i] else null;
 }
 
+fn hasDepth0AlternationAfter(regex_source: []const u8, start: usize) bool {
+    var i = start;
+    var depth: u32 = 0;
+    var in_class = false;
+    while (i < regex_source.len) : (i += 1) {
+        const c = regex_source[i];
+        if (c == '\\') {
+            if (i + 1 < regex_source.len) i += 1;
+            continue;
+        }
+        if (in_class) {
+            if (c == ']') in_class = false;
+            continue;
+        }
+        switch (c) {
+            '[' => in_class = true,
+            '(' => depth += 1,
+            ')' => {
+                if (depth > 0) depth -= 1;
+            },
+            '|' => {
+                if (depth == 0) return true;
+            },
+            else => {},
+        }
+    }
+    return false;
+}
+
 fn patternMightMatch(regex_source: []const u8, cmd: []const u8) bool {
     const lit = requiredPrefixLiteral(regex_source) orelse return true;
     if (lit.len < 2) return true;
+    var prefix_at: usize = 0;
+    if (prefix_at < regex_source.len and regex_source[prefix_at] == '^') prefix_at += 1;
+    if (hasDepth0AlternationAfter(regex_source, prefix_at + lit.len)) return true;
     return std.ascii.indexOfIgnoreCase(cmd, lit) != null;
 }
 
@@ -218,13 +244,19 @@ fn initOnce(load_all: bool) !void {
         const obj = packs_json[pos..end];
         pos = end;
 
-        const id = packIdFromObject(obj) orelse return error.BadPacksJson;
-        if (std.mem.eql(u8, id, "test.deadline")) continue;
-        if (!load_all and !isDefaultEnabled(id)) continue;
+        if (packIdFromObject(obj)) |id| {
+            if (std.mem.eql(u8, id, "test.deadline")) continue;
+            if (!load_all and !isDefaultEnabled(id)) continue;
+        }
 
         const parsed = std.json.parseFromSlice(PackJson, a, obj, .{
             .ignore_unknown_fields = true,
         }) catch return error.BadPacksJson;
+        if (packIdFromObject(obj) == null) {
+            if (std.mem.eql(u8, parsed.value.id, "test.deadline")) continue;
+            if (!load_all and !isDefaultEnabled(parsed.value.id)) continue;
+        }
+
         const pack = try compilePack(a, parsed.value);
         packs_list.append(a, pack) catch |err| {
             freePatternList(pack.safe);
@@ -799,6 +831,23 @@ test "required prefix literal skips impossible regex compiles" {
     try std.testing.expect(patternMightMatch("rm\\s+-[a-zA-Z]*[rR]", "rm -rf /"));
     try std.testing.expect(!safePatternMightMatch("^rm\\s+/tmp/", "rm -rf /"));
     try std.testing.expect(safePatternMightMatch("^rm\\s+/tmp/", "rm -rf /tmp/foo"));
+}
+
+test "depth-0 alternation after prefix still denies del" {
+    // Skipping a destructive compile is an allow if nothing else hits.
+    // `^rm|del` extracts prefix "rm"; without a depth-0 `|` guard the
+    // heuristic would skip `del /s /q C:\` and fail open.
+    const cmd = "del /s /q C:\\";
+    try std.testing.expect(patternMightMatch("^rm|del", cmd));
+    var re = try regex_pcre.Regex.compile("^rm|del");
+    defer re.deinit();
+    try std.testing.expect(try re.isMatch(cmd));
+}
+
+test "packIdFromObject requires compact id-first and ignores nested id" {
+    try std.testing.expectEqualStrings("core.git", packIdFromObject("{\"id\":\"core.git\",\"keywords\":[]}").?);
+    try std.testing.expect(packIdFromObject("{\"keywords\":[],\"meta\":{\"id\":\"nested\"},\"id\":\"core.git\"}") == null);
+    try std.testing.expect(packIdFromObject("{\"name\":\"x\",\"id\":\"core.git\"}") == null);
 }
 
 test "match infrastructure error hit is deny not allow_miss" {
