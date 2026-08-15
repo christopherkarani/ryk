@@ -22,8 +22,9 @@ const std = @import("std");
 const builtin = @import("builtin");
 const theme = @import("theme.zig");
 const render = @import("render.zig");
+const enable_tui = @import("build_options").enable_tui;
 
-const vaxis = @import("vaxis");
+const vaxis = if (enable_tui) @import("vaxis") else struct {};
 
 // ────────────────────────────────────────────────────────────────────────────
 // Key action — the logical input both cores consume
@@ -112,7 +113,7 @@ pub fn confirmCore(io: std.Io, stdout: anytype, reader: *std.Io.Reader, kind: Co
 pub fn confirm(io: std.Io, stdout: anytype, kind: ConfirmKind, message: []const u8, injected_reader: ?*std.Io.Reader) !bool {
     if (injected_reader) |reader| return confirmCore(io, stdout, reader, kind, message);
     if (!ttyAvailable(io)) return false;
-    if (comptime !builtin.is_test) return confirmRaw(io, stdout, kind, message) catch false;
+    if (comptime enable_tui and !builtin.is_test) return confirmRaw(io, stdout, kind, message) catch false;
     return false;
 }
 
@@ -341,7 +342,7 @@ pub fn select(
     // Tty initialization failure falls back to the stream-injected core. Once
     // a raw frame is visible, errors propagate instead of changing protocols
     // or manufacturing an unconfirmed selection.
-    if (comptime !builtin.is_test) {
+    if (comptime enable_tui and !builtin.is_test) {
         if (ttyAvailable(io)) {
             if (selectRaw(io, allocator, stdout, options, default_index, header)) |idx| {
                 return idx;
@@ -368,7 +369,7 @@ pub fn multiSelect(
     if (injected_reader) |r| {
         return multiSelectCore(io, stdout, options, r, header);
     }
-    if (comptime !builtin.is_test) {
+    if (comptime enable_tui and !builtin.is_test) {
         if (ttyAvailable(io)) {
             if (multiSelectRaw(io, allocator, stdout, options, header)) |ok| {
                 return ok;
@@ -978,6 +979,7 @@ test "danger confirm requires explicit confirmation and defaults to deny" {
 }
 
 test "raw decoder carries fragmented CSI key sequences across reads" {
+    if (comptime !enable_tui) return;
     var decoder: RawDecoder = .{};
     try std.testing.expectEqual(@as(?KeyAction, null), try decoder.feed("\x1b"));
     try std.testing.expectEqual(@as(?KeyAction, .up), try decoder.feed("[A"));
@@ -985,6 +987,7 @@ test "raw decoder carries fragmented CSI key sequences across reads" {
 }
 
 test "raw decoder resolves standalone escape on inter-byte timeout" {
+    if (comptime !enable_tui) return;
     var decoder: RawDecoder = .{};
     try std.testing.expectEqual(@as(?KeyAction, null), try decoder.feed("\x1b"));
     try std.testing.expectEqual(@as(?KeyAction, .escape), decoder.interByteTimeout());

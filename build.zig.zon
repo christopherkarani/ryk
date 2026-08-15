@@ -7,12 +7,15 @@
         .vaxis = .{
             .url = "https://github.com/rockorager/libvaxis/archive/ca781b3c01f44a92e5331652823b5a9ce445be96.tar.gz",
             .hash = "vaxis-0.6.0-BWNV_Gz5CQBTx7g34RYMPTL-bJhsFCU3ECHQ-CZlBVsn",
+            .lazy = true,
         },
-        // libvaxis marks this dependency lazy; declare it at the root so clean
-        // checkouts resolve the Unicode module without a vendored cache.
+        // libvaxis marks this dependency lazy; declare it at the root so a
+        // TUI-on checkout resolves Unicode without a vendored cache. Both stay
+        // lazy so `-Dtui=false` does not fetch or link them.
         .uucode = .{
             .url = "git+https://github.com/jacobsandlund/uucode#2826a37a4562284fdacd8fa029d49509cc9bffcd",
             .hash = "uucode-0.2.0-ZZjBPlK5VADj7fdoq7G8LIHzD5o6FSkcBXXrRWr4jnrA",
+            .lazy = true,
         },
         .pcre2 = .{
             .url = "https://github.com/PCRE2Project/pcre2/archive/5a632d3cf0dbcc6821cfc39cacf88b19f3281791.tar.gz",

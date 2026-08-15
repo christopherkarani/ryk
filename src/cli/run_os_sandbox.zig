@@ -11,7 +11,7 @@ const core_api = @import("ryk_core").api;
 const sandbox = @import("../sandbox/mod.zig");
 const path_list = sandbox.path_list;
 const exit_codes = @import("exit_codes.zig");
-const tui = @import("../tui/mod.zig");
+const tui = @import("ryk").tui;
 
 /// ~12 fps — same cadence as `ryk scan` spinner.
 const prepare_spinner_tick = std.Io.Duration.fromNanoseconds(80 * std.time.ns_per_ms);

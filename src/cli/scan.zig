@@ -4,7 +4,8 @@ const gpa_mod = @import("gpa.zig");
 const exit_codes = @import("exit_codes.zig");
 const help = @import("help.zig");
 const scan_lib = @import("../scan/mod.zig");
-const tui = @import("../tui/mod.zig");
+const tui = @import("ryk").tui;
+const enable_tui = @import("build_options").enable_tui;
 
 const Options = struct {
     days: ?u32 = null,
@@ -206,7 +207,7 @@ pub fn command(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: an
     defer if (xdg_data) |x| allocator.free(x);
 
     // TTY auto-TUI: interactive colour terminal, not --json/--plain.
-    const want_tui = !options.json and !options.plain and tui.output_policy.shouldEnterTuiIo(io, argv);
+    const want_tui = enable_tui and !options.json and !options.plain and tui.output_policy.shouldEnterTuiIo(io, argv);
     const report_progress = shouldReportProgress(options.json, options.plain);
 
     var progress_ctx: ProgressCtx = .{

@@ -9,7 +9,7 @@ const mcp_mod = @import("../mcp/mod.zig");
 const policy_mod = @import("ryk_core").policy;
 const sandbox = @import("../sandbox/mod.zig");
 const resource_root = @import("../resource_root.zig");
-const tui = @import("../tui/mod.zig");
+const tui = @import("ryk").tui;
 const style = @import("style.zig");
 
 const exit_codes = @import("exit_codes.zig");
@@ -24,14 +24,30 @@ const readiness = @import("readiness.zig");
 const ensure = @import("ensure.zig");
 const policy_migrate = @import("policy_migrate.zig");
 const deadlock_check = @import("deadlock_check.zig");
-const doctor_tui = @import("doctor_tui.zig");
+const enable_tui = @import("build_options").enable_tui;
+const doctor_tui = if (enable_tui) @import("doctor_tui.zig") else struct {
+    pub const fail_closed_message =
+        "ryk doctor: --tui requires a TUI-enabled ryk build; using linear report.\n";
+    pub fn wouldEnterDoctorTui(
+        stdin_is_tty: bool,
+        stdout_is_tty: bool,
+        argv: []const []const u8,
+        want_tui: bool,
+        machine_json: bool,
+    ) bool {
+        _ = .{ stdin_is_tty, stdout_is_tty, argv, want_tui, machine_json };
+        return false;
+    }
+};
 const doctor_mcp = @import("doctor_mcp.zig");
 const core_api = @import("ryk_core").api;
 
 // Monopath: pull nested doctor_tui / doctor_mcp / deadlock_check tests into the
 // lib test binary.
 test {
-    _ = doctor_tui;
+    if (enable_tui) {
+        _ = @import("doctor_tui.zig");
+    }
     _ = doctor_mcp;
     _ = deadlock_check;
 }
@@ -240,11 +256,13 @@ pub fn command(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: an
         true,
         false,
     )) {
-        const tui_code = try runDoctorTui(io, allocator, stdout, os, backend_report, context);
-        // Tty.init / loop failure → linear report (never green-paint empty TUI success).
-        if (tui_code != exit_codes.success) {
-            try stderr.writeAll(doctor_tui.fail_closed_message);
-            try writeReport(io, stdout, os, backend_report, context, options.verbose);
+        if (comptime enable_tui) {
+            const tui_code = try runDoctorTui(io, allocator, stdout, os, backend_report, context);
+            // Tty.init / loop failure → linear report (never green-paint empty TUI success).
+            if (tui_code != exit_codes.success) {
+                try stderr.writeAll(doctor_tui.fail_closed_message);
+                try writeReport(io, stdout, os, backend_report, context, options.verbose);
+            }
         }
     } else {
         if (options.tui) {
@@ -2058,11 +2076,14 @@ test "doctor --tui non-TTY fail-closed message then linear report" {
 
 test "doctor TUI entry uses shared shouldEnterTui gate via wouldEnterDoctorTui" {
     // Composition: opt-in --tui + shouldEnterTui — not a dead import.
-    try std.testing.expect(doctor_tui.wouldEnterDoctorTui(true, true, &.{"--tui"}, true, false));
+    // Slim stub is always false; TUI-on applies the real TTY/--tui gate.
+    try std.testing.expectEqual(enable_tui, doctor_tui.wouldEnterDoctorTui(true, true, &.{"--tui"}, true, false));
     try std.testing.expect(!doctor_tui.wouldEnterDoctorTui(true, true, &.{}, false, false));
     try std.testing.expect(!doctor_tui.wouldEnterDoctorTui(false, true, &.{"--tui"}, true, false));
     try std.testing.expect(!doctor_tui.wouldEnterDoctorTui(true, true, &.{ "--tui", "--json" }, true, true));
-    try std.testing.expect(@TypeOf(tui.browse.keyToAction) != void);
+    if (enable_tui) {
+        try std.testing.expect(@TypeOf(tui.browse.keyToAction) != void);
+    }
 }
 
 test "doctor --json frozen when --tui also present" {

@@ -13,7 +13,7 @@ const ensure = @import("ensure.zig");
 const pack_state = @import("pack_state.zig");
 const spinner_pkg = @import("spinner.zig");
 const build_options = @import("build_options");
-const tui = @import("../tui/mod.zig");
+const tui = @import("ryk").tui;
 
 /// Library entry for host wiring (policy ensure + plugin install + smoke).
 /// Prefer `ryk start` for the public product path.

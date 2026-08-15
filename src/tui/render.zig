@@ -1,7 +1,7 @@
 const std = @import("std");
 const theme = @import("theme.zig");
 const terminal_text = @import("terminal_text.zig");
-const vaxis = @import("vaxis");
+const ctlseqs = @import("ctlseqs.zig");
 
 /// Linear rich-output primitives for the ryk CLI.
 ///
@@ -448,7 +448,7 @@ pub fn stepLine(io: std.Io, stdout: anytype, status: StepStatus, label: []const 
 
     // Bracket the live spinner frame in a single synchronized-output pair so it
     // paints atomically (no tear). Exactly one pair per active render.
-    if (live_active) try stdout.writeAll(vaxis.ctlseqs.sync_set);
+    if (live_active) try stdout.writeAll(ctlseqs.sync_set);
 
     try stdout.writeAll("  ");
     try theme.paintBold(io, stdout, marker_token, glyph);
@@ -463,7 +463,7 @@ pub fn stepLine(io: std.Io, stdout: anytype, status: StepStatus, label: []const 
         try theme.paint(io, stdout, .muted, d);
     }
 
-    if (live_active) try stdout.writeAll(vaxis.ctlseqs.sync_reset);
+    if (live_active) try stdout.writeAll(ctlseqs.sync_reset);
     try stdout.writeAll("\n");
 }
 
@@ -723,8 +723,8 @@ test "stepLine: live active step is bracketed by exactly one sync pair" {
     try std.testing.expect(std.mem.indexOf(u8, out, "⠋") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "›") == null);
     // Exactly one synchronized-output pair brackets the frame.
-    try std.testing.expectEqual(@as(usize, 1), countSeq(out, vaxis.ctlseqs.sync_set));
-    try std.testing.expectEqual(@as(usize, 1), countSeq(out, vaxis.ctlseqs.sync_reset));
+    try std.testing.expectEqual(@as(usize, 1), countSeq(out, ctlseqs.sync_set));
+    try std.testing.expectEqual(@as(usize, 1), countSeq(out, ctlseqs.sync_reset));
 }
 
 test "stepLine: reduced-motion active step emits no sync controls" {
@@ -744,8 +744,8 @@ test "stepLine: reduced-motion active step emits no sync controls" {
     try std.testing.expect(std.mem.indexOf(u8, out, "›") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "⠋") == null);
     // No synchronized-output controls on the reduced-motion path.
-    try std.testing.expect(std.mem.indexOf(u8, out, vaxis.ctlseqs.sync_set) == null);
-    try std.testing.expect(std.mem.indexOf(u8, out, vaxis.ctlseqs.sync_reset) == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, ctlseqs.sync_set) == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, ctlseqs.sync_reset) == null);
     // Colour is retained — reduced-motion stops animation, not colour.
     try std.testing.expect(std.mem.indexOf(u8, out, "38;5;") != null);
 }

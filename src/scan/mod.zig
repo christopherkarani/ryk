@@ -1,5 +1,6 @@
 //! Session forensics scan library (public `ryk scan`).
 const std = @import("std");
+const enable_tui = @import("build_options").enable_tui;
 
 pub const types = @import("types.zig");
 pub const time_window = @import("time_window.zig");
@@ -15,7 +16,12 @@ pub const engine = @import("engine.zig");
 pub const render = @import("render.zig");
 pub const risk = @import("risk.zig");
 pub const present = @import("present.zig");
-pub const tui_view = @import("tui_view.zig");
+pub const tui_view = if (enable_tui) @import("tui_view.zig") else struct {
+    pub fn run(io: std.Io, stdout: anytype, result: anytype) !void {
+        _ = .{ io, stdout, result };
+        return error.TuiDisabled;
+    }
+};
 pub const os_actions = @import("os_actions.zig");
 
 pub const Finding = types.Finding;
@@ -40,6 +46,8 @@ test {
     _ = render;
     _ = risk;
     _ = present;
-    _ = tui_view;
+    if (enable_tui) {
+        _ = @import("tui_view.zig");
+    }
     _ = os_actions;
 }
