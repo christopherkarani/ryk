@@ -59,7 +59,7 @@ pub fn command(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: an
     // (M-12). Host execution (hook/run/shim) still defaults to true. Optional `--consume`
     // flag is deferred.
     var stores: shell_eval.ProductShellStores = .{};
-    try shell_eval.loadProductShellStores(io, std.heap.smp_allocator, workspace, &stores);
+    try shell_eval.loadProductShellStores(io, std.heap.smp_allocator, workspace, &stores, true);
     defer stores.deinit(std.heap.smp_allocator);
 
     // Allow-once cwd-scope matches exact evaluate cwd (hook uses event cwd). Prefer
@@ -375,7 +375,7 @@ test "s-product-wire: explicit consume_allow_once true burns single-use (engine 
     try sProductWireSeedAllowOnce(xdg.data_root, cmd, root, reason);
 
     var stores: shell_eval.ProductShellStores = .{};
-    try shell_eval.loadProductShellStores(std.testing.io, std.testing.allocator, root, &stores);
+    try shell_eval.loadProductShellStores(std.testing.io, std.testing.allocator, root, &stores, true);
     defer stores.deinit(std.testing.allocator);
 
     {

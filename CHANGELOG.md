@@ -20,6 +20,10 @@
 
 ## [Unreleased]
 
+### Security
+
+* **Product evaluate ignores `allow_once.jsonl` unless the session OS sandbox is active.** Hook/run/shim used to always load `$XDG_DATA_HOME/ryk/allow_once.jsonl` (or `~/.local/share/ryk/allow_once.jsonl`). Redeem is TTY-bound (`ryk allow-once`), but consume is "read the JSONL" — a same-UID agent on a hook-only session (no OS sandbox) could append a well-formed grant and the next evaluate allowed. Product evaluate now sets `allow_once_path = null` unless OS sandbox is active for that session (child cannot write the user store). Operator redeem/list/clear is unchanged.
+
 ### Fixed
 
 * **Bare `ryk` empty/whitespace stdin on a non-TTY hook entry is fail-closed.** `src/cli/mod.zig` used to map `agent_hook.command`'s blank stdin (`NotAgentHookInput`) to help + exit 0. Hosts that treat exit 0 / non-JSON as allow skipped the gate. Empty and whitespace-only stdin now emit dual-contract deny JSON and exit 2. A failed stdin TTY probe enters hook mode (same deny path) instead of help. Interactive TTY with no args still shows help. This is the bare `ryk` stdin hook entry only — not `ryk hook <host>`.

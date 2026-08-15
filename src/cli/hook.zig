@@ -1368,6 +1368,7 @@ fn evaluateShellCommandRoute(
         .command = shell_event.command,
         .cwd = shell_event.cwd,
         .workspace_root = workspace_root,
+        .os_sandbox_active = shell_event.os_sandbox_active,
     };
     const daemon_response = evaluator(allocator, event_for_eval) catch |err| {
         if (!std.mem.eql(u8, host_name, "hermes")) recordShellHookUnavailable(io, allocator, workspace_root, host_name, err);

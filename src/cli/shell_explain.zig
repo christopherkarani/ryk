@@ -83,7 +83,7 @@ pub fn command(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: an
     // Permanent + allow-once on product path (distinct API, not options.allowlists).
     // consume_allow_once=false: dry-run never burns single-use entries.
     var stores: shell_eval.ProductShellStores = .{};
-    try shell_eval.loadProductShellStores(io, std.heap.smp_allocator, workspace, &stores);
+    try shell_eval.loadProductShellStores(io, std.heap.smp_allocator, workspace, &stores, true);
     defer stores.deinit(std.heap.smp_allocator);
 
     // Allow-once cwd-scope matches exact evaluate cwd (hook uses event cwd). Prefer
@@ -354,7 +354,7 @@ test "s-product-wire: shell_explain sets consume_allow_once false (does not burn
 
     // Explicit consume (hook/run/shim path) burns; second consume misses.
     var stores: shell_eval.ProductShellStores = .{};
-    try shell_eval.loadProductShellStores(std.testing.io, std.testing.allocator, root, &stores);
+    try shell_eval.loadProductShellStores(std.testing.io, std.testing.allocator, root, &stores, true);
     defer stores.deinit(std.testing.allocator);
     {
         var eval = try shell_engine.evaluateCommand(std.testing.allocator, cmd, .{

@@ -28,6 +28,10 @@ pub const ShellCommandEvent = struct {
     /// When null, `zigEvaluator` walks up from tool cwd — residual: nested
     /// `.git` / `.ryk` under agent-controlled cwd can still hijack loads (M-9).
     workspace_root: ?[]const u8 = null,
+    /// Product evaluate (hook/run/shim) honors `allow_once.jsonl` only when the
+    /// session OS sandbox is active (child cannot write the user store). Default
+    /// false: same-UID hook-only agents can plant a well-formed grant.
+    os_sandbox_active: bool = false,
 };
 
 pub const ShellCommandEvaluatorFn = *const fn (
@@ -42,6 +46,9 @@ pub const ShellAuditOptions = struct {
     host: ?[]const u8 = null,
     session_id: ?[]const u8 = null,
     verified: bool = false,
+    /// Session OS sandbox is active / child-apply planned. Copied onto
+    /// `ShellCommandEvent.os_sandbox_active` for product allow-once gating.
+    os_sandbox_active: bool = false,
 };
 
 const event_source_run = rust_visibility.event_source_run;
@@ -104,6 +111,7 @@ fn resolveUserAllowlistPath(allocator: std.mem.Allocator) error{OutOfMemory}!?[]
 }
 
 /// Match CLI empty checks: empty `XDG_DATA_HOME` falls back to HOME (not join under "").
+/// Product evaluate calls this only when the session OS sandbox is active.
 fn resolveAllowOnceJsonlPath(allocator: std.mem.Allocator) error{OutOfMemory}!?[]u8 {
     if (std.c.getenv("XDG_DATA_HOME")) |xdg_z| {
         const xdg = std.mem.span(xdg_z);
@@ -135,7 +143,10 @@ fn resolveAllowOnceJsonlPath(allocator: std.mem.Allocator) error{OutOfMemory}!?[
 /// - User file: `$XDG_CONFIG_HOME/ryk/allowlist.toml` or `~/.config/ryk/allowlist.toml`
 ///   (empty `XDG_CONFIG_HOME` falls back to HOME, matching allowlist CLI)
 /// - Allow-once: `$XDG_DATA_HOME/ryk/allow_once.jsonl` or `~/.local/share/ryk/allow_once.jsonl`
-///   (empty `XDG_DATA_HOME` falls back to HOME, matching allow-once CLI)
+///   (empty `XDG_DATA_HOME` falls back to HOME, matching allow-once CLI).
+///   On product evaluate, `os_sandbox_active` must be true or the path is left
+///   null — a same-UID agent can otherwise plant this JSONL and the next
+///   evaluate allows. Operator `ryk allow-once` redeem/list/clear is unchanged.
 ///
 /// Missing files → empty layer / match miss. Corrupt permanent file → empty + no panic.
 /// Does **not** set `EvaluateOptions.allowlists` (Layered pre-pack banned on product path).
@@ -152,6 +163,7 @@ pub fn loadProductShellStores(
     allocator: std.mem.Allocator,
     workspace_root: []const u8,
     out: *ProductShellStores,
+    os_sandbox_active: bool,
 ) error{OutOfMemory}!void {
     out.* = .{};
     errdefer out.deinit(allocator);
@@ -182,7 +194,13 @@ pub fn loadProductShellStores(
     // Keep project kind=rule (E8) and all user-layer entries (including command).
     stripProjectCommandEntries(allocator, &out.permanent);
 
-    out.allow_once_path = try resolveAllowOnceJsonlPath(allocator);
+    // Same-UID fail-open: consume is "read the JSONL". Without an active OS
+    // sandbox the agent can append a well-formed grant. Operator redeem stays
+    // on `ryk allow-once` (TTY-bound) and does not use this loader.
+    out.allow_once_path = if (os_sandbox_active)
+        try resolveAllowOnceJsonlPath(allocator)
+    else
+        null;
 }
 
 /// Free permanent entry fields owned by the store (mirrors allowlist_store.freeEntry).
@@ -236,6 +254,46 @@ fn stripProjectCommandEntries(gpa: std.mem.Allocator, store: *shell_engine.allow
     store.entries = new_entries;
 }
 
+/// True when this process inherited an OS sandbox that denies writes to `$HOME`
+/// (ryk profile: no home). Hook/shim inherit attach; the agent then cannot
+/// plant `allow_once.jsonl`. Test binaries never claim active (no HOME probe).
+///
+/// Linux: ryk Landlock always sets `NO_NEW_PRIVS` before `restrict_self`.
+/// NNP unset → not our attach (skip the HOME probe on hook-only). NNP set
+/// still write-probes HOME so a container NNP bit alone cannot unlock the store.
+fn currentProcessOsSandboxActive() bool {
+    if (@import("builtin").is_test) return false;
+    if (@import("builtin").os.tag == .windows) return false;
+    if (@import("builtin").os.tag == .linux) {
+        const nnp = std.os.linux.prctl(@intFromEnum(std.os.linux.PR.GET_NO_NEW_PRIVS), 0, 0, 0, 0);
+        if (std.os.linux.errno(nnp) != .SUCCESS or nnp != 1) return false;
+    }
+    return homeWriteDeniedByOsSandbox();
+}
+
+fn homeWriteDeniedByOsSandbox() bool {
+    const home_z = std.c.getenv("HOME") orelse return false;
+    const home = std.mem.span(home_z);
+    if (home.len == 0) return false;
+
+    const pid = std.posix.getpid();
+    var name_buf: [64]u8 = undefined;
+    const probe_name = std.fmt.bufPrint(&name_buf, ".ryk-sbx-probe-{d}", .{pid}) catch return false;
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ home, probe_name }) catch return false;
+
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const io = threaded.io();
+    const file = std.Io.Dir.cwd().createFile(io, path, .{ .exclusive = true }) catch |err| switch (err) {
+        error.AccessDenied, error.PermissionDenied => return true,
+        else => return false,
+    };
+    file.close(io);
+    std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    return false;
+}
+
 fn zigEvaluator(
     allocator: std.mem.Allocator,
     shell_event: ShellCommandEvent,
@@ -285,8 +343,11 @@ fn zigEvaluator(
     // Permanent pack exceptions + allow-once via distinct API (not options.allowlists).
     // consume_allow_once defaults true for hook/run/shim (burns single-use).
     // loadProductShellStores is error{OutOfMemory}!void — map honestly (M-20).
+    // Allow-once only when this session's OS sandbox is active (event flag or
+    // inherited Landlock/Seatbelt). Tests never treat the runner as sandboxed.
+    const os_sandbox_active = shell_event.os_sandbox_active or currentProcessOsSandboxActive();
     var stores: ProductShellStores = .{};
-    loadProductShellStores(io, allocator, workspace, &stores) catch |err| switch (err) {
+    loadProductShellStores(io, allocator, workspace, &stores, os_sandbox_active) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
     };
     defer stores.deinit(allocator);
@@ -1354,6 +1415,7 @@ pub fn evaluateCommand(
         .command = display,
         .cwd = cwd,
         .workspace_root = if (audit_options) |opts| opts.workspace_root else null,
+        .os_sandbox_active = if (audit_options) |opts| opts.os_sandbox_active else false,
     };
     const daemon_response = evaluateParsed(allocator, shell_event, evaluator_override) catch |err| {
         if (metadata_out) |out| {
@@ -3443,7 +3505,7 @@ test "s-product-wire: loadProductShellStores strips project command keeps rule +
     try sProductWireWriteUserCommandAllow(xdg.config_root, "npm test", "user-cmd-keep");
 
     var stores: ProductShellStores = .{};
-    try loadProductShellStores(std.testing.io, allocator, ws.root, &stores);
+    try loadProductShellStores(std.testing.io, allocator, ws.root, &stores, false);
     defer stores.deinit(allocator);
 
     var saw_project_cmd = false;
@@ -3571,6 +3633,7 @@ test "s-product-wire: zigEvaluator loads allow-once from XDG data and consumes b
         var parsed = try zigEvaluator(allocator, .{
             .command = cmd,
             .cwd = ws.root,
+            .os_sandbox_active = true,
         });
         defer parsed.deinit();
         try std.testing.expectEqual(daemon.ResponseStatus.allow, daemon.responseStatus(parsed.value.result));
@@ -3583,10 +3646,38 @@ test "s-product-wire: zigEvaluator loads allow-once from XDG data and consumes b
         var parsed = try zigEvaluator(allocator, .{
             .command = cmd,
             .cwd = ws.root,
+            .os_sandbox_active = true,
         });
         defer parsed.deinit();
         try std.testing.expectEqual(daemon.ResponseStatus.deny, daemon.responseStatus(parsed.value.result));
     }
+}
+
+test "s-product-wire: planted allow_once.jsonl is ignored when OS sandbox is not active" {
+    const allocator = std.testing.allocator;
+    var xdg = try sProductWireIsolateXdg();
+    defer xdg.deinit();
+    var ws = try sProductWireGitWorkspace();
+    defer ws.deinit();
+
+    const cmd = "git reset --hard HEAD";
+    const reason = "planted allow-once must not unlock without OS sandbox";
+    try sProductWireSeedAllowOnce(xdg.data_root, cmd, ws.root, reason);
+
+    var stores: ProductShellStores = .{};
+    try loadProductShellStores(std.testing.io, allocator, ws.root, &stores, false);
+    defer stores.deinit(allocator);
+    try std.testing.expect(stores.allow_once_path == null);
+
+    var parsed = try zigEvaluator(allocator, .{
+        .command = cmd,
+        .cwd = ws.root,
+        .workspace_root = ws.root,
+    });
+    defer parsed.deinit();
+    try std.testing.expectEqual(daemon.ResponseStatus.deny, daemon.responseStatus(parsed.value.result));
+    const got_reason = daemon.responseReason(parsed.value.result) orelse "";
+    try std.testing.expect(std.mem.indexOf(u8, got_reason, reason) == null);
 }
 
 test "s-product-wire: zigEvaluator without stores still denies destructive (baseline packs-only)" {

@@ -848,6 +848,7 @@ fn commandWithStdioAndEnv(io: std.Io, argv: []const []const u8, stdout: anytype,
                 .event_source = rust_visibility.event_source_run,
                 .session_id = session.id.slice(),
                 .verified = false,
+                .os_sandbox_active = self.os_attach_planned,
             };
 
             var command_decision = try shell_eval.evaluateCommand(
