@@ -386,13 +386,10 @@ fn runWithCwdUsing(
 
     if (argv.len == 0) {
         if (agent_hook.shouldEnter(io)) {
-            return agent_hook.command(io, stdout, stderr) catch |err| switch (err) {
-                error.NotAgentHookInput => {
-                    try help.write(io, stdout);
-                    return exit_codes.success;
-                },
-                else => return err,
-            };
+            // Non-TTY hook entry: empty/whitespace/malformed stdin fail closed
+            // inside agent_hook.command (deny JSON + exit 2). Do not map any
+            // pre-eval miss to help + exit 0 — hosts treat that as allow.
+            return agent_hook.command(io, stdout, stderr);
         }
         try help.write(io, stdout);
         return exit_codes.success;

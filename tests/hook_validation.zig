@@ -547,3 +547,75 @@ test "phase2f shell tool with empty command fails closed before daemon evaluatio
 
     try expectHookDecision(allocator, "claude", "block", result);
 }
+
+test "bare ryk empty/whitespace stdin on non-TTY hook entry fails closed; TTY still gets help" {
+    // Fail-open: src/cli/mod.zig used to map agent_hook.command's empty stdin
+    // (NotAgentHookInput) to help + exit 0. Hosts that treat exit 0 / non-JSON
+    // as allow skipped the gate. Garbage JSON already denied + exit 2.
+    if (!fileExists(ryk_bin)) return;
+
+    const allocator = std.testing.allocator;
+    const blank_cases = [_][]const u8{ "", "   ", "\n", "\t\r\n  " };
+    for (blank_cases) |stdin_data| {
+        const result = try runRyk(allocator, &.{ryk_bin}, stdin_data, null);
+        defer allocator.free(result.stdout);
+        defer allocator.free(result.stderr);
+
+        try std.testing.expectEqual(@as(u8, 2), result.code);
+        try std.testing.expect(std.mem.indexOf(u8, result.stdout, "\"permission\":\"deny\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, result.stdout, "\"permissionDecision\":\"deny\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, result.stdout, "\"continue\":false") != null);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, std.mem.trim(u8, result.stdout, "\n"), .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value == .object);
+    }
+
+    const tty = try runRykOnTty(allocator, ryk_bin);
+    defer allocator.free(tty.stdout);
+    defer allocator.free(tty.stderr);
+    try std.testing.expectEqual(exit_codes.success, tty.code);
+    try std.testing.expect(std.mem.indexOf(u8, tty.stdout, "Common tasks") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tty.stdout, "\"permission\":\"deny\"") == null);
+}
+
+fn runRykOnTty(allocator: std.mem.Allocator, bin: []const u8) !HookRunResult {
+    const io = std.testing.io;
+    const script =
+        \\import os, pty, sys
+        \\pid, fd = pty.fork()
+        \\if pid == 0:
+        \\    os.execv(sys.argv[1], [sys.argv[1]])
+        \\chunks = []
+        \\while True:
+        \\    try:
+        \\        data = os.read(fd, 4096)
+        \\    except OSError:
+        \\        break
+        \\    if not data:
+        \\        break
+        \\    chunks.append(data)
+        \\_, status = os.waitpid(pid, 0)
+        \\sys.stdout.buffer.write(b"".join(chunks))
+        \\sys.exit(os.WEXITSTATUS(status) if os.WIFEXITED(status) else 255)
+    ;
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ "python3", "-c", script, bin },
+        .stdin = .pipe,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    });
+    if (child.stdin) |stdin| {
+        stdin.close(io);
+        child.stdin = null;
+    }
+    const stdout = try readPipeToAlloc(io, allocator, child.stdout.?, 1024 * 1024);
+    errdefer allocator.free(stdout);
+    const stderr = try readPipeToAlloc(io, allocator, child.stderr.?, 1024 * 1024);
+    errdefer allocator.free(stderr);
+    const term = try child.wait(io);
+    const code: u8 = switch (term) {
+        .exited => |c| @intCast(@min(c, 255)),
+        .signal, .stopped, .unknown => 255,
+    };
+    return .{ .stdout = stdout, .stderr = stderr, .code = code };
+}
