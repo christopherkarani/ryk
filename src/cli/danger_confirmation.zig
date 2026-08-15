@@ -1,5 +1,6 @@
 const std = @import("std");
-const tui = @import("../tui/mod.zig");
+const enable_tui = @import("build_options").enable_tui;
+const tui = @import("ryk").tui;
 
 pub const Decision = enum { proceed, cancelled, requires_yes };
 
@@ -13,6 +14,7 @@ pub fn decide(
 ) !Decision {
     if (yes) return .proceed;
     if (!is_tty) return .requires_yes;
+    if (comptime !enable_tui) return .cancelled;
     return if (try tui.prompt.confirm(io, stdout, .danger, message, injected_reader)) .proceed else .cancelled;
 }
 

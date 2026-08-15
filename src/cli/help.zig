@@ -1,7 +1,7 @@
 const std = @import("std");
 const style = @import("style.zig");
 const build_options = @import("build_options");
-const tui = @import("../tui/mod.zig");
+const tui = if (build_options.enable_tui) @import("../tui/mod.zig") else @import("../tui/linear.zig");
 const host_launch = @import("host_launch.zig");
 
 pub const Category = enum {

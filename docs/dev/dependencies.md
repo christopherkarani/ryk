@@ -4,8 +4,8 @@ Dependency changes should be reviewed for provenance, license, input handling, a
 
 ## Zig packages
 
-- [libvaxis](https://github.com/rockorager/libvaxis) is pinned to commit `ca781b3c01f44a92e5331652823b5a9ce445be96` for terminal capability detection and interactive widgets.
-- [uucode](https://github.com/jacobsandlund/uucode) is pinned in `build.zig.zon` because libvaxis declares it as a lazy dependency.
+- [libvaxis](https://github.com/rockorager/libvaxis) is pinned to commit `ca781b3c01f44a92e5331652823b5a9ce445be96` for terminal capability detection and interactive widgets. Default `zig build` / PATH `ryk` keeps TUI (`-Dtui` defaults true). `-Dtui=false` is a slim profile that must not fetch or link vaxis/uucode.
+- [uucode](https://github.com/jacobsandlund/uucode) is pinned in `build.zig.zon` as a lazy root dep so a TUI-on checkout resolves Unicode without a vendored cache. Both vaxis and uucode are `.lazy = true`.
 - [PCRE2](https://github.com/PCRE2Project/pcre2) is built and statically linked for the in-process Zig shell evaluator.
 
 The package hashes in `build.zig.zon` are part of the build contract. Do not replace them with floating versions or a system library search path.

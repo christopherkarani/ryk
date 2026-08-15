@@ -1,3 +1,5 @@
+/// Full TUI facade (libvaxis). Slim builds import `linear.zig` instead.
+///
 /// ryk CLI design system and rich-output rendering (`tui`).
 ///
 /// - `theme` — palette, color-capability detection, semantic tokens.

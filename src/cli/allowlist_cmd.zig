@@ -20,13 +20,20 @@ const exit_codes = @import("exit_codes.zig");
 const help = @import("help.zig");
 const suggestions = @import("suggestions.zig");
 const shell_engine = @import("../shell_engine/mod.zig");
-const allowlist_browse = @import("../tui/allowlist_browse.zig");
+const enable_tui = @import("build_options").enable_tui;
+const allowlist_browse = if (enable_tui) @import("../tui/allowlist_browse.zig") else struct {
+    pub fn shouldEnterAllowlistBrowseIo(_: std.Io, _: []const []const u8) bool {
+        return false;
+    }
+};
 
 const allowlist_store = shell_engine.allowlist_store;
 
 // Pull pure browse tests into the allowlist test filter set.
 test {
-    _ = allowlist_browse;
+    if (enable_tui) {
+        _ = @import("../tui/allowlist_browse.zig");
+    }
 }
 
 /// Same gzip oracle as shell_engine.registry / packs CLI — known rule ids for validate --strict.
@@ -476,13 +483,15 @@ fn cmdList(
 
     // Machine / plain / non-TTY: linear frozen. TTY + shouldEnterTui → dual-layer browse.
     // Gate argv must include escape flags (--json/--plain/--no-rich/…) from the list path.
-    const want_tui = !flags.as_json and !flags.as_plain and
+    const want_tui = enable_tui and !flags.as_json and !flags.as_plain and
         allowlist_browse.shouldEnterAllowlistBrowseIo(io, argv);
 
     if (want_tui) {
-        const entered = try tryEnterAllowlistBrowse(io, gpa, now_iso, flags, stdout, stderr);
-        if (entered) return exit_codes.success;
-        // TtyUnavailable → fall through to linear so findings are never dropped.
+        if (comptime enable_tui) {
+            const entered = try tryEnterAllowlistBrowse(io, gpa, now_iso, flags, stdout, stderr);
+            if (entered) return exit_codes.success;
+            // TtyUnavailable → fall through to linear so findings are never dropped.
+        }
     }
 
     // --project / --user: single layer. auto: merge both (project wins).

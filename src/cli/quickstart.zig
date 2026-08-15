@@ -12,7 +12,7 @@ const onboarding = @import("onboarding.zig");
 const ensure_lib = @import("ensure.zig");
 const readiness = @import("readiness.zig");
 const build_options = @import("build_options");
-const tui = @import("../tui/mod.zig");
+const tui = @import("ryk").tui;
 
 /// Library entry (doctor → policy → setup). Prefer `ryk start` for the public product path.
 pub fn command(io: std.Io, cwd: std.Io.Dir, argv: []const []const u8, stdout: anytype, stderr: anytype) !u8 {

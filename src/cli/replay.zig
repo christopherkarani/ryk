@@ -8,7 +8,8 @@ const brand = @import("brand.zig");
 const exit_codes = @import("exit_codes.zig");
 const help = @import("help.zig");
 const rust_visibility = @import("rust_visibility.zig");
-const tui = @import("../tui/mod.zig");
+const tui = @import("ryk").tui;
+const enable_tui = @import("build_options").enable_tui;
 const suggestions = @import("suggestions.zig");
 
 const ReplayCliOptions = struct {
@@ -62,6 +63,10 @@ fn replaySession(
     // (invariant #2). Reject up front so a missing session never masks the flag
     // conflict and we never load data we'll refuse to render.
     if (options.tui_view) {
+        if (comptime !enable_tui) {
+            try stderr.writeAll("ryk replay: --tui is not available in this build.\n");
+            return exit_codes.usage;
+        }
         if (options.json) {
             try stderr.writeAll("ryk replay: --tui cannot be combined with --json (machine output is frozen).\n");
             return exit_codes.usage;
@@ -106,9 +111,14 @@ fn replaySession(
     if (options.json) {
         try core_api.writeReplayJson(stdout, session);
     } else if (options.tui_view) {
-        const lines = try buildTimelineLinesForTui(allocator, session);
-        defer freeTimelineLines(allocator, lines);
-        try tui.live_view.run(io, stdout, "replay", lines, null, null);
+        if (comptime enable_tui) {
+            const lines = try buildTimelineLinesForTui(allocator, session);
+            defer freeTimelineLines(allocator, lines);
+            try tui.live_view.run(io, stdout, "replay", lines, null, null);
+        } else {
+            try stderr.writeAll("ryk replay: --tui is not available in this build.\n");
+            return exit_codes.usage;
+        }
     } else {
         try writeReplayHuman(io, allocator, stdout, session, options.verify);
     }

@@ -7,7 +7,7 @@ const supervisor = core.supervisor;
 const report = @import("../report.zig");
 const exit_codes = @import("exit_codes.zig");
 const help = @import("help.zig");
-const tui = @import("../tui/mod.zig");
+const tui = @import("ryk").tui;
 const suggestions = @import("suggestions.zig");
 
 const Format = enum { human, markdown, json };

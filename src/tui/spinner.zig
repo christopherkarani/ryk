@@ -1,7 +1,7 @@
 const std = @import("std");
 const theme = @import("theme.zig");
 const terminal_text = @import("terminal_text.zig");
-const vaxis = @import("vaxis");
+const ctlseqs = @import("ctlseqs.zig");
 
 /// Inline spinner using libvaxis synchronized-output control sequences so each
 /// frame update is atomic. Timing remains caller-driven; plain output is static.
@@ -38,11 +38,11 @@ pub fn Spinner(comptime Writer: type) type {
                 return;
             }
             const frame = self.frames[self.frame_index % self.frames.len];
-            try self.stdout.writeAll(vaxis.ctlseqs.sync_set);
+            try self.stdout.writeAll(ctlseqs.sync_set);
             try self.stdout.print("\r\x1b[2K\r  {s} ", .{frame});
             try terminal_text.write(self.stdout, self.label, .single_line);
             try self.stdout.writeAll("...");
-            try self.stdout.writeAll(vaxis.ctlseqs.sync_reset);
+            try self.stdout.writeAll(ctlseqs.sync_reset);
             try flush(self.stdout);
             self.frame_index += 1;
         }
@@ -85,8 +85,8 @@ test "spinner rich frames are atomically bracketed by libvaxis sync controls" {
     var spinner = Spinner(*std.Io.Writer){ .label = "Checking\x1b[2J", .io = std.testing.io, .stdout = &writer };
     try spinner.start();
     try spinner.stop(true);
-    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), vaxis.ctlseqs.sync_set) != null);
-    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), vaxis.ctlseqs.sync_reset) != null);
+    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), ctlseqs.sync_set) != null);
+    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), ctlseqs.sync_reset) != null);
     try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "\r\x1b[2K\r") != null);
     try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "[2J") == null);
 }
@@ -131,8 +131,8 @@ test "spinner reduced-motion emits one static frame with no sync controls" {
     // Exactly one spinner frame (the first), no repeat frames.
     try std.testing.expectEqual(@as(usize, 1), countSeq(out, "⠋"));
     // No synchronized-output controls on the reduced-motion path.
-    try std.testing.expect(std.mem.indexOf(u8, out, vaxis.ctlseqs.sync_set) == null);
-    try std.testing.expect(std.mem.indexOf(u8, out, vaxis.ctlseqs.sync_reset) == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, ctlseqs.sync_set) == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, ctlseqs.sync_reset) == null);
     // Colour capability retained — the frame rendered (did not bail) and the
     // final result line carries the label.
     try std.testing.expect(std.mem.indexOf(u8, out, "Checking") != null);

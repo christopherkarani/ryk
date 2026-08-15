@@ -3,7 +3,7 @@ const builtin = @import("builtin");
 const build_options = @import("build_options");
 const brand = @import("brand.zig");
 const daemon = @import("daemon.zig");
-const tui = @import("../tui/mod.zig");
+const tui = @import("ryk").tui;
 
 pub const Metadata = struct {
     product: []const u8 = brand.versionProduct(),

@@ -14,7 +14,7 @@ const help = @import("help.zig");
 const policy = @import("ryk_core").policy;
 const version_command = @import("version.zig");
 const suggestions = @import("suggestions.zig");
-const tui = @import("../tui/mod.zig");
+const tui = @import("ryk").tui;
 
 pub fn command(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: anytype) !u8 {
     if (argv.len > 0 and (std.mem.eql(u8, argv[0], "--help") or std.mem.eql(u8, argv[0], "-h"))) {

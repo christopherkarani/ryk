@@ -1,18 +1,31 @@
 const std = @import("std");
 const exit_codes = @import("exit_codes.zig");
 const help = @import("help.zig");
-const tui = @import("../tui/mod.zig");
+const tui = @import("ryk").tui;
 const suggestions = @import("suggestions.zig");
 const pack_config = @import("pack_config.zig");
 const onboarding = @import("onboarding.zig");
 const danger_confirmation = @import("danger_confirmation.zig");
-const packs_tui = @import("packs_tui.zig");
+const enable_tui = @import("build_options").enable_tui;
+const packs_tui = if (enable_tui) @import("packs_tui.zig") else struct {
+    pub fn wouldEnterPacksBrowse(
+        stdin_is_tty: bool,
+        stdout_is_tty: bool,
+        argv: []const []const u8,
+        machine_json: bool,
+    ) bool {
+        _ = .{ stdin_is_tty, stdout_is_tty, argv, machine_json };
+        return false;
+    }
+};
 const util = @import("ryk_core").core.util;
 
 // Zig 0.16 monopath: nested module tests need an explicit test-block reference
 // (same pattern as tui.mod → browse) so `packs browse` filters discover them.
 test {
-    _ = packs_tui;
+    if (enable_tui) {
+        _ = @import("packs_tui.zig");
+    }
 }
 
 /// Inflated oracle pack definitions (same gzip as `shell_engine.registry`).
@@ -139,9 +152,11 @@ fn runList(io: std.Io, argv: []const []const u8, options: Options, stdout: anyty
     const stdin_tty = std.Io.File.stdin().isTty(io) catch false;
     const stdout_tty = std.Io.File.stdout().isTty(io) catch false;
     if (packs_tui.wouldEnterPacksBrowse(stdin_tty, stdout_tty, argv, options.machine_json)) {
-        const code = try runPacksBrowse(io, allocator, &catalog, options, stdout, stderr);
-        // Tty.init failure after gate: fall through to linear (never green-paint empty success).
-        if (code != exit_codes.general) return code;
+        if (comptime enable_tui) {
+            const code = try runPacksBrowse(io, allocator, &catalog, options, stdout, stderr);
+            // Tty.init failure after gate: fall through to linear (never green-paint empty success).
+            if (code != exit_codes.general) return code;
+        }
     }
 
     return renderHuman(allocator, io, options, catalog.packs, stdout, stderr);
@@ -1592,5 +1607,7 @@ test "s-packs: packs list TUI entry uses shared shouldEnterTui gate" {
     try std.testing.expect(!packs_tui.wouldEnterPacksBrowse(true, true, &.{"--json"}, true));
     try std.testing.expect(!packs_tui.wouldEnterPacksBrowse(false, true, &.{}, false));
     // Browse kit is the frame chassis used by the TUI helper.
-    try std.testing.expect(@TypeOf(tui.browse.keyToAction) != void);
+    if (enable_tui) {
+        try std.testing.expect(@TypeOf(tui.browse.keyToAction) != void);
+    }
 }

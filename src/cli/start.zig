@@ -14,7 +14,7 @@ const plugin = @import("plugin.zig");
 const shell_eval = @import("shell_eval.zig");
 const build_options = @import("build_options");
 const env_util = @import("../env_util.zig");
-const tui = @import("../tui/mod.zig");
+const tui = @import("ryk").tui;
 const telemetry = @import("../telemetry.zig");
 /// Re-export: run adapters for host_keys; regenerate managed store under workspace_root.
 /// Body lives in `policy.network_discovered` (DIS-1 / DIS-7).

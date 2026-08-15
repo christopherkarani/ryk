@@ -441,6 +441,13 @@ fn detectBackground(io: std.Io, is_tty: bool) Background {
 /// stubbed libvaxis `Tty` is never analyzed. Restores terminal termios on every
 /// exit path. Returns `null` on any failure (caller falls back).
 fn queryBackgroundOsc(io: std.Io) ?Background {
+    if (comptime @import("build_options").enable_tui) {
+        return queryBackgroundOscTty(io);
+    }
+    return null;
+}
+
+fn queryBackgroundOscTty(io: std.Io) ?Background {
     if (comptime builtin.is_test) return null;
     if (comptime builtin.os.tag == .windows) return null;
     const vaxis = @import("vaxis");

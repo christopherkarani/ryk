@@ -101,12 +101,17 @@ pub fn build(b: *std.Build) void {
     // argv on the terminal test runner. Use: ./scripts/zig build test-lib -Dtest-filter=Spinner
     const test_filter = b.option([]const u8, "test-filter", "Only run unit tests whose names contain this substring");
     const test_filters: []const []const u8 = if (test_filter) |f| b.dupeStrings(&.{f}) else &.{};
+    // Default stays TUI-on (PATH `ryk`, `zig build test`). `-Dtui=false` is a slim
+    // profile that omits libvaxis/uucode. Do not ship curl|sh without TUI extras
+    // that `doctor --fix` / host aliases still need on the linear path.
+    const enable_tui = b.option(bool, "tui", "Link libvaxis TUI (default true; false is slim)") orelse true;
 
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", version);
     build_options.addOption([]const u8, "commit", commit);
     build_options.addOption([]const u8, "build_date", build_date);
     build_options.addOption([]const u8, "posthog_project_token", posthog_project_token);
+    build_options.addOption(bool, "enable_tui", enable_tui);
     const build_options_mod = build_options.createModule();
 
     const core_schema_documents = b.addOptions();
@@ -116,14 +121,20 @@ pub fn build(b: *std.Build) void {
     const core_schema_documents_mod = core_schema_documents.createModule();
     _ = &core_schema_documents_mod;
 
-    const vaxis_dep = b.dependency("vaxis", .{ .target = target, .optimize = optimize, .external_uucode = true });
-    const vaxis_mod = vaxis_dep.module("vaxis");
-    const uucode_dep = b.dependency("uucode", .{
-        .target = target,
-        .optimize = optimize,
-        .fields = @as([]const []const u8, &.{ "east_asian_width", "grapheme_break", "general_category", "is_emoji_presentation" }),
-    });
-    vaxis_mod.addImport("uucode", uucode_dep.module("uucode"));
+    const vaxis_mod: ?*std.Build.Module = if (enable_tui) blk: {
+        // zon marks these lazy so `-Dtui=false` never fetches them. Zig 0.16
+        // requires `lazyDependency` for lazy pins; null means "fetch then rerun".
+        const vaxis_dep = b.lazyDependency("vaxis", .{ .target = target, .optimize = optimize, .external_uucode = true });
+        const uucode_dep = b.lazyDependency("uucode", .{
+            .target = target,
+            .optimize = optimize,
+            .fields = @as([]const []const u8, &.{ "east_asian_width", "grapheme_break", "general_category", "is_emoji_presentation" }),
+        });
+        if (vaxis_dep == null or uucode_dep == null) return;
+        const loaded = vaxis_dep.?.module("vaxis");
+        loaded.addImport("uucode", uucode_dep.?.module("uucode"));
+        break :blk loaded;
+    } else null;
 
     const ryk_core_engine_mod = b.createModule(.{
         .root_source_file = b.path("src/core_engine.zig"),
@@ -148,11 +159,11 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "ryk_core", .module = ryk_core_mod },
             .{ .name = "build_options", .module = build_options_mod },
-            .{ .name = "vaxis", .module = vaxis_mod },
         },
     });
     ryk_mod.addImport("build_options", build_options_mod);
     ryk_mod.addImport("ryk", ryk_mod);
+    if (vaxis_mod) |vm| ryk_mod.addImport("vaxis", vm);
 
     const ryk_cli_mod = b.addModule("ryk_cli", .{
         .root_source_file = b.path("packages/cli/src/root.zig"),
@@ -179,7 +190,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     exe.root_module.link_libc = true;
-    exe.root_module.addImport("vaxis", vaxis_mod);
+    if (vaxis_mod) |vm| exe.root_module.addImport("vaxis", vm);
     // Attach once on the lib module (imported by the exe). Linking the same C shim on both
     // exe.root_module and ryk_mod duplicates _ryk_regex_* symbols at link time.
     addPcre2Shim(b, ryk_mod, target, optimize);

@@ -51,7 +51,7 @@ pub const feedback = @import("feedback.zig");
 pub const interactive = @import("interactive.zig");
 pub const child_process = @import("child_process.zig");
 pub const style = @import("style.zig");
-pub const tui = @import("../tui/mod.zig");
+pub const tui = if (build_options.enable_tui) @import("../tui/mod.zig") else @import("../tui/linear.zig");
 pub const daemon = @import("daemon.zig");
 pub const daemon_uds = @import("daemon_uds.zig");
 pub const shutdown = @import("shutdown.zig");
@@ -68,7 +68,6 @@ pub const daemon_contracts = @import("daemon_contracts.zig");
 pub const packs = @import("packs.zig");
 pub const pack_state = @import("pack_state.zig");
 pub const readiness = @import("readiness.zig");
-pub const history = @import("history.zig");
 pub const suggestions = @import("suggestions.zig");
 pub const danger_confirmation = @import("danger_confirmation.zig");
 pub const fm_steward_client = @import("fm_steward_client.zig");
@@ -136,12 +135,13 @@ test {
     _ = daemon_contracts;
     _ = packs;
     _ = pack_state;
-    _ = @import("packs_tui.zig");
+    if (build_options.enable_tui) {
+        _ = @import("packs_tui.zig");
+        _ = @import("doctor_tui.zig");
+    }
     _ = readiness;
     _ = doctor;
-    _ = @import("doctor_tui.zig");
     _ = @import("doctor_mcp.zig");
-    _ = history;
     _ = danger_confirmation;
     _ = run_command;
     _ = shim; // PATH-shim audit mode session attestation (F36)
@@ -344,8 +344,12 @@ fn parseGlobalArgs(allocator: std.mem.Allocator, argv: []const []const u8) !Glob
     return .{ .argv = try list.toOwnedSlice(allocator), .no_rich = no_rich, .owned = true };
 }
 
+fn stubbedHistoryCommand(_: std.Io, _: []const []const u8, _: anytype, stderr: anytype) !u8 {
+    return rust_legacy_stub.unavailable("history", stderr);
+}
+
 pub fn runWithCwd(io: std.Io, environ_map: *const std.process.Environ.Map, cwd: std.Io.Dir, argv_input: []const []const u8, stdout: anytype, stderr: anytype) !u8 {
-    return runWithCwdUsing(realDaemonExecuteCli, packs.command, history.command, mcp.command, io, environ_map, cwd, argv_input, stdout, stderr);
+    return runWithCwdUsing(realDaemonExecuteCli, packs.command, stubbedHistoryCommand, mcp.command, io, environ_map, cwd, argv_input, stdout, stderr);
 }
 
 fn runWithCwdUsing(
@@ -1533,8 +1537,8 @@ fn fakeRawMcp(_: std.Io, argv: []const []const u8, stdout: anytype, _: anytype) 
 test "public dispatch preserves MCP protocol bytes; Zig-native test/explain no longer daemon-proxy" {
     const Case = struct { argv: []const []const u8, expected_substr: []const u8, code: u8 };
     const cases = [_]Case{
-        // Zig shell_engine: allow git status → exit 0, JSON/text decision output.
-        .{ .argv = &.{ "test", "git status" }, .expected_substr = "allow", .code = 0 },
+        // Zig shell_engine: allow git status → exit 0, human Decision: ALLOW (JSON is --format json).
+        .{ .argv = &.{ "test", "git status" }, .expected_substr = "ALLOW", .code = 0 },
         // s-packs: live oracle registry JSON (no daemon; --robot → machine schema).
         .{ .argv = &.{ "packs", "--robot" }, .expected_substr = "schema_version", .code = 0 },
         // Slice 1 honesty: hide-list verbs fail short (usage), not daemon essay.
