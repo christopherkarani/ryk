@@ -105,14 +105,14 @@ pub fn runWithServer(
                 });
                 continue;
             }
-            // Deny-default (P1-3): only spec-shaped notifications/* forward.
-            // A request-shaped method without an id is not a valid notification
-            // and fails closed rather than passing through unmediated.
-            if (!std.mem.startsWith(u8, method, "notifications/")) {
+            // Deny-default (P1-3): only allowlisted spec notification methods
+            // forward. A notifications/ prefix is fail-open — vendor methods
+            // such as notifications/vendor.do must not pass unmediated.
+            if (!isAllowlistedNotificationMethod(method)) {
                 try jsonrpc.writeErrorResponse(client_writer, null, .invalid_request, "unknown MCP method denied by ryk policy proxy");
                 try appendAudit(config.audit_writer, .mcp_unknown_method, .unknown, method, .{
                     .result = .deny,
-                    .reason = "unknown MCP method denied by default (not a notifications/* method)",
+                    .reason = "unknown MCP method denied by default (not an allowlisted notification method)",
                     .ci_may_proceed = false,
                 });
                 continue;
@@ -221,6 +221,18 @@ fn isAllowlistedPassthroughMethod(method: []const u8) bool {
         std.mem.eql(u8, method, "tools/list") or
         std.mem.eql(u8, method, "resources/list") or
         std.mem.eql(u8, method, "prompts/list");
+}
+
+/// Spec notification methods that may forward without policy gating.
+/// Prefix-matching `notifications/` is fail-open (a server that treats
+/// `notifications/vendor.do` as a side effect would bypass policy).
+fn isAllowlistedNotificationMethod(method: []const u8) bool {
+    return std.mem.eql(u8, method, "notifications/initialized") or
+        std.mem.eql(u8, method, "notifications/cancelled") or
+        std.mem.eql(u8, method, "notifications/progress") or
+        std.mem.eql(u8, method, "notifications/message") or
+        (std.mem.startsWith(u8, method, "notifications/") and
+            std.mem.endsWith(u8, method, "/list_changed"));
 }
 
 fn isPolicyCoveredMethod(method: []const u8) bool {
@@ -1943,6 +1955,7 @@ test "proxy denies send_email when effects.deny includes comms.message" {
 const MethodRecordingServer = struct {
     saw_unknown_request: bool = false,
     saw_unknown_notification: bool = false,
+    saw_vendor_do_notification: bool = false,
     saw_ping: bool = false,
 
     fn request(context: *anyopaque, allocator: std.mem.Allocator, line: []const u8) ![]u8 {
@@ -1970,6 +1983,9 @@ const MethodRecordingServer = struct {
 
     fn notify(context: *anyopaque, line: []const u8) !void {
         const self: *MethodRecordingServer = @ptrCast(@alignCast(context));
+        if (std.mem.indexOf(u8, line, "notifications/vendor.do") != null) {
+            self.saw_vendor_do_notification = true;
+        }
         if (std.mem.indexOf(u8, line, "notifications/") == null) {
             self.saw_unknown_notification = true;
         }
@@ -2041,6 +2057,24 @@ test "request-shaped MCP message without id is denied instead of forwarded" {
     }, &input, &output_writer, .{ .context = &server, .request = MethodRecordingServer.request, .notify = MethodRecordingServer.notify });
     // Vendor request-shaped notification denied; spec notifications/* still forward.
     try std.testing.expect(!server.saw_unknown_notification);
+    try std.testing.expect(std.mem.indexOf(u8, output_writer.buffered(), "denied by ryk policy proxy") != null);
+}
+
+test "notifications/vendor.do is denied and not forwarded" {
+    const load = policy_mod.load;
+    var policy = try load.loadPreset(std.testing.allocator, .strict);
+    defer policy.deinit();
+    var server = MethodRecordingServer{};
+    var input: std.Io.Reader = .fixed("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/vendor.do\",\"params\":{}}\n");
+    var output_buf: [1024]u8 = undefined;
+    var output_writer: std.Io.Writer = .fixed(&output_buf);
+    try runWithServer(std.testing.allocator, .{
+        .server_name = "fake",
+        .server_command_display = "fake",
+        .policy = &policy,
+        .mode = .strict,
+    }, &input, &output_writer, .{ .context = &server, .request = MethodRecordingServer.request, .notify = MethodRecordingServer.notify });
+    try std.testing.expect(!server.saw_vendor_do_notification);
     try std.testing.expect(std.mem.indexOf(u8, output_writer.buffered(), "denied by ryk policy proxy") != null);
 }
 
