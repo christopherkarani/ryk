@@ -3,6 +3,8 @@
 //! Invokes `fm-steward classify --card <tempfile> --timeout-ms N --json` via the
 //! existing StewardSession CLI path. Fail-open: timeout / missing binary / parse
 //! error / non-macOS / `RYK_FM_STEWARD=0` → continue + fallback=true.
+//! Swift package: https://github.com/christopherkarani/ryk-fm-steward
+//! Contract pin: macos/fm-steward/Schemas + Fixtures.
 //!
 //! Transport: subprocess MVP only (no UDS serve). Do not call residual Classifier.
 
