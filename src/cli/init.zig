@@ -194,8 +194,9 @@ fn writePolicy(io: std.Io, file: std.Io.File, preset_text: []const u8, mode_over
     if (mode_override) |mode| {
         var lines = std.mem.splitScalar(u8, preset_text, '\n');
         while (lines.next()) |line| {
-            const trimmed = std.mem.trimStart(u8, line, " \t");
-            if (std.mem.startsWith(u8, trimmed, "mode:")) {
+            // Only the unindented top-level `mode:` key. Nested keys under
+            // files.write / network stay as written in the preset.
+            if (std.mem.startsWith(u8, line, "mode:")) {
                 try writer.interface.print("mode: {s}\n", .{mode});
             } else {
                 try writer.interface.writeAll(line);
@@ -340,6 +341,60 @@ test "init writes requested phase 18 presets as valid policies" {
         defer loaded.deinit();
         try policy_mod.validate.policy(&loaded);
     }
+}
+
+test "init --mode overrides only top-level policy mode and writes parseable YAML" {
+    const modes = [_][]const u8{ "ask", "strict", "observe", "ci", "trusted" };
+    for (modes) |mode| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+
+        var stdout_buf: [512]u8 = undefined;
+        var stderr_buf: [512]u8 = undefined;
+        var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+        var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+
+        const code = try command(std.testing.io, tmp.dir, &.{ "--mode", mode, "--quiet" }, &stdout_writer, &stderr_writer);
+        try std.testing.expectEqual(exit_codes.success, code);
+        try std.testing.expectEqualStrings("", stdout_writer.buffered());
+        try std.testing.expectEqualStrings("", stderr_writer.buffered());
+
+        const policy = try tmp.dir.readFileAlloc(std.testing.io, ".ryk/policy.yaml", std.testing.allocator, .limited(16 * 1024));
+        defer std.testing.allocator.free(policy);
+
+        // Schema/load parse — substring search would pass on broken YAML with extra
+        // unindented `mode:` keys rewritten from files.write / network.
+        var loaded = try policy_mod.load.parseFromSlice(std.testing.allocator, policy, ".ryk/policy.yaml");
+        defer loaded.deinit();
+        try policy_mod.validate.policy(&loaded);
+        try std.testing.expectEqual(policy_mod.schema.Mode.parse(mode).?, loaded.mode);
+        try std.testing.expectEqual(policy_mod.schema.WriteMode.staged, loaded.files.write_mode);
+        try std.testing.expectEqual(policy_mod.schema.NetworkMode.allowlist, loaded.network.mode.?);
+    }
+}
+
+test "init without --mode writes default preset unchanged" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var stdout_buf: [512]u8 = undefined;
+    var stderr_buf: [512]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+
+    const code = try command(std.testing.io, tmp.dir, &.{ "--quiet" }, &stdout_writer, &stderr_writer);
+    try std.testing.expectEqual(exit_codes.success, code);
+
+    const policy = try tmp.dir.readFileAlloc(std.testing.io, ".ryk/policy.yaml", std.testing.allocator, .limited(16 * 1024));
+    defer std.testing.allocator.free(policy);
+    try std.testing.expectEqualStrings(policy_mod.presets.agentPresetText(.generic_agent), policy);
+
+    var loaded = try policy_mod.load.parseFromSlice(std.testing.allocator, policy, ".ryk/policy.yaml");
+    defer loaded.deinit();
+    try policy_mod.validate.policy(&loaded);
+    try std.testing.expectEqual(policy_mod.schema.Mode.strict, loaded.mode);
+    try std.testing.expectEqual(policy_mod.schema.WriteMode.staged, loaded.files.write_mode);
+    try std.testing.expectEqual(policy_mod.schema.NetworkMode.allowlist, loaded.network.mode.?);
 }
 
 test "init rejects invalid preset names clearly" {
