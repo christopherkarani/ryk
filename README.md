@@ -1,8 +1,4 @@
 <p align="center">
-  <img src="docs/images/ryk-banner.svg" alt="ryk, guardrails for coding agents" width="100%">
-</p>
-
-<p align="center">
   <a href="https://rykanv.com/">Website</a> ·
   <a href="https://discord.gg/uZn9MDUYKx">Discord</a> ·
   <a href="CONTRIBUTING.md">Contributing</a> ·
@@ -23,11 +19,15 @@
 
 # ryk
 
-Local guardrails for coding agents.
+**Local guardrails for coding agents.**
 
-ryk runs the agents you already use with local checks for commands, files, secrets, network requests, MCP actions, and other effects. It returns an explicit `allow`, `ask`, `deny`, or `observe` decision and keeps session evidence on your machine.
+Run Claude Code, Codex, Pi, OpenCode, Hermes, OpenClaw, or Grok through one local binary. ryk checks commands, files, secrets, network, and MCP actions before they hit your machine — allow / ask / deny / observe — and keeps the evidence on disk.
 
-If ryk is useful in your workflow, [star the repository](https://github.com/christopherkarani/ryk). It helps other engineers find the project.
+<p align="center">
+  <img src="docs/assets/ryk-deny-demo.gif" alt="ryk denying an OpenCode rm -rf / command" width="720">
+</p>
+
+<p align="center"><em>Agent tries <code>rm -rf</code>. ryk denies it. Session stays on your laptop.</em></p>
 
 ## Install
 
@@ -37,12 +37,9 @@ curl -fsSL https://rykanv.com/install | sh
 
 ## Start an agent
 
-`ryk <agent>` launches the host through a protected child session. ryk is macOS/Linux-first: it attaches the OS filesystem sandbox by default on those platforms (Seatbelt on macOS, Landlock on Linux). Windows sessions have no OS sandbox and run at wrapper/hook grade only. See the [compatibility matrix](docs/compatibility.md).
-
 ```sh
-ryk <agent>
+ryk claude    # or: codex | pi | opencode | openclaw | hermes | grok
 ```
-
 
 Scan past agent sessions for risky commands and secret-like exposure:
 
@@ -50,11 +47,7 @@ Scan past agent sessions for risky commands and secret-like exposure:
 ryk scan
 ```
 
-The installer prints the shell activation line for your platform. After `ryk` is on your `PATH`, check the local posture:
-
-```sh
-ryk doctor
-```
+If ryk saves you a bad day, [star the repo](https://github.com/christopherkarani/ryk) — it helps other engineers find it.
 
 ## What you get
 
