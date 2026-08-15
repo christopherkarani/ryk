@@ -6,7 +6,7 @@ const pack_config = @import("pack_config.zig");
 const core = @import("ryk_core").core;
 
 pub fn command(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: anytype) !u8 {
-    if (argv.len == 0 or hasHelpFlag(argv)) {
+    if (isRykTestHelp(argv)) {
         try stdout.writeAll(
             \\Usage: ryk test [--format json] <command>
             \\
@@ -119,10 +119,11 @@ const ParsedTestArgv = struct {
     command_args: []const []const u8,
 };
 
-fn hasHelpFlag(argv: []const []const u8) bool {
-    for (argv) |arg| {
-        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) return true;
-    }
+/// Only `ryk test` / `ryk test --help` / `ryk test -h`. `ryk test git --help`
+/// evaluates the tested command; host help interception is `ryk <host> --help`.
+fn isRykTestHelp(argv: []const []const u8) bool {
+    if (argv.len == 0) return true;
+    if (argv.len == 1 and (std.mem.eql(u8, argv[0], "--help") or std.mem.eql(u8, argv[0], "-h"))) return true;
     return false;
 }
 
@@ -159,10 +160,8 @@ fn parseTestArgv(argv: []const []const u8, stderr: anytype) !ParsedTestArgv {
             if (i == 0) cmd_start = 1 else if (i + 1 == argv.len) cmd_end = i;
             continue;
         }
-        if (std.mem.startsWith(u8, arg, "-") and !std.mem.eql(u8, arg, "--")) {
-            try stderr.print("ryk test: unknown option '{s}'\n", .{arg});
-            return error.Usage;
-        }
+        // Dashed tokens that are not ryk test flags belong to the tested command
+        // (`ryk test git --help` must evaluate `git --help`).
     }
     return .{
         .format_json = format_json,
@@ -179,6 +178,18 @@ fn joinArgs(allocator: std.mem.Allocator, args: []const []const u8) ![]u8 {
         try list.appendSlice(allocator, arg);
     }
     return try list.toOwnedSlice(allocator);
+}
+
+test "test git --help evaluates the command instead of ryk usage" {
+    var stderr_buf: [256]u8 = undefined;
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+    const parsed = try parseTestArgv(&.{ "git", "--help" }, &stderr_writer);
+    try std.testing.expectEqual(@as(usize, 2), parsed.command_args.len);
+    try std.testing.expectEqualStrings("git", parsed.command_args[0]);
+    try std.testing.expectEqualStrings("--help", parsed.command_args[1]);
+    try std.testing.expect(!isRykTestHelp(&.{ "git", "--help" }));
+    try std.testing.expect(isRykTestHelp(&.{"--help"}));
+    try std.testing.expectEqualStrings("", stderr_writer.buffered());
 }
 
 test "test --help writes usage to stdout" {

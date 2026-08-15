@@ -43,7 +43,7 @@ pub fn commandAs(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: 
     while (index < argv.len) : (index += 1) {
         const arg = argv[index];
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
-            _ = try help.writeCommand(io, stdout, if (std.mem.eql(u8, invoked, "disable")) "stop" else "stop");
+            _ = try help.writeCommand(io, stdout, invoked);
             return exit_codes.success;
         }
         if (std.mem.eql(u8, arg, "--yes")) {
@@ -639,6 +639,20 @@ test "disableOpenCode removes planted ryk.ts and ryk-tui.ts in project and globa
     try std.testing.expect(!plugin.fileExistsAbsolute(io, global_tui));
     const out = stdout_writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, out, "ryk-tui.ts") != null);
+}
+
+test "disable --help names disable not stop" {
+    var stdout_buf: [4096]u8 = undefined;
+    var stderr_buf: [256]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+
+    const code = try commandAs(std.testing.io, &.{"--help"}, &stdout_writer, &stderr_writer, "disable");
+    try std.testing.expectEqual(exit_codes.success, code);
+    const out = stdout_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "ryk disable") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Usage:\n  ryk stop") == null);
+    try std.testing.expectEqualStrings("", stderr_writer.buffered());
 }
 
 test "stop --no cancels without disabling" {

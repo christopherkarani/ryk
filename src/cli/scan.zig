@@ -144,8 +144,8 @@ fn progressCb(ctx: ?*anyopaque, host: scan_lib.types.Host, phase: scan_lib.engin
     }
 }
 
-fn shouldReportProgress(json: bool) bool {
-    return !json;
+fn shouldReportProgress(json: bool, plain: bool) bool {
+    return !json and !plain;
 }
 
 fn flushWriter(writer: anytype) !void {
@@ -195,7 +195,7 @@ pub fn command(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: an
 
     // TTY auto-TUI: interactive colour terminal, not --json/--plain.
     const want_tui = !options.json and !options.plain and tui.output_policy.shouldEnterTuiIo(io, argv);
-    const report_progress = shouldReportProgress(options.json);
+    const report_progress = shouldReportProgress(options.json, options.plain);
 
     var progress_ctx: ProgressCtx = .{
         .io = io,
@@ -362,10 +362,11 @@ test "scan --help writes usage to stdout" {
     try std.testing.expectEqualStrings("", err.buffered());
 }
 
-test "scan reports progress for any non-json invocation" {
-    try std.testing.expect(shouldReportProgress(false));
-    try std.testing.expect(shouldReportProgress(false));
-    try std.testing.expect(!shouldReportProgress(true));
+test "scan reports progress only for interactive non-plain invocations" {
+    try std.testing.expect(shouldReportProgress(false, false));
+    try std.testing.expect(!shouldReportProgress(true, false));
+    try std.testing.expect(!shouldReportProgress(false, true));
+    try std.testing.expect(!shouldReportProgress(true, true));
 }
 
 test "scan CLI rejects --plain with --json" {

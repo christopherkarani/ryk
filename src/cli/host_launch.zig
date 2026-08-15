@@ -75,12 +75,8 @@ pub fn tryDispatch(
 
 /// `ryk <host> --help` is ryk's launch help. Agent help is `ryk <host> -- --help`.
 fn isBareHostHelp(rest: []const []const u8) bool {
-    if (rest.len == 0) return false;
-    if (rest.len == 1) {
-        return std.mem.eql(u8, rest[0], "--help") or std.mem.eql(u8, rest[0], "-h");
-    }
-    return (std.mem.eql(u8, rest[0], "--help") or std.mem.eql(u8, rest[0], "-h")) and
-        !std.mem.eql(u8, rest[0], "--");
+    if (rest.len != 1) return false;
+    return std.mem.eql(u8, rest[0], "--help") or std.mem.eql(u8, rest[0], "-h");
 }
 
 test "isHostLaunchAlias exact allowlist only" {

@@ -451,17 +451,18 @@ fn hookCommand(io: std.Io, host: Host, event: Event, original_event_name: []cons
                     stderr,
                     "hook",
                     "unsupported schema version",
-                    "ryk hook: unsupported schema version; expected {\"version\":1,\"host\":\"…\",\"event\":\"…\",\"payload\":{…}}.",
+                    "ryk hook: unsupported schema version; ryk blocked it before evaluation.",
                 );
                 try stderr.print(
-                    "ryk hook: unsupported schema version {d}. Expected version 1 ({{\"version\":1,\"host\":\"{s}\",\"event\":\"{s}\",\"payload\":{{...}}}}).\n",
-                    .{ version_value, @tagName(host), @tagName(event) },
+                    "ryk hook: expected {{\"version\":1,\"host\":\"{s}\",\"event\":\"{s}\",\"payload\":{{...}}}}.\n",
+                    .{ @tagName(host), @tagName(event) },
                 );
-                return if (code != 0) code else exit_codes.general;
+                return code;
             }
+            try stderr.print("ryk hook: unsupported schema version {d}. Expected 1.\n", .{version_value});
             try stderr.print(
-                "ryk hook: unsupported schema version {d}. Expected version 1 ({{\"version\":1,\"host\":\"{s}\",\"event\":\"{s}\",\"payload\":{{...}}}}).\n",
-                .{ version_value, @tagName(host), @tagName(event) },
+                "ryk hook: expected {{\"version\":1,\"host\":\"{s}\",\"event\":\"{s}\",\"payload\":{{...}}}}.\n",
+                .{ @tagName(host), @tagName(event) },
             );
             return exit_codes.general;
         }

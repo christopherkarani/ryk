@@ -584,6 +584,15 @@ pub const commands =
             "Codex / Claude: removes known plugin paths (host-managed install locations).",
             "Restart protection later with: ryk start",
         } },
+        .{ .name = "disable", .summary = "Stop ryk protection for host agents", .usage = "ryk disable [codex|claude|cursor|opencode|openclaw|hermes|all] [--yes|--no]", .category = .integrations, .hidden = true, .examples = &.{
+            "ryk disable",
+            "ryk disable codex",
+        }, .details = &.{
+            "Alias of `ryk stop`. Removes ryk plugin registrations from host agents without removing the ryk binary or policy files.",
+            "Non-interactive cancel: --no. Mutation requires --yes or an interactive confirm.",
+            "Hosts: codex, claude, cursor, opencode, openclaw, hermes, grok. Defaults to all if no host is specified.",
+            "Restart protection later with: ryk start",
+        } },
         .{ .name = "uninstall", .summary = "Uninstall ryk from this machine", .usage = "ryk uninstall [--plugins-only] [--keep-config] [--dry-run] [--yes]", .category = .integrations, .details = &.{
             "Completely removes ryk and its integrations from the machine.",
             "Steps:",
@@ -1049,82 +1058,17 @@ pub fn writeCommand(io: std.Io, writer: anytype, name: []const u8) !bool {
         try writer.writeAll("\n");
     }
 
-    const details = briefDetails(command);
-    for (details) |line| {
+    for (command.details) |line| {
         try writer.print("{s}\n", .{line});
     }
     return true;
 }
-
-fn briefDetails(command: CommandInfo) []const []const u8 {
-    if (std.mem.eql(u8, command.name, "run")) return &run_brief_details;
-    if (std.mem.eql(u8, command.name, "hook")) return &hook_brief_details;
-    if (std.mem.eql(u8, command.name, "agents")) return &agents_brief_details;
-    return command.details;
-}
-
-const run_brief_details = [_][]const u8{
-    "Starts a protected session and mirrors the child exit code.",
-    "Host aliases use network mode allowlist + empty-backpack. Non-alias ryk run defaults network mode to ask; secretless stays off unless --secretless.",
-    "Flags:",
-    "  --workspace <path>  --policy <path>  --session-name <name>",
-    "  --mode observe|ask|yolo|strict|ci",
-    "  --network allowlist|observe|off|ask|open  --no-network  --allow-network <domain>",
-    "  --network-backend decision-only|proxy",
-    "  --os-sandbox auto|on|off  --seatbelt-profile compatible|hardened|strict",
-    "  --secretless  --with-host-secrets  --inherit-env  --no-secrets",
-    "  --require-backend <capability>",
-    "Agent help: ryk <host> -- --help. More: ryk help --all",
-};
-
-const hook_brief_details = [_][]const u8{
-    "Reads host JSON from stdin and writes a host-valid decision to stdout.",
-    "Schema: {\"version\":1,\"host\":\"<host>\",\"event\":\"<event>\",\"payload\":{...}}",
-    "Hosts: codex, claude, opencode, openclaw, hermes, grok",
-    "Pass --ci to fail closed without prompts.",
-    "Full event catalog: ryk help --all",
-};
-
-const agents_brief_details = [_][]const u8{
-    "Setup and health-check always-on Hermes/OpenClaw agents.",
-    "  ryk agents setup [hermes|openclaw]",
-    "  ryk agents health [--json]",
-    "Health never waits for an operator. Not ready → follow the printed remediation.",
-};
 
 pub fn findCommand(name: []const u8) ?CommandInfo {
     for (commands) |command| {
         if (std.mem.eql(u8, command.name, name)) return command;
     }
     return null;
-}
-
-test "run help is a short flag list" {
-    var buf: [8192]u8 = undefined;
-    var writer: std.Io.Writer = .fixed(&buf);
-    try std.testing.expect(try writeCommand(std.testing.io, &writer, "run"));
-    const text = writer.buffered();
-    var lines: usize = 1;
-    for (text) |c| {
-        if (c == '\n') lines += 1;
-    }
-    try std.testing.expect(lines < 40);
-    try std.testing.expect(std.mem.indexOf(u8, text, "--os-sandbox") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "RYK_AGENT_NETWORK_DEFAULT") == null);
-}
-
-test "hook help is a short contract not an event catalog" {
-    var buf: [4096]u8 = undefined;
-    var writer: std.Io.Writer = .fixed(&buf);
-    try std.testing.expect(try writeCommand(std.testing.io, &writer, "hook"));
-    const text = writer.buffered();
-    var lines: usize = 1;
-    for (text) |c| {
-        if (c == '\n') lines += 1;
-    }
-    try std.testing.expect(lines < 40);
-    try std.testing.expect(std.mem.indexOf(u8, text, "version\":1") != null or std.mem.indexOf(u8, text, "version: 1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "ryk hook hermes on_session_end") == null);
 }
 
 test "run help documents --os-sandbox auto degrade and fail-closed paths" {
@@ -1136,6 +1080,10 @@ test "run help documents --os-sandbox auto degrade and fail-closed paths" {
         try w.writeAll("\n");
     }
     const text = w.buffered();
+    var printed_buf: [8192]u8 = undefined;
+    var printed_w: std.Io.Writer = .fixed(&printed_buf);
+    try std.testing.expect(try writeCommand(std.testing.io, &printed_w, "run"));
+    const printed = printed_w.buffered();
     try std.testing.expect(std.mem.indexOf(u8, text, "--os-sandbox auto|on|off") != null);
     // Happy path: no required sandbox flags for protected launch.
     try std.testing.expect(std.mem.indexOf(u8, text, "no flags required") != null);
@@ -1147,6 +1095,11 @@ test "run help documents --os-sandbox auto degrade and fail-closed paths" {
     try std.testing.expect(std.mem.indexOf(u8, text, "--seatbelt-profile compatible|hardened|strict") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "default hardened") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "--with-host-secrets") != null);
+    try std.testing.expect(std.mem.indexOf(u8, printed, "--os-sandbox auto|on|off") != null);
+    try std.testing.expect(std.mem.indexOf(u8, printed, "degrades loudly when no backend plan exists") != null);
+    try std.testing.expect(std.mem.indexOf(u8, printed, "fails closed on incomplete env scrub/allowlist") != null);
+    try std.testing.expect(std.mem.indexOf(u8, printed, "fails closed if attach fails after materials are prepared") != null);
+    try std.testing.expect(std.mem.indexOf(u8, printed, "empty-backpack") != null);
     var lists_escape = false;
     for (info.additional_completion_flags) |flag| {
         if (std.mem.eql(u8, flag, "--with-host-secrets")) lists_escape = true;

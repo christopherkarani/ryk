@@ -26,26 +26,46 @@ pub fn command(
         );
         return exit_codes.usage;
     };
-    const status = telemetry.recordFeedback(io, environ_map, std.heap.smp_allocator, category);
-    try writeFeedbackReceipt(io, stdout, category, status);
-    return exit_codes.success;
-}
-
-fn writeFeedbackReceipt(io: std.Io, stdout: anytype, category: []const u8, status: telemetry.FeedbackStatus) !void {
-    switch (status) {
-        .accepted => {
+    return switch (telemetry.recordFeedback(io, environ_map, std.heap.smp_allocator, category)) {
+        .accepted => blk: {
             try stdout.writeAll("Decision: queued\nWhy: category recorded for telemetry\nNext: ryk telemetry status\n");
+            break :blk exit_codes.success;
         },
-        .disabled, .unavailable => {
-            try stdout.writeAll("Decision: saved locally\nWhy: telemetry is off\nNext: ryk telemetry status\n");
-            writeLocalFeedbackFile(io, category) catch {};
-        },
-    }
+        .disabled => try finishUnavailable(io, environ_map, stdout, stderr, category, "ryk feedback: telemetry is disabled; nothing was sent.\n"),
+        .unavailable => try finishUnavailable(io, environ_map, stdout, stderr, category, "ryk feedback: telemetry state is unavailable; nothing was sent.\n"),
+    };
 }
 
-fn writeLocalFeedbackFile(io: std.Io, category: []const u8) !void {
-    const home_z = std.c.getenv("HOME") orelse return;
-    const home = std.mem.span(home_z);
+fn finishUnavailable(
+    io: std.Io,
+    environ_map: *const std.process.Environ.Map,
+    stdout: anytype,
+    stderr: anytype,
+    category: []const u8,
+    notice: []const u8,
+) !u8 {
+    try stdout.writeAll("Decision: saved locally\nWhy: telemetry is off\nNext: ryk telemetry status\n");
+    writeLocalFeedbackFile(io, environ_map, category) catch |err| {
+        try stderr.print("ryk feedback: could not write local receipt: {s}\n", .{@errorName(err)});
+        return exit_codes.general;
+    };
+    try stderr.writeAll(notice);
+    return exit_codes.general;
+}
+
+fn resolveHome(environ_map: *const std.process.Environ.Map) ?[]const u8 {
+    if (environ_map.get("HOME")) |home| {
+        if (home.len > 0) return home;
+    }
+    if (std.c.getenv("HOME")) |home_z| {
+        const home = std.mem.span(home_z);
+        if (home.len > 0) return home;
+    }
+    return null;
+}
+
+fn writeLocalFeedbackFile(io: std.Io, environ_map: *const std.process.Environ.Map, category: []const u8) !void {
+    const home = resolveHome(environ_map) orelse return error.HomeDirectoryNotFound;
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -76,20 +96,50 @@ test "feedback accepts only fixed categories" {
 }
 
 test "feedback bug writes a local receipt when telemetry is disabled" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(home);
+
     var environ_map = std.process.Environ.Map.init(std.testing.allocator);
     defer environ_map.deinit();
+    try environ_map.put("HOME", home);
+
     var stdout_buf: [512]u8 = undefined;
     var stderr_buf: [256]u8 = undefined;
     var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
     var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
 
     const code = try command(std.testing.io, &environ_map, &.{"bug"}, &stdout_writer, &stderr_writer);
-    try std.testing.expectEqual(exit_codes.success, code);
+    try std.testing.expectEqual(exit_codes.general, code);
     const out = stdout_writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, out, "Decision: saved locally") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "Why: telemetry is off") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "Next: ryk telemetry status") != null);
-    try std.testing.expectEqualStrings("", stderr_writer.buffered());
+    try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "telemetry is disabled") != null);
+}
+
+test "feedback write errors are not swallowed" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "not-a-dir", .data = "x" });
+    const tmp_root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(tmp_root);
+    const home = try std.fs.path.join(std.testing.allocator, &.{ tmp_root, "not-a-dir" });
+    defer std.testing.allocator.free(home);
+
+    var environ_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ_map.deinit();
+    try environ_map.put("HOME", home);
+
+    var stdout_buf: [512]u8 = undefined;
+    var stderr_buf: [256]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+
+    const code = try command(std.testing.io, &environ_map, &.{"bug"}, &stdout_writer, &stderr_writer);
+    try std.testing.expectEqual(exit_codes.general, code);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "could not write local receipt") != null);
 }
 
 test "feedback reports unavailable transport instead of claiming delivery" {
