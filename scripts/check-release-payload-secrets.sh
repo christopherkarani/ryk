@@ -122,7 +122,7 @@ is_reviewed_synthetic_file() {
     ryk-pi/test/secret_capture.test.ts) expected='d1a3ad088d51656841c69ab7fdff637d82069a9769f9c878308e8eaf7190655d' ;;
     examples/leaky-agent-demo/run-demo.ps1) expected='c100efa79dedcc7f75a96ad49f440982de282e516a64bfe24025a48e5f640a19' ;;
     examples/leaky-agent-demo/run-demo.sh) expected='e91cb78655865e4b246d4682fb4e829259942766763673a78677773402755ce8' ;;
-    scripts/adversarial/secret-boundary-canary.sh) expected='074cdc08ddd43bb6739654903ae5d43df9af8e032476ba96265da8e688d0d59b' ;;
+    scripts/adversarial/secret-boundary-canary.sh) expected='8eaa78a0559ab606859448f2d4ad68219f537ec21224725ea1377059fa307247' ;;
     scripts/test-telemetry-release-contract.sh) expected='b5e5508354dd0958853e180317474d2ff34291e36ac4d7e57a4c1a78d2c63bdc' ;;
     packages/core/tests/contract.zig) expected='1b593a3c36a1cdbd98205248075ee8769dc28169d7a0958a421fc30e25092dc3' ;;
     fixtures/network-exfil/http-query-exfil/fixture.yaml) expected='9a72613bd364dec2d991921230acd2990483202b6ee663ef0c37d5d6aa1bc07e' ;;

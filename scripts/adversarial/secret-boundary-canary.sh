@@ -325,8 +325,10 @@ else
     fail_case 'B child did not create regular output and diagnostic fixtures'
   elif contains_forbidden "$B_CHILD_STDOUT" || contains_forbidden "$B_STDOUT"; then
     fail_case 'B workspace .env body reached child output'
-  elif ! grep -Eiq 'Operation not permitted|Permission denied' "$B_CHILD_STDERR"; then
-    fail_case 'B workspace .env exit 1 was not an OS permission denial'
+  elif ! grep -Eiq 'Operation not permitted|Permission denied|No such file or directory' "$B_CHILD_STDERR"; then
+    # Linux workspace-view hides secret names (LOOKUP → ENOENT). Seatbelt /
+    # Landlock without the view return EPERM/EACCES. Either is OS-enforced.
+    fail_case 'B workspace .env exit 1 was not an OS hide or permission denial'
   elif contains_forbidden "$B_CHILD_STDERR" || contains_forbidden "$B_STDERR"; then
     fail_case 'B workspace .env probe leaked a forbidden synthetic substring'
   else
