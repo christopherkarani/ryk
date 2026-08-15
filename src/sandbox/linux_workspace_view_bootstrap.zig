@@ -58,10 +58,11 @@ pub const MountIdentity = struct {
 };
 
 pub fn mountedViewIdentityIsValid(backing: MountIdentity, view: MountIdentity) bool {
+    // Distinct mount ids + directory is the overmount proof. STATX_ATTR_MOUNT_ROOT
+    // is not set by every FUSE implementation (Ubuntu 24.04 fuse3 included).
     return backing.mount_id_present and
         view.mount_id_present and
         backing.mount_id != view.mount_id and
-        view.is_mount_root and
         view.is_directory;
 }
 
@@ -219,7 +220,9 @@ fn runLinux(allocator: std.mem.Allocator, fds: BootstrapFds) !void {
     var view_root_fd = mount.openBackingRoot(request.workspace_root) catch
         return response.fail(.mount_verification_failed);
     defer closeLinux(view_root_fd);
-    const view_stat = statFd(view_root_fd) orelse
+    // Do not use DONT_SYNC here: the path was just overmounted and cached
+    // attributes can still describe the backing inode.
+    const view_stat = statFdSynced(view_root_fd) orelse
         return response.fail(.mount_verification_failed);
     if (!mountedViewIdentityIsValid(
         mountIdentity(backing_stat),
@@ -358,6 +361,14 @@ fn applyBootstrapStdio(stdio: ipc.StdioBehavior) !void {
 }
 
 fn statFd(fd: i32) ?std.os.linux.Statx {
+    return statFdWithFlags(fd, std.os.linux.AT.EMPTY_PATH | std.os.linux.AT.STATX_DONT_SYNC);
+}
+
+fn statFdSynced(fd: i32) ?std.os.linux.Statx {
+    return statFdWithFlags(fd, std.os.linux.AT.EMPTY_PATH);
+}
+
+fn statFdWithFlags(fd: i32, flags: u32) ?std.os.linux.Statx {
     if (builtin.os.tag != .linux or fd < 0) return null;
     const linux = std.os.linux;
     var stat = std.mem.zeroes(linux.Statx);
@@ -366,7 +377,7 @@ fn statFd(fd: i32) ?std.os.linux.Statx {
     const result = linux.statx(
         fd,
         "",
-        linux.AT.EMPTY_PATH | linux.AT.STATX_DONT_SYNC,
+        flags,
         mask,
         &stat,
     );
@@ -711,8 +722,12 @@ test "bootstrap accepts only a distinct pinned mount root and contained cwd" {
     invalid.mount_id_present = false;
     try std.testing.expect(!mountedViewIdentityIsValid(backing, invalid));
     invalid = view;
-    invalid.is_mount_root = false;
+    invalid.is_directory = false;
     try std.testing.expect(!mountedViewIdentityIsValid(backing, invalid));
+    // FUSE may omit STATX_ATTR_MOUNT_ROOT; distinct mount ids still count.
+    invalid = view;
+    invalid.is_mount_root = false;
+    try std.testing.expect(mountedViewIdentityIsValid(backing, invalid));
 
     try std.testing.expect(cwdIsWithinWorkspace("/work/app", "/work/app"));
     try std.testing.expect(cwdIsWithinWorkspace("/work/app", "/work/app/src"));

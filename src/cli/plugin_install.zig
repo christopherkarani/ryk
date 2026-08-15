@@ -1020,7 +1020,11 @@ test "marketplace atomic write revalidates concurrent changes and removes its te
     defer std.testing.allocator.free(actual);
     try std.testing.expectEqualStrings("raced", actual);
 
-    var it = tmp.dir.iterate();
+    // Zig 0.16 `tmp.dir.iterate()` seeks an O_PATH handle (BADF panic). Open a
+    // fresh iterate fd via the canonical path instead.
+    var listing = try std.Io.Dir.cwd().openDir(std.testing.io, root, .{ .iterate = true });
+    defer listing.close(std.testing.io);
+    var it = listing.iterate();
     while (try it.next(std.testing.io)) |entry| {
         try std.testing.expect(std.mem.indexOf(u8, entry.name, ".ryk-marketplace-") == null);
     }
