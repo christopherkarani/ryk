@@ -218,17 +218,24 @@ pub fn writeDoctorPacksSectionWithConfig(
     }
 }
 
-/// Embedded oracle pack definitions (same source as shell_engine.registry / packs CLI).
-const packs_json = @embedFile("../shell_engine/oracle_packs.json");
+/// Inflated oracle pack definitions (same gzip as shell_engine.registry / packs CLI).
+const oracle_embed = @import("../shell_engine/oracle_embed.zig");
 
 /// Query packs inventory in-process (Zig registry + pack_config). Never requires daemon.
 /// RT-12: doctor packs summary must stay available when daemon is unhealthy.
+///
+/// Doctor UX may report `known=false` when inflate/parse fails. That fail-open
+/// inventory line must not be copied into the eval path (registry.initOnce
+/// maps the same failure to RegistryInitFailed → deny).
 pub fn queryPacksSummaryInProcess(io: std.Io, allocator: std.mem.Allocator) !PacksSummary {
+    const packs_json = oracle_embed.inflateAlloc(allocator) catch return unknownPacksSummary();
+    defer allocator.free(packs_json);
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, packs_json, .{}) catch {
         return unknownPacksSummary();
     };
     defer parsed.deinit();
     if (parsed.value != .array) return unknownPacksSummary();
+    if (parsed.value.array.items.len == 0) return unknownPacksSummary();
 
     const onboarding = @import("onboarding.zig");
     const workspace_root = onboarding.resolveWorkspaceRoot(io, allocator) catch null;
@@ -274,6 +281,8 @@ pub fn queryPacksSummaryInProcess(io: std.Io, allocator: std.mem.Allocator) !Pac
         errdefer allocator.free(owned);
         try opt_in.append(allocator, owned);
     }
+    // Only synthetic packs (e.g. test.deadline): eval denies on g_packs.len == 0.
+    if (total_available == 0) return unknownPacksSummary();
     std.mem.sort([]const u8, opt_in.items, {}, struct {
         fn less(_: void, a: []const u8, b: []const u8) bool {
             return std.mem.order(u8, a, b) == .lt;
