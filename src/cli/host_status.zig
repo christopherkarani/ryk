@@ -558,7 +558,7 @@ fn piExtensionInstalledAtHome(io: std.Io, allocator: std.mem.Allocator, home: []
     const settings_path = std.fs.path.join(allocator, &.{ home, ".pi/agent/settings.json" }) catch return false;
     defer allocator.free(settings_path);
 
-    std.Io.Dir.accessAbsolute(io, extension_path, .{}) catch return false;
+    if (!pathExists(io, extension_path)) return false;
     const manifest_text = std.Io.Dir.cwd().readFileAlloc(io, manifest_path, allocator, .limited(64 * 1024)) catch return false;
     defer allocator.free(manifest_text);
     var parsed = std.json.parseFromSlice(PiPackageManifest, allocator, manifest_text, .{ .ignore_unknown_fields = true }) catch return false;
@@ -575,21 +575,49 @@ fn piExtensionInstalledAtHome(io: std.Io, allocator: std.mem.Allocator, home: []
     return false;
 }
 
+/// Probe a path without asserting absolutness. Access errors (missing host,
+/// permission, broken PATH entry) are "not found" — never a crash.
+fn pathExists(io: std.Io, path: []const u8) bool {
+    std.Io.Dir.cwd().access(io, path, .{}) catch return false;
+    return true;
+}
+
+/// Walk a pre-resolved PATH string for `name` (and `.exe` on Windows).
+/// Uses the caller-supplied delimiter so Windows drive-letter PATH
+/// (`C:\Windows\System32;…`) can be tested on every host.
+pub fn binaryOnSearchPathDelimited(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    path_value: []const u8,
+    delimiter: u8,
+    name: []const u8,
+) bool {
+    var parts = std.mem.splitScalar(u8, path_value, delimiter);
+    while (parts.next()) |dir| {
+        if (dir.len == 0) continue;
+        const candidate = std.fs.path.join(allocator, &.{ dir, name }) catch continue;
+        defer allocator.free(candidate);
+        if (pathExists(io, candidate)) return true;
+        if (builtin.os.tag == .windows) {
+            const exe_candidate = std.fmt.allocPrint(allocator, "{s}.exe", .{candidate}) catch continue;
+            defer allocator.free(exe_candidate);
+            if (pathExists(io, exe_candidate)) return true;
+        }
+    }
+    return false;
+}
+
+pub fn binaryOnSearchPath(io: std.Io, allocator: std.mem.Allocator, path_value: []const u8, name: []const u8) bool {
+    return binaryOnSearchPathDelimited(io, allocator, path_value, std.fs.path.delimiter, name);
+}
+
 fn binaryInPath(io: std.Io, allocator: std.mem.Allocator, name: []const u8) bool {
     var env_map = env_util.createProcessMap(allocator) catch return false;
     defer env_map.deinit();
     const path_owned = env_util.getOwned(&env_map, allocator, "PATH") catch return false;
     const path_val = path_owned orelse return false;
     defer allocator.free(path_val);
-    var it = std.mem.splitScalar(u8, path_val, ':');
-    while (it.next()) |dir| {
-        if (dir.len == 0) continue;
-        const candidate = std.fs.path.join(allocator, &.{ dir, name }) catch continue;
-        defer allocator.free(candidate);
-        std.Io.Dir.accessAbsolute(io, candidate, .{}) catch continue;
-        return true;
-    }
-    return false;
+    return binaryOnSearchPath(io, allocator, path_val, name);
 }
 
 /// Stance file written next to installed Hermes plugin for *new* installs (fail-closed).
@@ -899,4 +927,78 @@ test "hermesFailOpenEffective prefers env then stance then default closed" {
     try std.testing.expect(!hermesFailOpenEffective("typo", "fail-open"));
     try std.testing.expect(!hermesFailOpenEffective("", "fail-open"));
     try std.testing.expect(!hermesFailOpenFromStanceText("fail-closed").?);
+}
+
+test "binaryOnSearchPathDelimited treats missing host as absent without crashing" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    try std.testing.expect(!binaryOnSearchPathDelimited(
+        io,
+        allocator,
+        "C:\\Windows\\System32;C:\\Windows;relative\\bin",
+        ';',
+        "pi",
+    ));
+}
+
+test "binaryOnSearchPathDelimited colon-split Windows PATH does not panic" {
+    // The v0.2.18 inspectPi panic: PATH `C:\Windows\System32;…` split on ':'
+    // produced `C` + `pi` and accessAbsolute asserted non-absolute.
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    try std.testing.expect(!binaryOnSearchPathDelimited(
+        io,
+        allocator,
+        "C:\\Windows\\System32;C:\\Windows",
+        ':',
+        "pi",
+    ));
+}
+
+test "binaryOnSearchPath relative PATH entries do not panic" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    try std.testing.expect(!binaryOnSearchPath(io, allocator, ".:relative/bin", "definitely-missing-pi-host"));
+}
+
+test "binaryOnSearchPath finds a present file and ignores access failures" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+
+    const present_dir = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(present_dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = "pi", .data = "x" });
+
+    try tmp.dir.createDirPath(io, "denied");
+    const denied_dir = try tmp.dir.realPathFileAlloc(io, "denied", allocator);
+    defer allocator.free(denied_dir);
+    const denied_z = try allocator.dupeZ(u8, denied_dir);
+    defer allocator.free(denied_z);
+    if (builtin.os.tag != .windows) {
+        _ = std.c.chmod(denied_z.ptr, 0o000);
+    }
+    defer if (builtin.os.tag != .windows) {
+        _ = std.c.chmod(denied_z.ptr, 0o755);
+    };
+
+    const mixed = try std.fmt.allocPrint(allocator, "{s}{c}{s}{c}.", .{
+        denied_dir,
+        std.fs.path.delimiter,
+        present_dir,
+        std.fs.path.delimiter,
+    });
+    defer allocator.free(mixed);
+
+    try std.testing.expect(binaryOnSearchPath(io, allocator, mixed, "pi"));
+    try std.testing.expect(!binaryOnSearchPath(io, allocator, denied_dir, "pi"));
+}
+
+test "inspectPi does not panic when Pi is missing from PATH" {
+    const status = inspectPi(std.testing.io, std.testing.allocator);
+    if (!status.binary_detected) {
+        try std.testing.expectEqualStrings("—", status.wiredLabel());
+        try std.testing.expectEqualStrings("Pi not detected", status.detail());
+    }
 }

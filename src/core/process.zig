@@ -123,9 +123,11 @@ pub const PreparedChild = struct {
     }
 
     fn spawnPlain(self: *PreparedChild) !void {
+        var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const cwd_path = try spawnWorkingDirectory(self.workspace_root, &cwd_buf);
         const child = try std.process.spawn(self.io, .{
             .argv = self.argv,
-            .cwd = .{ .path = self.workspace_root },
+            .cwd = .{ .path = cwd_path },
             .environ_map = self.env_map,
             .stdin = mapStdio(self.stdio),
             .stdout = mapStdio(self.stdio),
@@ -302,6 +304,53 @@ pub fn prepareChild(io: std.Io, allocator: std.mem.Allocator, request: PrepareRe
     return prepared;
 }
 
+/// CreateProcess `lpCurrentDirectory` rejects NT prefixes (`\\?\`, `\??\`).
+/// Drive paths become `C:\...`. UNC `\\?\UNC\server\share` becomes
+/// `\\server\share` (written into `buf`). Volume GUID and other `\\?\`
+/// forms are left intact.
+pub fn spawnWorkingDirectory(workspace_root: []const u8, buf: []u8) error{NameTooLong}![]const u8 {
+    return stripWindowsNtPrefix(workspace_root, buf);
+}
+
+pub fn stripWindowsNtPrefix(path: []const u8, buf: []u8) error{NameTooLong}![]const u8 {
+    const rest = if (std.mem.startsWith(u8, path, "\\\\?\\"))
+        path[4..]
+    else if (std.mem.startsWith(u8, path, "\\??\\"))
+        path[4..]
+    else
+        return path;
+
+    if (rest.len >= 4 and std.ascii.eqlIgnoreCase(rest[0..3], "UNC") and
+        (rest[3] == '\\' or rest[3] == '/'))
+    {
+        const tail = rest[4..];
+        const needed = 2 + tail.len;
+        if (needed > buf.len) return error.NameTooLong;
+        buf[0] = '\\';
+        buf[1] = '\\';
+        @memcpy(buf[2..][0..tail.len], tail);
+        return buf[0..needed];
+    }
+
+    if (rest.len >= 2 and std.ascii.isAlphabetic(rest[0]) and rest[1] == ':') {
+        return rest;
+    }
+
+    return path;
+}
+
+/// Human launch failure for `ryk run`. Windows AccessDenied is not a sandbox
+/// deny and must not be printed as a bare error name.
+pub fn childLaunchFailureMessage(err: anyerror) []const u8 {
+    if (comptime builtin.os.tag == .windows) {
+        return switch (err) {
+            error.AccessDenied, error.PermissionDenied => "Windows child spawn was denied. Check the command path and working directory; this is not an OS sandbox deny (Windows has no Seatbelt/Landlock attach).",
+            else => @errorName(err),
+        };
+    }
+    return @errorName(err);
+}
+
 fn mapStdio(behavior: StdioBehavior) std.process.SpawnOptions.StdIo {
     return switch (behavior) {
         .inherit => .inherit,
@@ -405,6 +454,53 @@ test "child status exit code mapping" {
     try std.testing.expectEqual(@as(i32, 0), (ChildStatus{ .exited = 0 }).exitCode());
     try std.testing.expectEqual(@as(i32, 7), (ChildStatus{ .exited = 7 }).exitCode());
     try std.testing.expectEqual(@as(i32, 1), (ChildStatus{ .signal = 9 }).exitCode());
+}
+
+test "stripWindowsNtPrefix drops CreateProcess-unsafe prefixes" {
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("C:\\repo", try stripWindowsNtPrefix("\\\\?\\C:\\repo", &buf));
+    try std.testing.expectEqualStrings("C:\\repo", try stripWindowsNtPrefix("\\??\\C:\\repo", &buf));
+    try std.testing.expectEqualStrings("C:\\repo", try stripWindowsNtPrefix("C:\\repo", &buf));
+    try std.testing.expectEqualStrings("/tmp/ryk", try stripWindowsNtPrefix("/tmp/ryk", &buf));
+}
+
+test "stripWindowsNtPrefix keeps UNC as \\\\server\\share" {
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "\\\\server\\share\\dir",
+        try stripWindowsNtPrefix("\\\\?\\UNC\\server\\share\\dir", &buf),
+    );
+    try std.testing.expectEqualStrings(
+        "\\\\server\\share",
+        try stripWindowsNtPrefix("\\??\\UNC\\server\\share", &buf),
+    );
+    try std.testing.expectEqualStrings(
+        "\\\\server\\share",
+        try stripWindowsNtPrefix("\\\\?\\unc\\server\\share", &buf),
+    );
+    try std.testing.expectEqualStrings(
+        "\\\\?\\Volume{abc}\\foo",
+        try stripWindowsNtPrefix("\\\\?\\Volume{abc}\\foo", &buf),
+    );
+}
+
+test "spawnWorkingDirectory is the stripped workspace root" {
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("D:\\work", try spawnWorkingDirectory("\\\\?\\D:\\work", &buf));
+    try std.testing.expectEqualStrings(
+        "\\\\files\\proj",
+        try spawnWorkingDirectory("\\\\?\\UNC\\files\\proj", &buf),
+    );
+}
+
+test "childLaunchFailureMessage is not a bare AccessDenied on Windows" {
+    const msg = childLaunchFailureMessage(error.AccessDenied);
+    if (builtin.os.tag == .windows) {
+        try std.testing.expect(!std.mem.eql(u8, msg, "AccessDenied"));
+        try std.testing.expect(std.mem.indexOf(u8, msg, "Windows child spawn") != null);
+    } else {
+        try std.testing.expectEqualStrings("AccessDenied", msg);
+    }
 }
 
 test "prepareChild defaults to no OS child apply" {
