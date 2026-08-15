@@ -1,4 +1,5 @@
 const std = @import("std");
+const gpa_mod = @import("gpa.zig");
 
 const policy_mod = @import("ryk_core").policy;
 const core = @import("ryk_core").core;
@@ -46,7 +47,7 @@ pub fn command(io: std.Io, cwd: std.Io.Dir, argv: []const []const u8, stdout: an
 
     // Additive pack enablement for the daemon evaluator (project `.ryk.toml` when in a git
     // repo, else user config). Zig still owns policy.yaml; packs config is additive.
-    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    var gpa_state: gpa_mod.State = .init;
     defer _ = gpa_state.deinit();
     const allocator = gpa_state.allocator();
 

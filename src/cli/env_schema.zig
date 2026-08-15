@@ -1,4 +1,5 @@
 const std = @import("std");
+const gpa_mod = @import("gpa.zig");
 
 const env_util = @import("../env_util.zig");
 const intercept = @import("../intercept/mod.zig");
@@ -14,9 +15,9 @@ pub fn command(
         try stderr.writeAll("Usage: ryk env schema --agent\n");
         return exit_codes.usage;
     }
-    var gpa: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    var gpa_state: gpa_mod.State = .init;
+    defer _ = gpa_state.deinit();
+    const allocator = gpa_state.allocator();
     const workspace = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator);
     defer allocator.free(workspace);
     var maybe_schema = intercept.env_schema.loadOptional(io, allocator, workspace) catch |err| {

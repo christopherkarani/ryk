@@ -2,6 +2,7 @@
 //! Mutation never happens without --dry-run exit, --yes, or interactive confirm (default No).
 
 const std = @import("std");
+const gpa_mod = @import("gpa.zig");
 const core = @import("ryk_core").core;
 const supervisor = core.supervisor;
 const core_api = @import("ryk_core").api;
@@ -68,7 +69,7 @@ pub fn command(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: an
         return exit_codes.usage;
     }
 
-    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    var gpa_state: gpa_mod.State = .init;
     defer _ = gpa_state.deinit();
     const allocator = gpa_state.allocator();
 

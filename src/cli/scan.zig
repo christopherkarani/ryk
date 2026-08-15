@@ -1,5 +1,6 @@
 //! `ryk scan` — free, offline session forensics for new users.
 const std = @import("std");
+const gpa_mod = @import("gpa.zig");
 const exit_codes = @import("exit_codes.zig");
 const help = @import("help.zig");
 const scan_lib = @import("../scan/mod.zig");
@@ -174,7 +175,7 @@ pub fn command(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: an
         else => return err,
     };
 
-    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    var gpa_state: gpa_mod.State = .init;
     defer _ = gpa_state.deinit();
     const allocator = gpa_state.allocator();
 

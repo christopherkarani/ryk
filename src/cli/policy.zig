@@ -1,4 +1,5 @@
 const std = @import("std");
+const gpa_mod = @import("gpa.zig");
 const policy_mod = @import("ryk_core").policy;
 const core = @import("ryk_core").core;
 const supervisor = core.supervisor;
@@ -77,7 +78,7 @@ fn check(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: anytype)
         return exit_codes.usage;
     }
 
-    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    var gpa_state: gpa_mod.State = .init;
     defer _ = gpa_state.deinit();
     const allocator = gpa_state.allocator();
 
@@ -170,7 +171,7 @@ fn explain(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: anytyp
         try suggestions.writeSanitizedValue(stderr, "ryk policy explain: unsupported type '", positional[0], "'.\n");
         return exit_codes.usage;
     };
-    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    var gpa_state: gpa_mod.State = .init;
     defer _ = gpa_state.deinit();
     const allocator = gpa_state.allocator();
 
@@ -414,7 +415,7 @@ fn applyPack(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: anyt
         try stderr.print("ryk policy apply-pack: '{s}' is an init preset, not a product policy pack.\n", .{pack_name});
         return exit_codes.usage;
     }
-    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    var gpa_state: gpa_mod.State = .init;
     defer _ = gpa_state.deinit();
     const allocator = gpa_state.allocator();
     const cwd = std.Io.Dir.cwd();

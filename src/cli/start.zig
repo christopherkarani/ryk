@@ -1,4 +1,5 @@
 const std = @import("std");
+const gpa_mod = @import("gpa.zig");
 
 const core_api = @import("ryk_core").api;
 const policy_mod = @import("ryk_core").policy;
@@ -56,7 +57,7 @@ pub fn runStart(
     daemon_check_fn: ?*const fn (std.mem.Allocator, bool) anyerror!void,
     shell_evaluator: ?shell_eval.ShellCommandEvaluatorFn,
 ) !u8 {
-    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    var gpa_state: gpa_mod.State = .init;
     defer _ = gpa_state.deinit();
     const allocator = gpa_state.allocator();
     var setup_succeeded = false;

@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const build_options = @import("build_options");
 
 pub const args = @import("args.zig");
+pub const gpa = @import("gpa.zig");
 pub const brand = @import("brand.zig");
 pub const exit_codes = @import("exit_codes.zig");
 pub const help = @import("help.zig");
@@ -76,6 +77,7 @@ pub const host_mcp_sandbox = @import("host_mcp_sandbox.zig");
 pub const telemetry = @import("../telemetry.zig");
 
 test {
+    _ = gpa;
     _ = brand;
     _ = staged_mutation;
     // Ensure the child_process module (and its tests) are pulled into the test binary.

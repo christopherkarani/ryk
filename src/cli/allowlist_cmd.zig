@@ -14,6 +14,7 @@
 //! Shortcuts: `commandAllow` → add, `commandUnallow` → remove.
 
 const std = @import("std");
+const gpa_mod = @import("gpa.zig");
 const core = @import("ryk_core").core;
 const exit_codes = @import("exit_codes.zig");
 const help = @import("help.zig");
@@ -69,7 +70,7 @@ pub fn command(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: an
         }
     }
 
-    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    var gpa_state: gpa_mod.State = .init;
     defer _ = gpa_state.deinit();
     const gpa = gpa_state.allocator();
 
@@ -125,7 +126,7 @@ pub fn commandAllow(io: std.Io, argv: []const []const u8, stdout: anytype, stder
         return exit_codes.usage;
     }
     // Prepend synthetic "add" framing via shared add body.
-    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    var gpa_state: gpa_mod.State = .init;
     defer _ = gpa_state.deinit();
     const gpa = gpa_state.allocator();
     var now_buf: [32]u8 = undefined;
@@ -144,7 +145,7 @@ pub fn commandUnallow(io: std.Io, argv: []const []const u8, stdout: anytype, std
         try stderr.writeAll(usage_text);
         return exit_codes.usage;
     }
-    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    var gpa_state: gpa_mod.State = .init;
     defer _ = gpa_state.deinit();
     return cmdRemove(io, gpa_state.allocator(), argv, stdout, stderr);
 }

@@ -12,9 +12,17 @@ file_size_bytes() {
   fi
 }
 
+# Archive names are ryk-vVERSION-os-arch.ext. Lookup is by os-arch + binary
+# so a VERSION bump still matches. Missing row still passes (establishing).
+# P0 does not fail on growth.
+os_arch_from_archive() {
+  printf '%s\n' "$1" | sed -E 's/^ryk-v[0-9][0-9.]*-//; s/\.tar\.gz$//; s/\.zip$//'
+}
+
 baseline_size_for() {
   [ -f "$SIZE_BASELINE_FILE" ] || return 1
-  awk -F '\t' -v artifact="$1" -v binary="$2" '$1 == artifact && $2 == binary {print $3; found=1} END {exit found ? 0 : 1}' "$SIZE_BASELINE_FILE"
+  os_arch="$(os_arch_from_archive "$1")"
+  awk -F '\t' -v os_arch="$os_arch" -v binary="$2" '$1 == os_arch && $2 == binary {print $3; found=1} END {exit found ? 0 : 1}' "$SIZE_BASELINE_FILE"
 }
 
 report_binary_sizes() {

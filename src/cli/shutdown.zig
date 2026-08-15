@@ -1,4 +1,5 @@
 const std = @import("std");
+const gpa_mod = @import("gpa.zig");
 
 const daemon = @import("daemon.zig");
 const exit_codes = @import("exit_codes.zig");
@@ -43,7 +44,7 @@ fn commandWithShutdownImpl(comptime shutdown_fn: anytype, io: std.Io, argv: []co
         return exit_codes.usage;
     }
 
-    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    var gpa_state: gpa_mod.State = .init;
     defer _ = gpa_state.deinit();
     const allocator = gpa_state.allocator();
 

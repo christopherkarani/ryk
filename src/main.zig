@@ -7,7 +7,7 @@ pub fn main(init: std.process.Init) !u8 {
         setupWindowsConsole();
     }
 
-    var dbg: std.heap.DebugAllocator(.{}) = .init;
+    var dbg: ryk.cli.gpa.State = .init;
     defer _ = dbg.deinit();
 
     const io = init.io;

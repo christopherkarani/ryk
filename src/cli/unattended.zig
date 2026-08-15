@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const gpa_mod = @import("gpa.zig");
 
 const child_process = @import("child_process.zig");
 const exit_codes = @import("exit_codes.zig");
@@ -188,7 +189,7 @@ fn healthCommandWithDeadline(
     stdout: anytype,
     stderr: anytype,
 ) !u8 {
-    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    var gpa_state: gpa_mod.State = .init;
     defer _ = gpa_state.deinit();
     const allocator = gpa_state.allocator();
     const self_exe = std.process.executablePathAlloc(io, allocator) catch {
@@ -244,7 +245,7 @@ fn setupCommand(
     stdout: anytype,
     stderr: anytype,
 ) !u8 {
-    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    var gpa_state: gpa_mod.State = .init;
     defer _ = gpa_state.deinit();
     const allocator = gpa_state.allocator();
     var positional_host: ?[]const u8 = null;
@@ -410,7 +411,7 @@ fn healthCommandInner(
         positional_host = arg;
     }
 
-    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    var gpa_state: gpa_mod.State = .init;
     defer _ = gpa_state.deinit();
     const allocator = gpa_state.allocator();
     const self_exe = std.process.executablePathAlloc(io, allocator) catch null;

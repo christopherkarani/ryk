@@ -16,6 +16,7 @@
 //! child-controlled and authenticate nobody.
 
 const std = @import("std");
+const gpa_mod = @import("gpa.zig");
 const core = @import("ryk_core").core;
 const exit_codes = @import("exit_codes.zig");
 const help = @import("help.zig");
@@ -67,7 +68,7 @@ fn commandAt(io: std.Io, argv: []const []const u8, now_iso: []const u8, stdout: 
         return exit_codes.success;
     }
 
-    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    var gpa_state: gpa_mod.State = .init;
     defer _ = gpa_state.deinit();
     const gpa = gpa_state.allocator();
 

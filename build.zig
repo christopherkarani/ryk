@@ -29,6 +29,23 @@ fn addPcre2Shim(
     if (target.result.os.tag == .windows) mod.linkSystemLibrary("advapi32", .{});
 }
 
+/// Compile-time `-fstrip` is per-module. Setting it only on `exe.root_module`
+/// leaves DWARF in `ryk_mod`, vaxis, PCRE2, and other linked objects.
+/// ReleaseSafe only — default Debug test binaries stay unstripped.
+fn applyReleaseSafeStrip(mod: *std.Build.Module) void {
+    if (mod.strip == true) return;
+    mod.strip = true;
+    for (mod.import_table.values()) |imported| {
+        applyReleaseSafeStrip(imported);
+    }
+    for (mod.link_objects.items) |obj| {
+        switch (obj) {
+            .other_step => |compile| applyReleaseSafeStrip(compile.root_module),
+            else => {},
+        }
+    }
+}
+
 fn addRunTestTerminal(b: *std.Build, exe: *std.Build.Step.Compile) *std.Build.Step.Run {
     const step_name = if (exe.kind == .@"test" and std.mem.eql(u8, exe.name, "test"))
         b.fmt("run {s}", .{@tagName(exe.kind)})
@@ -166,6 +183,11 @@ pub fn build(b: *std.Build) void {
     // Attach once on the lib module (imported by the exe). Linking the same C shim on both
     // exe.root_module and ryk_mod duplicates _ryk_regex_* symbols at link time.
     addPcre2Shim(b, ryk_mod, target, optimize);
+    // Ship `ryk` only. `ryk-windows-check` is a compile probe, not the Windows
+    // artifact — that is this same `exe` with `-Dtarget=x86_64-windows`.
+    if (optimize == .ReleaseSafe) {
+        applyReleaseSafeStrip(exe.root_module);
+    }
 
     const install_ryk = b.addInstallArtifact(exe, .{});
     b.getInstallStep().dependOn(&install_ryk.step);

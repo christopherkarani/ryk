@@ -4,6 +4,7 @@
 //! macOS primary (pbcopy / open -R); Linux best-effort; Windows unavailable.
 const std = @import("std");
 const builtin = @import("builtin");
+const gpa_mod = @import("../cli/gpa.zig");
 
 pub const Result = enum {
     ok,
@@ -139,7 +140,7 @@ fn openLinux(io: std.Io, path: []const u8) Result {
 fn runArgv(io: std.Io, argv: []const []const u8) Result {
     // Use process.run so we don't manage pipes; path is argv element (spaces OK).
     // Bound wait so a hung open/xdg-open cannot freeze the TUI forever.
-    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    var gpa_state: gpa_mod.State = .init;
     defer _ = gpa_state.deinit();
     const allocator = gpa_state.allocator();
 
