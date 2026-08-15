@@ -4,7 +4,7 @@ const core_api = @import("ryk_core").api;
 const core = @import("ryk_core").core;
 const presentation = @import("../presentation/mod.zig");
 const feed_writer = @import("../cli/feed_writer.zig");
-const rust_visibility = @import("../cli/rust_visibility.zig");
+const rust_visibility = @import("../cli/feed_visibility.zig");
 
 pub const SessionLoadHealth = enum { healthy, degraded };
 

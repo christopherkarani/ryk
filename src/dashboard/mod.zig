@@ -12,7 +12,7 @@ const supervisor = core.supervisor;
 const license_mod = @import("../license.zig");
 const ci_check = @import("../ci_check.zig");
 const brand = @import("../cli/brand.zig");
-const rust_visibility = @import("../cli/rust_visibility.zig");
+const rust_visibility = @import("../cli/feed_visibility.zig");
 const feed_writer = @import("../cli/feed_writer.zig");
 
 pub const max_request_body_len = 1024 * 1024;
