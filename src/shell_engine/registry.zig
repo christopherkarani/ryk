@@ -353,7 +353,8 @@ fn ensureInitWith(load_all: bool) !void {
                 g_state.store(1, .release);
                 return error.RegistryInitFailed;
             };
-            _ = previous_arena;
+            // Success: previous_arena is intentionally leaked so in-flight
+            // matchers can finish against previous_packs. Upgrade is once.
             return;
         }
         if (state == 3) {
