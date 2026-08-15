@@ -98,7 +98,7 @@ const git_reset_tips = [_][]const u8{
 
 const git_push_force_tips = [_][]const u8{
     "Preview first: Confirm the remote tip with `git fetch` and `git log --oneline origin/BRANCH..HEAD`",
-    "Safer alternative: Prefer `--force-with-lease` over bare `--force` when rewriting published history",
+    "Safer alternative: Use a fast-forward `git push` — `--force-with-lease` is still force-equivalent and stays denied",
     "Workflow fix: Confirm with a human before force-pushing shared branches",
 };
 
@@ -149,4 +149,14 @@ test "suggestions rule_id lookup for git reset-hard" {
     const tips = forRuleId("core.git:reset-hard").?;
     try std.testing.expect(tips.len >= 2);
     try std.testing.expect(std.mem.indexOf(u8, tips[0], "git") != null);
+}
+
+test "force-push tips do not present lease as an allowed rewrite" {
+    const tips = forRuleId("core.git:push-force").?;
+    var saw_honest_alt = false;
+    for (tips) |tip| {
+        try std.testing.expect(std.mem.indexOf(u8, tip, "Prefer `--force-with-lease`") == null);
+        if (std.mem.indexOf(u8, tip, "fast-forward") != null) saw_honest_alt = true;
+    }
+    try std.testing.expect(saw_honest_alt);
 }

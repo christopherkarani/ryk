@@ -868,7 +868,7 @@ fn isForceEquivalentGitPush(value: []const u8) bool {
     if (std.ascii.indexOfIgnoreCase(value, "git") == null) return false;
     if (std.ascii.indexOfIgnoreCase(value, "push") == null) return false;
 
-    var it = std.mem.tokenizeAny(u8, value, " \t");
+    var it = std.mem.tokenizeAny(u8, value, " \t\n\r");
     var seen_push = false;
     while (it.next()) |raw| {
         const tok = unwrapGitToken(raw);
@@ -876,10 +876,12 @@ fn isForceEquivalentGitPush(value: []const u8) bool {
             if (std.ascii.eqlIgnoreCase(tok, "push")) seen_push = true;
             continue;
         }
-        if (std.ascii.eqlIgnoreCase(tok, "--force") or std.ascii.startsWithIgnoreCase(tok, "--force-")) return true;
+        if (std.ascii.eqlIgnoreCase(tok, "--force") or
+            std.ascii.startsWithIgnoreCase(tok, "--force-") or
+            std.ascii.startsWithIgnoreCase(tok, "--force=")) return true;
         if (isShortOptCluster(tok, 'f')) return true;
         if (std.ascii.eqlIgnoreCase(tok, "--delete") or std.mem.eql(u8, tok, "-d")) return true;
-        if (std.ascii.eqlIgnoreCase(tok, "--mirror")) return true;
+        if (std.ascii.eqlIgnoreCase(tok, "--mirror") or std.ascii.startsWithIgnoreCase(tok, "--mirror=")) return true;
         if (isForceRefspec(tok) or isDeleteRefspec(tok)) return true;
     }
     return false;
@@ -1144,11 +1146,17 @@ test "Door A: normal coding work allows under generic-agent strict default" {
     // Danger stays blocked on the same surface (YAML heuristic + deny list).
     const danger = [_][]const u8{
         "git push --force origin main",
+        "git push --force-with-lease origin main",
+        "git push --force-if-includes",
         "git push -f",
         "git push origin +main",
         "git push --delete origin old-branch",
         "git push --mirror",
         "git push origin :old-branch",
+        "git\npush\n-f",
+        "git push --force=true origin main",
+        "git -C /tmp/repo push -f",
+        "git push -uf origin main",
         "rm -rf /",
         "cat .env",
         "sudo rm -rf /var",
