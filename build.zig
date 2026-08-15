@@ -1,10 +1,11 @@
 const std = @import("std");
+const pcre2_slim = @import("build/pcre2_slim.zig");
 
 /// Run a test binary in terminal mode (avoiding Zig 0.16 server-mode IPC
 /// which hangs with this project's test suite).
-/// Link Zig-built static PCRE2 + C shim for shell_engine pack regex matching.
-/// Built from source so host/cross targets (linux/darwin amd64+arm64) do not need
-/// system libpcre2-dev; Windows native CI can keep using the same path later.
+/// Link the slim static PCRE2 (UNICODE/UCD/DFA/substitute dropped) + C shim.
+/// Built from the pinned tarball so host/cross targets do not need system
+/// libpcre2-dev. See `docs/dev/pcre2-slim.md`.
 fn addPcre2Shim(
     b: *std.Build,
     mod: *std.Build.Module,
@@ -12,13 +13,9 @@ fn addPcre2Shim(
     optimize: std.builtin.OptimizeMode,
 ) void {
     mod.link_libc = true;
-    const pcre2_dep = b.dependency("pcre2", .{
-        .target = target,
-        .optimize = optimize,
-        .linkage = .static,
-    });
-    const pcre2_lib = pcre2_dep.artifact("pcre2-8");
-    mod.linkLibrary(pcre2_lib);
+    const slim = pcre2_slim.addLibrary(b, target, optimize);
+    mod.linkLibrary(slim.lib);
+    mod.addIncludePath(slim.include_dir);
     mod.addIncludePath(b.path("src/shell_engine"));
     // Static PCRE2 requires PCRE2_STATIC for the public header macros on all targets.
     mod.addCSourceFile(.{
@@ -97,6 +94,14 @@ pub fn build(b: *std.Build) void {
         "posthog-project-token",
         "PostHog project token for release telemetry",
     ) orelse "";
+    // Default stays HTTP-on (PATH `ryk`, curl|sh with a live PostHog token).
+    // `-Dhttp=false` omits telemetry_transport + provider_gateway so TLS/HTTP
+    // client code is not analyzed. Empty-token dry-run does not shrink curl|sh.
+    const enable_http = b.option(
+        bool,
+        "http",
+        "Link HTTP/TLS client (telemetry transport + provider gateway; default true)",
+    ) orelse true;
     // Zig 0.16: filters are compile-time (passed to `zig test` as --test-filter), not runtime
     // argv on the terminal test runner. Use: ./scripts/zig build test-lib -Dtest-filter=Spinner
     const test_filter = b.option([]const u8, "test-filter", "Only run unit tests whose names contain this substring");
@@ -107,6 +112,7 @@ pub fn build(b: *std.Build) void {
     build_options.addOption([]const u8, "commit", commit);
     build_options.addOption([]const u8, "build_date", build_date);
     build_options.addOption([]const u8, "posthog_project_token", posthog_project_token);
+    build_options.addOption(bool, "enable_http", enable_http);
     const build_options_mod = build_options.createModule();
 
     const core_schema_documents = b.addOptions();
@@ -284,6 +290,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "ryk_core", .module = ryk_core_mod },
+                .{ .name = "build_options", .module = build_options_mod },
             },
         }),
         .filters = test_filters,
