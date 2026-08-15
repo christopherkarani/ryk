@@ -152,14 +152,34 @@ fn runRyk(
     stdin_data: []const u8,
     env_map: ?*const std.process.Environ.Map,
 ) !HookRunResult {
+    return runRykIn(allocator, args, stdin_data, env_map, null);
+}
+
+fn runRykIn(
+    allocator: std.mem.Allocator,
+    args: []const []const u8,
+    stdin_data: []const u8,
+    env_map: ?*const std.process.Environ.Map,
+    cwd: ?[]const u8,
+) !HookRunResult {
     const io = std.testing.io;
-    var child = try std.process.spawn(io, .{
-        .argv = args,
-        .stdin = .pipe,
-        .stdout = .pipe,
-        .stderr = .pipe,
-        .environ_map = env_map,
-    });
+    var child = if (cwd) |cwd_path|
+        try std.process.spawn(io, .{
+            .argv = args,
+            .cwd = .{ .path = cwd_path },
+            .stdin = .pipe,
+            .stdout = .pipe,
+            .stderr = .pipe,
+            .environ_map = env_map,
+        })
+    else
+        try std.process.spawn(io, .{
+            .argv = args,
+            .stdin = .pipe,
+            .stdout = .pipe,
+            .stderr = .pipe,
+            .environ_map = env_map,
+        });
 
     if (child.stdin) |stdin| {
         stdin.writeStreamingAll(io, stdin_data) catch |err| switch (err) {
@@ -299,6 +319,118 @@ test "phase2e Codex PreToolUse invalid JSON fails closed with exit 2 and sentine
 
     try std.testing.expectEqual(codex_deny_exit_code, result.code);
     try std.testing.expectEqual(@as(usize, 0), result.stdout.len);
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "[[RYKAN-V-GUARD]]") != null);
+}
+
+fn nowNs() i96 {
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    return std.Io.Timestamp.now(threaded.io(), .awake).toNanoseconds();
+}
+
+fn claudePermissionDecision(allocator: std.mem.Allocator, stdout: []const u8) ![]const u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, stdout, .{});
+    defer parsed.deinit();
+    const hso = parsed.value.object.get("hookSpecificOutput") orelse return error.TestUnexpectedResult;
+    if (hso != .object) return error.TestUnexpectedResult;
+    const pd = hso.object.get("permissionDecision") orelse return error.TestUnexpectedResult;
+    if (pd != .string) return error.TestUnexpectedResult;
+    return try allocator.dupe(u8, pd.string);
+}
+
+test "host hook contracts: Claude allow/deny, Codex exit 2, Cursor empty stdin" {
+    // Missing binary is a failure, not a skip. Timing is observational only —
+    // elapsed==0 is a measurement bug, not a 5ms SLA pass.
+    try std.testing.expect(fileExists(ryk_bin));
+
+    const allocator = std.testing.allocator;
+    const claude_allow =
+        \\{"version":1,"host":"claude","event":"PreToolUse","payload":{"tool":"Bash","command":"git status"}}
+    ;
+    const claude_deny =
+        \\{"version":1,"host":"claude","event":"PreToolUse","payload":{"tool":"Bash","command":"rm -rf /"}}
+    ;
+    const codex_deny =
+        \\{"version":1,"host":"codex","event":"PreToolUse","payload":{"tool":"Bash","command":"rm -rf /"}}
+    ;
+
+    {
+        const started = nowNs();
+        const result = try runRyk(allocator, &.{ ryk_bin, "hook", "claude", "PreToolUse" }, claude_allow, null);
+        const elapsed = if (nowNs() > started) @as(u64, @intCast(nowNs() - started)) else 0;
+        defer allocator.free(result.stdout);
+        defer allocator.free(result.stderr);
+        try std.testing.expect(elapsed > 0);
+        try std.testing.expectEqual(exit_codes.success, result.code);
+        const decision = try claudePermissionDecision(allocator, result.stdout);
+        defer allocator.free(decision);
+        try std.testing.expectEqualStrings("allow", decision);
+    }
+
+    {
+        const started = nowNs();
+        const result = try runRyk(allocator, &.{ ryk_bin, "hook", "claude", "PreToolUse" }, claude_deny, null);
+        const elapsed = if (nowNs() > started) @as(u64, @intCast(nowNs() - started)) else 0;
+        defer allocator.free(result.stdout);
+        defer allocator.free(result.stderr);
+        try std.testing.expect(elapsed > 0);
+        try std.testing.expectEqual(exit_codes.success, result.code);
+        const decision = try claudePermissionDecision(allocator, result.stdout);
+        defer allocator.free(decision);
+        try std.testing.expectEqualStrings("deny", decision);
+    }
+
+    {
+        const started = nowNs();
+        const result = try runRyk(allocator, &.{ ryk_bin, "hook", "codex", "PreToolUse" }, codex_deny, null);
+        const elapsed = if (nowNs() > started) @as(u64, @intCast(nowNs() - started)) else 0;
+        defer allocator.free(result.stdout);
+        defer allocator.free(result.stderr);
+        try std.testing.expect(elapsed > 0);
+        try std.testing.expectEqual(codex_deny_exit_code, result.code);
+        try std.testing.expectEqual(@as(usize, 0), result.stdout.len);
+        try std.testing.expect(std.mem.indexOf(u8, result.stderr, "[[RYKAN-V-GUARD]]") != null);
+    }
+
+    {
+        const started = nowNs();
+        const result = try runRyk(allocator, &.{ryk_bin}, "", null);
+        const elapsed = if (nowNs() > started) @as(u64, @intCast(nowNs() - started)) else 0;
+        defer allocator.free(result.stdout);
+        defer allocator.free(result.stderr);
+        try std.testing.expect(elapsed > 0);
+        try std.testing.expectEqual(@as(u8, 2), result.code);
+        try std.testing.expect(std.mem.indexOf(u8, result.stdout, "\"permission\":\"deny\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, result.stdout, "\"permissionDecision\":\"deny\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, result.stdout, "hook payload was empty") != null);
+    }
+}
+
+test "codex SessionStart fails closed when workspace policy is broken" {
+    // Informational shortcut must not turn a discover failure into allow.
+    // Codex SessionStart is shouldFailClosedOnPreEval — exit 2 + sentinel.
+    try std.testing.expect(fileExists(ryk_bin));
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, ".ryk");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = ".ryk/policy.yaml",
+        .data = ":::not-valid-policy:::\n",
+    });
+    const cwd = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(cwd);
+    const ryk_abs = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ryk_bin, allocator);
+    defer allocator.free(ryk_abs);
+
+    const payload =
+        \\{"version":1,"host":"codex","event":"SessionStart","payload":{}}
+    ;
+    const result = try runRykIn(allocator, &.{ ryk_abs, "hook", "codex", "SessionStart" }, payload, null, cwd);
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    try std.testing.expectEqual(codex_deny_exit_code, result.code);
     try std.testing.expect(std.mem.indexOf(u8, result.stderr, "[[RYKAN-V-GUARD]]") != null);
 }
 

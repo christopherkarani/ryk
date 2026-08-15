@@ -63,9 +63,9 @@ pub fn commandWithEvaluator(
 ) !u8 {
     _ = stderr;
 
-    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = gpa_state.deinit();
-    const allocator = gpa_state.allocator();
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
 
     const payload = readBoundedStdin(io, allocator, max_payload_len) catch |err| {
         // Unreadable or oversized payload: no evaluation happened, so the only

@@ -104,11 +104,8 @@ pub fn processGlobalWritesDisabled() bool {
 }
 
 pub fn resolveGlobalDashboardRoot(allocator: std.mem.Allocator) ![]u8 {
-    var env_map = try env_util.createProcessMap(allocator);
-    defer env_map.deinit();
-    const home = (try env_util.getOwned(&env_map, allocator, "HOME")) orelse return error.HomeDirectoryNotFound;
-    defer allocator.free(home);
-    return std.fs.path.join(allocator, &.{ home, ".ryk", "dashboard" });
+    const home_z = env_util.getenvHome() orelse return error.HomeDirectoryNotFound;
+    return std.fs.path.join(allocator, &.{ std.mem.span(home_z), ".ryk", "dashboard" });
 }
 
 fn updateWorkspaceRegistry(

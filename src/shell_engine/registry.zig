@@ -1,5 +1,6 @@
 //! Oracle pack registry: embed all pack patterns and match via PCRE2.
 const std = @import("std");
+const builtin = @import("builtin");
 const regex_pcre = @import("regex_pcre.zig");
 const Severity = @import("types.zig").Severity;
 
@@ -22,7 +23,25 @@ const CompiledPattern = struct {
     reason: []const u8,
     severity: Severity,
     regex_source: []const u8,
-    regex: regex_pcre.Regex,
+    /// Compiled on first use. Hook processes parse default packs without compiling
+    /// the full oracle up front; PCRE compile is keyword- and prefix-gated.
+    regex: ?regex_pcre.Regex = null,
+};
+
+/// Embedded oracle JSON shape. Parsed once into the process arena; pattern
+/// strings are borrowed (no per-field dupes). PCRE compile is deferred.
+const PackJson = struct {
+    id: []const u8,
+    keywords: [][]const u8 = &.{},
+    safe: []PatternJson = &.{},
+    destructive: []PatternJson = &.{},
+};
+
+const PatternJson = struct {
+    name: []const u8 = "unnamed",
+    regex: []const u8,
+    reason: []const u8 = "",
+    severity: []const u8 = "high",
 };
 
 const CompiledPack = struct {
@@ -39,10 +58,13 @@ var g_packs: []CompiledPack = &.{};
 /// 0=uninit (or failed+reclaimed, retryable), 1=ok, 3=in-progress
 var g_state: std.atomic.Value(u8) = .init(0);
 var g_arena: std.heap.ArenaAllocator = undefined;
+/// True when `g_packs` holds the full oracle, not just default-enabled packs.
+var g_full: bool = false;
 
 fn freePatternList(patterns: []CompiledPattern) void {
     for (patterns) |*p| {
-        p.regex.deinit();
+        if (p.regex) |*re| re.deinit();
+        p.regex = null;
     }
 }
 
@@ -57,20 +79,142 @@ fn freePackList(packs: []CompiledPack) void {
 fn reclaimRegistry() void {
     freePackList(g_packs);
     g_packs = &.{};
+    g_full = false;
     g_arena.deinit();
     g_arena = undefined;
 }
 
-fn initOnce() !void {
+fn skipJsonWs(src: []const u8, start: usize) usize {
+    var i = start;
+    while (i < src.len) : (i += 1) {
+        switch (src[i]) {
+            ' ', '\t', '\n', '\r' => {},
+            else => return i,
+        }
+    }
+    return i;
+}
+
+/// String-aware end of a JSON object starting at `start` (`{` … matching `}`).
+fn matchingObjectEnd(src: []const u8, start: usize) ?usize {
+    if (start >= src.len or src[start] != '{') return null;
+    var depth: u32 = 0;
+    var i = start;
+    var in_string = false;
+    var escape = false;
+    while (i < src.len) : (i += 1) {
+        const c = src[i];
+        if (in_string) {
+            if (escape) {
+                escape = false;
+                continue;
+            }
+            if (c == '\\') {
+                escape = true;
+                continue;
+            }
+            if (c == '"') in_string = false;
+            continue;
+        }
+        switch (c) {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if (depth == 0) return i + 1;
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+/// Compact `{"id":"..."` only. A nested `"id"` must not select the pack —
+/// callers fall back to a full JSON parse (fail closed on error).
+fn packIdFromObject(obj: []const u8) ?[]const u8 {
+    const compact = "{\"id\":\"";
+    if (!std.mem.startsWith(u8, obj, compact)) return null;
+    const start = compact.len;
+    const end = std.mem.indexOfScalarPos(u8, obj, start, '"') orelse return null;
+    return obj[start..end];
+}
+
+/// Leading required literal after an optional `^`. Used to skip PCRE compile
+/// when the subject cannot contain that prefix. Skipping a *destructive*
+/// pattern is an allow if nothing else hits — `patternMightMatch` must not
+/// skip when a depth-0 `|` follows the prefix.
+fn requiredPrefixLiteral(regex_source: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    if (i < regex_source.len and regex_source[i] == '^') i += 1;
+    const start = i;
+    while (i < regex_source.len) {
+        const c = regex_source[i];
+        switch (c) {
+            '\\', '.', '$', '*', '+', '?', '{', '[', '(', ')', '|', ']' => {
+                return if (i > start) regex_source[start..i] else null;
+            },
+            else => i += 1,
+        }
+    }
+    return if (i > start) regex_source[start..i] else null;
+}
+
+fn hasDepth0AlternationAfter(regex_source: []const u8, start: usize) bool {
+    var i = start;
+    var depth: u32 = 0;
+    var in_class = false;
+    while (i < regex_source.len) : (i += 1) {
+        const c = regex_source[i];
+        if (c == '\\') {
+            if (i + 1 < regex_source.len) i += 1;
+            continue;
+        }
+        if (in_class) {
+            if (c == ']') in_class = false;
+            continue;
+        }
+        switch (c) {
+            '[' => in_class = true,
+            '(' => depth += 1,
+            ')' => {
+                if (depth > 0) depth -= 1;
+            },
+            '|' => {
+                if (depth == 0) return true;
+            },
+            else => {},
+        }
+    }
+    return false;
+}
+
+fn patternMightMatch(regex_source: []const u8, cmd: []const u8) bool {
+    const lit = requiredPrefixLiteral(regex_source) orelse return true;
+    if (lit.len < 2) return true;
+    var prefix_at: usize = 0;
+    if (prefix_at < regex_source.len and regex_source[prefix_at] == '^') prefix_at += 1;
+    if (hasDepth0AlternationAfter(regex_source, prefix_at + lit.len)) return true;
+    return std.ascii.indexOfIgnoreCase(cmd, lit) != null;
+}
+
+/// Safe-list only. Patterns that only authorize `/tmp` or `$TMPDIR` cannot
+/// match a command that never mentions those tokens. Skipping them is
+/// fail-closed: a false skip can only deny, never allow.
+fn safePatternMightMatch(regex_source: []const u8, cmd: []const u8) bool {
+    if (!patternMightMatch(regex_source, cmd)) return false;
+    const mentions_tmp = std.ascii.indexOfIgnoreCase(regex_source, "/tmp") != null or
+        std.mem.indexOf(u8, regex_source, "TMPDIR") != null;
+    if (!mentions_tmp) return true;
+    return std.ascii.indexOfIgnoreCase(cmd, "tmp") != null or
+        std.mem.indexOf(u8, cmd, "TMPDIR") != null;
+}
+
+fn initOnce(load_all: bool) !void {
     // Process-lifetime arena (not testing allocator — avoids leak noise).
     g_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     errdefer reclaimRegistry();
 
     const a = g_arena.allocator();
-
-    const parsed = try std.json.parseFromSlice(std.json.Value, a, packs_json, .{});
-    const root = parsed.value;
-    if (root != .array) return error.BadPacksJson;
 
     var packs_list: std.ArrayList(CompiledPack) = .empty;
     errdefer {
@@ -79,45 +223,68 @@ fn initOnce() !void {
         packs_list.deinit(a);
     }
 
-    for (root.array.items) |item| {
-        const obj = item.object;
-        const id = obj.get("id").?.string;
-        if (std.mem.eql(u8, id, "test.deadline")) continue;
+    // Scan pack objects instead of parsing the full 300KB oracle. Hook processes
+    // only need core.* + system.disk (~36KB). Strings stay borrowed from embed.
+    var pos = skipJsonWs(packs_json, 0);
+    if (pos >= packs_json.len or packs_json[pos] != '[') return error.BadPacksJson;
+    pos += 1;
+    while (true) {
+        pos = skipJsonWs(packs_json, pos);
+        if (pos >= packs_json.len) return error.BadPacksJson;
+        switch (packs_json[pos]) {
+            ']' => break,
+            ',' => {
+                pos += 1;
+                continue;
+            },
+            '{' => {},
+            else => return error.BadPacksJson,
+        }
+        const end = matchingObjectEnd(packs_json, pos) orelse return error.BadPacksJson;
+        const obj = packs_json[pos..end];
+        pos = end;
 
-        const pack = try compilePack(a, obj, id);
+        if (packIdFromObject(obj)) |id| {
+            if (std.mem.eql(u8, id, "test.deadline")) continue;
+            if (!load_all and !isDefaultEnabled(id)) continue;
+        }
+
+        const parsed = std.json.parseFromSlice(PackJson, a, obj, .{
+            .ignore_unknown_fields = true,
+        }) catch return error.BadPacksJson;
+        if (packIdFromObject(obj) == null) {
+            if (std.mem.eql(u8, parsed.value.id, "test.deadline")) continue;
+            if (!load_all and !isDefaultEnabled(parsed.value.id)) continue;
+        }
+
+        const pack = try compilePack(a, parsed.value);
         packs_list.append(a, pack) catch |err| {
             freePatternList(pack.safe);
             freePatternList(pack.destructive);
             return err;
         };
     }
+
     g_packs = try packs_list.toOwnedSlice(a);
     // Phase 1 hard fence: tier+lex order (not JSON alpha) for first-match attribution.
     // Do not rewrite oracle_packs.json — sort code-side after load.
     std.mem.sort(CompiledPack, g_packs, {}, packOrderLessThan);
+    g_full = load_all;
 }
 
-fn compilePack(a: std.mem.Allocator, obj: std.json.ObjectMap, id: []const u8) !CompiledPack {
-    var keywords: std.ArrayList([]const u8) = .empty;
-    if (obj.get("keywords")) |kw| {
-        if (kw == .array) {
-            for (kw.array.items) |k| {
-                try keywords.append(a, try a.dupe(u8, k.string));
-            }
-        }
-    }
-
-    const safe = try compileList(a, obj.get("safe"));
+fn compilePack(a: std.mem.Allocator, item: PackJson) !CompiledPack {
+    const keywords = try a.dupe([]const u8, item.keywords);
+    const safe = try parsePatternList(a, item.safe);
     errdefer freePatternList(safe);
-    const destructive = try compileList(a, obj.get("destructive"));
+    const destructive = try parsePatternList(a, item.destructive);
     errdefer freePatternList(destructive);
 
     return .{
-        .id = try a.dupe(u8, id),
-        .keywords = try keywords.toOwnedSlice(a),
+        .id = item.id,
+        .keywords = keywords,
         .safe = safe,
         .destructive = destructive,
-        .default_enabled = isDefaultEnabled(id),
+        .default_enabled = isDefaultEnabled(item.id),
     };
 }
 
@@ -181,11 +348,47 @@ fn packOrderLessThan(_: void, a: CompiledPack, b: CompiledPack) bool {
     return std.mem.order(u8, a.id, b.id) == .lt;
 }
 
-pub fn ensureInit() !void {
+fn finishInit(load_all: bool) !void {
+    initOnce(load_all) catch {
+        // initOnce errdefer already reclaimed C heap + arena.
+        g_state.store(0, .release);
+        return error.RegistryInitFailed;
+    };
+    if (g_packs.len == 0) {
+        reclaimRegistry();
+        g_state.store(0, .release);
+        return error.RegistryInitFailed;
+    }
+    g_state.store(1, .release);
+}
+
+fn ensureInitWith(load_all: bool) !void {
     // State machine: 0 uninit/retryable, 1 ok, 2 legacy sticky-fail (treated as retryable), 3 in-progress.
     while (true) {
         const state = g_state.load(.acquire);
-        if (state == 1) return;
+        if (state == 1) {
+            if (!load_all or g_full) return;
+            // Upgrade default-only → full oracle (extra packs / tests).
+            // Do not reclaim the live registry: in-flight matchers may still
+            // hold `g_packs`. Build a replacement, then leak the previous
+            // arena (process-lifetime; upgrade happens at most once).
+            if (g_state.cmpxchgStrong(1, 3, .acq_rel, .acquire)) |_| continue;
+            const previous_arena = g_arena;
+            const previous_packs = g_packs;
+            g_arena = undefined;
+            g_packs = &.{};
+            g_full = false;
+            finishInit(true) catch {
+                g_arena = previous_arena;
+                g_packs = previous_packs;
+                g_full = false;
+                g_state.store(1, .release);
+                return error.RegistryInitFailed;
+            };
+            // Success: previous_arena is intentionally leaked so in-flight
+            // matchers can finish against previous_packs. Upgrade is once.
+            return;
+        }
         if (state == 3) {
             while (g_state.load(.acquire) == 3) {
                 std.atomic.spinLoopHint();
@@ -199,17 +402,29 @@ pub fn ensureInit() !void {
         break;
     }
 
-    initOnce() catch {
-        // initOnce errdefer already reclaimed C heap + arena.
-        g_state.store(0, .release);
-        return error.RegistryInitFailed;
-    };
-    if (g_packs.len == 0) {
-        reclaimRegistry();
-        g_state.store(0, .release);
-        return error.RegistryInitFailed;
-    }
-    g_state.store(1, .release);
+    return finishInit(load_all);
+}
+
+/// Default product packs only (`core.*` + `system.disk`). Hook hot path.
+pub fn ensureInitDefault() !void {
+    return ensureInitWith(false);
+}
+
+/// Full embedded oracle (opt-in packs, corpus tests, `default_packs_only=false`).
+pub fn ensureFullInit() !void {
+    return ensureInitWith(true);
+}
+
+/// Tests load the full oracle so existing pack-count assertions stay valid.
+/// Production hook processes load the default set only.
+pub fn ensureInit() !void {
+    if (builtin.is_test) return ensureFullInit();
+    return ensureInitDefault();
+}
+
+pub fn ensureForMatchOptions(opts: MatchOptions) !void {
+    if (!opts.default_packs_only or opts.extra_enabled.len > 0) return ensureFullInit();
+    return ensureInitDefault();
 }
 
 pub fn packCount() usize {
@@ -301,17 +516,30 @@ fn ruleIdIsSkipped(pack_id: []const u8, pattern_name: []const u8, skipped: []con
     return false;
 }
 
+fn ensurePatternCompiled(pat: *CompiledPattern) !void {
+    if (pat.regex != null) return;
+    // Hook evaluation is single-threaded per process. First match compiles.
+    pat.regex = regex_pcre.Regex.compile(pat.regex_source) catch return error.PatternCompileFailed;
+}
+
 pub fn matchCommandDetailedOpts(cmd: []const u8, opts: MatchOptions) MatchResult {
-    if (g_packs.len == 0) return .allow_miss;
+    return matchCommandDetailedOptsWithGates(cmd, opts, true);
+}
+
+fn matchCommandDetailedOptsWithGates(cmd: []const u8, opts: MatchOptions, use_prefix_gates: bool) MatchResult {
+    ensureForMatchOptions(opts) catch return matchInfraDeny();
+    if (g_packs.len == 0) return matchInfraDeny();
 
     var any_safe = false;
-    for (g_packs) |pack| {
-        if (!packIsActive(pack, opts)) continue;
-        if (!mightMatch(pack, cmd)) continue;
+    for (g_packs) |*pack| {
+        if (!packIsActive(pack.*, opts)) continue;
+        if (!mightMatch(pack.*, cmd)) continue;
 
         var pack_safe = false;
-        for (pack.safe) |pat| {
-            const matched = pat.regex.isMatch(cmd) catch return matchInfraDeny();
+        for (pack.safe) |*pat| {
+            if (use_prefix_gates and !safePatternMightMatch(pat.regex_source, cmd)) continue;
+            ensurePatternCompiled(pat) catch return matchInfraDeny();
+            const matched = pat.regex.?.isMatch(cmd) catch return matchInfraDeny();
             if (matched) {
                 pack_safe = true;
                 any_safe = true;
@@ -321,8 +549,10 @@ pub fn matchCommandDetailedOpts(cmd: []const u8, opts: MatchOptions) MatchResult
         // Same-pack only: skip this pack's destructives, keep scanning others.
         if (pack_safe) continue;
 
-        for (pack.destructive) |pat| {
-            const span = pat.regex.findMatch(cmd) catch return matchInfraDeny();
+        for (pack.destructive) |*pat| {
+            if (use_prefix_gates and !patternMightMatch(pat.regex_source, cmd)) continue;
+            ensurePatternCompiled(pat) catch return matchInfraDeny();
+            const span = pat.regex.?.findMatch(cmd) catch return matchInfraDeny();
             if (span) |m| {
                 // E8: permanent kind=rule skips this rule only; keep scanning.
                 // Product permanent path filters critical rule ids out of skip lists
@@ -377,50 +607,31 @@ pub fn severityForRuleId(rule_id: []const u8) Severity {
 pub const expected_destructive_patterns: usize = 794;
 pub const expected_safe_patterns: usize = 830;
 
-fn compileOnePattern(a: std.mem.Allocator, pat: std.json.Value) !CompiledPattern {
-    const o = pat.object;
-    const name = if (o.get("name")) |n| (if (n == .string) n.string else "unnamed") else "unnamed";
-    const regex_s = o.get("regex").?.string;
-    const reason = if (o.get("reason")) |r| (if (r == .string) r.string else "") else "";
-    const sev_s = if (o.get("severity")) |s| (if (s == .string) s.string else "high") else "high";
-    const severity: Severity = if (std.mem.eql(u8, sev_s, "critical"))
+fn parseOnePattern(pat: PatternJson) CompiledPattern {
+    const severity: Severity = if (std.mem.eql(u8, pat.severity, "critical"))
         .critical
-    else if (std.mem.eql(u8, sev_s, "medium"))
+    else if (std.mem.eql(u8, pat.severity, "medium"))
         .medium
-    else if (std.mem.eql(u8, sev_s, "low"))
+    else if (std.mem.eql(u8, pat.severity, "low"))
         .low
     else
         .high;
 
-    // Fail closed: do not silently drop patterns (would shrink the guard).
-    var cre = regex_pcre.Regex.compile(regex_s) catch return error.PatternCompileFailed;
-    errdefer cre.deinit();
     return .{
-        .name = try a.dupe(u8, name),
-        .reason = try a.dupe(u8, reason),
+        .name = pat.name,
+        .reason = pat.reason,
         .severity = severity,
-        .regex_source = try a.dupe(u8, regex_s),
-        .regex = cre,
+        .regex_source = pat.regex,
+        .regex = null,
     };
 }
 
-fn compileList(a: std.mem.Allocator, val: ?std.json.Value) ![]CompiledPattern {
-    var list: std.ArrayList(CompiledPattern) = .empty;
-    errdefer {
-        for (list.items) |*p| p.regex.deinit();
-        list.deinit(a);
+fn parsePatternList(a: std.mem.Allocator, pats: []PatternJson) ![]CompiledPattern {
+    const list = try a.alloc(CompiledPattern, pats.len);
+    for (pats, list) |pat, *out| {
+        out.* = parseOnePattern(pat);
     }
-
-    const arr = if (val) |v| (if (v == .array) v.array.items else &[_]std.json.Value{}) else &[_]std.json.Value{};
-    for (arr) |pat| {
-        const compiled = try compileOnePattern(a, pat);
-        list.append(a, compiled) catch |err| {
-            var leaked = compiled;
-            leaked.regex.deinit();
-            return err;
-        };
-    }
-    return try list.toOwnedSlice(a);
+    return list;
 }
 
 /// Count compiled patterns across all loaded packs (post-init).
@@ -580,12 +791,130 @@ test "disabled pack suppresses default-enabled destructive match" {
     try std.testing.expect(disabled != .deny);
 }
 
+test "lazy compile still denies git reset and allows a keyword miss" {
+    try ensureInit();
+    const deny = matchCommandDetailed("git reset --hard");
+    try std.testing.expect(deny == .deny);
+    try std.testing.expectEqualStrings("core.git", deny.deny.pack_id);
+
+    const miss = matchCommandDetailed("echo hook-latency-keyword-miss");
+    try std.testing.expect(miss != .deny);
+}
+
+test "oracle json scanner finds four default packs" {
+    var n: usize = 0;
+    var pos = skipJsonWs(packs_json, 0);
+    try std.testing.expect(packs_json[pos] == '[');
+    pos += 1;
+    while (true) {
+        pos = skipJsonWs(packs_json, pos);
+        if (packs_json[pos] == ']') break;
+        if (packs_json[pos] == ',') {
+            pos += 1;
+            continue;
+        }
+        const end = matchingObjectEnd(packs_json, pos) orelse return error.TestUnexpectedResult;
+        const id = packIdFromObject(packs_json[pos..end]) orelse return error.TestUnexpectedResult;
+        if (isDefaultEnabled(id)) n += 1;
+        pos = end;
+    }
+    try std.testing.expectEqual(@as(usize, 4), n);
+}
+
+test "required prefix literal skips impossible regex compiles" {
+    try std.testing.expectEqualStrings("rm", requiredPrefixLiteral("^rm\\s+-rf").?);
+    try std.testing.expectEqualStrings("find", requiredPrefixLiteral("^find\\s+/tmp").?);
+    try std.testing.expect(requiredPrefixLiteral("\\bcp\\b") == null);
+    try std.testing.expect(requiredPrefixLiteral("(?i)rm") == null);
+    try std.testing.expect(!patternMightMatch("^find\\s+", "rm -rf /"));
+    try std.testing.expect(patternMightMatch("^rm\\s+", "rm -rf /"));
+    try std.testing.expect(patternMightMatch("rm\\s+-[a-zA-Z]*[rR]", "rm -rf /"));
+    try std.testing.expect(!safePatternMightMatch("^rm\\s+/tmp/", "rm -rf /"));
+    try std.testing.expect(safePatternMightMatch("^rm\\s+/tmp/", "rm -rf /tmp/foo"));
+}
+
+test "depth-0 alternation after prefix still denies del" {
+    // Skipping a destructive compile is an allow if nothing else hits.
+    // `^rm|del` extracts prefix "rm"; without a depth-0 `|` guard the
+    // heuristic would skip `del /s /q C:\` and fail open.
+    const cmd = "del /s /q C:\\";
+    try std.testing.expect(patternMightMatch("^rm|del", cmd));
+    var re = try regex_pcre.Regex.compile("^rm|del");
+    defer re.deinit();
+    try std.testing.expect(try re.isMatch(cmd));
+}
+
+test "packIdFromObject requires compact id-first and ignores nested id" {
+    try std.testing.expectEqualStrings("core.git", packIdFromObject("{\"id\":\"core.git\",\"keywords\":[]}").?);
+    try std.testing.expect(packIdFromObject("{\"keywords\":[],\"meta\":{\"id\":\"nested\"},\"id\":\"core.git\"}") == null);
+    try std.testing.expect(packIdFromObject("{\"name\":\"x\",\"id\":\"core.git\"}") == null);
+}
+
 test "match infrastructure error hit is deny not allow_miss" {
-    // Contract: matchInfraDeny is what matchCommandDetailedOpts returns on isMatch error.
+    // Contract: matchInfraDeny is what matchCommandDetailedOpts returns on isMatch error
+    // and when the registry is empty after a failed/abandoned init.
     const r = matchInfraDeny();
     try std.testing.expect(r == .deny);
     try std.testing.expectEqualStrings("pcre-match-error", r.deny.pattern_name);
     try std.testing.expect(r.deny.severity == .critical);
+}
+
+fn expectMatchEqual(lazy: MatchResult, eager: MatchResult) !void {
+    try std.testing.expectEqual(std.meta.activeTag(lazy), std.meta.activeTag(eager));
+    if (lazy == .deny) {
+        try std.testing.expectEqualStrings(eager.deny.pack_id, lazy.deny.pack_id);
+        try std.testing.expectEqualStrings(eager.deny.pattern_name, lazy.deny.pattern_name);
+    }
+}
+
+const prefix_gate_oracle_commands = [_][]const u8{
+    "git status",
+    "git push",
+    "git push origin main",
+    "git push --force",
+    "git push --force-with-lease origin main",
+    "git reset --hard",
+    "rm -rf /",
+    "rm -rf /tmp/foo",
+    "echo hello",
+    "ls",
+    "pwd",
+    "mkfs.ext4 /dev/sda1",
+    "docker system prune",
+    "find /tmp -delete",
+    "chmod 777 /etc/passwd",
+};
+
+test "lazy prefix skip equals eager compile on default packs" {
+    try ensureInitDefault();
+    const opts = MatchOptions{};
+    for (prefix_gate_oracle_commands) |cmd| {
+        const lazy = matchCommandDetailedOptsWithGates(cmd, opts, true);
+        const eager = matchCommandDetailedOptsWithGates(cmd, opts, false);
+        expectMatchEqual(lazy, eager) catch |err| {
+            std.debug.print("default-pack lazy/eager mismatch for `{s}`\n", .{cmd});
+            return err;
+        };
+    }
+}
+
+test "lazy prefix skip equals eager compile on full oracle" {
+    try ensureFullInit();
+    const opts = MatchOptions{ .default_packs_only = false };
+    for (prefix_gate_oracle_commands) |cmd| {
+        const lazy = matchCommandDetailedOptsWithGates(cmd, opts, true);
+        const eager = matchCommandDetailedOptsWithGates(cmd, opts, false);
+        expectMatchEqual(lazy, eager) catch |err| {
+            std.debug.print("full-oracle lazy/eager mismatch for `{s}`\n", .{cmd});
+            return err;
+        };
+    }
+
+    const extra = MatchOptions{ .extra_enabled = &.{"containers.docker"} };
+    const lazy_docker = matchCommandDetailedOptsWithGates("docker system prune", extra, true);
+    const eager_docker = matchCommandDetailedOptsWithGates("docker system prune", extra, false);
+    try expectMatchEqual(lazy_docker, eager_docker);
+    try std.testing.expect(lazy_docker == .deny);
 }
 
 // ── s-engine: MatchOptions.skipped_rule_ids (E8 skip-this-rule only) ─────────

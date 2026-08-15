@@ -365,6 +365,12 @@ fn runWithCwdUsing(
     const global_args = try parseGlobalArgs(allocator, argv_input);
     defer if (global_args.owned) allocator.free(global_args.argv);
     const argv = global_args.argv;
+    // Named `ryk hook` never uses the human banner/theme path. Skip that setup
+    // so each host event process does less work. Bare `ryk` stays on the #159
+    // path below — do not call agent_hook.command here (stdin is consumed once).
+    if (argv.len > 0 and std.mem.eql(u8, argv[0], "hook")) {
+        return hook.command(io, argv[1..], stdout, stderr);
+    }
     const no_rich_env = tui.output_policy.envDisablesRich(
         environ_map.get("RYK_NO_RICH"),
     );
