@@ -813,6 +813,9 @@ fn commandWithStdioAndEnv(io: std.Io, argv: []const []const u8, stdout: anytype,
         os_attach_planned: bool = false,
         /// Prepared mechanism for session-level backend requirements.
         os_attach_kind: sandbox.apply.ChildApplyKind = .none,
+        /// Identity-verified host launch (`resolveHostIdentity` + launch alias).
+        /// Skip shell-command eval of argv0; plugin hooks mediate the host.
+        trusted_agent_host: bool = false,
 
         pub fn beforeProcessLaunch(context: *anyopaque, session: core.session.Session) !void {
             const self: *@This() = @ptrCast(@alignCast(context));
@@ -841,6 +844,27 @@ fn commandWithStdioAndEnv(io: std.Io, argv: []const []const u8, stdout: anytype,
 
             var rust_metadata: core.event.EventMetadata = .{};
             defer rust_metadata.deinit(self.allocator);
+
+            // Product host launch is not a user shell command. Only skip when
+            // launch identity is already a trusted host alias (F-02). Basename
+            // `./hermes` / `/tmp/evil/hermes` stays on the command-guard path.
+            if (self.trusted_agent_host) {
+                const allow_decision = core.decision.Decision{
+                    .result = .allow,
+                    .reason = "trusted host launch",
+                    .ci_may_proceed = true,
+                };
+                telemetry.recordEnforcement(
+                    "run",
+                    null,
+                    "allow",
+                    "low",
+                    "shell",
+                    self.effective_mode.toString(),
+                );
+                try self.auditCommandEvent(session, .command_allowed, rust_visibility.target_summary_shell, allow_decision, rust_metadata);
+                return;
+            }
 
             const audit_options = shell_eval.ShellAuditOptions{
                 .io = self.audit_context.io,
@@ -1186,6 +1210,7 @@ fn commandWithStdioAndEnv(io: std.Io, argv: []const []const u8, stdout: anytype,
         // PATH honesty only when child will actually OS-attach (not soft-degraded unboxed).
         .os_attach_planned = apply_result.requiresChildApply(),
         .os_attach_kind = apply_result.childApplyKind(),
+        .trusted_agent_host = trusted_agent_host,
     };
     // Fail closed if proxy dies when policy/backend requires it, session is
     // route-forced onto the proxy port (M-7), or host-alias mediation is active.
@@ -3328,6 +3353,224 @@ test "workspace basename spoof does not empty-backpack without secretless" {
     const ran = try tmp.dir.readFileAlloc(std.testing.io, "child-out.txt", std.testing.allocator, .limited(64));
     defer std.testing.allocator.free(ran);
     try std.testing.expect(std.mem.indexOf(u8, ran, "ran") != null);
+}
+
+test "trusted host alias launch is not CommandDenied under strict/unattended commands-default-deny" {
+    // Product path only: exact alias token + resolveHostIdentity trusted.
+    // evaluateCommand must not run (deny evaluator + strict permit would block).
+    // Bare `ryk hermes` rewrites to `ryk run -- hermes` via host_launch.buildRunArgv.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const process_home = if (std.c.getenv("HOME")) |h| std.mem.span(h) else return error.SkipZigTest;
+    if (!std.fs.path.isAbsolute(process_home) or
+        std.mem.eql(u8, process_home, "/tmp") or
+        std.mem.startsWith(u8, process_home, "/tmp/") or
+        std.mem.eql(u8, process_home, "/workspace") or
+        std.mem.startsWith(u8, process_home, "/workspace/"))
+        return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    {
+        const policy_file = try tmp.dir.createFile(io, "policy.yaml", .{});
+        defer policy_file.close(io);
+        try policy_file.writeStreamingAll(io,
+            \\version: 1
+            \\mode: strict
+            \\env:
+            \\  inherit: true
+            \\commands:
+            \\  default: deny
+            \\  allow:
+            \\    - "git status"
+            \\    - "ls *"
+            \\    - "pwd"
+            \\
+        );
+    }
+    const policy_path = try tmp.dir.realPathFileAlloc(io, "policy.yaml", allocator);
+    defer allocator.free(policy_path);
+
+    // Managed $HOME/.local/bin is trusted without RYK_TRUSTED_HOST_PREFIXES.
+    // std.testing.tmpDir is often under /tmp; isTmpPath rejects that before inject.
+    const fixture_home = try std.fs.path.join(allocator, &.{ process_home, ".cache", "ryk-pr173-trusted-home" });
+    defer {
+        std.Io.Dir.cwd().deleteTree(io, fixture_home) catch {};
+        allocator.free(fixture_home);
+    }
+    std.Io.Dir.cwd().deleteTree(io, fixture_home) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, fixture_home);
+    var home_dir = try std.Io.Dir.cwd().openDir(io, fixture_home, .{});
+    defer home_dir.close(io);
+    try home_dir.createDirPath(io, ".local/bin");
+    var bin_dir = try home_dir.openDir(io, ".local/bin", .{});
+    defer bin_dir.close(io);
+    for (host_launch.host_launch_aliases) |host| {
+        const script = try bin_dir.createFile(io, host, .{});
+        defer script.close(io);
+        try script.writeStreamingAll(io,
+            \\#!/bin/sh
+            \\exit 0
+            \\
+        );
+        try bin_dir.setFilePermissions(io, host, @enumFromInt(0o755), .{});
+    }
+    const bin_path = try std.fs.path.join(allocator, &.{ fixture_home, ".local/bin" });
+    defer allocator.free(bin_path);
+
+    var current = std.process.Environ.Map.init(allocator);
+    defer current.deinit();
+    const path_env = try std.fmt.allocPrint(allocator, "{s}:/usr/bin:/bin", .{bin_path});
+    defer allocator.free(path_env);
+    try current.put("PATH", path_env);
+    try current.put("HOME", fixture_home);
+
+    // supervisor.spawnPlain looks up bare argv0 on the *process* PATH.
+    // Identity already used current_env; keep them aligned so the exact token
+    // launches without OS-attach argv0 absolute-ize (sandbox off).
+    const previous_path = std.c.getenv("PATH");
+    const prev_path_owned: ?[:0]const u8 = if (previous_path) |p|
+        try allocator.dupeZ(u8, std.mem.span(p))
+    else
+        null;
+    defer if (prev_path_owned) |o| allocator.free(o);
+    const path_z = try allocator.dupeZ(u8, path_env);
+    defer allocator.free(path_z);
+    try std.testing.expectEqual(@as(c_int, 0), setenv("PATH", path_z.ptr, 1));
+    defer {
+        if (prev_path_owned) |o| {
+            _ = setenv("PATH", o.ptr, 1);
+        } else {
+            _ = unsetenv("PATH");
+        }
+    }
+
+    for (host_launch.host_launch_aliases) |host| {
+        var stdout_buf: [4096]u8 = undefined;
+        var stderr_buf: [4096]u8 = undefined;
+        var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+        var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+        // Deny evaluator: if evaluateCommand runs, launch is CommandDenied.
+        const code = try commandForTestWithEnvAndShellEvaluator(
+            &.{
+                "--workspace",         root,
+                "--policy",            policy_path,
+                "--mode",              "strict",
+                "--with-host-secrets",
+                "--network",           "open",
+                "--os-sandbox",        "off",
+                "--",
+                host,
+            },
+            &stdout_writer,
+            &stderr_writer,
+            .ignore,
+            &current,
+            shell_eval.mockDaemonDenyEvaluator,
+        );
+        if (code != exit_codes.success) {
+            std.debug.print(
+                "trusted host {s} exited {d}\nstderr: {s}\nstdout: {s}\n",
+                .{ host, code, stderr_writer.buffered(), stdout_writer.buffered() },
+            );
+        }
+        try std.testing.expectEqual(exit_codes.success, code);
+        try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "ryk blocked") == null);
+    }
+}
+
+test "planted host-alias basename paths stay CommandDenied under strict/unattended" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    {
+        const policy_file = try tmp.dir.createFile(std.testing.io, "policy.yaml", .{});
+        defer policy_file.close(std.testing.io);
+        try policy_file.writeStreamingAll(std.testing.io,
+            \\version: 1
+            \\mode: strict
+            \\env:
+            \\  inherit: true
+            \\commands:
+            \\  default: deny
+            \\  allow:
+            \\    - "git status"
+            \\    - "ls *"
+            \\    - "pwd"
+            \\
+        );
+    }
+    const policy_path = try tmp.dir.realPathFileAlloc(std.testing.io, "policy.yaml", std.testing.allocator);
+    defer std.testing.allocator.free(policy_path);
+    {
+        const script = try tmp.dir.createFile(std.testing.io, "hermes", .{});
+        defer script.close(std.testing.io);
+        try script.writeStreamingAll(std.testing.io,
+            \\#!/bin/sh
+            \\exit 0
+            \\
+        );
+        try tmp.dir.setFilePermissions(std.testing.io, "hermes", @enumFromInt(0o755), .{});
+    }
+    const workspace_plant = try tmp.dir.realPathFileAlloc(std.testing.io, "hermes", std.testing.allocator);
+    defer std.testing.allocator.free(workspace_plant);
+
+    var evil_tmp = std.testing.tmpDir(.{});
+    defer evil_tmp.cleanup();
+    {
+        const script = try evil_tmp.dir.createFile(std.testing.io, "hermes", .{});
+        defer script.close(std.testing.io);
+        try script.writeStreamingAll(std.testing.io,
+            \\#!/bin/sh
+            \\exit 0
+            \\
+        );
+        try evil_tmp.dir.setFilePermissions(std.testing.io, "hermes", @enumFromInt(0o755), .{});
+    }
+    const tmp_plant = try evil_tmp.dir.realPathFileAlloc(std.testing.io, "hermes", std.testing.allocator);
+    defer std.testing.allocator.free(tmp_plant);
+
+    var current = std.process.Environ.Map.init(std.testing.allocator);
+    defer current.deinit();
+    try current.put("PATH", "/usr/bin:/bin");
+    try current.put("HOME", root);
+
+    const Case = struct { argv: []const []const u8, evaluator: shell_eval.ShellCommandEvaluatorFn };
+    const cases = [_]Case{
+        .{ .argv = &.{ "--workspace", root, "--policy", policy_path, "--mode", "strict", "--os-sandbox", "off", "--", "./hermes" }, .evaluator = shell_eval.mockDaemonAllowEvaluator },
+        .{ .argv = &.{ "--workspace", root, "--policy", policy_path, "--mode", "strict", "--os-sandbox", "off", "--", tmp_plant }, .evaluator = shell_eval.mockDaemonAllowEvaluator },
+        .{ .argv = &.{ "--workspace", root, "--policy", policy_path, "--mode", "strict", "--os-sandbox", "off", "--", workspace_plant }, .evaluator = shell_eval.mockDaemonAllowEvaluator },
+        .{ .argv = &.{ "--workspace", root, "--policy", policy_path, "--mode", "strict", "--os-sandbox", "off", "--", "rm", "-rf", "/" }, .evaluator = shell_eval.mockDaemonDenyEvaluator },
+        .{ .argv = &.{ "--workspace", root, "--policy", policy_path, "--mode", "strict", "--os-sandbox", "off", "--", "git", "push", "--force" }, .evaluator = shell_eval.mockDaemonDenyEvaluator },
+    };
+    for (cases) |case| {
+        var stdout_buf: [4096]u8 = undefined;
+        var stderr_buf: [4096]u8 = undefined;
+        var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+        var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+        const code = try commandForTestWithEnvAndShellEvaluator(
+            case.argv,
+            &stdout_writer,
+            &stderr_writer,
+            .ignore,
+            &current,
+            case.evaluator,
+        );
+        if (code != exit_codes.denial) {
+            std.debug.print(
+                "planted argv0={s} exited {d}\nstderr: {s}\n",
+                .{ case.argv[case.argv.len - 1], code, stderr_writer.buffered() },
+            );
+        }
+        try std.testing.expectEqual(exit_codes.denial, code);
+    }
 }
 
 test "writeSessionPosture attests boundary sandbox gateway and escape truthfully" {
