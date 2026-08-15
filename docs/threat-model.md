@@ -60,5 +60,6 @@ Strict and CI modes reject invalid policies, malformed untrusted input, unsuppor
 - A user can approve an unsafe action.
 - A host can treat hook output as advisory rather than blocking.
 - A local actor who rewrites both the audit event log and the session summary can produce a new internally consistent hash chain. Detecting that rewrite is out of scope; copy the printed session-end chain hash out of band if you need an external check.
+- Product evaluate realpaths `XDG_CONFIG_HOME` / `HOME` before loading user `allowlist.toml` and skips a candidate under the workspace (unresolved paths are treated as inside). Poisoned XDG falls back to HOME only if HOME is outside the workspace; if both are poisoned there is no user store. Allow-once remains gated by the caller OS-sandbox flag (no HOME write-probe).
 
 For implementation-specific residuals, read the platform notes and run `ryk doctor` on the machine that will run the agent.

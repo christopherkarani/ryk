@@ -33,6 +33,53 @@ pub fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
     return std.ascii.eqlIgnoreCase(a, b);
 }
 
+/// True when `path` is `root` or a descendant, using `/` or `\` as the boundary.
+/// Rejects `/repo` matching `/repo-other`. Empty root never matches.
+/// Lexical only — does not follow symlinks. Use `pathIsUnderRootResolved` when
+/// the path may be a symlink or `..` into `root`.
+pub fn pathIsUnderRoot(root: []const u8, path: []const u8) bool {
+    if (root.len == 0 or path.len == 0) return false;
+    if (std.mem.eql(u8, root, path)) return true;
+    if (path.len <= root.len) return false;
+    if (!std.mem.startsWith(u8, path, root)) return false;
+    const last = root[root.len - 1];
+    if (last == '/' or last == '\\') return true;
+    const next = path[root.len];
+    return next == '/' or next == '\\';
+}
+
+/// Quiet realpath. Null on any failure (including EPERM under Seatbelt) so
+/// callers can fail closed without Debug errno spam.
+pub fn realpathOrNull(allocator: std.mem.Allocator, path: []const u8) error{OutOfMemory}!?[]u8 {
+    if (@import("builtin").os.tag == .windows) {
+        var threaded: std.Io.Threaded = .init_single_threaded;
+        const io = threaded.io();
+        const resolved_z = std.Io.Dir.cwd().realPathFileAlloc(io, path, allocator) catch return null;
+        defer allocator.free(resolved_z);
+        return try allocator.dupe(u8, resolved_z);
+    }
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+    var buf: [std.posix.PATH_MAX]u8 = undefined;
+    const rc = std.c.realpath(path_z.ptr, &buf) orelse return null;
+    return try allocator.dupe(u8, std.mem.span(rc));
+}
+
+/// True when `path` is inside `root` after resolving both through the real
+/// filesystem (symlinks, `.`, `..`). If `root` or `path` cannot be resolved,
+/// returns true so callers that reject in-workspace stores fail closed.
+pub fn pathIsUnderRootResolved(
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    path: []const u8,
+) error{OutOfMemory}!bool {
+    const resolved_root = (try realpathOrNull(allocator, root)) orelse return true;
+    defer allocator.free(resolved_root);
+    const resolved_path = (try realpathOrNull(allocator, path)) orelse return true;
+    defer allocator.free(resolved_path);
+    return pathIsUnderRoot(resolved_root, resolved_path);
+}
+
 pub fn dupBoundedUtf8(allocator: std.mem.Allocator, input: []const u8, max_len: usize) ![]u8 {
     if (input.len > max_len) return errors.RykError.InputTooLarge;
     if (!std.unicode.utf8ValidateSlice(input)) return errors.RykError.InvalidUtf8;
@@ -92,6 +139,49 @@ test "bounded utf8 duplication rejects oversized or invalid input" {
     try std.testing.expectEqualStrings("ryk", copied);
     try std.testing.expectError(error.InputTooLarge, dupBoundedUtf8(allocator, "too long", 3));
     try std.testing.expectError(error.InvalidUtf8, dupBoundedUtf8(allocator, &.{0xff}, 3));
+}
+
+test "pathIsUnderRoot requires a separator boundary" {
+    try std.testing.expect(pathIsUnderRoot("/repo", "/repo"));
+    try std.testing.expect(pathIsUnderRoot("/repo", "/repo/allowlist.toml"));
+    try std.testing.expect(pathIsUnderRoot("/repo/", "/repo/nested"));
+    try std.testing.expect(!pathIsUnderRoot("/repo", "/repo-other/allowlist.toml"));
+    try std.testing.expect(!pathIsUnderRoot("/repo", "/tmp/allowlist.toml"));
+    try std.testing.expect(!pathIsUnderRoot("", "/repo/x"));
+    try std.testing.expect(pathIsUnderRoot("C:\\ws", "C:\\ws\\ryk\\allowlist.toml"));
+    try std.testing.expect(!pathIsUnderRoot("C:\\ws", "C:\\ws-other\\ryk"));
+}
+
+test "pathIsUnderRootResolved follows a symlink into root and fails closed when unresolved" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var root_tmp = std.testing.tmpDir(.{});
+    defer root_tmp.cleanup();
+    var outside_tmp = std.testing.tmpDir(.{});
+    defer outside_tmp.cleanup();
+
+    const root = try root_tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const outside = try outside_tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(outside);
+
+    const link = try std.fs.path.join(allocator, &.{ outside, "xdg" });
+    defer allocator.free(link);
+    std.Io.Dir.cwd().symLink(io, root, link, .{ .is_directory = true }) catch |err| switch (err) {
+        error.AccessDenied, error.PermissionDenied => return error.SkipZigTest,
+        else => return err,
+    };
+
+    try std.testing.expect(!pathIsUnderRoot(root, link));
+    try std.testing.expect(try pathIsUnderRootResolved(allocator, root, link));
+    try std.testing.expect(!try pathIsUnderRootResolved(allocator, root, outside));
+
+    const missing = try std.fs.path.join(allocator, &.{ outside, "does-not-exist" });
+    defer allocator.free(missing);
+    try std.testing.expect(try pathIsUnderRootResolved(allocator, root, missing));
 }
 
 test "json string writer escapes bounded values" {

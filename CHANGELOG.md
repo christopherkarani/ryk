@@ -23,6 +23,7 @@
 ### Security
 
 * **Product evaluate ignores `allow_once.jsonl` unless the session OS sandbox is active.** Hook/run/shim used to always load `$XDG_DATA_HOME/ryk/allow_once.jsonl` (or `~/.local/share/ryk/allow_once.jsonl`). Redeem is TTY-bound (`ryk allow-once`), but consume is "read the JSONL" — a same-UID agent on a hook-only session (no OS sandbox) could append a well-formed grant and the next evaluate allowed. Product evaluate now sets `allow_once_path = null` unless the caller marks OS sandbox active (`ryk run` passes `requiresChildApply()`). Hook/shim do not infer active from a `$HOME` write-probe (an agent can point `HOME` at an unwritable path and plant the grant under `XDG_DATA_HOME`). Operator redeem/list/clear is unchanged.
+* **User `allowlist.toml` rejects poisoned XDG/HOME.** Product evaluate realpaths both the workspace root and `XDG_CONFIG_HOME` / `HOME` before the under-root check (unresolved paths are treated as inside and skipped). A workspace-planted or symlink/`..` XDG cannot load a user-layer `allowlist.toml`. Poisoned XDG falls back to HOME only if HOME is outside the workspace; if both are poisoned the resolver returns null (no user store).
 
 ### Fixed
 

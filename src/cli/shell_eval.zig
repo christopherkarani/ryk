@@ -93,18 +93,58 @@ pub const ProductShellStores = struct {
     }
 };
 
+/// Join `dir_parts` under a realpath'd `dir` that is outside `workspace_root`.
+/// Realpaths both sides before the under-root check; unresolved paths are
+/// treated as inside and skipped. Does not realpath the joined file (it often
+/// does not exist yet).
+fn joinUserAllowlistFromDir(
+    allocator: std.mem.Allocator,
+    workspace_root: []const u8,
+    dir: []const u8,
+    dir_parts: []const []const u8,
+) error{OutOfMemory}!?[]u8 {
+    if (try core.util.pathIsUnderRootResolved(allocator, workspace_root, dir)) return null;
+    const canon = (try core.util.realpathOrNull(allocator, dir)) orelse return null;
+    defer allocator.free(canon);
+
+    var parts_buf: [6][]const u8 = undefined;
+    if (dir_parts.len + 1 > parts_buf.len) return error.OutOfMemory;
+    parts_buf[0] = canon;
+    for (dir_parts, 0..) |part, i| parts_buf[i + 1] = part;
+    const path = try std.fs.path.join(allocator, parts_buf[0 .. dir_parts.len + 1]);
+
+    const ws = (try core.util.realpathOrNull(allocator, workspace_root)) orelse {
+        allocator.free(path);
+        return null;
+    };
+    defer allocator.free(ws);
+    if (core.util.pathIsUnderRoot(ws, path)) {
+        allocator.free(path);
+        return null;
+    }
+    return path;
+}
+
 /// Match CLI empty checks: empty `XDG_CONFIG_HOME` falls back to HOME (not join under "").
-fn resolveUserAllowlistPath(allocator: std.mem.Allocator) error{OutOfMemory}!?[]u8 {
+/// Realpath both workspace_root and XDG/HOME before the under-root check
+/// (unresolved = inside / skip) so a workspace-planted or symlink/`..` XDG
+/// cannot load `allowlist.toml`. Poisoned XDG falls back to HOME only if HOME
+/// is outside the workspace; if both are poisoned the resolver returns null.
+fn resolveUserAllowlistPath(allocator: std.mem.Allocator, workspace_root: []const u8) error{OutOfMemory}!?[]u8 {
     if (std.c.getenv("XDG_CONFIG_HOME")) |xdg_z| {
         const xdg = std.mem.span(xdg_z);
         if (xdg.len > 0) {
-            return try std.fs.path.join(allocator, &.{ xdg, "ryk", "allowlist.toml" });
+            if (try joinUserAllowlistFromDir(allocator, workspace_root, xdg, &.{ "ryk", "allowlist.toml" })) |path| {
+                return path;
+            }
         }
     }
     if (std.c.getenv("HOME")) |home_z| {
         const home = std.mem.span(home_z);
         if (home.len > 0) {
-            return try std.fs.path.join(allocator, &.{ home, ".config", "ryk", "allowlist.toml" });
+            if (try joinUserAllowlistFromDir(allocator, workspace_root, home, &.{ ".config", "ryk", "allowlist.toml" })) |path| {
+                return path;
+            }
         }
     }
     return null;
@@ -140,8 +180,11 @@ fn resolveAllowOnceJsonlPath(allocator: std.mem.Allocator) error{OutOfMemory}!?[
 /// evaluate paths (hook/run/shim, `ryk test`, `ryk explain`).
 ///
 /// - Project file: `<workspace>/.ryk/allowlist.toml`
-/// - User file: `$XDG_CONFIG_HOME/ryk/allowlist.toml` or `~/.config/ryk/allowlist.toml`
-///   (empty `XDG_CONFIG_HOME` falls back to HOME, matching allowlist CLI)
+/// - User file: `$XDG_CONFIG_HOME/ryk/allowlist.toml` or `$HOME/.config/ryk/allowlist.toml`
+///   (empty `XDG_CONFIG_HOME` falls back to HOME, matching allowlist CLI).
+///   Realpath both workspace_root and XDG/HOME before the under-root check
+///   (unresolved = inside / skip). Poisoned XDG falls back to HOME only if
+///   HOME is outside the workspace; if both are poisoned there is no user store.
 /// - Allow-once: `$XDG_DATA_HOME/ryk/allow_once.jsonl` or `~/.local/share/ryk/allow_once.jsonl`
 ///   (empty `XDG_DATA_HOME` falls back to HOME, matching allow-once CLI).
 ///   On product evaluate, `os_sandbox_active` must be true or the path is left
@@ -175,7 +218,7 @@ pub fn loadProductShellStores(
     };
     out.now_iso = out.now_iso_buf[0..iso.len];
 
-    const user_path = try resolveUserAllowlistPath(allocator);
+    const user_path = try resolveUserAllowlistPath(allocator, workspace_root);
     defer if (user_path) |p| allocator.free(p);
 
     const project_path = try std.fs.path.join(allocator, &.{ workspace_root, ".ryk", "allowlist.toml" });
@@ -3674,6 +3717,143 @@ test "s-product-wire: unwritable HOME plus planted XDG allow_once.jsonl still de
         std.Io.File.Permissions.fromMode(0o755),
         .{},
     ) catch {};
+
+    var parsed = try zigEvaluator(allocator, .{
+        .command = cmd,
+        .cwd = ws.root,
+        .workspace_root = ws.root,
+    });
+    defer parsed.deinit();
+    try std.testing.expectEqual(daemon.ResponseStatus.deny, daemon.responseStatus(parsed.value.result));
+    const got_reason = daemon.responseReason(parsed.value.result) orelse "";
+    try std.testing.expect(std.mem.indexOf(u8, got_reason, reason) == null);
+}
+
+test "s-product-wire: user allowlist under workspace XDG_CONFIG_HOME is ignored" {
+    const allocator = std.testing.allocator;
+    var xdg = try sProductWireIsolateXdg();
+    defer xdg.deinit();
+    var ws = try sProductWireGitWorkspace();
+    defer ws.deinit();
+
+    const planted = try sProductWireJoin(&.{ ws.root, ".xdg-config" });
+    defer allocator.free(planted);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, planted);
+    const planted_z = try allocator.dupeZ(u8, planted);
+    defer allocator.free(planted_z);
+    try std.testing.expectEqual(@as(c_int, 0), setenv("XDG_CONFIG_HOME", planted_z.ptr, 1));
+
+    var home_tmp = std.testing.tmpDir(.{});
+    defer home_tmp.cleanup();
+    const home_abs = try home_tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(home_abs);
+    const prev_home = try sProductWireDupEnvZ("HOME");
+    defer sProductWireRestoreEnv("HOME", prev_home);
+    const home_z = try allocator.dupeZ(u8, home_abs);
+    defer allocator.free(home_z);
+    try std.testing.expectEqual(@as(c_int, 0), setenv("HOME", home_z.ptr, 1));
+
+    const cmd = "git branch -D feature";
+    const reason = "workspace-xdg user allowlist must not unlock";
+    try sProductWireWriteUserCommandAllow(planted, cmd, reason);
+
+    var parsed = try zigEvaluator(allocator, .{
+        .command = cmd,
+        .cwd = ws.root,
+        .workspace_root = ws.root,
+    });
+    defer parsed.deinit();
+    try std.testing.expectEqual(daemon.ResponseStatus.deny, daemon.responseStatus(parsed.value.result));
+    const got_reason = daemon.responseReason(parsed.value.result) orelse "";
+    try std.testing.expect(std.mem.indexOf(u8, got_reason, reason) == null);
+}
+
+test "s-product-wire: user allowlist via XDG_CONFIG_HOME symlink into workspace is ignored" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var xdg = try sProductWireIsolateXdg();
+    defer xdg.deinit();
+    var ws = try sProductWireGitWorkspace();
+    defer ws.deinit();
+
+    var link_tmp = std.testing.tmpDir(.{});
+    defer link_tmp.cleanup();
+    const link_parent = try link_tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(link_parent);
+    const link_path = try sProductWireJoin(&.{ link_parent, "xdg" });
+    defer allocator.free(link_path);
+
+    const planted = try sProductWireJoin(&.{ ws.root, ".xdg-config" });
+    defer allocator.free(planted);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, planted);
+    std.Io.Dir.cwd().symLink(std.testing.io, planted, link_path, .{ .is_directory = true }) catch |err| switch (err) {
+        error.AccessDenied, error.PermissionDenied => return error.SkipZigTest,
+        else => return err,
+    };
+
+    try std.testing.expect(!core.util.pathIsUnderRoot(ws.root, link_path));
+    try std.testing.expect(try core.util.pathIsUnderRootResolved(allocator, ws.root, link_path));
+
+    const link_z = try allocator.dupeZ(u8, link_path);
+    defer allocator.free(link_z);
+    try std.testing.expectEqual(@as(c_int, 0), setenv("XDG_CONFIG_HOME", link_z.ptr, 1));
+
+    var home_tmp = std.testing.tmpDir(.{});
+    defer home_tmp.cleanup();
+    const home_abs = try home_tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(home_abs);
+    const prev_home = try sProductWireDupEnvZ("HOME");
+    defer sProductWireRestoreEnv("HOME", prev_home);
+    const home_z = try allocator.dupeZ(u8, home_abs);
+    defer allocator.free(home_z);
+    try std.testing.expectEqual(@as(c_int, 0), setenv("HOME", home_z.ptr, 1));
+
+    const cmd = "git branch -D feature";
+    const reason = "symlink-xdg user allowlist must not unlock";
+    try sProductWireWriteUserCommandAllow(planted, cmd, reason);
+
+    var parsed = try zigEvaluator(allocator, .{
+        .command = cmd,
+        .cwd = ws.root,
+        .workspace_root = ws.root,
+    });
+    defer parsed.deinit();
+    try std.testing.expectEqual(daemon.ResponseStatus.deny, daemon.responseStatus(parsed.value.result));
+    const got_reason = daemon.responseReason(parsed.value.result) orelse "";
+    try std.testing.expect(std.mem.indexOf(u8, got_reason, reason) == null);
+}
+
+test "s-product-wire: poisoned XDG_CONFIG_HOME and HOME yield no user allowlist" {
+    const allocator = std.testing.allocator;
+    var xdg = try sProductWireIsolateXdg();
+    defer xdg.deinit();
+    var ws = try sProductWireGitWorkspace();
+    defer ws.deinit();
+
+    const planted = try sProductWireJoin(&.{ ws.root, ".xdg-config" });
+    defer allocator.free(planted);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, planted);
+    const planted_z = try allocator.dupeZ(u8, planted);
+    defer allocator.free(planted_z);
+    try std.testing.expectEqual(@as(c_int, 0), setenv("XDG_CONFIG_HOME", planted_z.ptr, 1));
+
+    const prev_home = try sProductWireDupEnvZ("HOME");
+    defer sProductWireRestoreEnv("HOME", prev_home);
+    const home_z = try allocator.dupeZ(u8, ws.root);
+    defer allocator.free(home_z);
+    try std.testing.expectEqual(@as(c_int, 0), setenv("HOME", home_z.ptr, 1));
+
+    const cmd = "git branch -D feature";
+    const reason = "both-poisoned user allowlist must not unlock";
+    try sProductWireWriteUserCommandAllow(planted, cmd, reason);
+
+    var stores: ProductShellStores = .{};
+    try loadProductShellStores(std.testing.io, allocator, ws.root, &stores, false);
+    defer stores.deinit(allocator);
+    for (stores.permanent.entries) |e| {
+        try std.testing.expect(!(e.layer == .user and e.kind == .command));
+    }
 
     var parsed = try zigEvaluator(allocator, .{
         .command = cmd,
