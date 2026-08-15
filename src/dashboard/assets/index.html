@@ -23,6 +23,7 @@
           <button class="nav-item active" type="button" data-view="overview">Overview</button>
           <button class="nav-item" type="button" data-view="secretless" data-workspace-only>Secretless</button>
           <button class="nav-item" type="button" data-view="activity">Activity</button>
+          <button class="nav-item" type="button" data-view="terminal">Terminal</button>
           <button class="nav-item" type="button" data-view="policy" data-workspace-only>Policy</button>
           <button class="nav-item" type="button" data-view="integrations" data-workspace-only>Integrations</button>
         </nav>
@@ -236,6 +237,30 @@
               <span class="caption">Sessions, prompt reviews, tool vetoes, and subagents</span>
             </div>
             <div class="timeline" id="hermesActivity"></div>
+          </section>
+        </section>
+
+        <section class="view" data-view-panel="terminal" aria-labelledby="terminal-title">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">Local evidence</p>
+              <h3 id="terminal-title" class="section-title">Blocked command stream</h3>
+              <p class="caption">localhost only. Denied shell and tool calls from this machine. An empty feed stays empty.</p>
+            </div>
+            <div class="topbar-actions">
+              <span class="pill" id="terminalSourcePill">Empty</span>
+              <button class="button secondary" type="button" id="terminalDemoButton">Load demo</button>
+            </div>
+          </div>
+          <div class="metric-grid" id="terminalStats"></div>
+          <div class="host-filter" id="terminalHostFilter" role="toolbar" aria-label="Filter terminal by host"></div>
+          <section class="blocked-terminal" aria-labelledby="terminal-chrome-title">
+            <div class="blocked-terminal-chrome">
+              <div class="dots" aria-hidden="true"><span></span><span></span><span></span></div>
+              <h4 id="terminal-chrome-title">localhost — blocked command stream</h4>
+              <span class="chrome-right" id="terminalChromeStatus">idle</span>
+            </div>
+            <div class="blocked-terminal-body" id="terminalStream" tabindex="0"></div>
           </section>
         </section>
 

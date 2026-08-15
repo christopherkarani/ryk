@@ -173,6 +173,9 @@ const DashboardOptions = struct {
     port: u16 = default_port,
     once: bool = false,
     workspace: ?[]const u8 = null,
+    view: []const u8 = "overview",
+    demo: bool = false,
+    cloud: bool = false,
 };
 
 const DashboardContext = struct {
@@ -201,6 +204,46 @@ pub fn command(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: an
 
 pub fn commandForTest(argv: []const []const u8, stdout: anytype, stderr: anytype) !u8 {
     return command(std.testing.io, argv, stdout, stderr);
+}
+
+pub fn commandCloud(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: anytype) !u8 {
+    if (comptime builtin.os.tag == .windows) return exit_codes.unsupported;
+    if (argv.len > 0 and (std.mem.eql(u8, argv[0], "--help") or std.mem.eql(u8, argv[0], "-h"))) {
+        _ = try help.writeCommand(io, stdout, "cloud");
+        return exit_codes.success;
+    }
+    var options = parseOptions(io, argv, stdout, stderr) catch |err| switch (err) {
+        error.HelpShown => return exit_codes.success,
+        error.Usage => return exit_codes.usage,
+        else => return err,
+    };
+    applyCloudAlias(&options);
+    return serve(io, options, stdout, stderr);
+}
+
+fn applyCloudAlias(options: *DashboardOptions) void {
+    options.cloud = true;
+    if (std.mem.eql(u8, options.view, "overview")) options.view = "terminal";
+}
+
+fn effectiveView(options: DashboardOptions) []const u8 {
+    if (options.cloud and std.mem.eql(u8, options.view, "overview")) return "terminal";
+    if (options.demo and std.mem.eql(u8, options.view, "overview")) return "terminal";
+    return options.view;
+}
+
+fn formatListenUrl(buf: []u8, options: DashboardOptions) ![]u8 {
+    const view = effectiveView(options);
+    if (std.mem.eql(u8, view, "terminal")) {
+        if (options.demo) {
+            return std.fmt.bufPrint(buf, "http://{s}:{d}/terminal/?demo=1", .{ options.host, options.port });
+        }
+        return std.fmt.bufPrint(buf, "http://{s}:{d}/terminal/", .{ options.host, options.port });
+    }
+    if (std.mem.eql(u8, view, "activity")) {
+        return std.fmt.bufPrint(buf, "http://{s}:{d}/activity/", .{ options.host, options.port });
+    }
+    return std.fmt.bufPrint(buf, "http://{s}:{d}/", .{ options.host, options.port });
 }
 
 fn parseOptions(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: anytype) !DashboardOptions {
@@ -245,13 +288,26 @@ fn parseOptions(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: a
             explicit_workspace = argv[index];
         } else if (std.mem.eql(u8, arg, "--machine")) {
             explicit_machine = true;
+        } else if (std.mem.eql(u8, arg, "--view")) {
+            index += 1;
+            if (index >= argv.len or argv[index].len == 0) {
+                try stderr.writeAll("ryk dashboard: --view requires overview, activity, or terminal.\n");
+                return error.Usage;
+            }
+            if (!std.mem.eql(u8, argv[index], "overview") and !std.mem.eql(u8, argv[index], "activity") and !std.mem.eql(u8, argv[index], "terminal")) {
+                try stderr.writeAll("ryk dashboard: --view must be overview, activity, or terminal.\n");
+                return error.Usage;
+            }
+            options.view = argv[index];
+        } else if (std.mem.eql(u8, arg, "--demo")) {
+            options.demo = true;
         } else {
             const suggestions = @import("suggestions.zig");
             suggestions.writeUnknownOption(
                 stderr,
                 "ryk dashboard",
                 arg,
-                &.{ "--host", "--port", "--once", "--workspace", "--machine", "--help" },
+                &.{ "--host", "--port", "--once", "--workspace", "--machine", "--view", "--demo", "--help" },
                 "dashboard",
             ) catch {};
             return error.Usage;
@@ -285,7 +341,20 @@ fn serve(io: std.Io, options: DashboardOptions, stdout: anytype, stderr: anytype
     };
     defer server.deinit(io);
     const mode_label: []const u8 = if (options.workspace != null) "workspace" else "machine";
-    try stdout.print("ryk dashboard listening at http://{s}:{d} ({s} mode)\n", .{ options.host, options.port, mode_label });
+    var url_buf: [128]u8 = undefined;
+    const listen_url = formatListenUrl(&url_buf, options) catch {
+        try stderr.writeAll("ryk dashboard: failed to format listen URL.\n");
+        return exit_codes.general;
+    };
+    if (options.cloud) {
+        try stdout.print("ryk cloud listening at {s} ({s} mode)\n", .{ listen_url, mode_label });
+        try stdout.writeAll("localhost only — blocked-command evidence from this machine. Not a hosted control plane.\n");
+        if (options.demo) {
+            try stdout.writeAll("DEMO fixture stream requested. An empty live feed stays empty unless you pass --demo.\n");
+        }
+    } else {
+        try stdout.print("ryk dashboard listening at {s} ({s} mode)\n", .{ listen_url, mode_label });
+    }
     if (options.once) {
         try stdout.print("Waiting for one request. Press Ctrl-C to cancel. Idle timeout: {d}s.\n", .{once_idle_timeout_ms / 1000});
     }
@@ -1341,4 +1410,46 @@ test "dashboard request source accepts loopback and rejects rebinding origins" {
 test "dashboard --once has a bounded idle timeout" {
     try std.testing.expect(once_idle_timeout_ms <= 30_000);
     try std.testing.expect(once_idle_timeout_ms >= 1_000);
+}
+
+test "dashboard parses --view terminal and --demo without inventing a remote plane" {
+    var stdout_buf: [256]u8 = undefined;
+    var stderr_buf: [256]u8 = undefined;
+    var stdout: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr: std.Io.Writer = .fixed(&stderr_buf);
+    const terminal = try parseOptions(std.testing.io, &.{ "--view", "terminal", "--demo" }, &stdout, &stderr);
+    try std.testing.expectEqualStrings("terminal", terminal.view);
+    try std.testing.expect(terminal.demo);
+    try std.testing.expect(!terminal.cloud);
+    try std.testing.expectError(error.Usage, parseOptions(std.testing.io, &.{ "--view", "remote" }, &stdout, &stderr));
+}
+
+test "ryk cloud is a localhost dashboard alias for the terminal view" {
+    var stdout_buf: [256]u8 = undefined;
+    var stderr_buf: [256]u8 = undefined;
+    var stdout: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr: std.Io.Writer = .fixed(&stderr_buf);
+    var options = try parseOptions(std.testing.io, &.{}, &stdout, &stderr);
+    applyCloudAlias(&options);
+    try std.testing.expect(options.cloud);
+    try std.testing.expectEqualStrings("terminal", effectiveView(options));
+    try std.testing.expect(!options.demo);
+
+    var demo = try parseOptions(std.testing.io, &.{"--demo"}, &stdout, &stderr);
+    applyCloudAlias(&demo);
+    try std.testing.expect(demo.demo);
+    try std.testing.expectEqualStrings("terminal", effectiveView(demo));
+
+    var href_buf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "http://127.0.0.1:7742/terminal/",
+        try formatListenUrl(&href_buf, options),
+    );
+    try std.testing.expectEqualStrings(
+        "http://127.0.0.1:7742/terminal/?demo=1",
+        try formatListenUrl(&href_buf, demo),
+    );
+    const overview = try parseOptions(std.testing.io, &.{}, &stdout, &stderr);
+    try std.testing.expectEqualStrings("http://127.0.0.1:7742/", try formatListenUrl(&href_buf, overview));
+    try std.testing.expect(std.mem.indexOf(u8, try formatListenUrl(&href_buf, options), "demo") == null);
 }

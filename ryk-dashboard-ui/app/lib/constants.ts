@@ -55,6 +55,7 @@ export const VIEW_TITLES: Record<string, string> = {
   overview: "Overview",
   secretless: "Secretless",
   activity: "Activity",
+  terminal: "Terminal",
   policy: "Policy",
   integrations: "Integrations",
 };

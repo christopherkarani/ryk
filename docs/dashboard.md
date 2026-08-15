@@ -4,9 +4,13 @@ ryk includes a local-first web dashboard for machine-wide activity and workspace
 
 ```sh
 ryk dashboard
+ryk dashboard --view terminal
+ryk cloud
 ```
 
 `ryk dashboard` now opens the machine-wide view by default. It is no longer tied to the shell's current working directory, so it can be started from `~` or any other directory.
+
+`ryk cloud` is a thin alias for `ryk dashboard --view terminal`. It binds the same localhost dashboard on port 7742 and prints that URL. It is not a hosted control plane, and install does not start this UI.
 
 Use an explicit workspace for policy, Secretless, integrations, and workspace-scoped actions:
 
@@ -45,6 +49,8 @@ Machine-wide mode reads ryk's local workspace registry and global decision feed.
 - Recent shell / policy decisions across Pi, Codex, Claude, OpenCode, `ryk run`, and other hook paths
 - Sessions merged from registered workspace `.ryk/sessions` directories and feed-backed agent sessions such as Pi
 - Denied shell decisions with `workspace_root`, `host`, and recording source
+- Terminal stream of real `blocked_actions` from the dashboard API (`ryk cloud` or `ryk dashboard --view terminal`). An empty feed stays empty and shows "No blocked commands yet".
+- `ryk cloud --demo` / `ryk dashboard --view terminal --demo` / `?demo=1` load a labeled fixture stream only. Demo is never loaded because the feed is empty or `/api/status` failed.
 - Machine-wide daemon health
 
 Decision writers continue to store the existing per-workspace feed and also append a redacted record to `$HOME/.ryk/dashboard/events.jsonl`. `$HOME/.ryk/dashboard/workspaces.json` indexes recently active workspaces for session aggregation. Feed writes are best-effort and do not change hook, run, or evaluate exit behavior. Crafted feed `session_id` or `workspace_root` values (`..`, extra separators) are skipped before any filesystem join; that is a loader skip, not a fail-closed policy deny.

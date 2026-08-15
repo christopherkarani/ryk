@@ -815,15 +815,37 @@ pub const commands =
             "  ryk hook hermes on_session_end",
             "Hook responses include host_limitations to honestly report enforcement limits.",
         } },
-        .{ .name = "dashboard", .summary = "Start the local ryk dashboard", .usage = "ryk dashboard [--machine | --workspace PATH] [--host 127.0.0.1] [--port 7742] [--once]", .category = .diagnostics, .details = &.{
+        .{ .name = "dashboard", .summary = "Start the local ryk dashboard", .usage = "ryk dashboard [--machine | --workspace PATH] [--host 127.0.0.1] [--port 7742] [--view overview|activity|terminal] [--demo] [--once]", .category = .diagnostics, .additional_completion_flags = &.{ "--view", "--demo" }, .details = &.{
             "Starts a localhost-only machine-wide dashboard by default; the view is not tied to shell cwd.",
             "Use --workspace PATH or RYK_DASHBOARD_WORKSPACE for policy, integrations, and workspace-scoped actions.",
             "The dashboard calls existing ryk CLI/Core paths and does not replace policy evaluation.",
             "Mutation routes use a per-run browser token and only expose fixed ryk actions; arbitrary shell commands are not accepted.",
             "Defaults to http://127.0.0.1:7742.",
             "LAN and non-loopback binds (for example 0.0.0.0) are rejected; the dashboard is intentionally localhost-only.",
+            "Use --view terminal to open the local blocked-command stream. An empty feed stays empty.",
+            "Use --demo only to load a labeled fixture stream. Demo is never loaded because the feed is empty or /api/status failed.",
             "Use --once to serve one request for smoke tests and automation.",
         } },
+        .{
+            .name = "cloud",
+            .summary = "Open the local dashboard Terminal view of blocked commands",
+            .usage = "ryk cloud [--machine | --workspace PATH] [--host 127.0.0.1] [--port 7742] [--demo] [--once]",
+            .category = .diagnostics,
+            .public = true,
+            .additional_completion_flags = &.{ "--view", "--demo" },
+            .examples = &.{
+                "ryk cloud",
+                "ryk cloud --demo",
+                "ryk cloud --workspace /path/to/project",
+            },
+            .details = &.{
+                "Thin alias for `ryk dashboard --view terminal`. Same localhost bind and port 127.0.0.1:7742.",
+                "Shows real blocked_actions from the local dashboard API. An empty feed stays empty.",
+                "Use --demo only to load a labeled fixture stream. Demo is never loaded because the feed is empty or /api/status failed.",
+                "This is not a hosted control plane and not a remote product. Install does not start this UI.",
+                "Policy still belongs to the CLI and host plugins. `ryk replay --only denied` is the CLI equivalent.",
+            },
+        },
         .{ .name = "help", .summary = "Show help", .usage = "ryk help [command|--all]", .category = .getting_started, .details = &.{
             "Shows Safe Launch help by default (public verbs only).",
             "Use `ryk help --all` for the full command surface.",
@@ -835,7 +857,7 @@ pub const commands =
 const public_help_prefix = [_][]const u8{ "start", "agents", "stop" };
 /// Suffix of Safe Launch teaching order (after host aliases).
 /// Day-2 loop: doctor → packs → allowlist, then review/forensics/explain/update.
-const public_help_suffix = [_][]const u8{ "doctor", "packs", "allowlist", "replay", "scan", "explain", "update", "telemetry" };
+const public_help_suffix = [_][]const u8{ "doctor", "packs", "allowlist", "replay", "scan", "explain", "cloud", "update", "telemetry" };
 
 pub const WriteMode = enum {
     /// Safe Launch surface only (default `ryk` / `ryk help`).
@@ -1225,6 +1247,7 @@ test "default root help shows only public Safe Launch verbs" {
     try std.testing.expect(helpListsPeerCommand(top, "replay"));
     try std.testing.expect(helpListsPeerCommand(top, "scan"));
     try std.testing.expect(helpListsPeerCommand(top, "explain"));
+    try std.testing.expect(helpListsPeerCommand(top, "cloud"));
     try std.testing.expect(helpListsPeerCommand(top, "update"));
     for (host_launch.host_launch_aliases) |host| {
         try std.testing.expect(helpListsPeerCommand(top, host));
@@ -1286,6 +1309,8 @@ test "help --all lists full advanced command surface" {
     try std.testing.expect(!helpListsPeerCommand(all, "history"));
     // scan is public Zig session forensics (not the old daemon file scan).
     try std.testing.expect(helpListsPeerCommand(all, "scan"));
+    try std.testing.expect(helpListsPeerCommand(all, "cloud"));
+    try std.testing.expect(helpListsPeerCommand(all, "dashboard"));
     // Live P0: packs, allow-once, permanent allowlist writers.
     try std.testing.expect(helpListsPeerCommand(all, "packs"));
     try std.testing.expect(helpListsPeerCommand(all, "allow-once"));
@@ -1489,4 +1514,38 @@ test "public Safe Launch: packs and allowlist help details mention TTY browse an
     try std.testing.expect(!allow_info.public);
     const unallow_info = findCommand("unallow") orelse return error.TestUnexpectedResult;
     try std.testing.expect(!unallow_info.public);
+}
+
+test "cloud help is a localhost dashboard alias and does not sell a control plane" {
+    const info = findCommand("cloud") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(info.public);
+    try std.testing.expect(!info.hidden);
+    try std.testing.expect(std.mem.indexOf(u8, info.usage, "ryk cloud") != null);
+    try std.testing.expect(std.mem.indexOf(u8, info.usage, "--demo") != null);
+
+    var joined: [4096]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&joined);
+    for (info.details) |line| {
+        try writer.writeAll(line);
+        try writer.writeAll("\n");
+    }
+    const text = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, text, "ryk dashboard --view terminal") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "127.0.0.1:7742") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "localhost") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "--demo") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "empty") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "control plane") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "SIEM") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "SSO") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "$999") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Cursor Cloud") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Team") == null);
+
+    var help_buf: [8192]u8 = undefined;
+    var help_writer: std.Io.Writer = .fixed(&help_buf);
+    try std.testing.expect(try writeCommand(std.testing.io, &help_writer, "cloud"));
+    const rendered = help_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "ryk cloud") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "dashboard --view terminal") != null);
 }
