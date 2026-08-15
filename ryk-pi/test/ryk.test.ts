@@ -38,6 +38,8 @@ import {
 	resolvePiAskRoot,
 	resolveToolPath,
 	resolveUnavailableMode,
+	buildRykWidget,
+	buildThemedDecisionLines,
 	formatAgentBlockReason,
 	formatProtocolErrorReason,
 	formatMalformedJsonDetail,
@@ -910,7 +912,7 @@ test("write tool is evaluated via ryk decide file", async () => {
 	assert.ok(payload.path.includes(".ryk/policy.yaml"));
 	assert.equal(messages.length, 1);
 	assert.equal(messages[0].message.customType, "rykanv-decision");
-	assert.match(messages[0].message.content, /Meta:.*files\.write\.deny\[2\]/);
+	assert.match(messages[0].message.content, /Meta\s+files\.write\.deny\[2\]/);
 });
 
 test("edit tool allow proceeds without block", async () => {
@@ -962,7 +964,7 @@ test("read tool is evaluated via ryk decide file with operation read", async () 
 	assert.equal(payload.operation, "read");
 	assert.ok(payload.path.includes(".ssh/id_rsa"));
 	assert.equal(messages.length, 1);
-	assert.match(messages[0].message.content, /Meta:.*files\.read\.deny\[0\]/);
+	assert.match(messages[0].message.content, /Meta\s+files\.read\.deny\[0\]/);
 });
 
 test("grep tool requires approval even when its broad root is allowed", async () => {
@@ -1949,21 +1951,25 @@ test("bash dangerous command with ryk deny returns block", async () => {
 		"notify must not embed Recourse walls",
 	);
 	const inlineDecision = messages[0].message.content;
-	assert.match(inlineDecision, /┏━+/);
-	assert.match(inlineDecision, /RYKAN V/);
+	assert.match(inlineDecision, /RYKAN V · Blocked/);
+	assert.ok(
+		!/[┏┓┗┛┃━┌┐└┘│─]/.test(inlineDecision),
+		"decision card must not use ASCII/Unicode box frames",
+	);
 	assert.ok(
 		!/COMMAND STOPPED BEFORE EXECUTION|YOUR CALL/.test(inlineDecision),
 		"legacy state lines must be gone",
 	);
 	assert.match(inlineDecision, /destructive filesystem command/);
-	assert.match(inlineDecision, /Why: destructive filesystem command/);
+	assert.match(inlineDecision, /Why\s+destructive filesystem command/);
+	assert.match(inlineDecision, /Cmd\s+rm -rf \//);
 	assert.match(
 		inlineDecision,
-		/Meta:.*core\.filesystem:destructive-rm/,
+		/Meta\s+core\.filesystem:destructive-rm/,
 	);
 	assert.ok(
-		inlineDecision.split("\n").every((line) => line.length >= 40 && line.length <= 80),
-		"expected a compact, aligned decision card",
+		inlineDecision.split("\n").every((line) => line.length <= 80),
+		"expected a compact decision card",
 	);
 });
 
@@ -2134,7 +2140,7 @@ test("hard deny with remediation puts short Next in agent reason and card", asyn
 		| { nextStep?: string; summary?: string; rule?: string }
 		| undefined;
 	assert.match(details?.nextStep ?? "", /safer delete|project tree/i);
-	assert.match(decision?.message.content ?? "", /Next:/i);
+	assert.match(decision?.message.content ?? "", /Next\s+/);
 
 	// Notify stays short, no Recourse walls.
 	assert.equal(notifications.length, 1);
@@ -2243,7 +2249,24 @@ test("formatAgentBlockReason auto-deny why is single-branded", () => {
 	assert.ok(reason.length <= 320);
 });
 
-test("ryk inline decision keeps long reasons inside the compact frame", async () => {
+test("formatAgentBlockReason does not include command preview", () => {
+	const reason = formatAgentBlockReason(
+		{
+			variant: "block",
+			title: DISPLAY_BRAND,
+			summary: "destructive filesystem command",
+			rule: "core.filesystem:destructive-rm",
+			preview: "rm -rf /",
+		},
+		"bash",
+	);
+	assert.ok(!reason.includes("rm -rf /"), `preview leaked into agent reason: ${reason}`);
+	assert.ok(!/\bCmd\b/.test(reason), `Cmd label leaked into agent reason: ${reason}`);
+	assert.match(reason, /destructive filesystem command/);
+	assert.match(reason, /rule core\.filesystem:destructive-rm/);
+});
+
+test("ryk inline decision wraps long reasons without a fixed box frame", async () => {
 	const longReason = `unsafe-${"x".repeat(120)} command escaped policy`;
 	const { pi, handlers, messages } = makePi();
 	const { spawn } = makeSpawn([
@@ -2264,10 +2287,14 @@ test("ryk inline decision keeps long reasons inside the compact frame", async ()
 	const inlineDecision = messages[0]?.message.content;
 	assert.ok(inlineDecision, "expected inline ryk decision content");
 	assert.ok(
-		inlineDecision.split("\n").every((line) => line.length === 56),
-		"expected every long-reason card line to stay inside the frame",
+		!/[┏┓┗┛┃━┌┐└┘│─]/.test(inlineDecision),
+		"decision card must not use ASCII/Unicode box frames",
 	);
-	assert.match(inlineDecision, /Why: unsafe-/);
+	assert.ok(
+		inlineDecision.split("\n").every((line) => line.length <= 80),
+		"expected long-reason card lines to stay compact",
+	);
+	assert.match(inlineDecision, /Why\s+unsafe-/);
 	assert.match(inlineDecision, /command escaped policy/);
 });
 
@@ -2326,15 +2353,19 @@ test("ryk error in interactive mode waits for the user's decision", async () => 
 	assert.ok(askWidget, "expected Rykan V ask widget");
 	assert.deepEqual(askWidget.opts, { placement: "aboveEditor" });
 	const cardText = askWidget.value?.join("\n") ?? "";
-	assert.match(cardText, /RYKAN V/);
-	assert.match(cardText, /Tip:|Why:/);
+	assert.match(cardText, /RYKAN V · Needs approval/);
+	assert.match(cardText, /Tip\s+|Why\s+/);
 	assert.ok(
 		!/YOUR CALL|COMMAND STOPPED|Choose: Run once/.test(cardText),
 		"legacy chrome must be gone",
 	);
 	assert.ok(
-		askWidget.value?.every((line) => line.length >= 40 && line.length <= 80),
-		"expected a compact, aligned card",
+		!/[┏┓┗┛┃━┌┐└┘│─]/.test(cardText),
+		"ask widget must not use ASCII/Unicode box frames",
+	);
+	assert.ok(
+		askWidget.value?.every((line) => line.length <= 80),
+		"expected a compact card",
 	);
 
 	resolveSelection("Allow once");
@@ -2900,7 +2931,8 @@ test("decision message renderer returns a TUI component with render()", () => {
 	const lines = component.render!(80);
 	assert.ok(Array.isArray(lines));
 	assert.ok(lines.every((line) => typeof line === "string"));
-	assert.ok(lines.some((line) => line.includes("BLOCKED .env")));
+	assert.ok(lines.some((line) => line.includes("blocked secret file")));
+	assert.ok(lines.some((line) => /Blocked/.test(line)));
 	assert.ok(lines.some((line) => line.includes("[error]")));
 });
 
@@ -2926,7 +2958,8 @@ test("decision message renderer ask variant uses warning tone and is renderable"
 	const component = result as { render: (width: number) => string[] };
 	const lines = component.render(40);
 	assert.ok(lines.some((line) => line.includes("[warning]")));
-	assert.ok(lines.some((line) => line.includes("ASK cat .env")));
+	assert.ok(lines.some((line) => /Needs approval/.test(line)));
+	assert.ok(lines.some((line) => line.includes("needs approval")));
 });
 
 test("decision message renderer wait variant and empty content stay renderable", () => {
@@ -2951,7 +2984,8 @@ test("decision message renderer wait variant and empty content stay renderable",
 	);
 	const waitLines = (waitResult as { render: (width: number) => string[] }).render(80);
 	assert.ok(waitLines.some((line) => line.includes("[dim]")));
-	assert.ok(waitLines.some((line) => line.includes("WAIT parent")));
+	assert.ok(waitLines.some((line) => /Waiting/.test(line)));
+	assert.ok(waitLines.some((line) => line.includes("waiting on parent")));
 
 	const emptyResult = renderer(
 		{
@@ -2972,6 +3006,102 @@ test("decision message renderer wait variant and empty content stay renderable",
 	assert.ok(Array.isArray(emptyLines));
 	assert.ok(emptyLines.every((line) => typeof line === "string"));
 	assert.ok(emptyLines.some((line) => line.includes(DISPLAY_BRAND)));
+});
+
+test("decision message renderer never returns a string", () => {
+	const { pi, renderers } = makePi();
+	const { spawn } = makeSpawn();
+	installRykExtension(pi, { spawn, rykBin: "ryk" });
+	const renderer = renderers.get("rykanv-decision")!;
+
+	for (const message of [
+		{ content: "plain string body", details: undefined },
+		{
+			content: "",
+			details: {
+				variant: "block" as const,
+				title: DISPLAY_BRAND,
+				summary: "blocked",
+			},
+		},
+	]) {
+		const result = renderer(
+			{ customType: "rykanv-decision", display: true, ...message },
+			{ expanded: false, outputPad: 1 },
+			makeThemeStub(),
+		);
+		assert.notEqual(typeof result, "string");
+		assert.equal(typeof (result as { render?: unknown }).render, "function");
+		const lines = (result as { render: (width: number) => string[] }).render(80);
+		assert.ok(Array.isArray(lines));
+		assert.ok(lines.every((line) => typeof line === "string"));
+	}
+});
+
+test("buildRykWidget deny/ask/wait cards stay borderless with Why/Cmd/Meta/Next", () => {
+	const deny = buildRykWidget({
+		variant: "block",
+		title: DISPLAY_BRAND,
+		summary: "destructive filesystem command",
+		preview: "rm -rf /",
+		rule: "core.filesystem:destructive-rm",
+		nextStep: "Use a project-scoped path",
+	});
+	const denyText = deny.join("\n");
+	assert.match(denyText, /RYKAN V · Blocked/);
+	assert.match(denyText, /Why\s+destructive filesystem command/);
+	assert.match(denyText, /Cmd\s+rm -rf \//);
+	assert.match(denyText, /Meta\s+core\.filesystem:destructive-rm/);
+	assert.match(denyText, /Next\s+Use a project-scoped path/);
+	assert.ok(!/[┏┓┗┛┃━┌┐└┘│─]/.test(denyText));
+
+	const ask = buildRykWidget({
+		variant: "ask",
+		title: DISPLAY_BRAND,
+		summary: "needs approval for write",
+	});
+	const askText = ask.join("\n");
+	assert.match(askText, /RYKAN V · Needs approval/);
+	assert.match(askText, /Why\s+needs approval for write/);
+	assert.match(askText, /Tip\s+Use the prompt below/);
+	assert.ok(!/[┏┓┗┛┃━┌┐└┘│─]/.test(askText));
+
+	const wait = buildRykWidget({
+		variant: "wait",
+		title: DISPLAY_BRAND,
+		summary: "Waiting for approval in the parent Pi session (bash).",
+		preview: "rm -rf /",
+		nextStep:
+			"Switch to the main Pi window and answer the prompt. This card is not interactive.",
+		timeoutHint: "Auto-denies in ~30s if unanswered.",
+		rule: "rykanv:parent-ask-wait",
+	});
+	const waitText = wait.join("\n");
+	assert.match(waitText, /RYKAN V · Waiting/);
+	assert.match(waitText, /Why\s+Waiting for approval/);
+	assert.match(waitText, /Cmd\s+rm -rf \//);
+	assert.match(waitText, /Meta\s+rykanv:parent-ask-wait/);
+	assert.match(waitText, /Next\s+Switch to the main Pi window/);
+	assert.match(waitText, /Wait\s+Auto-denies in ~30s/);
+	assert.ok(!/[┏┓┗┛┃━┌┐└┘│─]/.test(waitText));
+});
+
+test("buildThemedDecisionLines uses theme tokens and matches plaintext rows", () => {
+	const card = {
+		variant: "block" as const,
+		title: DISPLAY_BRAND,
+		summary: "blocked secret file",
+		preview: "cat .env",
+		rule: "files.read.deny[0]",
+	};
+	const themed = buildThemedDecisionLines(card, makeThemeStub());
+	const plain = buildRykWidget(card);
+	assert.ok(themed.some((line) => line.includes("[error]")));
+	assert.ok(themed.some((line) => line.includes("[dim]")));
+	assert.ok(themed.some((line) => /Blocked/.test(line)));
+	assert.ok(themed.some((line) => line.includes("cat .env")));
+	assert.equal(themed.length, plain.length);
+	assert.ok(!themed.some((line) => /[┏┓┗┛┃━┌┐└┘│─]/.test(line)));
 });
 
 function makeEpermFs(): ParentAskFs {

@@ -152,12 +152,17 @@ type PiAPI = {
 		renderer: (
 			message: { content?: string; details?: unknown },
 			options: { expanded?: boolean; outputPad?: number },
-			theme: {
-				fg: (name: string, text: string) => string;
-				bg?: (name: string, text: string) => string;
-			},
+			theme: PiTheme,
 		) => TuiComponentLike | undefined,
 	) => void;
+};
+
+/** Pi theme surface used by decision cards — prefer semantic tokens over raw ANSI. */
+type PiTheme = {
+	fg: (name: string, text: string) => string;
+	bg?: (name: string, text: string) => string;
+	bold?: (text: string) => string;
+	dim?: (text: string) => string;
 };
 
 type SpawnOptions = {
@@ -1130,33 +1135,84 @@ export function tuiTextComponent(text: string): TuiComponentLike {
 	};
 }
 
+export function decisionStatusLabel(
+	variant: RykDecisionCard["variant"],
+): string {
+	if (variant === "ask") return "Needs approval";
+	if (variant === "wait") return "Waiting";
+	return "Blocked";
+}
+
+export function decisionTone(
+	variant: RykDecisionCard["variant"],
+): "error" | "warning" | "dim" {
+	if (variant === "ask") return "warning";
+	if (variant === "wait") return "dim";
+	return "error";
+}
+
+const PLAIN_THEME: PiTheme = {
+	fg: (_name, text) => text,
+};
+
+/**
+ * Themed decision lines for the Pi transcript renderer.
+ * Hierarchy: brand+status → Why/Cmd → Meta → Next. No box-drawing.
+ */
+export function buildThemedDecisionLines(
+	card: RykDecisionCard,
+	theme: PiTheme,
+): string[] {
+	const tone = decisionTone(card.variant);
+	const status = decisionStatusLabel(card.variant);
+	const brand = theme.bold ? theme.bold(DISPLAY_BRAND) : DISPLAY_BRAND;
+	const header = `${theme.fg(tone, brand)} ${theme.fg("dim", `· ${status}`)}`;
+	const lines: string[] = [header, ""];
+	const contentWidth = Math.min(
+		72,
+		Math.max(48, Math.min(terminalContentWidth(), 72)),
+	);
+
+	for (const row of decisionCardRows(card)) {
+		lines.push(
+			...formatMinimalRow(row.label, row.value, contentWidth, (lab, val, first) => {
+				const labelPart = theme.fg("dim", lab);
+				if (!first) return `${lab}${val}`;
+				if (row.label === "Cmd") {
+					return `${labelPart}${theme.fg("dim", val)}`;
+				}
+				return `${labelPart}${val}`;
+			}),
+		);
+	}
+	return lines;
+}
+
+function renderDecisionMessage(
+	message: { content?: string; details?: unknown },
+	_options: { expanded?: boolean; outputPad?: number },
+	theme: PiTheme,
+): TuiComponentLike {
+	const details = message.details as RykDecisionCard | undefined;
+	const card: RykDecisionCard = details ?? {
+		variant: "block",
+		title: DISPLAY_BRAND,
+		summary:
+			typeof message.content === "string" && message.content.length > 0
+				? message.content
+				: "Decision",
+	};
+	return tuiTextComponent(buildThemedDecisionLines(card, theme).join("\n"));
+}
+
 export function installRykExtension(
 	pi: PiAPI,
 	extensionOptions: RykExtensionOptions = {},
 ): void {
-	// Prefer semantic theme colors over Pi's purple custom-message chrome.
+	// Prefer theme tokens over purple default / ASCII frames. Always return
+	// `{ render(width) }` — a string crashes Pi with child.render is not a function.
 	try {
-		pi.registerMessageRenderer?.(DECISION_CUSTOM_TYPE, (message, _opts, theme) => {
-			const details = message.details as RykDecisionCard | undefined;
-			const variant = details?.variant ?? "block";
-			const tone =
-				variant === "block"
-					? "error"
-					: variant === "ask"
-						? "warning"
-						: "dim";
-			const body =
-				typeof message.content === "string" && message.content.length > 0
-					? message.content
-					: buildRykWidget(
-							details ?? {
-								variant: "block",
-								title: DISPLAY_BRAND,
-								summary: "Decision",
-							},
-					  ).join("\n");
-			return tuiTextComponent(theme.fg(tone, body));
-		});
+		pi.registerMessageRenderer?.(DECISION_CUSTOM_TYPE, renderDecisionMessage);
 	} catch {
 		// Older hosts without registerMessageRenderer — plain text content still works.
 	}
@@ -1728,6 +1784,14 @@ async function applyToolDecision(
 	if (decision.kind === "deny") {
 		if (session) session.protocolFailures = 0;
 		const card = buildRykDecisionCard(decision.response, "block");
+		const previewSource = askIpc?.commandOrName;
+		if (
+			previewSource &&
+			previewSource !== toolLabel &&
+			previewSource.trim().length > 0
+		) {
+			card.preview = truncate(sanitizeVisibleText(previewSource), 96);
+		}
 		showRykDecision(pi, ctx, card);
 		// Agent reason: short + structured Next; walls stripped.
 		const agentReason = formatAgentBlockReason(card, toolLabel);
@@ -2722,51 +2786,17 @@ function showRykDecision(
 	showRykWidget(ctx, card);
 }
 
-/** Enterprise card: brand header only, no fake action footer on wait. */
-function buildRykWidget(card: RykDecisionCard): string[] {
-	const contentWidth = Math.min(
-		72,
-		Math.max(48, Math.min(terminalContentWidth(), 72)),
-	);
-	const isBlock = card.variant === "block";
-	const isWait = card.variant === "wait";
-	const frame = isBlock
-		? {
-				topLeft: "┏",
-				topRight: "┓",
-				side: "┃",
-				teeLeft: "┣",
-				teeRight: "┫",
-				bottomLeft: "┗",
-				bottomRight: "┛",
-				rule: "━",
-			}
-		: {
-				topLeft: "┌",
-				topRight: "┐",
-				side: "│",
-				teeLeft: "├",
-				teeRight: "┤",
-				bottomLeft: "└",
-				bottomRight: "┘",
-				rule: "─",
-			};
-	const masthead = ` ${DISPLAY_BRAND} `;
-	const lines = [
-		buildLabeledBorder(
-			frame.topLeft,
-			frame.topRight,
-			frame.rule,
-			masthead,
-			contentWidth,
-		),
-	];
-	lines.push(...formatWidgetRow("Why", card.summary, contentWidth, frame.side));
-	if (card.preview) {
-		lines.push(
-			...formatWidgetRow("Cmd", card.preview, contentWidth, frame.side),
-		);
-	}
+/** Borderless decision card — brand header, no ASCII box frame. */
+export function buildRykWidget(card: RykDecisionCard): string[] {
+	return buildThemedDecisionLines(card, PLAIN_THEME);
+}
+
+function decisionCardRows(
+	card: RykDecisionCard,
+): Array<{ label: string; value: string }> {
+	const rows: Array<{ label: string; value: string }> = [];
+	if (card.summary) rows.push({ label: "Why", value: card.summary });
+	if (card.preview) rows.push({ label: "Cmd", value: card.preview });
 	const metaBits: string[] = [];
 	if (card.rule) metaBits.push(card.rule);
 	if (card.severity) metaBits.push(capitalize(card.severity));
@@ -2774,56 +2804,26 @@ function buildRykWidget(card: RykDecisionCard): string[] {
 		metaBits.push(card.pack);
 	}
 	if (metaBits.length > 0) {
-		lines.push(
-			`${frame.teeLeft}${frame.rule.repeat(contentWidth)}${frame.teeRight}`,
-		);
-		lines.push(
-			...formatWidgetRow("Meta", metaBits.join(" · "), contentWidth, frame.side),
-		);
+		rows.push({ label: "Meta", value: metaBits.join(" · ") });
 	}
-	if (card.nextStep) {
-		lines.push(
-			...formatWidgetRow("Next", card.nextStep, contentWidth, frame.side),
-		);
-	}
-	if (isWait && card.timeoutHint) {
-		lines.push(
-			...formatWidgetRow("Wait", card.timeoutHint, contentWidth, frame.side),
-		);
+	if (card.nextStep) rows.push({ label: "Next", value: card.nextStep });
+	if (card.variant === "wait" && card.timeoutHint) {
+		rows.push({ label: "Wait", value: card.timeoutHint });
 	}
 	// Ask only: real choices come from ui.select — one quiet hint, never fake buttons.
 	if (card.variant === "ask") {
-		lines.push(
-			...formatWidgetRow(
-				"Tip",
-				"Use the prompt below to Allow once, Allow for session, or Deny.",
-				contentWidth,
-				frame.side,
-			),
-		);
+		rows.push({
+			label: "Tip",
+			value: "Use the prompt below to Allow once, Allow for session, or Deny.",
+		});
 	}
-	lines.push(
-		`${frame.bottomLeft}${frame.rule.repeat(contentWidth)}${frame.bottomRight}`,
-	);
-	return lines;
+	return rows;
 }
 
 function terminalContentWidth(): number {
 	const cols = Number(process.stdout?.columns ?? 0);
 	if (!Number.isFinite(cols) || cols < 40) return 54;
 	return Math.max(40, cols - 8);
-}
-
-function buildLabeledBorder(
-	left: string,
-	right: string,
-	rule: string,
-	label: string,
-	width: number,
-): string {
-	const remaining = Math.max(0, width - label.length);
-	const before = Math.min(3, remaining);
-	return `${left}${rule.repeat(before)}${label}${rule.repeat(remaining - before)}${right}`;
 }
 
 function buildRykDecisionCard(
@@ -2962,20 +2962,28 @@ function wrapText(value: string, width: number): string[] {
 	});
 }
 
-function formatWidgetRow(
+const MINIMAL_LABEL_WIDTH = 4;
+
+/**
+ * Borderless labeled row. Optional `paint` styles label/value for the themed
+ * transcript renderer; plaintext widgets omit it.
+ */
+function formatMinimalRow(
 	label: string,
 	value: string | undefined,
 	width: number,
-	side: string,
+	paint?: (labelCol: string, valuePart: string, first: boolean) => string,
 ): string[] {
 	if (!value) return [];
-	const contentWidth = width - 2;
-	const rowLabel = `${label}:`;
-	const available = Math.max(1, contentWidth - rowLabel.length - 1);
+	const labelCol = label.padEnd(MINIMAL_LABEL_WIDTH);
+	const available = Math.max(1, width - MINIMAL_LABEL_WIDTH - 2);
 	const wrapped = wrapText(value, available);
 	return wrapped.map((line, index) => {
-		const prefix = index === 0 ? rowLabel : "".padEnd(rowLabel.length, " ");
-		return `${side} ${prefix} ${line.padEnd(available)} ${side}`;
+		const prefix =
+			index === 0 ? labelCol : "".padEnd(MINIMAL_LABEL_WIDTH, " ");
+		const raw = `${prefix}  ${line}`;
+		if (!paint) return raw;
+		return paint(prefix, `  ${line}`, index === 0);
 	});
 }
 

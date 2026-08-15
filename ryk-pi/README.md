@@ -58,10 +58,12 @@ When `ryk evaluate` / `ryk decide` fails (timeout, malformed JSON, spawn error):
 
 Card copy stays short (`Fail-closed. /ryk-doctor`).
 
-Decision cards must return a TUI component from `registerMessageRenderer`
-(`{ render(width) }`), not a colored string — a string crashes Pi with
-`child.render is not a function`. After updating ryk-pi, run `ryk doctor --fix`
-so `~/.pi/agent/extensions/ryk/runtime.ts` is replaced.
+Decision cards use a borderless layout (`RYKAN V · Blocked`) with Why / Cmd /
+Meta / Next rows. They must return a TUI component from
+`registerMessageRenderer` (`{ render(width) }`), not a colored string — a
+string crashes Pi with `child.render is not a function`. After updating
+ryk-pi, run `ryk doctor --fix` so `~/.pi/agent/extensions/ryk/runtime.ts` is
+replaced.
 
 Parent-ask IPC mkdir is best-effort. Under an attached OS sandbox, creating
 `~/.local/state/ryk/pi-ask/<session>` can EPERM; the extension must not throw.
