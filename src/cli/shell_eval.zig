@@ -254,46 +254,6 @@ fn stripProjectCommandEntries(gpa: std.mem.Allocator, store: *shell_engine.allow
     store.entries = new_entries;
 }
 
-/// True when this process inherited an OS sandbox that denies writes to `$HOME`
-/// (ryk profile: no home). Hook/shim inherit attach; the agent then cannot
-/// plant `allow_once.jsonl`. Test binaries never claim active (no HOME probe).
-///
-/// Linux: ryk Landlock always sets `NO_NEW_PRIVS` before `restrict_self`.
-/// NNP unset → not our attach (skip the HOME probe on hook-only). NNP set
-/// still write-probes HOME so a container NNP bit alone cannot unlock the store.
-fn currentProcessOsSandboxActive() bool {
-    if (@import("builtin").is_test) return false;
-    if (@import("builtin").os.tag == .windows) return false;
-    if (@import("builtin").os.tag == .linux) {
-        const nnp = std.os.linux.prctl(@intFromEnum(std.os.linux.PR.GET_NO_NEW_PRIVS), 0, 0, 0, 0);
-        if (std.os.linux.errno(nnp) != .SUCCESS or nnp != 1) return false;
-    }
-    return homeWriteDeniedByOsSandbox();
-}
-
-fn homeWriteDeniedByOsSandbox() bool {
-    const home_z = std.c.getenv("HOME") orelse return false;
-    const home = std.mem.span(home_z);
-    if (home.len == 0) return false;
-
-    const pid = std.posix.getpid();
-    var name_buf: [64]u8 = undefined;
-    const probe_name = std.fmt.bufPrint(&name_buf, ".ryk-sbx-probe-{d}", .{pid}) catch return false;
-
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ home, probe_name }) catch return false;
-
-    var threaded: std.Io.Threaded = .init_single_threaded;
-    const io = threaded.io();
-    const file = std.Io.Dir.cwd().createFile(io, path, .{ .exclusive = true }) catch |err| switch (err) {
-        error.AccessDenied, error.PermissionDenied => return true,
-        else => return false,
-    };
-    file.close(io);
-    std.Io.Dir.cwd().deleteFile(io, path) catch {};
-    return false;
-}
-
 fn zigEvaluator(
     allocator: std.mem.Allocator,
     shell_event: ShellCommandEvent,
@@ -343,11 +303,11 @@ fn zigEvaluator(
     // Permanent pack exceptions + allow-once via distinct API (not options.allowlists).
     // consume_allow_once defaults true for hook/run/shim (burns single-use).
     // loadProductShellStores is error{OutOfMemory}!void — map honestly (M-20).
-    // Allow-once only when this session's OS sandbox is active (event flag or
-    // inherited Landlock/Seatbelt). Tests never treat the runner as sandboxed.
-    const os_sandbox_active = shell_event.os_sandbox_active or currentProcessOsSandboxActive();
+    // Allow-once only when the caller marks the session OS sandbox active
+    // (`ryk run` passes requiresChildApply). Hook/shim stay false — a HOME
+    // write-probe must not unlock `$XDG_DATA_HOME/ryk/allow_once.jsonl`.
     var stores: ProductShellStores = .{};
-    loadProductShellStores(io, allocator, workspace, &stores, os_sandbox_active) catch |err| switch (err) {
+    loadProductShellStores(io, allocator, workspace, &stores, shell_event.os_sandbox_active) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
     };
     defer stores.deinit(allocator);
@@ -3668,6 +3628,52 @@ test "s-product-wire: planted allow_once.jsonl is ignored when OS sandbox is not
     try loadProductShellStores(std.testing.io, allocator, ws.root, &stores, false);
     defer stores.deinit(allocator);
     try std.testing.expect(stores.allow_once_path == null);
+
+    var parsed = try zigEvaluator(allocator, .{
+        .command = cmd,
+        .cwd = ws.root,
+        .workspace_root = ws.root,
+    });
+    defer parsed.deinit();
+    try std.testing.expectEqual(daemon.ResponseStatus.deny, daemon.responseStatus(parsed.value.result));
+    const got_reason = daemon.responseReason(parsed.value.result) orelse "";
+    try std.testing.expect(std.mem.indexOf(u8, got_reason, reason) == null);
+}
+
+test "s-product-wire: unwritable HOME plus planted XDG allow_once.jsonl still denies" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var xdg = try sProductWireIsolateXdg();
+    defer xdg.deinit();
+    var ws = try sProductWireGitWorkspace();
+    defer ws.deinit();
+
+    const cmd = "git reset --hard HEAD";
+    const reason = "HOME-unwritable must not unlock planted XDG allow-once";
+    try sProductWireSeedAllowOnce(xdg.data_root, cmd, ws.root, reason);
+
+    var home_tmp = std.testing.tmpDir(.{});
+    defer home_tmp.cleanup();
+    const home_abs = try home_tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(home_abs);
+    const prev_home = try sProductWireDupEnvZ("HOME");
+    defer sProductWireRestoreEnv("HOME", prev_home);
+    const home_z = try allocator.dupeZ(u8, home_abs);
+    defer allocator.free(home_z);
+    try std.testing.expectEqual(@as(c_int, 0), setenv("HOME", home_z.ptr, 1));
+    try std.Io.Dir.cwd().setFilePermissions(
+        std.testing.io,
+        home_abs,
+        std.Io.File.Permissions.fromMode(0o555),
+        .{},
+    );
+    defer std.Io.Dir.cwd().setFilePermissions(
+        std.testing.io,
+        home_abs,
+        std.Io.File.Permissions.fromMode(0o755),
+        .{},
+    ) catch {};
 
     var parsed = try zigEvaluator(allocator, .{
         .command = cmd,

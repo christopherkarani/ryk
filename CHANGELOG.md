@@ -22,7 +22,7 @@
 
 ### Security
 
-* **Product evaluate ignores `allow_once.jsonl` unless the session OS sandbox is active.** Hook/run/shim used to always load `$XDG_DATA_HOME/ryk/allow_once.jsonl` (or `~/.local/share/ryk/allow_once.jsonl`). Redeem is TTY-bound (`ryk allow-once`), but consume is "read the JSONL" — a same-UID agent on a hook-only session (no OS sandbox) could append a well-formed grant and the next evaluate allowed. Product evaluate now sets `allow_once_path = null` unless OS sandbox is active for that session (child cannot write the user store). Operator redeem/list/clear is unchanged.
+* **Product evaluate ignores `allow_once.jsonl` unless the session OS sandbox is active.** Hook/run/shim used to always load `$XDG_DATA_HOME/ryk/allow_once.jsonl` (or `~/.local/share/ryk/allow_once.jsonl`). Redeem is TTY-bound (`ryk allow-once`), but consume is "read the JSONL" — a same-UID agent on a hook-only session (no OS sandbox) could append a well-formed grant and the next evaluate allowed. Product evaluate now sets `allow_once_path = null` unless the caller marks OS sandbox active (`ryk run` passes `requiresChildApply()`). Hook/shim do not infer active from a `$HOME` write-probe (an agent can point `HOME` at an unwritable path and plant the grant under `XDG_DATA_HOME`). Operator redeem/list/clear is unchanged.
 
 ### Fixed
 
