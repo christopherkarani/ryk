@@ -22,6 +22,8 @@
 
 ### Changed
 
+* **PCRE2 is a slim static build (binary-size P3).** Same 10.48 tarball (`@5a632d3`), but ryk no longer links upstream's `build.zig` artifact. `build/pcre2_slim.zig` compiles match/compile only with `SUPPORT_UNICODE=false` (UCD property tables dropped), JIT off, and DFA/substitute/convert/serialize/UTF helpers omitted. Pack patterns stay byte/POSIX; `\\p{…}` fails compile (fail closed). See `docs/dev/pcre2-slim.md`.
+* **`-Dhttp=false` omits HTTP/TLS modules.** Default PATH and curl|sh builds stay HTTP-on (`-Dhttp` defaults true) so a token-present release still carries telemetry transport. Empty-token dry-run does not shrink that artifact. Slim profile drops `telemetry_transport.zig` and `provider_gateway.zig` (`std.http.Client` / TLS). Provider secrets on a slim binary fail closed. Linux default remains musl static + strip — not `x86_64-linux-gnu`.
 * **Mac FM steward source moved** to [ryk-fm-steward](https://github.com/christopherkarani/ryk-fm-steward). ryk keeps `macos/fm-steward/Schemas` and the shell fixture cards as the wire contract. Zig still resolves `fm-steward` on `PATH` or `RYK_FM_STEWARD_BIN`. Assist only; fail-open and “never soften deny” are unchanged.
 
 ### Security

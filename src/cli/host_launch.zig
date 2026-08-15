@@ -183,6 +183,13 @@ test "tryDispatch returns null for non-aliases and rewrites aliases" {
     defer environ_map.deinit();
     try environ_map.put("HOST_LAUNCH_ENV_CANARY", "forwarded");
 
+    // tryDispatch type-checks stdout.print on the help branch, so void `{}`
+    // no longer instantiates (bare --help landed in #163).
+    var stdout_buf: [64]u8 = undefined;
+    var stderr_buf: [64]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+
     const null_code = try tryDispatch(allocator, "notanagent", &.{}, struct {
         fn run(
             _: std.Io,
@@ -193,7 +200,7 @@ test "tryDispatch returns null for non-aliases and rewrites aliases" {
         ) !u8 {
             return error.ShouldNotRun;
         }
-    }.run, std.testing.io, &environ_map, {}, {});
+    }.run, std.testing.io, &environ_map, &stdout_writer, &stderr_writer);
     try std.testing.expect(null_code == null);
 
     const Capture = struct {
@@ -230,8 +237,8 @@ test "tryDispatch returns null for non-aliases and rewrites aliases" {
         Capture.run,
         std.testing.io,
         &environ_map,
-        {},
-        {},
+        &stdout_writer,
+        &stderr_writer,
     );
     try std.testing.expectEqual(@as(u8, 42), code.?);
     try std.testing.expectEqual(@as(usize, 3), Capture.seen_len);

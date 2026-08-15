@@ -65,3 +65,16 @@ test "pcre2 findMatch returns span for rm -rf flags" {
     try std.testing.expect(span.end >= 5);
     try std.testing.expectEqualStrings("rm -rf", "rm -rf /tmp"[span.start..span.end][0..6]);
 }
+
+test "pcre2 unicode property patterns fail closed without UCD" {
+    // UNICODE=false: \\p{}/\\P{} must not compile-and-no-match (fail open).
+    try std.testing.expectError(error.CompileFailed, Regex.compile("\\p{L}"));
+    try std.testing.expectError(error.CompileFailed, Regex.compile("\\P{N}"));
+}
+
+test "pcre2 no-match is zero and compile errors are not no-match" {
+    var re = try Regex.compile("(?:^|[^[:alnum:]_-])git\\s+reset");
+    defer re.deinit();
+    try std.testing.expect(!(try re.isMatch("echo hello")));
+    try std.testing.expectError(error.CompileFailed, Regex.compile("("));
+}
