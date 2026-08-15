@@ -28,6 +28,10 @@ fn disableTestRestoreHome(prev: ?[:0]const u8) void {
 const DisableTarget = enum { codex, claude, cursor, opencode, openclaw, hermes, grok, all };
 
 pub fn command(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: anytype) !u8 {
+    return commandAs(io, argv, stdout, stderr, "stop");
+}
+
+pub fn commandAs(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: anytype, invoked: []const u8) !u8 {
     var target: DisableTarget = .all;
     var yes = false;
 
@@ -39,12 +43,16 @@ pub fn command(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: an
     while (index < argv.len) : (index += 1) {
         const arg = argv[index];
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
-            _ = try help.writeCommand(io, stdout, "stop");
+            _ = try help.writeCommand(io, stdout, invoked);
             return exit_codes.success;
         }
         if (std.mem.eql(u8, arg, "--yes")) {
             yes = true;
             continue;
+        }
+        if (std.mem.eql(u8, arg, "--no")) {
+            try stdout.writeAll("canceled\n");
+            return exit_codes.success;
         }
         if (std.mem.eql(u8, arg, "codex")) {
             target = .codex;
@@ -78,11 +86,13 @@ pub fn command(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: an
             target = .all;
             continue;
         }
+        var invoked_label_buf: [32]u8 = undefined;
+        const invoked_label = std.fmt.bufPrint(&invoked_label_buf, "ryk {s}", .{invoked}) catch "ryk stop";
         try suggestions.writeUnknownOption(
             stderr,
-            "ryk stop",
+            invoked_label,
             arg,
-            &.{ "codex", "claude", "cursor", "opencode", "openclaw", "hermes", "grok", "all", "--yes", "--help" },
+            &.{ "codex", "claude", "cursor", "opencode", "openclaw", "hermes", "grok", "all", "--yes", "--no", "--help" },
             "stop",
         );
         return exit_codes.usage;
@@ -94,7 +104,7 @@ pub fn command(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: an
         var prompt_buf: [128]u8 = undefined;
         const prompt = std.fmt.bufPrint(&prompt_buf, "Stop ryk for {s}? This removes plugin registrations from host agents.", .{host_label}) catch "Stop ryk?";
         const decision = danger_confirmation.decide(io, stdout, prompt, false, try stdin.isTty(io), null) catch |err| {
-            try stderr.print("ryk stop: confirmation failed: {s}\n", .{@errorName(err)});
+            try stderr.print("ryk {s}: confirmation failed: {s}\n", .{ invoked, @errorName(err) });
             return exit_codes.general;
         };
         switch (decision) {
@@ -104,7 +114,7 @@ pub fn command(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: an
                 return exit_codes.success;
             },
             .requires_yes => {
-                try stderr.writeAll("ryk stop: requires --yes or run interactively.\n");
+                try stderr.print("ryk {s}: requires --yes or run interactively.\n", .{invoked});
                 return exit_codes.usage;
             },
         }
@@ -629,6 +639,32 @@ test "disableOpenCode removes planted ryk.ts and ryk-tui.ts in project and globa
     try std.testing.expect(!plugin.fileExistsAbsolute(io, global_tui));
     const out = stdout_writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, out, "ryk-tui.ts") != null);
+}
+
+test "disable --help names disable not stop" {
+    var stdout_buf: [4096]u8 = undefined;
+    var stderr_buf: [256]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+
+    const code = try commandAs(std.testing.io, &.{"--help"}, &stdout_writer, &stderr_writer, "disable");
+    try std.testing.expectEqual(exit_codes.success, code);
+    const out = stdout_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "ryk disable") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Usage:\n  ryk stop") == null);
+    try std.testing.expectEqualStrings("", stderr_writer.buffered());
+}
+
+test "stop --no cancels without disabling" {
+    var stdout_buf: [256]u8 = undefined;
+    var stderr_buf: [256]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+
+    const code = try command(std.testing.io, &.{"--no"}, &stdout_writer, &stderr_writer);
+    try std.testing.expectEqual(exit_codes.success, code);
+    try std.testing.expectEqualStrings("canceled\n", stdout_writer.buffered());
+    try std.testing.expectEqualStrings("", stderr_writer.buffered());
 }
 
 test "stop success output points at ryk start not setup" {

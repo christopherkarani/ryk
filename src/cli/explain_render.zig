@@ -5,8 +5,20 @@ const shell_engine = @import("../shell_engine/mod.zig");
 const theme = @import("../tui/theme.zig");
 const terminal_text = @import("../tui/terminal_text.zig");
 
-/// Pretty DCG-style decision tree for humans.
+/// Glanceable human receipt: decision, why, one next command.
 pub fn writePretty(io: std.Io, writer: anytype, command_text: []const u8, eval: shell_engine.Evaluation) !void {
+    _ = io;
+    const dec_label = switch (eval.decision) {
+        .allow => "ALLOW",
+        .deny => "DENY",
+    };
+    try writer.print("Decision: {s}\nWhy: {s}\nNext: ryk test \"", .{ dec_label, eval.reason });
+    try terminal_text.write(writer, command_text, .single_line);
+    try writer.writeAll("\"\n");
+}
+
+/// Verbose DCG-style decision tree (regex / latency stay in JSON).
+pub fn writePrettyVerbose(io: std.Io, writer: anytype, command_text: []const u8, eval: shell_engine.Evaluation) !void {
     try theme.paintBold(io, writer, .brand, "RYK EXPLAIN");
     try writer.writeAll("\n");
 
@@ -21,13 +33,9 @@ pub fn writePretty(io: std.Io, writer: anytype, command_text: []const u8, eval: 
             .allow => .success,
             .deny => .danger,
         };
-        try writeTreePrefix(writer, false, false);
+        try writeTreePrefix(writer, false, true);
         try theme.paint(io, writer, .muted, "Decision: ");
         try theme.paintBold(io, writer, tok, dec_label);
-        try writer.writeAll("\n");
-        try writeTreePrefix(writer, false, true);
-        try theme.paint(io, writer, .muted, "Latency: ");
-        try writeLatency(writer, eval);
         try writer.writeAll("\n");
     }
 
@@ -47,17 +55,9 @@ pub fn writePretty(io: std.Io, writer: anytype, command_text: []const u8, eval: 
         try lines.append(a, .{ .k = "Rule ID", .v = eval.rule_id orelse "(none)" });
         try lines.append(a, .{ .k = "Pack", .v = eval.pack_id orelse "(none)" });
         try lines.append(a, .{ .k = "Pattern", .v = eval.pattern_name orelse "(none)" });
-        if (eval.regex_source) |rx| try lines.append(a, .{ .k = "Regex", .v = rx });
         try lines.append(a, .{ .k = "Severity", .v = eval.severity.toString() });
         try lines.append(a, .{ .k = "Reason", .v = eval.reason });
         if (eval.explanation) |ex| try lines.append(a, .{ .k = "Explanation", .v = ex });
-        var span_buf: [64]u8 = undefined;
-        if (eval.match_start) |s| {
-            if (eval.match_end) |e| {
-                const span_s = try std.fmt.bufPrint(&span_buf, "bytes {d}..{d}", .{ s, e });
-                try lines.append(a, .{ .k = "Span", .v = span_s });
-            }
-        }
         if (eval.matched_text) |mt| try lines.append(a, .{ .k = "Matched", .v = mt });
         if (eval.matched_candidate) |mc| {
             if (!std.mem.eql(u8, mc, command_text)) {
@@ -109,18 +109,6 @@ pub fn writePretty(io: std.Io, writer: anytype, command_text: []const u8, eval: 
             try writer.writeAll("\n");
         }
     }
-}
-
-fn writeLatency(writer: anytype, eval: shell_engine.Evaluation) !void {
-    // Prefer microsecond precision from first pipeline step when present.
-    if (eval.trace.len > 0 and eval.trace[0].duration_us > 0) {
-        var buf: [32]u8 = undefined;
-        const s = shell_engine.trace.formatDurationMs(eval.trace[0].duration_us, &buf);
-        // If only one step, show total-ish as that step; still show eval latency_ms as fallback label.
-        try writer.writeAll(s);
-        return;
-    }
-    try writer.print("{d}ms", .{eval.latency_ms});
 }
 
 fn writeStepDuration(writer: anytype, step: shell_engine.TraceStep) !void {
@@ -219,7 +207,7 @@ pub fn writeJson(allocator: std.mem.Allocator, writer: anytype, command_text: []
     try writer.writeAll("\n");
 }
 
-test "writePretty includes decision and suggestions headers" {
+test "writePretty is a glanceable decision receipt" {
     theme.setTestActive(.{ .capability = .none, .background = .dark });
     defer theme.setTestActive(null);
     var buf: [4096]u8 = undefined;
@@ -247,18 +235,18 @@ test "writePretty includes decision and suggestions headers" {
     };
     try writePretty(std.testing.io, &w, "rm -rf", eval);
     const out = w.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, out, "RYK EXPLAIN") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "DENY") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "Suggestions") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "Preview first") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "Span") != null);
-    // Nest rule: timed step + nested details (not peer "matched")
-    try std.testing.expect(std.mem.indexOf(u8, out, "full_evaluation (") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "matched: core.filesystem") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "├── matched") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Decision: DENY") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Why: destructive") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Next: ryk test \"rm -rf\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Pipeline Trace") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "full_evaluation") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Regex") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "rm\\\\s+") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Latency") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Span") == null);
 }
 
-test "writePretty allow path nests details under timed step" {
+test "writePretty allow path is a glanceable receipt" {
     theme.setTestActive(.{ .capability = .none, .background = .dark });
     defer theme.setTestActive(null);
     var buf: [2048]u8 = undefined;
@@ -277,7 +265,8 @@ test "writePretty allow path nests details under timed step" {
     };
     try writePretty(std.testing.io, &w, "git status", eval);
     const out = w.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, out, "ALLOW") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "full_evaluation (") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "no destructive pack matched") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Decision: ALLOW") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Why: No destructive pack matched.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Next: ryk test \"git status\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "full_evaluation") == null);
 }

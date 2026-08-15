@@ -250,9 +250,30 @@ pub fn command(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: an
             // Fail-closed: message + linear fallback (D2).
             try stderr.writeAll(doctor_tui.fail_closed_message);
         }
-        try writeReport(io, stdout, os, backend_report, context, options.verbose);
+        if (options.check) {
+            try writeCheckReceipt(stdout, core_ready, context);
+        } else {
+            try writeReport(io, stdout, os, backend_report, context, options.verbose);
+        }
     }
     return core_ready.exitCode(options.check);
+}
+
+fn writeCheckReceipt(stdout: anytype, assessment: readiness.Assessment, context: IntegrationContext) !void {
+    var receipt_buf: [96]u8 = undefined;
+    const receipt = assessment.formatReceipt(&receipt_buf);
+    if (assessment.ready) {
+        try stdout.print("ready · {s}\n", .{receipt});
+        return;
+    }
+    try stdout.print("not ready · {s}\n", .{receipt});
+    if (context.daemon_health != .compatible) {
+        try stdout.writeAll("Next: ryk doctor --fix\n");
+    } else if (!context.policy_present) {
+        try stdout.writeAll("Next: ryk doctor --fix\n");
+    } else if (!context.policy_valid) {
+        try stdout.writeAll("Next: ryk policy check .ryk/policy.yaml\n");
+    }
 }
 
 fn isStdinTty(io: std.Io) bool {
@@ -1161,7 +1182,7 @@ fn writeRecommendations(stdout: anytype, context: IntegrationContext) !void {
             try stdout.writeAll("  Restore companion-service execute permission or reinstall ryk, then re-run `ryk doctor`.\n");
         } else if (!context.daemon_binary_exists) {
             try stdout.writeAll("  Reinstall the complete ryk release, then re-run `ryk doctor`.\n");
-            try stdout.writeAll("  For source builds, rebuild with `./scripts/build-all.sh`.\n");
+            try stdout.writeAll("  Source checkout: `./scripts/zig build`.\n");
         } else {
             try stdout.writeAll("  Reinstall ryk or rebuild with `./scripts/build-all.sh`, then re-run `ryk doctor`.\n");
         }

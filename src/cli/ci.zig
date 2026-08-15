@@ -31,7 +31,8 @@ pub fn command(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: an
     var result = try ci_check.run(io, allocator, workspace_root);
     defer result.deinit();
     switch (options.format) {
-        .text, .markdown => try ci_check.writeMarkdown(stdout, result),
+        .text => try ci_check.writeText(stdout, result),
+        .markdown => try ci_check.writeMarkdown(stdout, result),
         .json => try ci_check.writeJson(stdout, result),
     }
     const github_summary_path = options.github_summary orelse blk: {
@@ -62,11 +63,17 @@ fn parseOptions(argv: []const []const u8, stderr: anytype) !Options {
         if (std.mem.eql(u8, arg, "--format")) {
             index += 1;
             if (index >= argv.len) {
-                try stderr.writeAll("ryk ci check: --format requires markdown or json.\n");
+                try stderr.writeAll("ryk ci check: --format requires text, markdown, or json.\n");
                 return error.Usage;
             }
-            if (std.mem.eql(u8, argv[index], "markdown")) options.format = .markdown else if (std.mem.eql(u8, argv[index], "json")) options.format = .json else {
-                try stderr.writeAll("ryk ci check: --format supports markdown or json.\n");
+            if (std.mem.eql(u8, argv[index], "text")) {
+                options.format = .text;
+            } else if (std.mem.eql(u8, argv[index], "markdown")) {
+                options.format = .markdown;
+            } else if (std.mem.eql(u8, argv[index], "json")) {
+                options.format = .json;
+            } else {
+                try stderr.writeAll("ryk ci check: --format supports text, markdown, or json.\n");
                 return error.Usage;
             }
         } else if (std.mem.eql(u8, arg, "--github-summary")) {

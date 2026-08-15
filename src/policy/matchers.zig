@@ -9,7 +9,22 @@ pub fn matchesPattern(pattern: []const u8, value: []const u8) bool {
     return globMatch(pattern, value);
 }
 
+fn isWorkspaceRelativePattern(pattern: []const u8) bool {
+    return std.mem.startsWith(u8, pattern, "./") or std.mem.startsWith(u8, pattern, ".\\");
+}
+
+fn isAbsoluteFsPath(path: []const u8) bool {
+    if (path.len == 0) return false;
+    if (path[0] == '/') return true;
+    return path.len >= 3 and path[1] == ':' and (path[2] == '/' or path[2] == '\\');
+}
+
 pub fn matchesPath(pattern: []const u8, path: []const u8) bool {
+    // Workspace globs (`./**`, `./src/**`) must not match host-absolute paths
+    // such as `/etc/passwd`. Intercept normalizes in-workspace abs paths to `./…`
+    // before evaluate; policy explain uses the raw target.
+    if (isWorkspaceRelativePattern(pattern) and isAbsoluteFsPath(path)) return false;
+
     if (matchesPattern(pattern, path)) return true;
 
     // Quick-install DX robustness for .git/.ryk (and future user rules).
@@ -213,6 +228,14 @@ test "glob matcher supports exact wildcard and path-ish rules" {
     try std.testing.expect(matchesPath("./**", "./src/main.zig"));
     try std.testing.expect(matchesPath("~/.ssh/**", "~/.ssh/id_ed25519"));
     try std.testing.expect(!matchesPath("./.env", "./.env.local"));
+}
+
+test "workspace glob does not match absolute system paths" {
+    try std.testing.expect(!matchesPath("./**", "/etc/passwd"));
+    try std.testing.expect(!matchesPath("./**", "/etc/shadow"));
+    try std.testing.expect(!matchesPath("./src/**", "/etc/passwd"));
+    try std.testing.expect(matchesPath("./**", "./src/main.zig"));
+    try std.testing.expect(matchesPath("./**", "src/main.zig"));
 }
 
 test "domain and mcp selector matchers support wildcards" {

@@ -455,6 +455,10 @@ fn hookCommand(io: std.Io, host: Host, event: Event, original_event_name: []cons
                 );
             }
             try stderr.print("ryk hook: unsupported schema version {d}. Expected 1.\n", .{version_value});
+            try stderr.print(
+                "ryk hook: expected {{\"version\":1,\"host\":\"{s}\",\"event\":\"{s}\",\"payload\":{{...}}}}.\n",
+                .{ @tagName(host), @tagName(event) },
+            );
             return exit_codes.general;
         }
 

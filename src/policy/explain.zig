@@ -73,6 +73,17 @@ pub fn write(writer: anytype, policy: *const schema.Policy, evaluation: schema.E
     try writer.print("Mode: {s}\n", .{policy.mode.toString()});
 }
 
+test "file.read /etc/passwd is deny under default workspace allow" {
+    const load = @import("load.zig");
+    var policy = try load.loadPreset(std.testing.allocator, .strict);
+    defer policy.deinit();
+
+    const result = try explain(std.testing.allocator, &policy, .file_read, "/etc/passwd");
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(result.decision.result == .deny);
+    try std.testing.expect(std.mem.indexOf(u8, result.decision.rule_id orelse "", "files.read.allow") == null);
+}
+
 test "explanation includes matched rule where possible" {
     const load = @import("load.zig");
     var policy = try load.loadPreset(std.testing.allocator, .strict);

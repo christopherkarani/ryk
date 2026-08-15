@@ -35,6 +35,7 @@ pub const HostDiscovery = struct {
 pub const DiscoveryOptions = struct {
     home: []const u8,
     xdg_data_home: ?[]const u8 = null,
+    workspace_root: ?[]const u8 = null,
     window: time_window.Window,
     /// Optional host filter (null = all).
     only_host: ?types.Host = null,
@@ -148,6 +149,55 @@ fn discoverOpenCode(io: std.Io, allocator: std.mem.Allocator, options: Discovery
     }
 }
 
+fn collectRykSessionRoot(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    options: DiscoveryOptions,
+    host: *HostDiscovery,
+    root: []const u8,
+    any: *bool,
+    unreadable: *bool,
+) !void {
+    var dir = std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        error.AccessDenied => {
+            unreadable.* = true;
+            return;
+        },
+        else => {
+            unreadable.* = true;
+            return;
+        },
+    };
+    defer dir.close(io);
+    any.* = true;
+    var it = dir.iterate();
+    while (true) {
+        const entry = it.next(io) catch {
+            unreadable.* = true;
+            break;
+        } orelse break;
+        if (entry.kind != .directory) continue;
+        if (host.files.items.len >= types.max_sessions_per_host) break;
+        const session_path = try std.fs.path.join(allocator, &.{ root, entry.name });
+        defer allocator.free(session_path);
+        if (!isSafeEntryName(entry.name)) continue;
+        const events = try std.fs.path.join(allocator, &.{ session_path, "events.jsonl" });
+        if (!isRegularFileNoFollow(io, events)) {
+            allocator.free(events);
+            continue;
+        }
+        const mtime = fileMtimeSecsNoFollow(io, events) orelse 0;
+        if (!time_window.inWindow(mtime, options.window)) {
+            allocator.free(events);
+            continue;
+        }
+        const sid_name = try allocator.dupe(u8, entry.name);
+        defer allocator.free(sid_name);
+        try appendFile(allocator, &host.files, .ryk, events, sid_name, mtime);
+    }
+}
+
 fn discoverRyk(io: std.Io, allocator: std.mem.Allocator, options: DiscoveryOptions, host: *HostDiscovery) !void {
     const session_roots = [_][]const u8{ "/.ryk/sessions", "/.ryk/sessions" };
     var any = false;
@@ -155,47 +205,12 @@ fn discoverRyk(io: std.Io, allocator: std.mem.Allocator, options: DiscoveryOptio
     for (session_roots) |rel| {
         const root = try paths.resolveHomeRoot(allocator, options.home, rel);
         defer allocator.free(root);
-        var dir = std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true }) catch |err| switch (err) {
-            error.FileNotFound => continue,
-            error.AccessDenied => {
-                unreadable = true;
-                continue;
-            },
-            else => {
-                unreadable = true;
-                continue;
-            },
-        };
-        defer dir.close(io);
-        any = true;
-        var it = dir.iterate();
-        while (true) {
-            const entry = it.next(io) catch {
-                unreadable = true;
-                break;
-            } orelse break;
-            if (entry.kind != .directory) continue;
-            if (host.files.items.len >= types.max_sessions_per_host) break;
-            const session_path = try std.fs.path.join(allocator, &.{ root, entry.name });
-            defer allocator.free(session_path);
-            if (!isSafeEntryName(entry.name)) continue;
-            const events = try std.fs.path.join(allocator, &.{ session_path, "events.jsonl" });
-            // appendFile always consumes `events` (frees on reject/error, owns on success).
-            // Refuse symlink leaves (pathExists follows links — use no-follow open).
-            if (!isRegularFileNoFollow(io, events)) {
-                allocator.free(events);
-                continue;
-            }
-            const mtime = fileMtimeSecsNoFollow(io, events) orelse 0;
-            if (!time_window.inWindow(mtime, options.window)) {
-                allocator.free(events);
-                continue;
-            }
-            const sid_name = try allocator.dupe(u8, entry.name);
-            defer allocator.free(sid_name);
-            // appendFile owns a dupe of session_id; this temporary is freed on all paths.
-            try appendFile(allocator, &host.files, .ryk, events, sid_name, mtime);
-        }
+        try collectRykSessionRoot(io, allocator, options, host, root, &any, &unreadable);
+    }
+    if (options.workspace_root) |workspace| {
+        const ws_root = try std.fs.path.join(allocator, &.{ workspace, ".ryk", "sessions" });
+        defer allocator.free(ws_root);
+        try collectRykSessionRoot(io, allocator, options, host, ws_root, &any, &unreadable);
     }
     // Also note dashboard registry presence (bridge pointer, not full scan).
     const dash = try paths.resolveHomeRoot(allocator, options.home, "/.ryk/dashboard/workspaces.json");
@@ -592,4 +607,35 @@ test "discover claude fixture jsonl end-to-end path" {
     var parsed = try jsonl.parseJsonlFile(io, std.testing.allocator, items[0].files.items[0].path, 0);
     defer parsed.deinit(std.testing.allocator);
     try std.testing.expect(parsed.commands.items.len >= 1);
+}
+
+test "discover ryk reads workspace .ryk/sessions" {
+    const io = std.testing.io;
+    const home = try std.fmt.allocPrint(std.testing.allocator, "zig-cache/tmp-scan-ryk-home-{d}", .{std.Io.Timestamp.now(io, .real).toSeconds()});
+    defer std.testing.allocator.free(home);
+    defer std.Io.Dir.cwd().deleteTree(io, home) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, home);
+
+    var ws = std.testing.tmpDir(.{});
+    defer ws.cleanup();
+    const workspace = try ws.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(workspace);
+    try ws.dir.createDirPath(io, ".ryk/sessions/run-echo-1");
+    try ws.dir.writeFile(io, .{
+        .sub_path = ".ryk/sessions/run-echo-1/events.jsonl",
+        .data = "{\"event_type\":\"session_start\"}\n",
+    });
+
+    const window = time_window.resolveWindow(std.Io.Timestamp.now(io, .real).toSeconds(), 30, false);
+    const items = try discoverAll(io, std.testing.allocator, .{
+        .home = home,
+        .workspace_root = workspace,
+        .window = window,
+        .only_host = .ryk,
+    });
+    defer freeDiscoveries(std.testing.allocator, items);
+    try std.testing.expectEqual(@as(usize, 1), items.len);
+    try std.testing.expect(items[0].status == .ok);
+    try std.testing.expectEqual(@as(usize, 1), items[0].files.items.len);
+    try std.testing.expectEqualStrings("run-echo-1", items[0].files.items[0].session_id);
 }

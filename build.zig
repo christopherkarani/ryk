@@ -219,6 +219,7 @@ pub fn build(b: *std.Build) void {
         .filters = test_filters,
     });
     // util.zig realpath helpers (user allowlist under-root) use libc realpath.
+    // Also required so matcher unit tests can run under test-policy.
     core_engine_tests.root_module.link_libc = true;
     const run_core_engine_tests_only = addRunTestTerminal(b, core_engine_tests);
 

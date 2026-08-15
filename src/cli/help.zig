@@ -298,19 +298,20 @@ pub const commands =
         .{
             .name = "explain",
             .summary = "Explain why a shell command is blocked or allowed",
-            .usage = "ryk explain [--format json] [--] <command>",
+            .usage = "ryk explain [--verbose|--format json] [--] <command>",
             .category = .getting_started,
             .public = true,
             .examples = &.{
                 "ryk explain \"rm -rf /\"",
                 "ryk explain \"git reset --hard\"",
+                "ryk explain --verbose \"rm -rf /\"",
                 "ryk explain --format json \"rm -rf /tmp/x\"",
             },
+            .additional_completion_flags = &.{ "--verbose", "-v", "--format" },
             .details = &.{
-                "Runs the in-process Zig shell_engine and prints a decision tree: decision, match",
-                "(rule/pack/pattern/regex/span), pipeline steps, and safer-workflow suggestions.",
-                "Nothing is executed — this is a dry-run of the same authority hooks use.",
-                "Use --format json for machine-readable output (schema_version 2 includes span and tips).",
+                "Runs the in-process Zig shell_engine. Default output is decision, why, and one next command. Nothing is executed.",
+                "Use --verbose for the match tree, pipeline steps, and safer-workflow suggestions.",
+                "Use --format json for machine-readable output (regex, span, latency, tips).",
                 "Different from 'ryk policy explain', which explains .ryk/policy.yaml file/network/tool rules.",
             },
         },
@@ -567,12 +568,13 @@ pub const commands =
             "Removes $HOME/.ryk/daemon.sock and daemon.pid when shutdown succeeds.",
             "When the daemon is not running, stale artifacts are cleaned when safe.",
         } },
-        .{ .name = "stop", .summary = "Stop ryk protection for host agents", .usage = "ryk stop [codex|claude|cursor|opencode|openclaw|hermes|all] [--yes]", .category = .integrations, .public = true, .examples = &.{
+        .{ .name = "stop", .summary = "Stop ryk protection for host agents", .usage = "ryk stop [codex|claude|cursor|opencode|openclaw|hermes|all] [--yes|--no]", .category = .integrations, .public = true, .examples = &.{
             "ryk stop",
             "ryk stop codex",
             "ryk stop cursor",
         }, .details = &.{
             "Removes ryk plugin registrations from host agents without removing the ryk binary or policy files.",
+            "Non-interactive cancel: --no. Mutation requires --yes or an interactive confirm.",
             "Hosts: codex, claude, cursor, opencode, openclaw, hermes, grok. Defaults to all if no host is specified.",
             "Cursor: removes the ryk shell hook wrapper and disables simple ryk-only hooks.json files.",
             "OpenCode: removes .opencode/plugins/ryk.ts, ryk-tui.ts and ~/.config/opencode/plugins/ryk.ts, ryk-tui.ts",
@@ -580,6 +582,15 @@ pub const commands =
             "Hermes: runs 'hermes plugins disable ryk' and removes ~/.hermes/plugins/ryk/",
             "Grok: removes ~/.grok/hooks/ryk.json and strips ryk PreToolUse from ~/.grok/user-settings.json (restart Grok to reload).",
             "Codex / Claude: removes known plugin paths (host-managed install locations).",
+            "Restart protection later with: ryk start",
+        } },
+        .{ .name = "disable", .summary = "Stop ryk protection for host agents", .usage = "ryk disable [codex|claude|cursor|opencode|openclaw|hermes|all] [--yes|--no]", .category = .integrations, .hidden = true, .examples = &.{
+            "ryk disable",
+            "ryk disable codex",
+        }, .details = &.{
+            "Alias of `ryk stop`. Removes ryk plugin registrations from host agents without removing the ryk binary or policy files.",
+            "Non-interactive cancel: --no. Mutation requires --yes or an interactive confirm.",
+            "Hosts: codex, claude, cursor, opencode, openclaw, hermes, grok. Defaults to all if no host is specified.",
             "Restart protection later with: ryk start",
         } },
         .{ .name = "uninstall", .summary = "Uninstall ryk from this machine", .usage = "ryk uninstall [--plugins-only] [--keep-config] [--dry-run] [--yes]", .category = .integrations, .details = &.{
@@ -952,6 +963,17 @@ pub fn writeWithMode(io: std.Io, writer: anytype, mode: WriteMode) !void {
                 }
                 if (any) try writer.writeAll("\n");
             }
+            // `ryk help --all` holds the long run contract that brief help used to
+            // promise (os-sandbox auto degrade / fail-closed / empty-backpack).
+            if (findCommand("run")) |run_cmd| {
+                try writer.writeAll("  ");
+                try tui.theme.paintBold(io, writer, .brand, "run");
+                try writer.writeAll("\n");
+                for (run_cmd.details) |line| {
+                    try writer.print("    {s}\n", .{line});
+                }
+                try writer.writeAll("\n");
+            }
         },
     }
 
@@ -1069,6 +1091,10 @@ test "run help documents --os-sandbox auto degrade and fail-closed paths" {
         try w.writeAll("\n");
     }
     const text = w.buffered();
+    var printed_buf: [8192]u8 = undefined;
+    var printed_w: std.Io.Writer = .fixed(&printed_buf);
+    try std.testing.expect(try writeCommand(std.testing.io, &printed_w, "run"));
+    const printed = printed_w.buffered();
     try std.testing.expect(std.mem.indexOf(u8, text, "--os-sandbox auto|on|off") != null);
     // Happy path: no required sandbox flags for protected launch.
     try std.testing.expect(std.mem.indexOf(u8, text, "no flags required") != null);
@@ -1080,6 +1106,11 @@ test "run help documents --os-sandbox auto degrade and fail-closed paths" {
     try std.testing.expect(std.mem.indexOf(u8, text, "--seatbelt-profile compatible|hardened|strict") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "default hardened") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "--with-host-secrets") != null);
+    try std.testing.expect(std.mem.indexOf(u8, printed, "--os-sandbox auto|on|off") != null);
+    try std.testing.expect(std.mem.indexOf(u8, printed, "degrades loudly when no backend plan exists") != null);
+    try std.testing.expect(std.mem.indexOf(u8, printed, "fails closed on incomplete env scrub/allowlist") != null);
+    try std.testing.expect(std.mem.indexOf(u8, printed, "fails closed if attach fails after materials are prepared") != null);
+    try std.testing.expect(std.mem.indexOf(u8, printed, "empty-backpack") != null);
     var lists_escape = false;
     for (info.additional_completion_flags) |flag| {
         if (std.mem.eql(u8, flag, "--with-host-secrets")) lists_escape = true;
@@ -1260,6 +1291,9 @@ test "help --all lists full advanced command surface" {
     try std.testing.expect(helpListsPeerCommand(all, "allowlist"));
     try std.testing.expect(helpListsPeerCommand(all, "allow"));
     try std.testing.expect(helpListsPeerCommand(all, "unallow"));
+    try std.testing.expect(std.mem.indexOf(u8, all, "degrades loudly when no backend plan exists") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all, "fails closed on incomplete env scrub/allowlist") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all, "empty-backpack") != null);
 }
 
 test "help setup and quickstart print removal notice pointing at start" {

@@ -1,11 +1,7 @@
 Decision  [DENY]
 
-+----------------------------------------------------+
-| Decision details                                   |
-+----------------------------------------------------+
-| Reason   matched commands.deny rule "git push *"   |
-| Rule     commands.deny[0]                          |
-| Matched  git push *                                |
-| Mode     strict                                    |
-+----------------------------------------------------+
-  Risk  .................... unknown
+Reason   matched commands.deny rule "git push *"
+Rule     commands.deny[0]
+Matched  git push *
+Mode     strict
+Next: ryk help policy

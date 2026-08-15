@@ -18,9 +18,19 @@ const Options = struct {
 /// ~12 fps — smooth enough for braille frames without thrashing the TTY.
 const spinner_tick_duration = std.Io.Duration.fromNanoseconds(80 * std.time.ns_per_ms);
 
+/// `realPathFileAlloc` returns `[:0]u8`. Re-dupe to a plain `[]u8` so
+/// `allocator.free` matches the DebugAllocator size (Zig 0.16).
+fn realpathOwned(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    const rp_z = std.Io.Dir.cwd().realPathFileAlloc(io, path, allocator) catch
+        return allocator.dupe(u8, path);
+    defer allocator.free(rp_z);
+    return allocator.dupe(u8, rp_z);
+}
+
 const ProgressCtx = struct {
     io: std.Io,
     stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
     label_buf: [96]u8 = undefined,
     label_len: usize = 0,
     host_file_total: usize = 0,
@@ -134,8 +144,19 @@ fn progressCb(ctx: ?*anyopaque, host: scan_lib.types.Host, phase: scan_lib.engin
         .host_done => std.fmt.bufPrint(&tmp, "Scanned {s} ({d} files)", .{ host.toString(), sessions }) catch "Scanned",
     };
     self.setLabel(text);
-    // Redraw with new label; ticker advances frames between progress events.
-    self.tickLocked();
+    if (tui.theme.active(self.io, self.stdout).capability.hasColor()) {
+        // Redraw with new label; ticker advances frames between progress events.
+        self.tickLocked();
+    } else if (phase == .host_start or phase == .host_done or (phase == .file and sessions == 1)) {
+        // Non-TUI progress is stderr-only so --plain/--json stdout stays a receipt.
+        self.stderr.writeAll(self.label_buf[0..self.label_len]) catch {};
+        self.stderr.writeAll("\n") catch {};
+        flushWriter(self.stderr) catch {};
+    }
+}
+
+fn shouldReportProgress(json: bool, plain: bool) bool {
+    return !json and !plain;
 }
 
 fn flushWriter(writer: anytype) !void {
@@ -184,28 +205,28 @@ pub fn command(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: an
     defer if (xdg_data) |x| allocator.free(x);
 
     // TTY auto-TUI: interactive colour terminal, not --json/--plain.
-    const want_tui = !options.json and !options.plain and tui.theme.active(io, stdout).capability.hasColor();
+    const want_tui = !options.json and !options.plain and tui.output_policy.shouldEnterTuiIo(io, argv);
+    const report_progress = shouldReportProgress(options.json, options.plain);
 
     var progress_ctx: ProgressCtx = .{
         .io = io,
         .stdout = stdout,
+        .stderr = stderr,
     };
+
+    const workspace_root = try realpathOwned(io, allocator, ".");
+    defer allocator.free(workspace_root);
 
     var result = scan_lib.runScan(io, allocator, .{
         .home = home,
         .xdg_data_home = xdg_data,
+        .workspace_root = workspace_root,
         .days = options.days,
         .all_time = options.all_time,
         .show_all = options.show_all,
         .only_host = options.only_host,
-        .progress = if (want_tui or (!options.json and tui.theme.active(io, stdout).capability.hasColor()))
-            progressCb
-        else
-            null,
-        .progress_ctx = if (want_tui or (!options.json and tui.theme.active(io, stdout).capability.hasColor()))
-            &progress_ctx
-        else
-            null,
+        .progress = if (report_progress) progressCb else null,
+        .progress_ctx = if (report_progress) &progress_ctx else null,
     }) catch |err| {
         progress_ctx.clear();
         try stderr.print("ryk scan: failed: {s}\n", .{@errorName(err)});
@@ -241,13 +262,12 @@ pub fn command(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: an
 }
 
 fn parseOptions(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: anytype) !Options {
-    _ = stdout;
     var options: Options = .{};
     var i: usize = 0;
     while (i < argv.len) : (i += 1) {
         const arg = argv[i];
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
-            if (!try help.writeCommand(io, stderr, "scan")) {
+            if (!try help.writeCommand(io, stdout, "scan")) {
                 try stderr.writeAll("ryk scan: help entry missing\n");
                 return error.Usage;
             }
@@ -338,8 +358,34 @@ fn parseHost(name: []const u8) ?scan_lib.types.Host {
     return null;
 }
 
+test "scan workspace realpath frees without DebugAllocator size mismatch" {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    const allocator = gpa_state.allocator();
+    const path = try realpathOwned(std.testing.io, allocator, ".");
+    allocator.free(path);
+    try std.testing.expectEqual(.ok, gpa_state.deinit());
+}
+
 test "scan CLI module loads" {
     _ = command;
+}
+
+test "scan --help writes usage to stdout" {
+    var out_buf: [4096]u8 = undefined;
+    var err_buf: [256]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var err: std.Io.Writer = .fixed(&err_buf);
+    const code = try command(std.testing.io, &.{"--help"}, &out, &err);
+    try std.testing.expectEqual(@as(u8, exit_codes.success), code);
+    try std.testing.expect(std.mem.indexOf(u8, out.buffered(), "ryk scan") != null);
+    try std.testing.expectEqualStrings("", err.buffered());
+}
+
+test "scan reports progress only for interactive non-plain invocations" {
+    try std.testing.expect(shouldReportProgress(false, false));
+    try std.testing.expect(!shouldReportProgress(true, false));
+    try std.testing.expect(!shouldReportProgress(false, true));
+    try std.testing.expect(!shouldReportProgress(true, true));
 }
 
 test "scan CLI rejects --plain with --json" {

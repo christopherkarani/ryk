@@ -65,7 +65,7 @@ fn replaySession(
             try stderr.writeAll("ryk replay: --tui cannot be combined with --json (machine output is frozen).\n");
             return exit_codes.usage;
         }
-        if (!tui.theme.active(io, stdout).capability.hasColor()) {
+        if (!tui.output_policy.shouldEnterTuiIo(io, &.{ "--tui" })) {
             try stderr.writeAll("ryk replay: --tui needs an interactive colour terminal. Drop --tui, or unset NO_COLOR / --no-rich.\n");
             return exit_codes.usage;
         }
@@ -361,6 +361,55 @@ const empty_sessions_hint =
     \\
 ;
 
+const SessionListMeta = struct {
+    updated: []const u8,
+    command: []const u8,
+};
+
+fn truncateId(id: []const u8) []const u8 {
+    return if (id.len <= 20) id else id[0..20];
+}
+
+fn readSessionListMeta(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    sessions_dir: []const u8,
+    session_id: []const u8,
+    updated_buf: []u8,
+    command_buf: []u8,
+) SessionListMeta {
+    const events_path = std.fs.path.join(allocator, &.{ sessions_dir, session_id, "events.jsonl" }) catch
+        return .{ .updated = "-", .command = "-" };
+    defer allocator.free(events_path);
+    const mtime = std.Io.Dir.cwd().statFile(io, events_path, .{}) catch null;
+    const updated: []const u8 = if (mtime) |st|
+        std.fmt.bufPrint(updated_buf, "{d}", .{st.mtime.toSeconds()}) catch "-"
+    else
+        "-";
+
+    const summary_path = std.fs.path.join(allocator, &.{ sessions_dir, session_id, "summary.json" }) catch
+        return .{ .updated = updated, .command = "-" };
+    defer allocator.free(summary_path);
+    const summary = std.Io.Dir.cwd().readFileAlloc(io, summary_path, allocator, .limited(8 * 1024)) catch
+        return .{ .updated = updated, .command = "-" };
+    defer allocator.free(summary);
+    const command_text = extractSummaryCommand(summary, command_buf);
+    return .{ .updated = updated, .command = command_text };
+}
+
+fn extractSummaryCommand(summary: []const u8, buf: []u8) []const u8 {
+    const key = "\"command\"";
+    const start = std.mem.indexOf(u8, summary, key) orelse return "-";
+    const after = summary[start + key.len ..];
+    const q1 = std.mem.indexOfScalar(u8, after, '"') orelse return "-";
+    const rest = after[q1 + 1 ..];
+    const q2 = std.mem.indexOfScalar(u8, rest, '"') orelse return "-";
+    const raw = rest[0..q2];
+    const n = @min(raw.len, buf.len);
+    @memcpy(buf[0..n], raw[0..n]);
+    return buf[0..n];
+}
+
 fn listSessions(io: std.Io, allocator: std.mem.Allocator, workspace_root: []const u8, stdout: anytype) !u8 {
     const sessions_dir = try std.fs.path.join(allocator, &.{ workspace_root, ".ryk", "sessions" });
     defer allocator.free(sessions_dir);
@@ -374,13 +423,20 @@ fn listSessions(io: std.Io, allocator: std.mem.Allocator, workspace_root: []cons
     };
     defer dir.close(io);
 
-    try stdout.writeAll("SESSION ID\n");
+    try stdout.writeAll("SESSION              UPDATED              COMMAND\n");
 
     var count: usize = 0;
     var iter = dir.iterate();
     while (try iter.next(io)) |entry| {
         if (entry.kind != .directory) continue;
-        try stdout.print("{s}\n", .{entry.name});
+        var updated_buf: [20]u8 = undefined;
+        var command_buf: [48]u8 = undefined;
+        const meta = readSessionListMeta(io, allocator, sessions_dir, entry.name, &updated_buf, &command_buf);
+        try stdout.print("{s}\t{s}\t{s}\n", .{
+            truncateId(entry.name),
+            meta.updated,
+            meta.command,
+        });
         count += 1;
     }
 

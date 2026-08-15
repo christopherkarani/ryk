@@ -6,6 +6,7 @@ const core_api = @import("ryk_core").api;
 const exit_codes = @import("exit_codes.zig");
 const help = @import("help.zig");
 const tui = @import("../tui/render.zig");
+const terminal_text = @import("../tui/terminal_text.zig");
 const suggestions = @import("suggestions.zig");
 const onboarding = @import("onboarding.zig");
 
@@ -257,24 +258,27 @@ fn writePolicyExplanationHuman(io: std.Io, allocator: std.mem.Allocator, stdout:
     const rule_id = if (evaluation.matched_rule) |rule| rule.id else "none";
     const matched = if (evaluation.matched_rule) |rule| rule.pattern else "none";
     try writePolicyDetailsPanel(io, allocator, stdout, evaluation.decision.reason, rule_id, matched, policy_value.mode().toString());
-    const score = evaluation.decision.risk_score orelse 0;
-    const risk_label = if (evaluation.decision.risk_score == null) "unknown" else if (score <= 25) "low" else if (score <= 50) "medium" else if (score <= 75) "high" else "critical";
-    try stdout.writeAll("  Risk  ");
-    try tui.meter(io, stdout, @as(f32, @floatFromInt(score)) / 100.0, risk_label);
-    try stdout.writeAll("\n");
+    if (evaluation.decision.risk_score) |score| {
+        const risk_label = if (score <= 25) "low" else if (score <= 50) "medium" else if (score <= 75) "high" else "critical";
+        try stdout.writeAll("  Risk  ");
+        try tui.meter(io, stdout, @as(f32, @floatFromInt(score)) / 100.0, risk_label);
+        try stdout.writeAll("\n");
+    }
+    try stdout.writeAll("Next: ryk help policy\n");
 }
 
 fn writePolicyDetailsPanel(io: std.Io, allocator: std.mem.Allocator, stdout: anytype, reason: []const u8, rule_id: []const u8, matched: []const u8, mode: []const u8) !void {
-    const reason_line = try std.fmt.allocPrint(allocator, "Reason   {s}", .{reason});
-    errdefer allocator.free(reason_line);
-    const rule_line = try std.fmt.allocPrint(allocator, "Rule     {s}", .{rule_id});
-    errdefer allocator.free(rule_line);
-    const matched_line = try std.fmt.allocPrint(allocator, "Matched  {s}", .{matched});
-    errdefer allocator.free(matched_line);
-    const mode_line = try std.fmt.allocPrint(allocator, "Mode     {s}", .{mode});
-    const detail_lines = [_][]u8{ reason_line, rule_line, matched_line, mode_line };
-    defer for (detail_lines) |line| allocator.free(line);
-    try tui.panel(io, stdout, "Decision details", &detail_lines);
+    _ = io;
+    _ = allocator;
+    try stdout.writeAll("Reason   ");
+    try terminal_text.write(stdout, reason, .single_line);
+    try stdout.writeAll("\nRule     ");
+    try terminal_text.write(stdout, rule_id, .single_line);
+    try stdout.writeAll("\nMatched  ");
+    try terminal_text.write(stdout, matched, .single_line);
+    try stdout.writeAll("\nMode     ");
+    try terminal_text.write(stdout, mode, .single_line);
+    try stdout.writeAll("\n");
 }
 
 const ExplainTarget = struct {
@@ -567,7 +571,8 @@ test "policy explain reports matched deny rule" {
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "[DENY]") != null);
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "files.read.deny") != null);
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "Mode") != null);
-    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "Risk") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "unknown") == null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "Next:") != null);
     try std.testing.expectEqualStrings("", stderr_writer.buffered());
 }
 

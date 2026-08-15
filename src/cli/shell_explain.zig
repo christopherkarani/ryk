@@ -21,6 +21,7 @@ pub fn command(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: an
     }
 
     var format_json = false;
+    var verbose = false;
     var cmd_start: usize = 0;
     var i: usize = 0;
     while (i < argv.len) : (i += 1) {
@@ -28,6 +29,11 @@ pub fn command(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: an
         if (std.mem.eql(u8, arg, "--")) {
             cmd_start = i + 1;
             break;
+        }
+        if (std.mem.eql(u8, arg, "--verbose") or std.mem.eql(u8, arg, "-v")) {
+            verbose = true;
+            cmd_start = i + 1;
+            continue;
         }
         if (std.mem.eql(u8, arg, "--format")) {
             if (i + 1 >= argv.len) {
@@ -111,6 +117,8 @@ pub fn command(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: an
 
     if (format_json) {
         try explain_render.writeJson(std.heap.smp_allocator, stdout, command_text, eval);
+    } else if (verbose) {
+        try explain_render.writePrettyVerbose(io, stdout, command_text, eval);
     } else {
         try explain_render.writePretty(io, stdout, command_text, eval);
     }

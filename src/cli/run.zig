@@ -1110,15 +1110,8 @@ fn commandWithStdioAndEnv(io: std.Io, argv: []const []const u8, stdout: anytype,
                     try self.auditNetworkDecision(session, network_decision.redacted_target, .network_exfiltration_suspected, network_decision.decision);
                 }
             }
-            for (self.selected_policy.network.deny) |denied| {
-                const network_decision = try intercept.network.evaluate(self.allocator, self.selected_policy, self.effective_mode, denied, .{ .enforcement_mode = .unavailable, .ci_mode = self.effective_mode == .ci });
-                defer network_decision.deinit(self.allocator);
-                try self.auditNetworkDecision(session, network_decision.redacted_target, .network_connect_attempt, null);
-                try self.auditNetworkDecision(session, network_decision.redacted_target, .network_connect_denied, network_decision.decision);
-                if (network_decision.exfil_findings.len > 0) {
-                    try self.auditNetworkDecision(session, network_decision.redacted_target, .network_exfiltration_suspected, network_decision.decision);
-                }
-            }
+            // Policy-table deny hosts are not live connections. Emitting
+            // network_connect_denied here inflated report/replay "prevented" counts.
         }
 
         fn resolveApproval(self: *@This(), command_decision: intercept.commands.CommandDecision, display: []const u8) !intercept.approvals.ApprovalChoice {
@@ -2240,7 +2233,7 @@ fn printSessionStart(
     var grade_line_buf: [96]u8 = undefined;
     const grade_line = try std.fmt.bufPrint(
         &grade_line_buf,
-        "Session grade: {s} (env RYK_SESSION_SANDBOX_GRADE)\n",
+        "Session grade: {s}\n",
         .{session_grade.toString()},
     );
     // E0: one greppable audit=degraded line per session when in-shim audit is known dead.

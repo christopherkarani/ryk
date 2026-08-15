@@ -369,9 +369,25 @@ const secret_env_patterns = [_][]const u8{
     "SECRET_KEY",
     "*_SECRET_KEY",
     "*_CREDENTIALS",
-    "SSH_AUTH_SOCK",
     "PGPASSWORD",
     "MYSQL_PWD",
+};
+
+const benign_env_names = [_][]const u8{
+    "PWD",
+    "OLDPWD",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "PATH",
+    "TERM",
+    "SHELL",
+    "SHLVL",
+    "DISPLAY",
+    "SSH_AUTH_SOCK",
+    "SSH_AGENT_PID",
+    "CURSOR_CONVERSATION_ID",
+    "CURSOR_TRACE_ID",
 };
 
 pub fn redactString(value: []const u8) []const u8 {
@@ -518,6 +534,9 @@ pub fn redactTargetValueAlloc(allocator: std.mem.Allocator, kind_name: []const u
 }
 
 pub fn isSecretEnvName(name: []const u8) bool {
+    for (benign_env_names) |benign| {
+        if (std.ascii.eqlIgnoreCase(benign, name)) return false;
+    }
     for (secret_env_patterns) |pattern| {
         if (matchesPatternIgnoreCase(pattern, name)) return true;
     }
@@ -754,7 +773,7 @@ test "secret env name detection covers common variables" {
     try std.testing.expect(isSecretEnvName("GITHUB_TOKEN"));
     try std.testing.expect(isSecretEnvName("FAKE_GITHUB_TOKEN"));
     try std.testing.expect(isSecretEnvName("OPENAI_API_KEY"));
-    try std.testing.expect(isSecretEnvName("SSH_AUTH_SOCK"));
+    try std.testing.expect(!isSecretEnvName("SSH_AUTH_SOCK"));
     try std.testing.expect(!isSecretEnvName("PATH"));
 }
 
@@ -1171,6 +1190,9 @@ test "benign environment names are not credentials" {
     try std.testing.expect(!isSecretEnvName("AZURE_REGION"));
     try std.testing.expect(!isSecretEnvName("KEYBOARD_LAYOUT"));
     try std.testing.expect(!isSecretEnvName("MONKEY_MODE"));
+    try std.testing.expect(!isSecretEnvName("PWD"));
+    try std.testing.expect(!isSecretEnvName("SSH_AUTH_SOCK"));
+    try std.testing.expect(!isSecretEnvName("CURSOR_CONVERSATION_ID"));
     try std.testing.expect(isSecretEnvName("AWS_SECRET_ACCESS_KEY"));
     try std.testing.expect(isSecretEnvName("AZURE_CLIENT_SECRET"));
     try std.testing.expect(isSecretEnvName("CUSTOM_SIGNING_KEY"));

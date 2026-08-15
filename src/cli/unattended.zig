@@ -84,6 +84,15 @@ fn smokeCountsTowardHostReady(host: []const u8) bool {
     return !std.mem.eql(u8, host, "hermes");
 }
 
+/// `realPathFileAlloc` returns `[:0]u8`. Re-dupe to a plain `[]u8` so
+/// `allocator.free` matches the DebugAllocator size (Zig 0.16).
+fn realpathOwned(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    const rp_z = std.Io.Dir.cwd().realPathFileAlloc(io, path, allocator) catch
+        return allocator.dupe(u8, path);
+    defer allocator.free(rp_z);
+    return allocator.dupe(u8, rp_z);
+}
+
 fn formatDoctorProbeFailureJson(buf: []u8, err_name: []const u8) ![]const u8 {
     return std.fmt.bufPrint(
         buf,
@@ -479,8 +488,7 @@ fn healthCommandInner(
     // Smoke invokes `ryk hook` in this process tree under the operator health
     // cwd. Report that workspace so dual-path (operator cwd vs live host root)
     // is visible; Hermes never treats it as daemon readiness proof (M-4).
-    const smoke_workspace = std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator) catch
-        try allocator.dupe(u8, ".");
+    const smoke_workspace = try realpathOwned(io, allocator, ".");
     defer allocator.free(smoke_workspace);
 
     for (hosts, 0..) |host, host_index| {
@@ -600,7 +608,7 @@ fn probeOpenClaw(allocator: std.mem.Allocator, io: std.Io, budget: HealthBudget,
         return .{ .configured = false, .live_verified = false, .note = "OpenClaw workspace binding is missing or not an absolute JSON string" };
     };
     defer allocator.free(configured_workspace);
-    const canonical_workspace = std.Io.Dir.cwd().realPathFileAlloc(io, configured_workspace, allocator) catch {
+    const canonical_workspace = realpathOwned(io, allocator, configured_workspace) catch {
         return .{ .configured = false, .live_verified = false, .note = "OpenClaw workspace binding does not resolve to an existing directory" };
     };
     defer allocator.free(canonical_workspace);
@@ -1036,6 +1044,14 @@ test "unattended contract rejects unsafe posture overrides" {
     policy.network.mode = .allowlist;
     policy.audit.tamper_evident = false;
     try std.testing.expect(!isUnattendedPolicy(&policy));
+}
+
+test "health workspace realpath frees without DebugAllocator size mismatch" {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    const allocator = gpa_state.allocator();
+    const path = try realpathOwned(std.testing.io, allocator, ".");
+    allocator.free(path);
+    try std.testing.expectEqual(.ok, gpa_state.deinit());
 }
 
 test "unattended contract rejects broad custom allow rules" {

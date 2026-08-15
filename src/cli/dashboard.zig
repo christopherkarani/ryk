@@ -23,6 +23,7 @@ const intercept = @import("../intercept/mod.zig");
 
 const default_host = "127.0.0.1";
 const default_port: u16 = 7742;
+const once_idle_timeout_ms: u32 = 30_000;
 const canonical_ui_dir = "src/dashboard/assets";
 const installed_ui_dir = "ryk-dashboard-ui/dist";
 const dashboard_ui_missing_html =
@@ -284,6 +285,9 @@ fn serve(io: std.Io, options: DashboardOptions, stdout: anytype, stderr: anytype
     defer server.deinit(io);
     const mode_label: []const u8 = if (options.workspace != null) "workspace" else "machine";
     try stdout.print("ryk dashboard listening at http://{s}:{d} ({s} mode)\n", .{ options.host, options.port, mode_label });
+    if (options.once) {
+        try stdout.print("Waiting for one request. Press Ctrl-C to cancel. Idle timeout: {d}s.\n", .{once_idle_timeout_ms / 1000});
+    }
     try flushIfSupported(stdout);
 
     var gpa_state: std.heap.DebugAllocator(.{}) = .init;
@@ -307,6 +311,19 @@ fn serve(io: std.Io, options: DashboardOptions, stdout: anytype, stderr: anytype
     };
 
     while (true) {
+        if (options.once) {
+            var listen_fd = [_]std.posix.pollfd{.{
+                .fd = server.socket.handle,
+                .events = std.posix.POLL.IN,
+                .revents = 0,
+            }};
+            const ready = std.posix.poll(&listen_fd, @as(i32, @intCast(once_idle_timeout_ms))) catch 0;
+            if (ready == 0) {
+                try stdout.writeAll("ryk dashboard: --once idle timeout; no request received.\n");
+                try flushIfSupported(stdout);
+                return exit_codes.success;
+            }
+        }
         var stream = server.accept(io) catch |err| {
             try stderr.print("ryk dashboard: accept failed: {s}\n", .{@errorName(err)});
             continue;
@@ -1318,4 +1335,9 @@ test "dashboard request source accepts loopback and rejects rebinding origins" {
     try std.testing.expect(requestSourceAllowed(local_origin));
     const rebound = Request{ .method = "GET", .path = "/", .body = "", .csrf_token = null, .host = "attacker.example", .origin = "http://attacker.example" };
     try std.testing.expect(!requestSourceAllowed(rebound));
+}
+
+test "dashboard --once has a bounded idle timeout" {
+    try std.testing.expect(once_idle_timeout_ms <= 30_000);
+    try std.testing.expect(once_idle_timeout_ms >= 1_000);
 }

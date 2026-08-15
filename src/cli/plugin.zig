@@ -1805,10 +1805,6 @@ fn installCommand(io: std.Io, argv: []const []const u8, stdout: anytype, stderr:
             }
         }
 
-        // Safety notes (always printed)
-        try stdout.writeAll("  safety: host config will not be silently overwritten\n");
-        try stdout.writeAll("  safety: no credentials or telemetry will be stored\n");
-
         // P1 install smoke: safe allow + dangerous deny on the host veto path.
         if (!dry_run and t != .all) {
             const host_name = @tagName(t);
@@ -1835,6 +1831,8 @@ fn installCommand(io: std.Io, argv: []const []const u8, stdout: anytype, stderr:
         try stdout.writeAll("  Verify: ryk doctor · process isolation: ryk run -- pi\n");
     }
 
+    try stdout.writeAll("\n  safety: host config will not be silently overwritten\n");
+    try stdout.writeAll("  safety: no credentials or telemetry will be stored\n");
     try stdout.writeAll("\n");
     // Exit non-zero only when install claimed success but deny smoke failed.
     if (smoke_deny_failed) {
@@ -3523,6 +3521,8 @@ test "plugin doctor prints expected sections" {
     try std.testing.expect(std.mem.indexOf(u8, output, "ryk run -- pi") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "pi …") == null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Plugin directories:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "/6 found") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "integrations/common:") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Host binaries:") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Platform:") != null);
     try std.testing.expectEqualStrings("", stderr_writer.buffered());
