@@ -634,11 +634,13 @@ fn addRwGrantFromSurfaces(
     if (builtin.os.tag != .linux) return error.Unsupported;
     const ro = allowedAccessForMode(.ro, abi);
     const rw = allowedAccessForMode(.rw, abi);
+    // Walk-only on expand roots: READ_DIR+EXECUTE, no READ_FILE. Otherwise a
+    // skipped hardlink leaf is still readable via the parent PATH_BENEATH.
+    const walk = ro & ~ACCESS_FS_READ_FILE;
     var any_rw = false;
 
     for (surfaces.expand_roots) |root| {
-        // RO on expand roots so chdir/list/search works; WRITE/MAKE off.
-        _ = try addPathBeneathRule(ruleset_fd, root, ro, true);
+        _ = try addPathBeneathRule(ruleset_fd, root, walk, true);
     }
     for (surfaces.control_ro_paths) |root| {
         _ = try addPathBeneathRule(ruleset_fd, root, ro, false);

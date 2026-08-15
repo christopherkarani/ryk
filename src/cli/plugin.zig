@@ -2617,6 +2617,9 @@ pub fn openClawWorkspaceBindingMatches(expected_root: []const u8, configured_roo
 
 pub fn parseOpenClawWorkspaceBinding(allocator: std.mem.Allocator, output: []const u8) ![]u8 {
     const text = std.mem.trim(u8, output, " \t\r\n");
+    if (text.len > 0 and std.fs.path.isAbsolute(text) and std.mem.indexOfAny(u8, text, "\n\r") == null) {
+        return allocator.dupe(u8, text);
+    }
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, text, .{});
     defer parsed.deinit();
     if (parsed.value != .string or !std.fs.path.isAbsolute(parsed.value.string)) return error.InvalidOpenClawWorkspaceBinding;

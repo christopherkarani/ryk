@@ -270,6 +270,7 @@ if [[ "$A_STATUS" -ne 0 ]]; then
     skip_case 'A env canary dump (required OS sandbox unavailable)'
   else
     fail_case "A env canary dump exited $A_STATUS"
+    printf 'A stdout:\n%s\nA stderr:\n%s\n' "$(cat "$A_STDOUT")" "$(cat "$A_STDERR")" >&2
   fi
 elif ! attests_latest_session_active; then
   fail_case 'A env canary dump lacked active sandbox_posture audit with profile hash'
@@ -367,6 +368,7 @@ else
     skip_case 'D unminted reference rejection (required OS sandbox unavailable)'
   elif [[ "$D_STATUS" -ne 0 ]]; then
     fail_case "D unminted reference probe exited $D_STATUS"
+    printf 'D stdout:\n%s\nD stderr:\n%s\n' "$(cat "$D_STDOUT")" "$(cat "$D_STDERR")" >&2
   elif ! attests_latest_session_active; then
     fail_case 'D unminted reference probe lacked active sandbox_posture audit with profile hash'
   elif grep -Fq -- "$UNMINTED_REF" "$D_STDOUT" "$D_STDERR"; then

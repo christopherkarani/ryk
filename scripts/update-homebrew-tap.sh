@@ -100,7 +100,7 @@ if [[ -z "$CHECKSUMS" ]]; then
     log "using local dist/checksums.txt"
   else
     command -v gh >/dev/null 2>&1 || fail "no --checksums and no dist/checksums.txt; gh is required to download from the release"
-    CHECKSUMS="$(mktemp -t ryk-brew-checksums)"
+    CHECKSUMS="$(mktemp "${TMPDIR:-/tmp}/ryk-brew-checksums.XXXXXX")"
     log "downloading checksums.txt from release v${VERSION}…"
     gh release download "v${VERSION}" --pattern checksums.txt --output "$CHECKSUMS" --clobber \
       || fail "could not download checksums.txt for v${VERSION}; publish release assets first"
@@ -190,7 +190,7 @@ render() {
   ' "$src"
 }
 
-RENDERED="$(mktemp -t ryk-brew-formula)"
+RENDERED="$(mktemp "${TMPDIR:-/tmp}/ryk-brew-formula.XXXXXX")"
 trap 'rm -f "$RENDERED"' EXIT
 render "$FORMULA" >"$RENDERED" || fail "formula render failed (markers out of shape); ${FORMULA} left untouched"
 
@@ -228,7 +228,7 @@ fi
 cleanup_clone=""
 if [[ -z "$TAP_DIR" ]]; then
   command -v gh >/dev/null 2>&1 || fail "gh is required to clone the tap"
-  TAP_DIR="$(mktemp -d -t ryk-tap)"
+  TAP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ryk-tap.XXXXXX")"
   cleanup_clone="$TAP_DIR"
   log "cloning tap ${TAP_REPO}…"
   gh repo clone "$TAP_REPO" "$TAP_DIR" -- --depth 1 >/dev/null 2>&1 || fail "could not clone ${TAP_REPO}. Bootstrap the tap once (see packaging/homebrew/README.md), then re-run."

@@ -67,7 +67,13 @@ pub fn parseFromSlice(allocator: std.mem.Allocator, text: []const u8) !Schema {
         variables.deinit(allocator);
     }
     var active: ?Builder = null;
-    defer if (active) |*builder| builder.deinit(allocator);
+    defer {
+        if (active) |builder_value| {
+            active = null;
+            var builder = builder_value;
+            builder.deinit(allocator);
+        }
+    }
     var saw_unknown_omit = false;
     var section: enum { none, defaults, vars } = .none;
 
@@ -147,16 +153,16 @@ fn finishActive(
     variables: *std.ArrayList(Variable),
     active: *?Builder,
 ) !void {
-    if (active.*) |builder_value| {
-        var builder = builder_value;
-        active.* = null;
-        var transferred = false;
-        defer if (!transferred) builder.deinit(allocator);
-        const variable = try builder.intoVariable();
-        transferred = true;
-        errdefer variable.deinit(allocator);
-        try variables.append(allocator, variable);
-    }
+    const builder_value = active.* orelse return;
+    // Null first so parseFromSlice's defer cannot double-free after transfer.
+    active.* = null;
+    var builder = builder_value;
+    var transferred = false;
+    defer if (!transferred) builder.deinit(allocator);
+    const variable = try builder.intoVariable();
+    transferred = true;
+    errdefer variable.deinit(allocator);
+    try variables.append(allocator, variable);
 }
 
 const Pair = struct { key: []const u8, value: []const u8 };
