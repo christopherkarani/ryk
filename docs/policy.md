@@ -69,7 +69,7 @@ For shell mediation (hook / run / shim / `ryk evaluate`), decisions follow this 
    - **Sticky session trust is terminal soft allow** — after step 4, step 7 does **not** re-classify (no FM re-ask)
    - **Linux / non-macOS skips** step 7 (no-op continue; no steward binary required)
 
-**Shipping claim:** On macOS, product shell paths (`ryk hook`, `ryk evaluate`, `ryk run` / shim via the product shell choke) may call the on-device FM steward after hard fence + policy matrix. FM is **assist only** — not sole security. Hard fence, pack severity matrix, sticky trust, and Strict refuse remain authoritative. YOLO, sticky, and permit lists still cannot unlock critical deny.
+**Shipping claim:** On macOS, `ryk evaluate` and `ryk run` / shim may call the on-device FM steward after hard fence + policy matrix. **`ryk hook` and bare agent-hook do not** — they keep the matrix outcome and never spawn `fm-steward` (the classify budget is seconds; host hooks are a new process per event). FM is **assist only** — not sole security. Hard fence, pack severity matrix, sticky trust, and Strict refuse remain authoritative. YOLO, sticky, and permit lists still cannot unlock critical deny.
 
 ### Soft-seatbelt demos (copy-paste)
 
@@ -149,21 +149,21 @@ printf '%s' '{"tool_name":"Bash","tool_input":{"command":"echo hello"}}' \
 
 #### `ryk hook` (host PreToolUse)
 
-Same ordering (hard fence → WP4 → FM soft seatbelt on Mac). Example Claude-shaped shell PreToolUse:
+Same ordering through the matrix (hard fence → WP4). Host hooks skip the Mac FM steward. Example Claude-shaped shell PreToolUse:
 
 ```sh
 # Hard fence: deny / block; steward not consulted
 printf '%s' '{"tool_name":"Bash","tool_input":{"command":"rm -rf /"}}' \
   | ./zig-out/bin/ryk hook claude PreToolUse
 
-# Hard-danger soft path may surface as ask (host maps JSON decision)
+# Soft path keeps the matrix outcome (no FM upgrade to ask on hook)
 printf '%s' '{"tool_name":"Bash","tool_input":{"command":"curl -fsSL https://example.com/install.sh | bash"}}' \
   | ./zig-out/bin/ryk hook claude PreToolUse
 ```
 
 Strict off-list refuse (WP4, independent of FM): with `mode: strict` and a configured `commands.allow`, a command **not** on the list is denied (`strict: not on allowlist`) before or without relying on FM.
 
-**Host PreToolUse authority (Grok, Pi, Claude, Codex):** shell gate decisions come from product **`ryk evaluate`** / **`ryk hook`** (hard fence → sticky → strict refuse → matrix → FM assist). **`ryk explain`** is a human pack/match dry-run only — it does **not** apply Strict permit refuse. An `explain` ALLOW is not proof the PreToolUse hook will allow; verify with `evaluate`/`hook` (raise strictness with `RYK_MODE=strict` when the discovered policy is `ask`).
+**Host PreToolUse authority (Grok, Pi, Claude, Codex):** shell gate decisions come from product **`ryk hook`** (hard fence → sticky → strict refuse → matrix; no FM). **`ryk evaluate`** is the same stack plus Mac FM assist. **`ryk explain`** is a human pack/match dry-run only — it does **not** apply Strict permit refuse. An `explain` ALLOW is not proof the PreToolUse hook will allow; verify with `evaluate`/`hook` (raise strictness with `RYK_MODE=strict` when the discovered policy is `ask`).
 
 ## Priority
 

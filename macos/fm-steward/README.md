@@ -143,15 +143,14 @@ swift run fm-steward eval-danger
 
 ## Product Zig wiring
 
-Zig product hooks **do** call this steward. The choke is `applyFmSoftSeatbelt` in `src/cli/shell_eval.zig`. Live callers (do not treat as unattached):
+`ryk evaluate` and `ryk run` / shim call this steward. **`ryk hook` and bare agent-hook do not** (they set `disable_fm` so host PreToolUse never waits on classify). The choke is `applyFmSoftSeatbelt` in `src/cli/shell_eval.zig`. Live callers (do not treat as unattached):
 
 | Surface | Role |
 |---------|------|
 | `src/cli/fm_steward_client.zig` | Subprocess client: `fm-steward classify --card <temp> --timeout-ms N --json`. Fail-open. |
 | `src/cli/shell_eval.zig` | Soft-seatbelt choke after hard fence + policy matrix |
-| `src/cli/hook.zig` | PreToolUse / PermissionRequest shell → that choke (`telemetry_source=hook`) |
-
-`ryk evaluate` and `ryk run` / shim use the same `shell_eval` choke (evaluate injects `fm_client` into `decisionFromDaemonResultWithPolicy`).
+| `src/cli/evaluate.zig` / run / shim | Product shell → that choke |
+| `src/cli/hook.zig` | PreToolUse / PermissionRequest shell: `disable_fm` on the live route; tests may inject a client |
 
 **Order (see `docs/policy.md`):** critical hard fence deny → sticky match → strict refuse → mode × severity matrix → **then** FM on remaining soft outcomes (`allow` \| `warn` \| `ask`).
 
