@@ -963,6 +963,17 @@ pub fn writeWithMode(io: std.Io, writer: anytype, mode: WriteMode) !void {
                 }
                 if (any) try writer.writeAll("\n");
             }
+            // `ryk help --all` holds the long run contract that brief help used to
+            // promise (os-sandbox auto degrade / fail-closed / empty-backpack).
+            if (findCommand("run")) |run_cmd| {
+                try writer.writeAll("  ");
+                try tui.theme.paintBold(io, writer, .brand, "run");
+                try writer.writeAll("\n");
+                for (run_cmd.details) |line| {
+                    try writer.print("    {s}\n", .{line});
+                }
+                try writer.writeAll("\n");
+            }
         },
     }
 
@@ -1280,6 +1291,9 @@ test "help --all lists full advanced command surface" {
     try std.testing.expect(helpListsPeerCommand(all, "allowlist"));
     try std.testing.expect(helpListsPeerCommand(all, "allow"));
     try std.testing.expect(helpListsPeerCommand(all, "unallow"));
+    try std.testing.expect(std.mem.indexOf(u8, all, "degrades loudly when no backend plan exists") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all, "fails closed on incomplete env scrub/allowlist") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all, "empty-backpack") != null);
 }
 
 test "help setup and quickstart print removal notice pointing at start" {

@@ -18,9 +18,19 @@ const Options = struct {
 /// ~12 fps — smooth enough for braille frames without thrashing the TTY.
 const spinner_tick_duration = std.Io.Duration.fromNanoseconds(80 * std.time.ns_per_ms);
 
+/// `realPathFileAlloc` returns `[:0]u8`. Re-dupe to a plain `[]u8` so
+/// `allocator.free` matches the DebugAllocator size (Zig 0.16).
+fn realpathOwned(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    const rp_z = std.Io.Dir.cwd().realPathFileAlloc(io, path, allocator) catch
+        return allocator.dupe(u8, path);
+    defer allocator.free(rp_z);
+    return allocator.dupe(u8, rp_z);
+}
+
 const ProgressCtx = struct {
     io: std.Io,
     stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
     label_buf: [96]u8 = undefined,
     label_len: usize = 0,
     host_file_total: usize = 0,
@@ -138,9 +148,10 @@ fn progressCb(ctx: ?*anyopaque, host: scan_lib.types.Host, phase: scan_lib.engin
         // Redraw with new label; ticker advances frames between progress events.
         self.tickLocked();
     } else if (phase == .host_start or phase == .host_done or (phase == .file and sessions == 1)) {
-        self.stdout.writeAll(self.label_buf[0..self.label_len]) catch {};
-        self.stdout.writeAll("\n") catch {};
-        flushWriter(self.stdout) catch {};
+        // Non-TUI progress is stderr-only so --plain/--json stdout stays a receipt.
+        self.stderr.writeAll(self.label_buf[0..self.label_len]) catch {};
+        self.stderr.writeAll("\n") catch {};
+        flushWriter(self.stderr) catch {};
     }
 }
 
@@ -200,10 +211,10 @@ pub fn command(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: an
     var progress_ctx: ProgressCtx = .{
         .io = io,
         .stdout = stdout,
+        .stderr = stderr,
     };
 
-    const workspace_root = std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator) catch
-        try allocator.dupeZ(u8, ".");
+    const workspace_root = try realpathOwned(io, allocator, ".");
     defer allocator.free(workspace_root);
 
     var result = scan_lib.runScan(io, allocator, .{
@@ -345,6 +356,14 @@ fn parseHost(name: []const u8) ?scan_lib.types.Host {
     if (std.mem.eql(u8, name, "grok")) return .grok;
     if (std.mem.eql(u8, name, "ryk")) return .ryk;
     return null;
+}
+
+test "scan workspace realpath frees without DebugAllocator size mismatch" {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    const allocator = gpa_state.allocator();
+    const path = try realpathOwned(std.testing.io, allocator, ".");
+    allocator.free(path);
+    try std.testing.expectEqual(.ok, gpa_state.deinit());
 }
 
 test "scan CLI module loads" {

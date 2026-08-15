@@ -129,11 +129,12 @@ fn isRykTestHelp(argv: []const []const u8) bool {
 
 fn parseTestArgv(argv: []const []const u8, stderr: anytype) !ParsedTestArgv {
     var format_json = false;
-    var cmd_start: usize = 0;
-    var cmd_end: usize = argv.len;
     var i: usize = 0;
     while (i < argv.len) : (i += 1) {
         const arg = argv[i];
+        if (std.mem.eql(u8, arg, "--")) {
+            return .{ .format_json = format_json, .command_args = argv[i + 1 ..] };
+        }
         if (std.mem.eql(u8, arg, "--format")) {
             if (i + 1 >= argv.len) {
                 try stderr.writeAll("ryk test: --format requires a value and a command\n");
@@ -144,29 +145,17 @@ fn parseTestArgv(argv: []const []const u8, stderr: anytype) !ParsedTestArgv {
                 return error.Usage;
             }
             format_json = true;
-            if (i == 0) {
-                cmd_start = 2;
-            } else if (i + 2 == argv.len) {
-                cmd_end = i;
-            } else {
-                try stderr.writeAll("ryk test: put --format json before or after the command, not in the middle\n");
-                return error.Usage;
-            }
             i += 1;
             continue;
         }
         if (std.mem.eql(u8, arg, "--format=json")) {
             format_json = true;
-            if (i == 0) cmd_start = 1 else if (i + 1 == argv.len) cmd_end = i;
             continue;
         }
-        // Dashed tokens that are not ryk test flags belong to the tested command
-        // (`ryk test git --help` must evaluate `git --help`).
+        // First non-ryk-flag token starts the opaque command (`rm -rf /`, `git --help`).
+        return .{ .format_json = format_json, .command_args = argv[i..] };
     }
-    return .{
-        .format_json = format_json,
-        .command_args = argv[cmd_start..cmd_end],
-    };
+    return .{ .format_json = format_json, .command_args = argv[i..] };
 }
 
 fn joinArgs(allocator: std.mem.Allocator, args: []const []const u8) ![]u8 {
@@ -192,6 +181,30 @@ test "test git --help evaluates the command instead of ryk usage" {
     try std.testing.expectEqualStrings("", stderr_writer.buffered());
 }
 
+test "test argv treats dashed command tokens as opaque" {
+    var stderr_buf: [256]u8 = undefined;
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+    const parsed = try parseTestArgv(&.{ "rm", "-rf", "/" }, &stderr_writer);
+    try std.testing.expectEqual(@as(usize, 3), parsed.command_args.len);
+    try std.testing.expectEqualStrings("rm", parsed.command_args[0]);
+    try std.testing.expectEqualStrings("-rf", parsed.command_args[1]);
+    try std.testing.expectEqualStrings("/", parsed.command_args[2]);
+    try std.testing.expect(!parsed.format_json);
+
+    stderr_writer = .fixed(&stderr_buf);
+    const prefixed = try parseTestArgv(&.{ "--format", "json", "rm", "-rf", "/" }, &stderr_writer);
+    try std.testing.expect(prefixed.format_json);
+    try std.testing.expectEqualStrings("rm", prefixed.command_args[0]);
+    try std.testing.expectEqualStrings("-rf", prefixed.command_args[1]);
+
+    stderr_writer = .fixed(&stderr_buf);
+    const after_dd = try parseTestArgv(&.{ "--format=json", "--", "git", "--help" }, &stderr_writer);
+    try std.testing.expect(after_dd.format_json);
+    try std.testing.expectEqualStrings("git", after_dd.command_args[0]);
+    try std.testing.expectEqualStrings("--help", after_dd.command_args[1]);
+    try std.testing.expectEqualStrings("", stderr_writer.buffered());
+}
+
 test "test --help writes usage to stdout" {
     var stdout_buf: [1024]u8 = undefined;
     var stderr_buf: [256]u8 = undefined;
@@ -203,7 +216,7 @@ test "test --help writes usage to stdout" {
     try std.testing.expectEqualStrings("", stderr_writer.buffered());
 }
 
-test "test --format json is accepted after the command" {
+test "test --format json is accepted as a ryk flag prefix" {
     var xdg = try sProductWireIsolateXdg();
     defer xdg.deinit();
 
@@ -219,11 +232,34 @@ test "test --format json is accepted after the command" {
     var stderr_buf: [1024]u8 = undefined;
     var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
     var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
-    const code = try command(std.testing.io, &.{ "echo hello", "--format", "json" }, &stdout_writer, &stderr_writer);
+    const code = try command(std.testing.io, &.{ "--format", "json", "echo", "hello" }, &stdout_writer, &stderr_writer);
     try std.testing.expectEqual(@as(u8, 0), code);
     const out = stdout_writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, out, "\"decision\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"schema_version\"") != null);
+}
+
+test "test rm -rf / is deny not an unknown-option error" {
+    var xdg = try sProductWireIsolateXdg();
+    defer xdg.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, ".git");
+    const previous_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(previous_cwd);
+    try std.process.setCurrentDir(std.testing.io, tmp.dir);
+    defer std.process.setCurrentPath(std.testing.io, previous_cwd) catch {};
+
+    var stdout_buf: [4096]u8 = undefined;
+    var stderr_buf: [1024]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+    const code = try command(std.testing.io, &.{ "rm", "-rf", "/" }, &stdout_writer, &stderr_writer);
+    try std.testing.expectEqual(@as(u8, 2), code);
+    const out = stdout_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "DENY") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "unknown option") == null);
 }
 
 test "test human output is a decision panel" {

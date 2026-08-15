@@ -443,7 +443,7 @@ fn hookCommand(io: std.Io, host: Host, event: Event, original_event_name: []cons
         const version_value = extractInteger(parsed.value, "version") orelse 0;
         if (version_value != 1) {
             if (shouldFailClosedOnPreEval(host, event)) {
-                const code = try emitPreEvalFailClosed(
+                return try emitPreEvalFailClosed(
                     allocator,
                     host,
                     event,
@@ -453,11 +453,6 @@ fn hookCommand(io: std.Io, host: Host, event: Event, original_event_name: []cons
                     "unsupported schema version",
                     "ryk hook: unsupported schema version; ryk blocked it before evaluation.",
                 );
-                try stderr.print(
-                    "ryk hook: expected {{\"version\":1,\"host\":\"{s}\",\"event\":\"{s}\",\"payload\":{{...}}}}.\n",
-                    .{ @tagName(host), @tagName(event) },
-                );
-                return code;
             }
             try stderr.print("ryk hook: unsupported schema version {d}. Expected 1.\n", .{version_value});
             try stderr.print(
