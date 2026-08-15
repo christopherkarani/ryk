@@ -7,13 +7,18 @@ pub fn main(init: std.process.Init) !u8 {
         setupWindowsConsole();
     }
 
-    // Hook invocations are a new process per event and must stay under 5ms.
-    // DebugAllocator leak walks are incompatible with that budget.
-    const allocator = std.heap.smp_allocator;
+    var dbg: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = dbg.deinit();
 
     const io = init.io;
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
-    const is_hook = argv.len > 1 and std.mem.eql(u8, argv[1], "hook");
+    // Gate the cheap hook allocator / skip color+telemetry only on a named
+    // `ryk hook` or a real bare-`ryk` agent-hook entry (non-TTY stdin). Do not
+    // replace DebugAllocator for the rest of the CLI.
+    const is_named_hook = argv.len > 1 and std.mem.eql(u8, argv[1], "hook");
+    const is_agent_hook = argv.len == 1 and ryk.cli.agent_hook.shouldEnter(io);
+    const hook_hot_path = is_named_hook or is_agent_hook;
+    const allocator = if (hook_hot_path) std.heap.smp_allocator else dbg.allocator();
 
     if (builtin.os.tag == .linux and
         argv.len > 1 and
@@ -34,7 +39,7 @@ pub fn main(init: std.process.Init) !u8 {
     var stdout_writer = std.Io.File.stdout().writerStreaming(io, &stdout_buffer);
     var stderr_writer = std.Io.File.stderr().writerStreaming(io, &stderr_buffer);
 
-    if (!is_hook) {
+    if (!hook_hot_path) {
         _ = ryk.cli.style.useColor(io, &stdout_writer.interface);
     }
 
@@ -51,7 +56,7 @@ pub fn main(init: std.process.Init) !u8 {
         ryk.cli.run(io, init.environ_map, argv[1..], &stdout_writer.interface, &stderr_writer.interface) catch |err| {
             stdout_writer.interface.flush() catch {};
             stderr_writer.interface.flush() catch {};
-            if (!is_hook) ryk.telemetry.recordInvocation(io, init.environ_map, allocator, argv[1..], ryk.cli.exit_codes.general);
+            if (!hook_hot_path) ryk.telemetry.recordInvocation(io, init.environ_map, allocator, argv[1..], ryk.cli.exit_codes.general);
             return err;
         };
     try stdout_writer.interface.flush();
@@ -59,7 +64,7 @@ pub fn main(init: std.process.Init) !u8 {
     if (shim_alias) |alias| {
         const telemetry_argv = [_][]const u8{alias};
         ryk.telemetry.recordInvocation(io, init.environ_map, allocator, &telemetry_argv, code);
-    } else if (!is_hook) {
+    } else if (!hook_hot_path) {
         ryk.telemetry.recordInvocation(io, init.environ_map, allocator, argv[1..], code);
     }
     return code;

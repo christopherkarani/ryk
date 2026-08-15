@@ -238,9 +238,7 @@ pub fn evaluatePayloadWithModeOpts(
             .permit = .{},
             .sticky = shell_eval.getSessionStickyStore(),
             .effect_class = null,
-            // Production hooks cannot afford the Mac FM steward (seconds).
-            // Tests that inject `fm_client` still exercise the seatbelt.
-            .disable_fm = opts.disable_fm or opts.fm_client == null,
+            .disable_fm = opts.disable_fm,
             .fm_client = opts.fm_client,
             .session_id = opts.session_id,
             .host = "other",

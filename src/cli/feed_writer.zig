@@ -43,8 +43,7 @@ fn appendRecordAtPath(io: std.Io, allocator: std.mem.Allocator, path: []const u8
     defer allocator.free(bytes);
     try file_writer.interface.writeAll(bytes);
     try file_writer.interface.flush();
-    // No fsync: hook evaluation is on a <5ms budget. Losing the last dashboard
-    // line on crash is acceptable; waiting for durable media is not.
+    try file.sync(io);
 }
 
 pub fn appendGlobalRecord(
@@ -159,6 +158,7 @@ fn updateWorkspaceRegistry(
         const file = try std.Io.Dir.cwd().createFile(io, temp_path, .{});
         defer file.close(io);
         try file.writeStreamingAll(io, bytes);
+        try file.sync(io);
     }
     try std.Io.Dir.renameAbsolute(temp_path, registry_path, io);
 }

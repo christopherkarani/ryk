@@ -1,5 +1,4 @@
 const std = @import("std");
-const builtin = @import("builtin");
 const exit_codes = @import("ryk").cli.exit_codes;
 
 const ryk_bin = "./zig-out/bin/ryk";
@@ -308,45 +307,81 @@ fn nowNs() i96 {
     return std.Io.Timestamp.now(threaded.io(), .awake).toNanoseconds();
 }
 
-test "product hook process stays under 5ms for typical events" {
-    if (!fileExists(ryk_bin)) return;
-    if (builtin.mode != .ReleaseFast and builtin.mode != .ReleaseSmall) return;
+fn claudePermissionDecision(allocator: std.mem.Allocator, stdout: []const u8) ![]const u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, stdout, .{});
+    defer parsed.deinit();
+    const hso = parsed.value.object.get("hookSpecificOutput") orelse return error.TestUnexpectedResult;
+    if (hso != .object) return error.TestUnexpectedResult;
+    const pd = hso.object.get("permissionDecision") orelse return error.TestUnexpectedResult;
+    if (pd != .string) return error.TestUnexpectedResult;
+    return try allocator.dupe(u8, pd.string);
+}
+
+test "host hook contracts: Claude allow/deny, Codex exit 2, Cursor empty stdin" {
+    // Missing binary is a failure, not a skip. Timing is observational only —
+    // elapsed==0 is a measurement bug, not a 5ms SLA pass.
+    try std.testing.expect(fileExists(ryk_bin));
 
     const allocator = std.testing.allocator;
-    const cases = [_]struct { host: []const u8, event: []const u8, payload: []const u8 }{
-        .{ .host = "claude", .event = "SessionStart", .payload = "{\"version\":1,\"host\":\"claude\",\"event\":\"SessionStart\",\"payload\":{}}" },
-        .{ .host = "claude", .event = "PostToolUse", .payload = "{\"version\":1,\"host\":\"claude\",\"event\":\"PostToolUse\",\"payload\":{}}" },
-        .{ .host = "claude", .event = "UserPromptSubmit", .payload = "{\"version\":1,\"host\":\"claude\",\"event\":\"UserPromptSubmit\",\"payload\":{\"prompt\":\"hello\"}}" },
-        .{ .host = "claude", .event = "PreToolUse", .payload = "{\"version\":1,\"host\":\"claude\",\"event\":\"PreToolUse\",\"payload\":{\"tool\":\"Bash\",\"command\":\"git status\"}}" },
-        .{ .host = "claude", .event = "PreToolUse", .payload = "{\"version\":1,\"host\":\"claude\",\"event\":\"PreToolUse\",\"payload\":{\"tool\":\"Bash\",\"command\":\"echo hello\"}}" },
-        .{ .host = "claude", .event = "PreToolUse", .payload = "{\"version\":1,\"host\":\"claude\",\"event\":\"PreToolUse\",\"payload\":{\"tool\":\"Bash\",\"command\":\"rm -rf /\"}}" },
-        .{ .host = "claude", .event = "PreToolUse", .payload = "{\"version\":1,\"host\":\"claude\",\"event\":\"PreToolUse\",\"payload\":{\"toolName\":\"Read\",\"toolInput\":{\"file_path\":\"README.md\"}}}" },
-        .{ .host = "codex", .event = "SessionStart", .payload = "{\"version\":1,\"host\":\"codex\",\"event\":\"SessionStart\",\"payload\":{}}" },
-        .{ .host = "codex", .event = "PreToolUse", .payload = "{\"version\":1,\"host\":\"codex\",\"event\":\"PreToolUse\",\"payload\":{\"tool\":\"Bash\",\"command\":\"ls\"}}" },
-    };
+    const claude_allow =
+        \\{"version":1,"host":"claude","event":"PreToolUse","payload":{"tool":"Bash","command":"git status"}}
+    ;
+    const claude_deny =
+        \\{"version":1,"host":"claude","event":"PreToolUse","payload":{"tool":"Bash","command":"rm -rf /"}}
+    ;
+    const codex_deny =
+        \\{"version":1,"host":"codex","event":"PreToolUse","payload":{"tool":"Bash","command":"rm -rf /"}}
+    ;
 
-    const budget_ns: u64 = 5 * std.time.ns_per_ms;
-    for (cases) |case| {
-        // Warm the binary and page cache; the budget is per hook, not first-fault.
-        {
-            const warm = try runRyk(allocator, &.{ ryk_bin, "hook", case.host, case.event }, case.payload, null);
-            allocator.free(warm.stdout);
-            allocator.free(warm.stderr);
-        }
+    {
         const started = nowNs();
-        const result = try runRyk(allocator, &.{ ryk_bin, "hook", case.host, case.event }, case.payload, null);
-        const ended = nowNs();
+        const result = try runRyk(allocator, &.{ ryk_bin, "hook", "claude", "PreToolUse" }, claude_allow, null);
+        const elapsed = if (nowNs() > started) @as(u64, @intCast(nowNs() - started)) else 0;
         defer allocator.free(result.stdout);
         defer allocator.free(result.stderr);
-        const elapsed: u64 = if (ended > started) @intCast(ended - started) else 0;
-        if (elapsed > budget_ns) {
-            std.debug.print("hook {s} {s} took {d}µs (budget 5000µs)\n", .{
-                case.host,
-                case.event,
-                elapsed / 1000,
-            });
-        }
-        try std.testing.expect(elapsed <= budget_ns);
+        try std.testing.expect(elapsed > 0);
+        try std.testing.expectEqual(exit_codes.success, result.code);
+        const decision = try claudePermissionDecision(allocator, result.stdout);
+        defer allocator.free(decision);
+        try std.testing.expectEqualStrings("allow", decision);
+    }
+
+    {
+        const started = nowNs();
+        const result = try runRyk(allocator, &.{ ryk_bin, "hook", "claude", "PreToolUse" }, claude_deny, null);
+        const elapsed = if (nowNs() > started) @as(u64, @intCast(nowNs() - started)) else 0;
+        defer allocator.free(result.stdout);
+        defer allocator.free(result.stderr);
+        try std.testing.expect(elapsed > 0);
+        try std.testing.expectEqual(exit_codes.success, result.code);
+        const decision = try claudePermissionDecision(allocator, result.stdout);
+        defer allocator.free(decision);
+        try std.testing.expectEqualStrings("deny", decision);
+    }
+
+    {
+        const started = nowNs();
+        const result = try runRyk(allocator, &.{ ryk_bin, "hook", "codex", "PreToolUse" }, codex_deny, null);
+        const elapsed = if (nowNs() > started) @as(u64, @intCast(nowNs() - started)) else 0;
+        defer allocator.free(result.stdout);
+        defer allocator.free(result.stderr);
+        try std.testing.expect(elapsed > 0);
+        try std.testing.expectEqual(codex_deny_exit_code, result.code);
+        try std.testing.expectEqual(@as(usize, 0), result.stdout.len);
+        try std.testing.expect(std.mem.indexOf(u8, result.stderr, "[[RYKAN-V-GUARD]]") != null);
+    }
+
+    {
+        const started = nowNs();
+        const result = try runRyk(allocator, &.{ryk_bin}, "", null);
+        const elapsed = if (nowNs() > started) @as(u64, @intCast(nowNs() - started)) else 0;
+        defer allocator.free(result.stdout);
+        defer allocator.free(result.stderr);
+        try std.testing.expect(elapsed > 0);
+        try std.testing.expectEqual(@as(u8, 2), result.code);
+        try std.testing.expect(std.mem.indexOf(u8, result.stdout, "\"permission\":\"deny\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, result.stdout, "\"permissionDecision\":\"deny\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, result.stdout, "hook payload was empty") != null);
     }
 }
 

@@ -23,8 +23,8 @@ const CompiledPattern = struct {
     reason: []const u8,
     severity: Severity,
     regex_source: []const u8,
-    /// Compiled on first use. Hook processes must not compile the full oracle
-    /// (1600+ PCRE patterns) during `ensureInit` — that alone exceeds the 5ms budget.
+    /// Compiled on first use. Hook processes parse default packs without compiling
+    /// the full oracle up front; PCRE compile is keyword- and prefix-gated.
     regex: ?regex_pcre.Regex = null,
 };
 
@@ -337,9 +337,24 @@ fn ensureInitWith(load_all: bool) !void {
         if (state == 1) {
             if (!load_all or g_full) return;
             // Upgrade default-only → full oracle (extra packs / tests).
+            // Do not reclaim the live registry: in-flight matchers may still
+            // hold `g_packs`. Build a replacement, then leak the previous
+            // arena (process-lifetime; upgrade happens at most once).
             if (g_state.cmpxchgStrong(1, 3, .acq_rel, .acquire)) |_| continue;
-            reclaimRegistry();
-            return finishInit(true);
+            const previous_arena = g_arena;
+            const previous_packs = g_packs;
+            g_arena = undefined;
+            g_packs = &.{};
+            g_full = false;
+            finishInit(true) catch {
+                g_arena = previous_arena;
+                g_packs = previous_packs;
+                g_full = false;
+                g_state.store(1, .release);
+                return error.RegistryInitFailed;
+            };
+            _ = previous_arena;
+            return;
         }
         if (state == 3) {
             while (g_state.load(.acquire) == 3) {
@@ -475,8 +490,12 @@ fn ensurePatternCompiled(pat: *CompiledPattern) !void {
 }
 
 pub fn matchCommandDetailedOpts(cmd: []const u8, opts: MatchOptions) MatchResult {
+    return matchCommandDetailedOptsWithGates(cmd, opts, true);
+}
+
+fn matchCommandDetailedOptsWithGates(cmd: []const u8, opts: MatchOptions, use_prefix_gates: bool) MatchResult {
     ensureForMatchOptions(opts) catch return matchInfraDeny();
-    if (g_packs.len == 0) return .allow_miss;
+    if (g_packs.len == 0) return matchInfraDeny();
 
     var any_safe = false;
     for (g_packs) |*pack| {
@@ -485,7 +504,7 @@ pub fn matchCommandDetailedOpts(cmd: []const u8, opts: MatchOptions) MatchResult
 
         var pack_safe = false;
         for (pack.safe) |*pat| {
-            if (!safePatternMightMatch(pat.regex_source, cmd)) continue;
+            if (use_prefix_gates and !safePatternMightMatch(pat.regex_source, cmd)) continue;
             ensurePatternCompiled(pat) catch return matchInfraDeny();
             const matched = pat.regex.?.isMatch(cmd) catch return matchInfraDeny();
             if (matched) {
@@ -498,7 +517,7 @@ pub fn matchCommandDetailedOpts(cmd: []const u8, opts: MatchOptions) MatchResult
         if (pack_safe) continue;
 
         for (pack.destructive) |*pat| {
-            if (!patternMightMatch(pat.regex_source, cmd)) continue;
+            if (use_prefix_gates and !patternMightMatch(pat.regex_source, cmd)) continue;
             ensurePatternCompiled(pat) catch return matchInfraDeny();
             const span = pat.regex.?.findMatch(cmd) catch return matchInfraDeny();
             if (span) |m| {
@@ -782,11 +801,70 @@ test "required prefix literal skips impossible regex compiles" {
 }
 
 test "match infrastructure error hit is deny not allow_miss" {
-    // Contract: matchInfraDeny is what matchCommandDetailedOpts returns on isMatch error.
+    // Contract: matchInfraDeny is what matchCommandDetailedOpts returns on isMatch error
+    // and when the registry is empty after a failed/abandoned init.
     const r = matchInfraDeny();
     try std.testing.expect(r == .deny);
     try std.testing.expectEqualStrings("pcre-match-error", r.deny.pattern_name);
     try std.testing.expect(r.deny.severity == .critical);
+}
+
+fn expectMatchEqual(lazy: MatchResult, eager: MatchResult) !void {
+    try std.testing.expectEqual(std.meta.activeTag(lazy), std.meta.activeTag(eager));
+    if (lazy == .deny) {
+        try std.testing.expectEqualStrings(eager.deny.pack_id, lazy.deny.pack_id);
+        try std.testing.expectEqualStrings(eager.deny.pattern_name, lazy.deny.pattern_name);
+    }
+}
+
+const prefix_gate_oracle_commands = [_][]const u8{
+    "git status",
+    "git push",
+    "git push origin main",
+    "git push --force",
+    "git push --force-with-lease origin main",
+    "git reset --hard",
+    "rm -rf /",
+    "rm -rf /tmp/foo",
+    "echo hello",
+    "ls",
+    "pwd",
+    "mkfs.ext4 /dev/sda1",
+    "docker system prune",
+    "find /tmp -delete",
+    "chmod 777 /etc/passwd",
+};
+
+test "lazy prefix skip equals eager compile on default packs" {
+    try ensureInitDefault();
+    const opts = MatchOptions{};
+    for (prefix_gate_oracle_commands) |cmd| {
+        const lazy = matchCommandDetailedOptsWithGates(cmd, opts, true);
+        const eager = matchCommandDetailedOptsWithGates(cmd, opts, false);
+        expectMatchEqual(lazy, eager) catch |err| {
+            std.debug.print("default-pack lazy/eager mismatch for `{s}`\n", .{cmd});
+            return err;
+        };
+    }
+}
+
+test "lazy prefix skip equals eager compile on full oracle" {
+    try ensureFullInit();
+    const opts = MatchOptions{ .default_packs_only = false };
+    for (prefix_gate_oracle_commands) |cmd| {
+        const lazy = matchCommandDetailedOptsWithGates(cmd, opts, true);
+        const eager = matchCommandDetailedOptsWithGates(cmd, opts, false);
+        expectMatchEqual(lazy, eager) catch |err| {
+            std.debug.print("full-oracle lazy/eager mismatch for `{s}`\n", .{cmd});
+            return err;
+        };
+    }
+
+    const extra = MatchOptions{ .extra_enabled = &.{"containers.docker"} };
+    const lazy_docker = matchCommandDetailedOptsWithGates("docker system prune", extra, true);
+    const eager_docker = matchCommandDetailedOptsWithGates("docker system prune", extra, false);
+    try expectMatchEqual(lazy_docker, eager_docker);
+    try std.testing.expect(lazy_docker == .deny);
 }
 
 // ── s-engine: MatchOptions.skipped_rule_ids (E8 skip-this-rule only) ─────────

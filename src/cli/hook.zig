@@ -1,5 +1,4 @@
 const std = @import("std");
-const builtin = @import("builtin");
 const core = @import("ryk_core").core;
 const supervisor = core.supervisor;
 const core_api = @import("ryk_core").api;
@@ -1460,8 +1459,6 @@ fn evaluateShellCommandRoute(
             .cwd = shell_event.cwd,
             .workspace_root = workspace_root,
             .session_id = session_id orelse brand.default_session_id,
-            // Hook budget is <5ms; never spawn the Mac FM steward from this path.
-            .disable_fm = true,
         },
     );
 }
@@ -1473,9 +1470,6 @@ fn recordShellHookUnavailable(
     host_name: []const u8,
     err: daemon.DaemonError,
 ) void {
-    // Production hook processes cannot afford exclusive-lock feed + global
-    // registry I/O on a <5ms budget. Tests still persist records.
-    if (!builtin.is_test) return;
     var record = rust_visibility.buildFeedRecordFromUnavailable(
         allocator,
         io,
@@ -1498,7 +1492,6 @@ fn recordShellHookDecision(
     daemon_status: []const u8,
     result: std.json.Value,
 ) void {
-    if (!builtin.is_test) return;
     var record = rust_visibility.buildFeedRecordFromDaemon(
         allocator,
         io,
@@ -1522,7 +1515,6 @@ fn recordHermesHookActivity(
     payload: std.json.Value,
     result: HookResponse,
 ) void {
-    if (!builtin.is_test) return;
     const shell_tool = std.mem.eql(u8, event_name, "pre_tool_call") and switch (preToolUseRoute(payload)) {
         .shell_command => true,
         .zig_native, .fail_closed => false,

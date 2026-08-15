@@ -602,8 +602,9 @@ fn recordInvocationInner(
 }
 
 fn isHookHotPath(argv: []const []const u8) bool {
-    if (argv.len == 0) return true;
-    return std.mem.eql(u8, argv[0], "hook");
+    // Only the named `ryk hook` subcommand. Empty argv is bare `ryk` (help or
+    // agent-hook); skipping it here would drop all bare-ryk telemetry.
+    return argv.len > 0 and std.mem.eql(u8, argv[0], "hook");
 }
 
 fn recordWorker(
@@ -1150,6 +1151,14 @@ fn detachWorker(child: *std.process.Child) void {
         }
     }
     child.id = null;
+}
+
+test "isHookHotPath only matches the named hook subcommand" {
+    try std.testing.expect(!isHookHotPath(&.{}));
+    try std.testing.expect(!isHookHotPath(&.{"version"}));
+    try std.testing.expect(!isHookHotPath(&.{"doctor"}));
+    try std.testing.expect(isHookHotPath(&.{"hook"}));
+    try std.testing.expect(isHookHotPath(&.{ "hook", "claude", "PreToolUse" }));
 }
 
 test "classifyInvocation emits only fixed command metadata" {
