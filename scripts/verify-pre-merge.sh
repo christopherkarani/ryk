@@ -40,4 +40,9 @@ echo "[verify-pre-merge] First-user install and uninstall regressions"
 ./scripts/install-first-user-regression-test.sh
 ./scripts/uninstall-first-user-regression-test.sh
 
+# Slim ReleaseSafe rebuild is too heavy for test-fast units. Isolates to a
+# prefix so it does not replace zig-out/bin/ryk from the gates above.
+echo "[verify-pre-merge] Slim -Dtui=false ReleaseSafe has no vaxis/uucode symbols"
+./scripts/check-slim-tui-symbols.sh
+
 echo "[verify-pre-merge] All checks passed."

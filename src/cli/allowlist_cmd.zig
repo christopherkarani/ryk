@@ -25,6 +25,12 @@ const allowlist_browse = if (enable_tui) @import("../tui/allowlist_browse.zig") 
     pub fn shouldEnterAllowlistBrowseIo(_: std.Io, _: []const []const u8) bool {
         return false;
     }
+    pub fn confirmRemoveDefaultNo(_: []const u8) bool {
+        return false;
+    }
+    pub fn applyRemoveIfConfirmed(_: bool, _: *const fn () anyerror!bool) !bool {
+        return false;
+    }
 };
 
 const allowlist_store = shell_engine.allowlist_store;

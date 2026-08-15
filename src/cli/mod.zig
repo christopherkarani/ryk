@@ -51,7 +51,7 @@ pub const feedback = @import("feedback.zig");
 pub const interactive = @import("interactive.zig");
 pub const child_process = @import("child_process.zig");
 pub const style = @import("style.zig");
-pub const tui = if (build_options.enable_tui) @import("../tui/mod.zig") else @import("../tui/linear.zig");
+pub const tui = @import("../tui/mod.zig");
 pub const daemon = @import("daemon.zig");
 pub const daemon_uds = @import("daemon_uds.zig");
 pub const shutdown = @import("shutdown.zig");
@@ -138,6 +138,8 @@ test {
     if (build_options.enable_tui) {
         _ = @import("packs_tui.zig");
         _ = @import("doctor_tui.zig");
+        // Uses tui.live_view — must stay off the slim (-Dtui=false) graph.
+        _ = @import("history.zig");
     }
     _ = readiness;
     _ = doctor;
@@ -344,12 +346,8 @@ fn parseGlobalArgs(allocator: std.mem.Allocator, argv: []const []const u8) !Glob
     return .{ .argv = try list.toOwnedSlice(allocator), .no_rich = no_rich, .owned = true };
 }
 
-fn stubbedHistoryCommand(_: std.Io, _: []const []const u8, _: anytype, stderr: anytype) !u8 {
-    return rust_legacy_stub.unavailable("history", stderr);
-}
-
 pub fn runWithCwd(io: std.Io, environ_map: *const std.process.Environ.Map, cwd: std.Io.Dir, argv_input: []const []const u8, stdout: anytype, stderr: anytype) !u8 {
-    return runWithCwdUsing(realDaemonExecuteCli, packs.command, stubbedHistoryCommand, mcp.command, io, environ_map, cwd, argv_input, stdout, stderr);
+    return runWithCwdUsing(realDaemonExecuteCli, packs.command, {}, mcp.command, io, environ_map, cwd, argv_input, stdout, stderr);
 }
 
 fn runWithCwdUsing(

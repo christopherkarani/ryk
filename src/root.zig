@@ -1,5 +1,4 @@
 const ryk_core = @import("ryk_core");
-const enable_tui = @import("build_options").enable_tui;
 
 pub const cli = @import("cli/mod.zig");
 pub const core = ryk_core.core;
@@ -22,7 +21,7 @@ pub const blocked_action_fixture = @import("blocked_action_fixture.zig");
 pub const resource_root = @import("resource_root.zig");
 pub const env_util = @import("env_util.zig");
 pub const telemetry = cli.telemetry;
-pub const tui = if (enable_tui) @import("tui/mod.zig") else @import("tui/linear.zig");
+pub const tui = @import("tui/mod.zig");
 
 test {
     _ = cli;

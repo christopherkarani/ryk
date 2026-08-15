@@ -71,7 +71,7 @@ fn replaySession(
             try stderr.writeAll("ryk replay: --tui cannot be combined with --json (machine output is frozen).\n");
             return exit_codes.usage;
         }
-        if (!tui.output_policy.shouldEnterTuiIo(io, &.{ "--tui" })) {
+        if (!tui.output_policy.shouldEnterTuiIo(io, &.{"--tui"})) {
             try stderr.writeAll("ryk replay: --tui needs an interactive colour terminal. Drop --tui, or unset NO_COLOR / --no-rich.\n");
             return exit_codes.usage;
         }
@@ -115,9 +115,6 @@ fn replaySession(
             const lines = try buildTimelineLinesForTui(allocator, session);
             defer freeTimelineLines(allocator, lines);
             try tui.live_view.run(io, stdout, "replay", lines, null, null);
-        } else {
-            try stderr.writeAll("ryk replay: --tui is not available in this build.\n");
-            return exit_codes.usage;
         }
     } else {
         try writeReplayHuman(io, allocator, stdout, session, options.verify);
@@ -1055,8 +1052,13 @@ test "replay --tui is rejected on non-interactive output (no colour terminal)" {
 
     const code = try command(std.testing.io, &.{ "--session", session_id, "--tui" }, &stdout_writer, &stderr_writer);
     try std.testing.expectEqual(exit_codes.usage, code);
-    try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "--tui") != null);
-    try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "interactive") != null);
+    const err = stderr_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, err, "--tui") != null);
+    if (enable_tui) {
+        try std.testing.expect(std.mem.indexOf(u8, err, "interactive") != null);
+    } else {
+        try std.testing.expect(std.mem.indexOf(u8, err, "not available in this build") != null);
+    }
     // No alt-screen controls leaked onto the buffer.
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "\x1b[?1049") == null);
 }
@@ -1071,8 +1073,13 @@ test "replay --tui cannot combine with --json" {
 
     const code = try command(std.testing.io, &.{ "--json", "--tui" }, &stdout_writer, &stderr_writer);
     try std.testing.expectEqual(exit_codes.usage, code);
-    try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "--tui") != null);
-    try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "--json") != null);
+    const err = stderr_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, err, "--tui") != null);
+    if (enable_tui) {
+        try std.testing.expect(std.mem.indexOf(u8, err, "--json") != null);
+    } else {
+        try std.testing.expect(std.mem.indexOf(u8, err, "not available") != null);
+    }
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "\x1b[?1049") == null);
 }
 

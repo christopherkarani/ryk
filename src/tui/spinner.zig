@@ -3,8 +3,8 @@ const theme = @import("theme.zig");
 const terminal_text = @import("terminal_text.zig");
 const ctlseqs = @import("ctlseqs.zig");
 
-/// Inline spinner using libvaxis synchronized-output control sequences so each
-/// frame update is atomic. Timing remains caller-driven; plain output is static.
+/// Inline spinner using DEC synchronized-output control sequences (`ctlseqs`)
+/// so each frame update is atomic. Timing remains caller-driven; plain output is static.
 pub fn Spinner(comptime Writer: type) type {
     return struct {
         frames: []const []const u8 = &.{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" },

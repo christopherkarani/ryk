@@ -263,9 +263,6 @@ pub fn command(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: an
                 try stderr.writeAll(doctor_tui.fail_closed_message);
                 try writeReport(io, stdout, os, backend_report, context, options.verbose);
             }
-        } else {
-            try stderr.writeAll(doctor_tui.fail_closed_message);
-            try writeReport(io, stdout, os, backend_report, context, options.verbose);
         }
     } else {
         if (options.tui) {
@@ -2079,7 +2076,8 @@ test "doctor --tui non-TTY fail-closed message then linear report" {
 
 test "doctor TUI entry uses shared shouldEnterTui gate via wouldEnterDoctorTui" {
     // Composition: opt-in --tui + shouldEnterTui — not a dead import.
-    try std.testing.expect(doctor_tui.wouldEnterDoctorTui(true, true, &.{"--tui"}, true, false));
+    // Slim stub is always false; TUI-on applies the real TTY/--tui gate.
+    try std.testing.expectEqual(enable_tui, doctor_tui.wouldEnterDoctorTui(true, true, &.{"--tui"}, true, false));
     try std.testing.expect(!doctor_tui.wouldEnterDoctorTui(true, true, &.{}, false, false));
     try std.testing.expect(!doctor_tui.wouldEnterDoctorTui(false, true, &.{"--tui"}, true, false));
     try std.testing.expect(!doctor_tui.wouldEnterDoctorTui(true, true, &.{ "--tui", "--json" }, true, true));

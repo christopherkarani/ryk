@@ -979,6 +979,7 @@ test "danger confirm requires explicit confirmation and defaults to deny" {
 }
 
 test "raw decoder carries fragmented CSI key sequences across reads" {
+    if (comptime !enable_tui) return;
     var decoder: RawDecoder = .{};
     try std.testing.expectEqual(@as(?KeyAction, null), try decoder.feed("\x1b"));
     try std.testing.expectEqual(@as(?KeyAction, .up), try decoder.feed("[A"));
@@ -986,6 +987,7 @@ test "raw decoder carries fragmented CSI key sequences across reads" {
 }
 
 test "raw decoder resolves standalone escape on inter-byte timeout" {
+    if (comptime !enable_tui) return;
     var decoder: RawDecoder = .{};
     try std.testing.expectEqual(@as(?KeyAction, null), try decoder.feed("\x1b"));
     try std.testing.expectEqual(@as(?KeyAction, .escape), decoder.interByteTimeout());

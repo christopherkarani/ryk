@@ -1602,7 +1602,8 @@ test "s-packs: --plain is accepted and stays on linear list path" {
 test "s-packs: packs list TUI entry uses shared shouldEnterTui gate" {
     // Composition: list path decides via packs_tui.wouldEnterPacksBrowse which
     // wraps tui.output_policy.shouldEnterTui — not a dead import.
-    try std.testing.expect(packs_tui.wouldEnterPacksBrowse(true, true, &.{}, false));
+    // Slim stub is always false; TUI-on applies the real TTY/argv gate.
+    try std.testing.expectEqual(enable_tui, packs_tui.wouldEnterPacksBrowse(true, true, &.{}, false));
     try std.testing.expect(!packs_tui.wouldEnterPacksBrowse(true, true, &.{"--plain"}, false));
     try std.testing.expect(!packs_tui.wouldEnterPacksBrowse(true, true, &.{"--json"}, true));
     try std.testing.expect(!packs_tui.wouldEnterPacksBrowse(false, true, &.{}, false));
