@@ -1718,6 +1718,33 @@ pub fn mockDaemonProtocolMismatchEvaluator(allocator: std.mem.Allocator, shell_e
 // Tests
 // ---------------------------------------------------------------------------
 
+test "host-alias basename paths stay denied under strict/unattended commands-default-deny" {
+    const allocator = std.testing.allocator;
+    // Unattended / builtin:strict shape: non-empty permit, host name not listed.
+    // evaluateCommand must not treat a hermes *basename* as a trusted launch.
+    const permit = [_][]const u8{ "git status", "ls *", "pwd", "which *", "ryk version" };
+    const planted = [_][]const []const u8{
+        &.{"hermes"},
+        &.{"./hermes"},
+        &.{"/tmp/evil/hermes"},
+        &.{"/workspace/planted/hermes"},
+        &.{ "rm", "-rf", "/" },
+        &.{ "git", "push", "--force" },
+    };
+
+    for (planted) |argv| {
+        const evaluator: ShellCommandEvaluatorFn = if (argv.len > 0 and std.mem.eql(u8, argv[0], "rm"))
+            mockDaemonDenyEvaluator
+        else if (argv.len > 1 and std.mem.eql(u8, argv[0], "git"))
+            mockDaemonDenyEvaluator
+        else
+            mockDaemonAllowEvaluator;
+        var decision = try evaluateCommand(allocator, .strict, argv, null, evaluator, null, null, &permit);
+        defer decision.deinit(allocator);
+        try std.testing.expectEqual(core.decision.DecisionResult.deny, decision.decision.result);
+    }
+}
+
 test "shell_eval allows safe command via mock daemon" {
     const allocator = std.testing.allocator;
     var decision = try evaluateCommand(allocator, .strict, &.{ "git", "status" }, "/tmp/repo", mockDaemonAllowEvaluator, null, null, &.{});

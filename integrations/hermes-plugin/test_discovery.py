@@ -38,6 +38,26 @@ def _chdir(path: str):
         os.chdir(previous)
 
 
+def _write_identity_ryk(path: Path, mode: int = 0o700) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = version ]; then printf '%s\\n' '{\"product\":\"ryk\",\"version\":\"0.2.18\"}'; exit 0; fi\n"
+        "printf '%s\\n' '{\"decision\":\"allow\"}'\n",
+        encoding="utf-8",
+    )
+    path.chmod(mode)
+    return path
+
+
+@contextlib.contextmanager
+def _non_tmp_dir():
+    """Temp directory that is not under /tmp, so source-build trust can be tested."""
+    root = Path(__file__).resolve().parent
+    with tempfile.TemporaryDirectory(prefix="ryk-disc-", dir=root) as directory:
+        yield Path(directory)
+
+
 class HermesPluginDiscoveryTests(unittest.TestCase):
     def setUp(self) -> None:
         _PLUGIN._ryk_cache_env = None
@@ -170,6 +190,121 @@ class HermesPluginDiscoveryTests(unittest.TestCase):
                 os.environ, {"HOME": directory, "PATH": ""}, clear=True
             ):
                 self.assertEqual(_PLUGIN._ryk_candidates(), [])
+
+    def test_ryk_bin_source_build_found_without_workspace_flag(self) -> None:
+        """Explicit RYK_BIN to a source-build must work; the error text promises this."""
+        with _non_tmp_dir() as source, tempfile.TemporaryDirectory() as qa_cwd:
+            binary = _write_identity_ryk(source / "zig-out" / "bin" / "ryk")
+            with _chdir(qa_cwd), mock.patch.dict(
+                os.environ,
+                {"HOME": qa_cwd, "PATH": qa_cwd, "RYK_BIN": str(binary)},
+                clear=True,
+            ):
+                os.environ.pop("RYK_ALLOW_WORKSPACE_BIN", None)
+                self.assertEqual(_PLUGIN._find_ryk(), str(binary.resolve()))
+
+    def test_ryk_bin_source_build_inside_cwd_is_not_skipped(self) -> None:
+        """RYK_BIN is an operator pin even when the path sits inside process cwd."""
+        with _non_tmp_dir() as source:
+            binary = _write_identity_ryk(source / "zig-out" / "bin" / "ryk")
+            with _chdir(source), mock.patch.dict(
+                os.environ,
+                {"HOME": str(source), "PATH": "", "RYK_BIN": str(binary)},
+                clear=True,
+            ):
+                os.environ.pop("RYK_ALLOW_WORKSPACE_BIN", None)
+                self.assertEqual(_PLUGIN._find_ryk(), str(binary.resolve()))
+
+    def test_ryk_bin_managed_local_bin_found_without_provenance(self) -> None:
+        """Explicit RYK_BIN to ~/.local/bin/ryk works with no .ryk-provenance receipt."""
+        with _non_tmp_dir() as home, tempfile.TemporaryDirectory() as qa_cwd:
+            for rel in ((".local", "bin"), (".ryk", "bin")):
+                _PLUGIN._ryk_cache_env = None
+                _PLUGIN._ryk_cache_path = None
+                binary = _write_identity_ryk(home.joinpath(*rel) / "ryk")
+                self.assertFalse((binary.parent / ".ryk-provenance").exists())
+                with _chdir(qa_cwd), mock.patch.dict(
+                    os.environ,
+                    {"HOME": str(home), "PATH": "", "RYK_BIN": str(binary)},
+                    clear=True,
+                ):
+                    os.environ.pop("RYK_ALLOW_WORKSPACE_BIN", None)
+                    self.assertTrue(_PLUGIN._candidate_is_trusted(binary))
+                    self.assertEqual(_PLUGIN._find_ryk(), str(binary.resolve()))
+                _PLUGIN._ryk_cache_env = None
+                _PLUGIN._ryk_cache_path = None
+                with _chdir(qa_cwd), mock.patch.dict(
+                    os.environ,
+                    {"HOME": str(home), "PATH": str(binary.parent)},
+                    clear=True,
+                ):
+                    os.environ.pop("RYK_BIN", None)
+                    os.environ.pop("RYK_ALLOW_WORKSPACE_BIN", None)
+                    self.assertFalse(_PLUGIN._candidate_is_trusted(binary))
+                    self.assertIsNone(_PLUGIN._find_ryk())
+
+    def test_path_source_build_outside_cwd_is_found(self) -> None:
+        with _non_tmp_dir() as source, tempfile.TemporaryDirectory() as qa_cwd:
+            binary = _write_identity_ryk(source / "zig-out" / "bin" / "ryk")
+            with _chdir(qa_cwd), mock.patch.dict(
+                os.environ,
+                {"HOME": qa_cwd, "PATH": str(binary.parent)},
+                clear=True,
+            ):
+                os.environ.pop("RYK_BIN", None)
+                os.environ.pop("RYK_ALLOW_WORKSPACE_BIN", None)
+                self.assertEqual(_PLUGIN._find_ryk(), str(binary.resolve()))
+
+    def test_planted_cwd_zig_out_rejected_without_workspace_flag(self) -> None:
+        with _non_tmp_dir() as cwd:
+            plant = _write_identity_ryk(cwd / "zig-out" / "bin" / "ryk")
+            with _chdir(cwd), mock.patch.dict(
+                os.environ,
+                {"HOME": str(cwd), "PATH": str(plant.parent)},
+                clear=True,
+            ):
+                os.environ.pop("RYK_BIN", None)
+                os.environ.pop("RYK_ALLOW_WORKSPACE_BIN", None)
+                self.assertIsNone(_PLUGIN._find_ryk())
+                self.assertEqual(_PLUGIN._ryk_candidates(), [])
+
+    def test_cwd_zig_out_does_not_win_over_managed(self) -> None:
+        with _non_tmp_dir() as root:
+            home = root / "home"
+            managed = home / ".local" / "bin"
+            managed.mkdir(parents=True)
+            managed_bin = _write_identity_ryk(managed / "ryk")
+            digest = hashlib.sha256(managed_bin.read_bytes()).hexdigest()
+            (managed / ".ryk-provenance").write_text(
+                "ryk-provenance-v1\n"
+                f"path={managed_bin.resolve()}\n"
+                f"sha256={digest}\n",
+                encoding="utf-8",
+            )
+            project = root / "project"
+            plant = _write_identity_ryk(project / "zig-out" / "bin" / "ryk")
+            with _chdir(project), mock.patch.dict(
+                os.environ,
+                {"HOME": str(home), "PATH": f"{plant.parent}:{managed}"},
+                clear=True,
+            ):
+                os.environ.pop("RYK_BIN", None)
+                os.environ.pop("RYK_ALLOW_WORKSPACE_BIN", None)
+                self.assertEqual(_PLUGIN._find_ryk(), str(managed_bin.resolve()))
+
+    def test_ryk_bin_world_writable_rejected(self) -> None:
+        with _non_tmp_dir() as source:
+            binary = _write_identity_ryk(source / "ryk", mode=0o777)
+            with mock.patch.dict(os.environ, {"RYK_BIN": str(binary)}, clear=False):
+                self.assertIsNone(_PLUGIN._ryk_executable(str(binary)))
+                self.assertFalse(_PLUGIN._candidate_is_trusted(binary))
+
+    def test_ryk_bin_node_modules_rejected(self) -> None:
+        with _non_tmp_dir() as source:
+            binary = _write_identity_ryk(source / "node_modules" / ".bin" / "ryk")
+            with mock.patch.dict(os.environ, {"RYK_BIN": str(binary)}, clear=False):
+                self.assertIsNone(_PLUGIN._ryk_executable(str(binary)))
+                self.assertFalse(_PLUGIN._candidate_is_trusted(binary))
 
     def test_managed_local_bin_trusted_when_cwd_is_home(self) -> None:
         """~/.local/bin/ryk must attest even when process cwd is $HOME."""
