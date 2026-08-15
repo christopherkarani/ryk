@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
-# Live host E2E: exercise each host's real ryk veto path when the host (or evaluate) is available.
+# ryk envelope E2E: exercise each supported host's ryk veto path
+# (`hook` / `evaluate` / bare stdin). This is not a live host-CLI test.
 #
-# Fixture/install smoke (`ryk hook …`) proves the CLI entrypoint offline.
-# This script is the optional live path: skip honestly when host/RYK_BIN missing.
-# Not part of default `test-fast` — do not make CI flaky.
+# Host binaries are noted when present but do not gate the fixture run —
+# `ryk hook claude` does not need `claude` on PATH. Cursor is bare stdin
+# (W3 writer deferred), not a first-class launch alias.
 #
 # Usage:
 #   ./scripts/host-live-e2e.sh              # all hosts
 #   ./scripts/host-live-e2e.sh codex hermes # subset
 #   RYK_BIN=/path/to/ryk ./scripts/host-live-e2e.sh
 #
-# Exit: 0 if no hard failures (skips OK); 1 if any host present failed allow or deny.
+# Exit: 0 if no hard failures; 1 if any host envelope failed allow or deny.
 
 set -euo pipefail
 
@@ -29,7 +30,7 @@ fi
 SAFE_CMD='git status'
 DANGER_CMD='rm -rf /'
 
-ALL_HOSTS=(codex claude opencode openclaw hermes pi)
+ALL_HOSTS=(codex claude opencode openclaw hermes grok pi cursor)
 REQUESTED=("$@")
 if [[ ${#REQUESTED[@]} -eq 0 ]]; then
   HOSTS=("${ALL_HOSTS[@]}")
@@ -46,11 +47,12 @@ have() { command -v "$1" >/dev/null 2>&1; }
 
 resolve_event() {
   case "$1" in
-    codex|claude) echo PreToolUse ;;
+    codex|claude|grok) echo PreToolUse ;;
     opencode) echo tool.execute.before ;;
     openclaw) echo tool.before ;;
     hermes) echo pre_tool_call ;;
     pi) echo evaluate ;;
+    cursor) echo beforeShellExecution ;;
     *) echo unknown ;;
   esac
 }
@@ -70,6 +72,13 @@ fixture_for() {
       printf '{"version":1,"host":"openclaw","event":"%s","payload":{"tool":"bash","command":"%s"}}' \
         "$event" "$cmd"
       ;;
+    grok)
+      printf '{"hookEventName":"pre_tool_use","sessionId":"live-e2e","cwd":"/tmp","workspaceRoot":"/tmp","toolName":"run_terminal_cmd","toolUseId":"1","toolInput":{"command":"%s"},"toolInputTruncated":false}' \
+        "$cmd"
+      ;;
+    cursor)
+      printf '{"command":"%s","cwd":"/tmp"}' "$cmd"
+      ;;
     codex|claude)
       printf '{"version":1,"host":"%s","event":"%s","payload":{"tool_name":"Bash","tool_input":{"command":"%s"}}}' \
         "$host" "$event" "$cmd"
@@ -80,24 +89,54 @@ fixture_for() {
   esac
 }
 
+# True when stdout carries an allow on any supported host wire.
+stdout_is_allow() {
+  local stdout="$1"
+  printf '%s' "$stdout" | grep -q '"decision"[[:space:]]*:[[:space:]]*"allow"' && return 0
+  printf '%s' "$stdout" | grep -q '"permissionDecision"[[:space:]]*:[[:space:]]*"allow"' && return 0
+  printf '%s' "$stdout" | grep -q '"permission"[[:space:]]*:[[:space:]]*"allow"' && return 0
+  return 1
+}
+
+# True when stdout carries a deny/block on any supported host wire.
+# ask/warn are not a successful deny.
+stdout_is_block() {
+  local stdout="$1"
+  printf '%s' "$stdout" | grep -q '"decision"[[:space:]]*:[[:space:]]*"block"' && return 0
+  printf '%s' "$stdout" | grep -q '"decision"[[:space:]]*:[[:space:]]*"deny"' && return 0
+  printf '%s' "$stdout" | grep -q '"permissionDecision"[[:space:]]*:[[:space:]]*"deny"' && return 0
+  printf '%s' "$stdout" | grep -q '"permission"[[:space:]]*:[[:space:]]*"deny"' && return 0
+  return 1
+}
+
 interpret_allow() {
   local host="$1" code="$2" stdout="$3"
   [[ "$code" == "0" ]] || return 1
-  printf '%s' "$stdout" | grep -q '"decision"[[:space:]]*:[[:space:]]*"allow"' || return 1
-  return 0
+  stdout_is_allow "$stdout"
 }
 
 interpret_deny() {
   local host="$1" code="$2" stdout="$3"
-  if [[ "$host" == "codex" ]]; then
-    # Codex deny: exit 2 + stderr sentinel (stdout JSON intentionally empty).
-    [[ "$code" == "2" ]] && return 0
-    printf '%s' "$stdout" | grep -q '"decision"[[:space:]]*:[[:space:]]*"block"' && return 0
-    return 1
-  fi
-  [[ "$code" == "0" ]] || return 1
-  printf '%s' "$stdout" | grep -q '"decision"[[:space:]]*:[[:space:]]*"block"' || return 1
-  return 0
+  case "$host" in
+    codex)
+      # Codex deny: exit 2 + stderr sentinel (stdout JSON intentionally empty).
+      [[ "$code" == "2" ]] && return 0
+      stdout_is_block "$stdout"
+      ;;
+    grok)
+      # Official Grok contract is exit 2 + decision deny JSON. Empty stdout is not enough.
+      [[ "$code" == "2" ]] || return 1
+      stdout_is_block "$stdout"
+      ;;
+    pi)
+      # Pi evaluate deny requires decision deny/block JSON. Exit 2 with empty stdout is not a pass.
+      stdout_is_block "$stdout" || return 1
+      ;;
+    *)
+      [[ "$code" == "0" ]] || return 1
+      stdout_is_block "$stdout"
+      ;;
+  esac
 }
 
 run_hook_case() {
@@ -134,55 +173,52 @@ run_pi_case() {
   body="$(cat "$out")"
   rm -f "$out"
   if [[ "$expected" == "allow" ]]; then
-    [[ "$code" == "0" ]] || return 1
-    printf '%s' "$body" | grep -Eq '"decision"[[:space:]]*:[[:space:]]*"(allow|ALLOW)"' \
-      || printf '%s' "$body" | grep -Eq '"status"[[:space:]]*:[[:space:]]*"Allow"' \
-      || return 1
-    return 0
+    interpret_allow "pi" "$code" "$body"
+  else
+    interpret_deny "pi" "$code" "$body"
   fi
-  # deny: exit 2 preferred; also accept decision deny/block in JSON
-  if [[ "$code" == "2" ]]; then
-    return 0
-  fi
-  printf '%s' "$body" | grep -Eqi '"decision"[[:space:]]*:[[:space:]]*"(deny|block)"' \
-    || printf '%s' "$body" | grep -Eqi '"status"[[:space:]]*:[[:space:]]*"(Deny|Block)"' \
-    || return 1
-  return 0
 }
 
-host_present() {
-  local host="$1"
-  case "$host" in
-    pi)
-      # Real Pi host sessions need the `pi` CLI; evaluate path is still exercised when present.
-      have "pi"
-      ;;
-    *)
-      have "$host"
-      ;;
-  esac
+run_cursor_case() {
+  local expected="$1" cmd="$2"
+  local out code
+  out="$(mktemp)"
+  set +e
+  fixture_for cursor beforeShellExecution "$cmd" | "$RYK_BIN" >"$out" 2>/dev/null
+  code=$?
+  set -e
+  local body
+  body="$(cat "$out")"
+  rm -f "$out"
+  if [[ "$expected" == "allow" ]]; then
+    interpret_allow cursor "$code" "$body"
+  else
+    interpret_deny cursor "$code" "$body"
+  fi
 }
 
-live_note() {
+envelope_note() {
   case "$1" in
-    codex) echo "hooks.json → ryk hook codex PreToolUse (deny=exit 2)" ;;
-    claude) echo "settings hooks → ryk hook claude PreToolUse (JSON decision)" ;;
-    opencode) echo "plugin throw path ← tool.execute.before decision" ;;
-    openclaw) echo "plugin tool.before → JSON block" ;;
-    hermes) echo "Hermes plugin pre_tool_call → {action:block}; fixture uses ryk hook" ;;
-    pi) echo "direct smoke: evaluate bash; extension also protects write/edit/read and approval-gates grep/find/ls after root preflight (not exercised here)" ;;
+    codex) echo "ryk hook codex PreToolUse (deny=exit 2)" ;;
+    claude) echo "ryk hook claude PreToolUse (permissionDecision)" ;;
+    opencode) echo "ryk hook opencode tool.execute.before" ;;
+    openclaw) echo "ryk hook openclaw tool.before" ;;
+    hermes) echo "ryk hook hermes pre_tool_call" ;;
+    grok) echo "ryk hook grok PreToolUse (deny=exit 2 + decision JSON)" ;;
+    pi) echo "ryk evaluate --json --stdin (Pi extension path)" ;;
+    cursor) echo "bare ryk stdin → beforeShellExecution permission (W3 writer deferred)" ;;
   esac
 }
 
 if [[ -z "$RYK_BIN" || ! -x "$RYK_BIN" ]]; then
-  log "RYK_BIN missing — cannot run live E2E. Build with ./scripts/zig build or set RYK_BIN."
+  log "RYK_BIN missing — cannot run envelope E2E. Build with ./scripts/zig build or set RYK_BIN."
   log "status: skipped (no ryk binary)"
   exit 0
 fi
 
-log "ryk live host E2E"
+log "ryk host envelope E2E"
 log "  ryk: $RYK_BIN"
-log "  note: fixture path via ryk hook/evaluate; host CLI presence gates skip vs run"
+log "  note: proves ryk hook/evaluate/bare stdin envelopes; host CLI is informational"
 log ""
 
 for host in "${HOSTS[@]}"; do
@@ -193,25 +229,20 @@ for host in "${HOSTS[@]}"; do
     continue
   fi
 
-  if ! host_present "$host"; then
-    log "[$host] skip — host not installed (live: skipped — host not installed)"
-    if [[ "$host" == "pi" ]]; then
-      log "         install Pi, then: pi install npm:@rykan/pi-ryk"
-    else
-      log "         fixture smoke still available via: ryk plugin install $host / ryk plugin doctor $host"
-    fi
-    log "         live differs: $(live_note "$host")"
-    skip=$((skip + 1))
-    continue
+  if have "$host" || { [[ "$host" == "cursor" ]] && have cursor-agent; }; then
+    log "[$host] run — gate=$event; $(envelope_note "$host") (host CLI present)"
+  else
+    log "[$host] run — gate=$event; $(envelope_note "$host") (host CLI not installed; ryk envelope path)"
   fi
-
-  log "[$host] run — gate=$(resolve_event "$host"); $(live_note "$host")"
 
   allow_ok=0
   deny_ok=0
   if [[ "$host" == "pi" ]]; then
     if run_pi_case allow "$SAFE_CMD"; then allow_ok=1; fi
     if run_pi_case deny "$DANGER_CMD"; then deny_ok=1; fi
+  elif [[ "$host" == "cursor" ]]; then
+    if run_cursor_case allow "$SAFE_CMD"; then allow_ok=1; fi
+    if run_cursor_case deny "$DANGER_CMD"; then deny_ok=1; fi
   else
     if run_hook_case "$host" allow "$SAFE_CMD"; then allow_ok=1; fi
     if run_hook_case "$host" deny "$DANGER_CMD"; then deny_ok=1; fi
@@ -222,7 +253,6 @@ for host in "${HOSTS[@]}"; do
     pass=$((pass + 1))
   elif [[ "$deny_ok" -eq 1 && "$allow_ok" -eq 0 ]]; then
     log "  readiness: degraded (deny ok, allow failed — policy/eval? fix: ryk doctor)"
-    # Degraded is not a hard fail for protection proof, but counts as fail for usability gate.
     fail=$((fail + 1))
   elif [[ "$deny_ok" -eq 0 ]]; then
     log "  readiness: not-protected (deny failed)"
