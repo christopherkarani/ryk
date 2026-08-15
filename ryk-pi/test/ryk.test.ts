@@ -910,7 +910,7 @@ test("write tool is evaluated via ryk decide file", async () => {
 	assert.ok(payload.path.includes(".ryk/policy.yaml"));
 	assert.equal(messages.length, 1);
 	assert.equal(messages[0].message.customType, "rykanv-decision");
-	assert.match(messages[0].message.content, /Meta:.*files\.write\.deny\[2\]/);
+	assert.match(messages[0].message.content, /Meta\s+files\.write\.deny\[2\]/);
 });
 
 test("edit tool allow proceeds without block", async () => {
@@ -962,7 +962,7 @@ test("read tool is evaluated via ryk decide file with operation read", async () 
 	assert.equal(payload.operation, "read");
 	assert.ok(payload.path.includes(".ssh/id_rsa"));
 	assert.equal(messages.length, 1);
-	assert.match(messages[0].message.content, /Meta:.*files\.read\.deny\[0\]/);
+	assert.match(messages[0].message.content, /Meta\s+files\.read\.deny\[0\]/);
 });
 
 test("grep tool requires approval even when its broad root is allowed", async () => {
@@ -1949,21 +1949,24 @@ test("bash dangerous command with ryk deny returns block", async () => {
 		"notify must not embed Recourse walls",
 	);
 	const inlineDecision = messages[0].message.content;
-	assert.match(inlineDecision, /┏━+/);
-	assert.match(inlineDecision, /RYKAN V/);
+	assert.match(inlineDecision, /RYKAN V · Blocked/);
+	assert.ok(
+		!/[┏┓┗┛┃━┌┐└┘│─]/.test(inlineDecision),
+		"decision card must not use ASCII/Unicode box frames",
+	);
 	assert.ok(
 		!/COMMAND STOPPED BEFORE EXECUTION|YOUR CALL/.test(inlineDecision),
 		"legacy state lines must be gone",
 	);
 	assert.match(inlineDecision, /destructive filesystem command/);
-	assert.match(inlineDecision, /Why: destructive filesystem command/);
+	assert.match(inlineDecision, /Why\s+destructive filesystem command/);
 	assert.match(
 		inlineDecision,
-		/Meta:.*core\.filesystem:destructive-rm/,
+		/Meta\s+core\.filesystem:destructive-rm/,
 	);
 	assert.ok(
-		inlineDecision.split("\n").every((line) => line.length >= 40 && line.length <= 80),
-		"expected a compact, aligned decision card",
+		inlineDecision.split("\n").every((line) => line.length <= 80),
+		"expected a compact decision card",
 	);
 });
 
@@ -2243,7 +2246,7 @@ test("formatAgentBlockReason auto-deny why is single-branded", () => {
 	assert.ok(reason.length <= 320);
 });
 
-test("ryk inline decision keeps long reasons inside the compact frame", async () => {
+test("ryk inline decision wraps long reasons without a fixed box frame", async () => {
 	const longReason = `unsafe-${"x".repeat(120)} command escaped policy`;
 	const { pi, handlers, messages } = makePi();
 	const { spawn } = makeSpawn([
@@ -2264,10 +2267,14 @@ test("ryk inline decision keeps long reasons inside the compact frame", async ()
 	const inlineDecision = messages[0]?.message.content;
 	assert.ok(inlineDecision, "expected inline ryk decision content");
 	assert.ok(
-		inlineDecision.split("\n").every((line) => line.length === 56),
-		"expected every long-reason card line to stay inside the frame",
+		!/[┏┓┗┛┃━┌┐└┘│─]/.test(inlineDecision),
+		"decision card must not use ASCII/Unicode box frames",
 	);
-	assert.match(inlineDecision, /Why: unsafe-/);
+	assert.ok(
+		inlineDecision.split("\n").every((line) => line.length <= 80),
+		"expected long-reason card lines to stay compact",
+	);
+	assert.match(inlineDecision, /Why\s+unsafe-/);
 	assert.match(inlineDecision, /command escaped policy/);
 });
 
@@ -2326,15 +2333,19 @@ test("ryk error in interactive mode waits for the user's decision", async () => 
 	assert.ok(askWidget, "expected Rykan V ask widget");
 	assert.deepEqual(askWidget.opts, { placement: "aboveEditor" });
 	const cardText = askWidget.value?.join("\n") ?? "";
-	assert.match(cardText, /RYKAN V/);
-	assert.match(cardText, /Tip:|Why:/);
+	assert.match(cardText, /RYKAN V · Needs approval/);
+	assert.match(cardText, /Tip\s+|Why\s+/);
 	assert.ok(
 		!/YOUR CALL|COMMAND STOPPED|Choose: Run once/.test(cardText),
 		"legacy chrome must be gone",
 	);
 	assert.ok(
-		askWidget.value?.every((line) => line.length >= 40 && line.length <= 80),
-		"expected a compact, aligned card",
+		!/[┏┓┗┛┃━┌┐└┘│─]/.test(cardText),
+		"ask widget must not use ASCII/Unicode box frames",
+	);
+	assert.ok(
+		askWidget.value?.every((line) => line.length <= 80),
+		"expected a compact card",
 	);
 
 	resolveSelection("Allow once");
@@ -2900,7 +2911,8 @@ test("decision message renderer returns a TUI component with render()", () => {
 	const lines = component.render!(80);
 	assert.ok(Array.isArray(lines));
 	assert.ok(lines.every((line) => typeof line === "string"));
-	assert.ok(lines.some((line) => line.includes("BLOCKED .env")));
+	assert.ok(lines.some((line) => line.includes("blocked secret file")));
+	assert.ok(lines.some((line) => /Blocked/.test(line)));
 	assert.ok(lines.some((line) => line.includes("[error]")));
 });
 
@@ -2926,7 +2938,8 @@ test("decision message renderer ask variant uses warning tone and is renderable"
 	const component = result as { render: (width: number) => string[] };
 	const lines = component.render(40);
 	assert.ok(lines.some((line) => line.includes("[warning]")));
-	assert.ok(lines.some((line) => line.includes("ASK cat .env")));
+	assert.ok(lines.some((line) => /Needs approval/.test(line)));
+	assert.ok(lines.some((line) => line.includes("needs approval")));
 });
 
 test("decision message renderer wait variant and empty content stay renderable", () => {
@@ -2951,7 +2964,8 @@ test("decision message renderer wait variant and empty content stay renderable",
 	);
 	const waitLines = (waitResult as { render: (width: number) => string[] }).render(80);
 	assert.ok(waitLines.some((line) => line.includes("[dim]")));
-	assert.ok(waitLines.some((line) => line.includes("WAIT parent")));
+	assert.ok(waitLines.some((line) => /Waiting/.test(line)));
+	assert.ok(waitLines.some((line) => line.includes("waiting on parent")));
 
 	const emptyResult = renderer(
 		{

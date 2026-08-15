@@ -39,14 +39,18 @@
   "dependencies": {
     "@rykan/ryk": "0.2.18"
   },
-  "peerDependencies": {
-    "@earendil-works/pi-coding-agent": ">=0.79.0"
-  },
-  "peerDependenciesMeta": {
-    "@earendil-works/pi-coding-agent": {
-      "optional": false
-    }
-  },
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": ">=0.79.0",
+		"@earendil-works/pi-tui": ">=0.79.0"
+	},
+	"peerDependenciesMeta": {
+		"@earendil-works/pi-coding-agent": {
+			"optional": false
+		},
+		"@earendil-works/pi-tui": {
+			"optional": true
+		}
+	},
   "devDependencies": {
     "@types/node": "^24.0.0",
     "tsx": "^4.20.0",
