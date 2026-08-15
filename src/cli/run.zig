@@ -813,10 +813,6 @@ fn commandWithStdioAndEnv(io: std.Io, argv: []const []const u8, stdout: anytype,
         os_attach_planned: bool = false,
         /// Prepared mechanism for session-level backend requirements.
         os_attach_kind: sandbox.apply.ChildApplyKind = .none,
-        /// Identity-verified host launch (`resolveHostIdentity` + launch alias).
-        /// Skip shell-command eval of argv0; plugin hooks mediate the host.
-        trusted_agent_host: bool = false,
-
         pub fn beforeProcessLaunch(context: *anyopaque, session: core.session.Session) !void {
             const self: *@This() = @ptrCast(@alignCast(context));
             try self.installShims(session);
@@ -845,10 +841,11 @@ fn commandWithStdioAndEnv(io: std.Io, argv: []const []const u8, stdout: anytype,
             var rust_metadata: core.event.EventMetadata = .{};
             defer rust_metadata.deinit(self.allocator);
 
-            // Product host launch is not a user shell command. Only skip when
-            // launch identity is already a trusted host alias (F-02). Basename
-            // `./hermes` / `/tmp/evil/hermes` stays on the command-guard path.
-            if (self.trusted_agent_host) {
+            // Product host launch (`ryk hermes` / `ryk run -- hermes`) is not a
+            // user shell command. Exact alias token only — never basename.
+            // Identity-trusted stays a separate gate for empty-backpack / OS
+            // sandbox; real Hermes lives under ~/.hermes/.../venv/bin/hermes.
+            if (self.command_argv.len > 0 and host_launch.isExactHostLaunchArgv0(self.command_argv[0])) {
                 const allow_decision = core.decision.Decision{
                     .result = .allow,
                     .reason = "trusted host launch",
@@ -1210,7 +1207,6 @@ fn commandWithStdioAndEnv(io: std.Io, argv: []const []const u8, stdout: anytype,
         // PATH honesty only when child will actually OS-attach (not soft-degraded unboxed).
         .os_attach_planned = apply_result.requiresChildApply(),
         .os_attach_kind = apply_result.childApplyKind(),
-        .trusted_agent_host = trusted_agent_host,
     };
     // Fail closed if proxy dies when policy/backend requires it, session is
     // route-forced onto the proxy port (M-7), or host-alias mediation is active.
@@ -3355,21 +3351,14 @@ test "workspace basename spoof does not empty-backpack without secretless" {
     try std.testing.expect(std.mem.indexOf(u8, ran, "ran") != null);
 }
 
-test "trusted host alias launch is not CommandDenied under strict/unattended commands-default-deny" {
-    // Product path only: exact alias token + resolveHostIdentity trusted.
-    // evaluateCommand must not run (deny evaluator + strict permit would block).
-    // Bare `ryk hermes` rewrites to `ryk run -- hermes` via host_launch.buildRunArgv.
+test "exact host-launch alias token is not CommandDenied under strict even when identity is untrusted" {
+    // Live Hermes is ~/.hermes/hermes-agent/venv/bin/hermes — not a trusted
+    // prefix. Skip eval on the exact token (`ryk run -- hermes`); do not
+    // require resolveHostIdentity. Deny evaluator proves evaluate was skipped.
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 
     const io = std.testing.io;
     const allocator = std.testing.allocator;
-    const process_home = if (std.c.getenv("HOME")) |h| std.mem.span(h) else return error.SkipZigTest;
-    if (!std.fs.path.isAbsolute(process_home) or
-        std.mem.eql(u8, process_home, "/tmp") or
-        std.mem.startsWith(u8, process_home, "/tmp/") or
-        std.mem.eql(u8, process_home, "/workspace") or
-        std.mem.startsWith(u8, process_home, "/workspace/"))
-        return error.SkipZigTest;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3395,19 +3384,12 @@ test "trusted host alias launch is not CommandDenied under strict/unattended com
     const policy_path = try tmp.dir.realPathFileAlloc(io, "policy.yaml", allocator);
     defer allocator.free(policy_path);
 
-    // Managed $HOME/.local/bin is trusted without RYK_TRUSTED_HOST_PREFIXES.
-    // std.testing.tmpDir is often under /tmp; isTmpPath rejects that before inject.
-    const fixture_home = try std.fs.path.join(allocator, &.{ process_home, ".cache", "ryk-pr173-trusted-home" });
-    defer {
-        std.Io.Dir.cwd().deleteTree(io, fixture_home) catch {};
-        allocator.free(fixture_home);
-    }
-    std.Io.Dir.cwd().deleteTree(io, fixture_home) catch {};
-    try std.Io.Dir.cwd().createDirPath(io, fixture_home);
-    var home_dir = try std.Io.Dir.cwd().openDir(io, fixture_home, .{});
-    defer home_dir.close(io);
-    try home_dir.createDirPath(io, ".local/bin");
-    var bin_dir = try home_dir.openDir(io, ".local/bin", .{});
+    var home_tmp = std.testing.tmpDir(.{});
+    defer home_tmp.cleanup();
+    const fixture_home = try home_tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(fixture_home);
+    try home_tmp.dir.createDirPath(io, ".hermes/hermes-agent/venv/bin");
+    var bin_dir = try home_tmp.dir.openDir(io, ".hermes/hermes-agent/venv/bin", .{});
     defer bin_dir.close(io);
     for (host_launch.host_launch_aliases) |host| {
         const script = try bin_dir.createFile(io, host, .{});
@@ -3419,7 +3401,7 @@ test "trusted host alias launch is not CommandDenied under strict/unattended com
         );
         try bin_dir.setFilePermissions(io, host, @enumFromInt(0o755), .{});
     }
-    const bin_path = try std.fs.path.join(allocator, &.{ fixture_home, ".local/bin" });
+    const bin_path = try std.fs.path.join(allocator, &.{ fixture_home, ".hermes", "hermes-agent", "venv", "bin" });
     defer allocator.free(bin_path);
 
     var current = std.process.Environ.Map.init(allocator);
@@ -3430,8 +3412,6 @@ test "trusted host alias launch is not CommandDenied under strict/unattended com
     try current.put("HOME", fixture_home);
 
     // supervisor.spawnPlain looks up bare argv0 on the *process* PATH.
-    // Identity already used current_env; keep them aligned so the exact token
-    // launches without OS-attach argv0 absolute-ize (sandbox off).
     const previous_path = std.c.getenv("PATH");
     const prev_path_owned: ?[:0]const u8 = if (previous_path) |p|
         try allocator.dupeZ(u8, std.mem.span(p))
@@ -3454,7 +3434,6 @@ test "trusted host alias launch is not CommandDenied under strict/unattended com
         var stderr_buf: [4096]u8 = undefined;
         var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
         var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
-        // Deny evaluator: if evaluateCommand runs, launch is CommandDenied.
         const code = try commandForTestWithEnvAndShellEvaluator(
             &.{
                 "--workspace",         root,
@@ -3474,7 +3453,7 @@ test "trusted host alias launch is not CommandDenied under strict/unattended com
         );
         if (code != exit_codes.success) {
             std.debug.print(
-                "trusted host {s} exited {d}\nstderr: {s}\nstdout: {s}\n",
+                "exact alias {s} exited {d}\nstderr: {s}\nstdout: {s}\n",
                 .{ host, code, stderr_writer.buffered(), stdout_writer.buffered() },
             );
         }

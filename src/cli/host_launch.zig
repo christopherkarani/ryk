@@ -26,6 +26,16 @@ pub fn isHostLaunchAlias(name: []const u8) bool {
     return false;
 }
 
+/// Product launch argv0 (`ryk hermes` / `ryk run -- hermes`): exact alias token
+/// with no path separators. Never basename — `./hermes` and `/tmp/evil/hermes`
+/// stay on the command-guard path.
+pub fn isExactHostLaunchArgv0(argv0: []const u8) bool {
+    if (argv0.len == 0) return false;
+    if (std.mem.indexOfScalar(u8, argv0, '/') != null) return false;
+    if (std.mem.indexOfScalar(u8, argv0, '\\') != null) return false;
+    return isHostLaunchAlias(argv0);
+}
+
 /// Builds argv for `run_command.command`: `["--", host] ++ rest`.
 /// Caller owns and must free the returned slice (not the pointed-to strings).
 /// Does not inject security flags: the run-level agent-primary default selects
@@ -90,6 +100,18 @@ test "isHostLaunchAlias exact allowlist only" {
     try std.testing.expect(!isHostLaunchAlias(""));
     try std.testing.expect(!isHostLaunchAlias("clau"));
     try std.testing.expect(!isHostLaunchAlias("pi2"));
+}
+
+test "isExactHostLaunchArgv0 rejects basename paths" {
+    for (host_launch_aliases) |host| {
+        try std.testing.expect(isExactHostLaunchArgv0(host));
+    }
+    try std.testing.expect(!isExactHostLaunchArgv0("./hermes"));
+    try std.testing.expect(!isExactHostLaunchArgv0("/tmp/evil/hermes"));
+    try std.testing.expect(!isExactHostLaunchArgv0("/workspace/planted/hermes"));
+    try std.testing.expect(!isExactHostLaunchArgv0("venv/bin/hermes"));
+    try std.testing.expect(!isExactHostLaunchArgv0(""));
+    try std.testing.expect(!isExactHostLaunchArgv0("sh"));
 }
 
 // Pin: agent-primary launch aliases must not drift away from host_config_table keys.
