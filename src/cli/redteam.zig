@@ -1,4 +1,5 @@
 const std = @import("std");
+const gpa_mod = @import("gpa.zig");
 
 const env_util = @import("ryk").env_util;
 const redteam = @import("ryk").redteam;
@@ -21,7 +22,7 @@ pub fn command(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: an
         else => return err,
     };
 
-    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    var gpa_state: gpa_mod.State = .init;
     defer _ = gpa_state.deinit();
     const allocator = gpa_state.allocator();
 

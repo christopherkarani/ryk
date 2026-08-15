@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const gpa_mod = @import("gpa.zig");
 
 const core = @import("ryk_core").core;
 const supervisor = core.supervisor;
@@ -216,7 +217,7 @@ fn commandWithStdioAndEnv(io: std.Io, argv: []const []const u8, stdout: anytype,
         return exit_codes.usage;
     }
 
-    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    var gpa_state: gpa_mod.State = .init;
     defer _ = gpa_state.deinit();
     const allocator = gpa_state.allocator();
 

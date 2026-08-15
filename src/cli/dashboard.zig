@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const gpa_mod = @import("gpa.zig");
 
 const dashboard = @import("../dashboard/mod.zig");
 const resource_root = @import("../resource_root.zig");
@@ -290,7 +291,7 @@ fn serve(io: std.Io, options: DashboardOptions, stdout: anytype, stderr: anytype
     }
     try flushIfSupported(stdout);
 
-    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    var gpa_state: gpa_mod.State = .init;
     defer _ = gpa_state.deinit();
     const allocator = gpa_state.allocator();
     const csrf_token = try makeCsrfToken(io, allocator);

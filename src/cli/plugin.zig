@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const gpa_mod = @import("gpa.zig");
 const core = @import("ryk_core").core;
 const supervisor = core.supervisor;
 const core_api = @import("ryk_core").api;
@@ -96,7 +97,7 @@ pub fn command(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: an
 }
 
 fn installAliasCommand(io: std.Io, host: []const u8, argv: []const []const u8, stdout: anytype, stderr: anytype) !u8 {
-    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    var gpa_state: gpa_mod.State = .init;
     defer _ = gpa_state.deinit();
     const allocator = gpa_state.allocator();
     const install_argv = try allocator.alloc([]const u8, argv.len + 1);
@@ -164,7 +165,7 @@ fn doctorCommand(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: 
         return exit_codes.usage;
     }
 
-    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    var gpa_state: gpa_mod.State = .init;
     defer _ = gpa_state.deinit();
     const allocator = gpa_state.allocator();
 
@@ -302,7 +303,7 @@ fn listCommand(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: an
         return exit_codes.usage;
     }
 
-    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    var gpa_state: gpa_mod.State = .init;
     defer _ = gpa_state.deinit();
     const allocator = gpa_state.allocator();
     var report = try collectPluginDoctorReport(io, allocator);
@@ -1090,7 +1091,7 @@ fn manifestCommand(io: std.Io, argv: []const []const u8, stdout: anytype, stderr
         return exit_codes.usage;
     }
 
-    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    var gpa_state: gpa_mod.State = .init;
     defer _ = gpa_state.deinit();
     const manifest_allocator = gpa_state.allocator();
     const workspace_root = try plugin_install.resolveWorkspaceInstallRoot(io, manifest_allocator);
@@ -1355,7 +1356,7 @@ fn installCommand(io: std.Io, argv: []const []const u8, stdout: anytype, stderr:
     var all_detected = false;
     var scope: InstallScope = .global; // OpenCode day-one: machine-wide path OpenCode always finds
 
-    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    var gpa_state: gpa_mod.State = .init;
     defer _ = gpa_state.deinit();
     const allocator = gpa_state.allocator();
 

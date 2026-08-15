@@ -2,6 +2,7 @@
 //! Public CLI door is `ryk start` — top-level `ryk setup` is hard-removed from the dispatcher.
 
 const std = @import("std");
+const gpa_mod = @import("gpa.zig");
 
 const exit_codes = @import("exit_codes.zig");
 const help = @import("help.zig");
@@ -73,7 +74,7 @@ const SetupRenderOpts = struct {
 };
 
 fn runAutoSetup(io: std.Io, cwd: std.Io.Dir, preset: []const u8, stdout: anytype, stderr: anytype, render: SetupRenderOpts) !u8 {
-    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    var gpa_state: gpa_mod.State = .init;
     defer _ = gpa_state.deinit();
     const allocator = gpa_state.allocator();
 
@@ -256,7 +257,7 @@ fn runGuidedSetup(
     injected_reader: ?*std.Io.Reader,
     render: SetupRenderOpts,
 ) !u8 {
-    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    var gpa_state: gpa_mod.State = .init;
     defer _ = gpa_state.deinit();
     const allocator = gpa_state.allocator();
 
@@ -494,7 +495,7 @@ fn runGuidedSetup(
 }
 
 test "guided setup host panel formats detected hosts" {
-    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    var gpa_state: gpa_mod.State = .init;
     defer _ = gpa_state.deinit();
     const allocator = gpa_state.allocator();
 

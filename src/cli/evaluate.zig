@@ -1,4 +1,5 @@
 const std = @import("std");
+const gpa_mod = @import("gpa.zig");
 const build_options = @import("build_options");
 
 const core = @import("ryk_core").core;
@@ -163,7 +164,7 @@ fn commandWithEvaluator(io: std.Io, argv: []const []const u8, stdout: anytype, s
         return exit_codes.usage;
     }
 
-    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    var gpa_state: gpa_mod.State = .init;
     defer _ = gpa_state.deinit();
     const allocator = gpa_state.allocator();
 

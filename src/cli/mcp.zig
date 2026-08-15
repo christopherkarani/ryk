@@ -1,4 +1,5 @@
 const std = @import("std");
+const gpa_mod = @import("gpa.zig");
 
 const env_util = @import("../env_util.zig");
 const mcp_mod = @import("../mcp/mod.zig");
@@ -197,7 +198,7 @@ fn inspect(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: anytyp
         try stdout.writeAll("Usage: ryk mcp inspect --command <server> [--name <server-name>] [--policy <path>]\n");
         return exit_codes.success;
     }
-    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    var gpa_state: gpa_mod.State = .init;
     defer _ = gpa_state.deinit();
     const allocator = gpa_state.allocator();
 
@@ -346,7 +347,7 @@ fn proxy(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: anytype)
         try stdout.writeAll("Usage: ryk mcp proxy --command <server> [--name <server-name>] [--policy <path>] [--manifest <path>] [--mode observe|ask|strict|ci]\n");
         return exit_codes.success;
     }
-    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    var gpa_state: gpa_mod.State = .init;
     defer _ = gpa_state.deinit();
     const allocator = gpa_state.allocator();
 
@@ -536,7 +537,7 @@ fn list(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: anytype) 
         try stderr.writeAll("ryk mcp list: unexpected arguments.\n");
         return exit_codes.usage;
     }
-    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    var gpa_state: gpa_mod.State = .init;
     defer _ = gpa_state.deinit();
     const allocator = gpa_state.allocator();
     const Inventory = struct {
@@ -667,7 +668,7 @@ fn manifestCheck(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: 
         try stderr.writeAll("ryk mcp manifest check: expected <manifest.yaml>.\n");
         return exit_codes.usage;
     }
-    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    var gpa_state: gpa_mod.State = .init;
     defer _ = gpa_state.deinit();
     const allocator = gpa_state.allocator();
     var manifest = mcp_mod.manifests.loadFile(io, allocator, argv[0]) catch |err| {
@@ -689,7 +690,7 @@ fn manifestCheck(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: 
 }
 
 fn manifestGenerate(argv: []const []const u8, stdout: anytype, stderr: anytype) !u8 {
-    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    var gpa_state: gpa_mod.State = .init;
     defer _ = gpa_state.deinit();
     const allocator = gpa_state.allocator();
     var command_name: ?[]const u8 = null;

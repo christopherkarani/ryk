@@ -2,6 +2,7 @@
 //! Public CLI door is `ryk start` — top-level `ryk quickstart` is hard-removed from the dispatcher.
 
 const std = @import("std");
+const gpa_mod = @import("gpa.zig");
 
 const exit_codes = @import("exit_codes.zig");
 const help = @import("help.zig");
@@ -33,7 +34,7 @@ fn commandWithDaemonChecker(
         }
     }
 
-    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    var gpa_state: gpa_mod.State = .init;
     defer _ = gpa_state.deinit();
     const allocator = gpa_state.allocator();
 

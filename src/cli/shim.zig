@@ -1,4 +1,5 @@
 const std = @import("std");
+const gpa_mod = @import("gpa.zig");
 
 const core = @import("ryk_core").core;
 const core_api = @import("ryk_core").api;
@@ -28,7 +29,7 @@ fn exec(io: std.Io, environ_map: *const std.process.Environ.Map, command_argv: [
         return exit_codes.usage;
     }
 
-    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    var gpa_state: gpa_mod.State = .init;
     defer _ = gpa_state.deinit();
     const allocator = gpa_state.allocator();
 

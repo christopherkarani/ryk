@@ -2,6 +2,7 @@
 //! `ryk tools classify` and `ryk tools packs` — not shell `ryk classify`.
 
 const std = @import("std");
+const gpa_mod = @import("gpa.zig");
 const policy_mod = @import("ryk_core").policy;
 const core = @import("ryk_core").core;
 const supervisor = core.supervisor;
@@ -40,7 +41,7 @@ fn classify(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: anyty
         return exit_codes.success;
     }
 
-    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    var gpa_state: gpa_mod.State = .init;
     defer _ = gpa_state.deinit();
     const allocator = gpa_state.allocator();
 
@@ -163,7 +164,7 @@ fn listPacks(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: anyt
         return exit_codes.usage;
     }
 
-    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    var gpa_state: gpa_mod.State = .init;
     defer _ = gpa_state.deinit();
     const allocator = gpa_state.allocator();
 

@@ -1,4 +1,5 @@
 const std = @import("std");
+const gpa_mod = @import("gpa.zig");
 const exit_codes = @import("exit_codes.zig");
 const help = @import("help.zig");
 const telemetry = @import("../telemetry.zig");
@@ -66,9 +67,9 @@ fn resolveHome(environ_map: *const std.process.Environ.Map) ?[]const u8 {
 
 fn writeLocalFeedbackFile(io: std.Io, environ_map: *const std.process.Environ.Map, category: []const u8) !void {
     const home = resolveHome(environ_map) orelse return error.HomeDirectoryNotFound;
-    var gpa: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    var gpa_state: gpa_mod.State = .init;
+    defer _ = gpa_state.deinit();
+    const allocator = gpa_state.allocator();
     const dir = try std.fs.path.join(allocator, &.{ home, ".ryk", "feedback" });
     defer allocator.free(dir);
     try std.Io.Dir.cwd().createDirPath(io, dir);
