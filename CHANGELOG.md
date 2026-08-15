@@ -20,6 +20,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+* **Mac FM steward source moved** to [ryk-fm-steward](https://github.com/christopherkarani/ryk-fm-steward). ryk keeps `macos/fm-steward/Schemas` and the shell fixture cards as the wire contract. Zig still resolves `fm-steward` on `PATH` or `RYK_FM_STEWARD_BIN`. Assist only; fail-open and “never soften deny” are unchanged.
+
 ### Security
 
 * **Force-equivalent git push stays denied on classify + shell_engine under generic-agent.** Shared detection covers `-f` / `--force*` / `--force=` / `--force-with-lease` / `--force-if-includes` / `+refspec` / `--delete` / `--mirror` / `:ref`, including `git -C` and short-opt clusters. Explain/TUI alternatives no longer recommend `--force-with-lease` as if it were allowed. Plain `git push` stays allowed.

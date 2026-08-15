@@ -34,4 +34,4 @@ be in this repo or in CI. See [`../release-signing.md`](../release-signing.md).
 
 ## macOS FM steward
 
-The macOS FM steward uses the pinned Wax package in `macos/fm-steward/Package.swift` for local few-shot retrieval. It is an assistive classifier, not a policy authority. Policy and shell decisions remain on the Zig path.
+Swift source and the Wax SPM pin live in [ryk-fm-steward](https://github.com/christopherkarani/ryk-fm-steward) (`Package.swift`, Wax 0.1.25, `traits: []`). This repo keeps the wire contract under `macos/fm-steward/Schemas` and `macos/fm-steward/Fixtures`. The steward is an assistive classifier, not a policy authority. Policy and shell decisions remain on the Zig path (`src/cli/fm_steward_client.zig`).

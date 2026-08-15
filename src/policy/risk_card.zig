@@ -1,6 +1,7 @@
 //! Risk-card-v1 encoder for Mac FM steward classify requests (Phase 4 WP1).
 //!
-//! Normative schema: `macos/fm-steward/Schemas/risk-card-v1.json`.
+//! Normative schema pin: `macos/fm-steward/Schemas/risk-card-v1.json`.
+//! Swift source: https://github.com/christopherkarani/ryk-fm-steward
 //! Shell MVP cards stay tiny (no transcripts). Product PreToolUse / evaluate / run
 //! paths must pass `executed=true` (about to run). Tests may use `executed=false`
 //! for fixture shapes such as data/grep text.

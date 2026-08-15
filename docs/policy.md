@@ -104,14 +104,15 @@ printf '%s' "{\"schema_version\":1,\"kind\":\"shell_command\",\"command\":\"rm -
 Optional Mac offline steward checks (rules pre-pass; no live Foundation Model required for these short-circuits):
 
 ```sh
-# Fixture shapes under macos/fm-steward/Fixtures/
-swift run --package-path macos/fm-steward fm-steward classify --card macos/fm-steward/Fixtures/curl_pipe_sh.json --human
+# Fixture cards are pinned here; Swift package is https://github.com/christopherkarani/ryk-fm-steward
+# From a ryk-fm-steward checkout:
+swift run fm-steward classify --card Fixtures/curl_pipe_sh.json --human
 # → ask (HardDangerRules)
 
-swift run --package-path macos/fm-steward fm-steward classify --card macos/fm-steward/Fixtures/grep_rm_rf.json --human
+swift run fm-steward classify --card Fixtures/grep_rm_rf.json --human
 # → continue (executed=false-shaped)
 
-swift run --package-path macos/fm-steward fm-steward classify --card macos/fm-steward/Fixtures/timeout_forced.json --human
+swift run fm-steward classify --card Fixtures/timeout_forced.json --human
 # → continue (timeout / fail-open path)
 ```
 

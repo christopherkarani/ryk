@@ -4,6 +4,7 @@
 # Usage (from repo root or this directory):
 #   ./macos/fm-steward/Fixtures/validate.sh
 #   bash macos/fm-steward/Fixtures/validate.sh
+# This is the ryk contract pin. Swift source lives in ryk-fm-steward.
 #
 # Exit 0 when:
 #   - risk-card-v1 + classify-response-v1 schemas exist and are valid JSON
