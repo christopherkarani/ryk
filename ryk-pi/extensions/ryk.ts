@@ -1254,10 +1254,10 @@ function renderDecisionMessage(
 	const text = buildThemedDecisionLines(card, theme).join("\n");
 	const tui = loadPiTui();
 	if (tui?.Box && tui?.Text) {
+		// Padding only — no customMessageBg fill. Keeps Pi layout chrome without a
+		// solid "card" panel so the surface stays Vercel-minimal.
 		const pad = options.outputPad ?? 1;
-		const box = new tui.Box(pad, 1, (t) =>
-			theme.bg ? theme.bg("customMessageBg", t) : t,
-		);
+		const box = new tui.Box(pad, 0);
 		box.addChild(new tui.Text(text, 0, 0));
 		return box;
 	}
