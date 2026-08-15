@@ -98,12 +98,31 @@ fn readPipeToAlloc(io: std.Io, allocator: std.mem.Allocator, file: std.Io.File, 
     return try list.toOwnedSlice(allocator);
 }
 
-fn argvFor(case: HostCase) []const []const u8 {
-    return switch (case.invoke) {
-        .hook => &.{ ryk_bin, "hook", case.host, case.event },
-        .evaluate => &.{ ryk_bin, "evaluate", "--json", "--stdin" },
-        .bare => &.{ryk_bin},
-    };
+/// Fill `buf` and return a slice of it. Do not return `&.{ ... }` from a
+/// helper — that is a pointer to a function-local temporary. After return
+/// the argv pointer array dangles; Debug often still works, ReleaseSafe
+/// `spawn`/`dupeSentinel` GPFs.
+fn argvFor(case: HostCase, buf: *[4][]const u8) []const []const u8 {
+    switch (case.invoke) {
+        .hook => {
+            buf[0] = ryk_bin;
+            buf[1] = "hook";
+            buf[2] = case.host;
+            buf[3] = case.event;
+            return buf[0..4];
+        },
+        .evaluate => {
+            buf[0] = ryk_bin;
+            buf[1] = "evaluate";
+            buf[2] = "--json";
+            buf[3] = "--stdin";
+            return buf[0..4];
+        },
+        .bare => {
+            buf[0] = ryk_bin;
+            return buf[0..1];
+        },
+    }
 }
 
 const HookRun = struct {
@@ -112,7 +131,11 @@ const HookRun = struct {
     code: u8,
 };
 
-fn runRyk(allocator: std.mem.Allocator, args: []const []const u8, stdin_data: ?[]const u8) !HookRun {
+fn runRyk(allocator: std.mem.Allocator, case: HostCase, stdin_data: ?[]const u8) !HookRun {
+    // argv storage must outlive spawn's dupeSentinel. Built here from HostCase
+    // so hook / evaluate / bare all own the pointer array for the call.
+    var argv_buf: [4][]const u8 = undefined;
+    const args = argvFor(case, &argv_buf);
     const io = std.testing.io;
     var child = try std.process.spawn(io, .{
         .argv = args,
@@ -184,6 +207,30 @@ fn isAllow(decision: []const u8) bool {
 fn isBlocked(decision: []const u8) bool {
     // ask/warn are not a successful deny — approval-required is not blocked.
     return std.mem.eql(u8, decision, "block") or std.mem.eql(u8, decision, "deny");
+}
+
+test "argvFor writes hook evaluate and bare into the caller buffer" {
+    var buf: [4][]const u8 = undefined;
+
+    const hook_args = argvFor(host_cases[0], &buf);
+    try std.testing.expectEqual(@intFromPtr(&buf[0]), @intFromPtr(hook_args.ptr));
+    try std.testing.expectEqual(@as(usize, 4), hook_args.len);
+    try std.testing.expectEqualStrings(ryk_bin, hook_args[0]);
+    try std.testing.expectEqualStrings("hook", hook_args[1]);
+    try std.testing.expectEqualStrings("codex", hook_args[2]);
+    try std.testing.expectEqualStrings("PreToolUse", hook_args[3]);
+
+    const eval_args = argvFor(host_cases[6], &buf);
+    try std.testing.expectEqual(@intFromPtr(&buf[0]), @intFromPtr(eval_args.ptr));
+    try std.testing.expectEqual(@as(usize, 4), eval_args.len);
+    try std.testing.expectEqualStrings("evaluate", eval_args[1]);
+    try std.testing.expectEqualStrings("--json", eval_args[2]);
+    try std.testing.expectEqualStrings("--stdin", eval_args[3]);
+
+    const bare_args = argvFor(host_cases[7], &buf);
+    try std.testing.expectEqual(@intFromPtr(&buf[0]), @intFromPtr(bare_args.ptr));
+    try std.testing.expectEqual(@as(usize, 1), bare_args.len);
+    try std.testing.expectEqualStrings(ryk_bin, bare_args[0]);
 }
 
 test "matrix allow/deny helpers reject ask warn and context_only" {
@@ -279,7 +326,7 @@ test "supported host harnesses allow safe commands and block destructive ones" {
         const safe_fixture = try readFile(allocator, host_case.safe_fixture);
         defer allocator.free(safe_fixture);
 
-        const safe_result = try runRyk(allocator, argvFor(host_case), safe_fixture);
+        const safe_result = try runRyk(allocator, host_case, safe_fixture);
         defer allocator.free(safe_result.stdout);
         defer allocator.free(safe_result.stderr);
         try expectSafeAllow(allocator, host_case, safe_result);
@@ -287,7 +334,7 @@ test "supported host harnesses allow safe commands and block destructive ones" {
         const dangerous_fixture = try readFile(allocator, host_case.dangerous_fixture);
         defer allocator.free(dangerous_fixture);
 
-        const deny_result = try runRyk(allocator, argvFor(host_case), dangerous_fixture);
+        const deny_result = try runRyk(allocator, host_case, dangerous_fixture);
         defer allocator.free(deny_result.stdout);
         defer allocator.free(deny_result.stderr);
         try expectDangerBlock(allocator, host_case, deny_result);
@@ -301,7 +348,7 @@ test "supported host harnesses fail closed on invalid JSON" {
     const bad = "{not json";
 
     for (host_cases) |host_case| {
-        const result = try runRyk(allocator, argvFor(host_case), bad);
+        const result = try runRyk(allocator, host_case, bad);
         defer allocator.free(result.stdout);
         defer allocator.free(result.stderr);
 
