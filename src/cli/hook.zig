@@ -542,7 +542,8 @@ fn hookCommand(io: std.Io, host: Host, event: Event, original_event_name: []cons
     const hook_payload = raw_grok_payload orelse parsed.value.object.get("payload") orelse std.json.Value{ .object = empty_payload };
 
     const needs_policy = eventNeedsPolicy(event);
-    const needs_workspace = needs_policy or host == .hermes;
+    const fail_closed_pre_eval = shouldFailClosedOnPreEval(host, event);
+    const needs_workspace = needs_policy or fail_closed_pre_eval or host == .hermes;
     const root = if (needs_workspace)
         supervisor.resolveWorkspaceRoot(io, allocator, null, ".") catch try allocator.dupe(u8, ".")
     else
@@ -565,6 +566,23 @@ fn hookCommand(io: std.Io, host: Host, event: Event, original_event_name: []cons
     }
 
     if (!needs_policy) {
+        if (fail_closed_pre_eval) {
+            // Codex informational events used to fail-closed on discover failure.
+            // Do not turn a broken workspace policy into allow.
+            var loaded = core_api.discoverPolicy(io, allocator, null, root) catch {
+                return try emitPreEvalFailClosed(
+                    allocator,
+                    host,
+                    event,
+                    stdout,
+                    stderr,
+                    "hook",
+                    "policy load failed",
+                    "ryk hook: failed to load policy; ryk blocked it before evaluation.",
+                );
+            };
+            loaded.deinit();
+        }
         var redactions: std.ArrayList(RedactionEntry) = .empty;
         var limitations: std.ArrayList([]const u8) = .empty;
         try limitations.append(allocator, try allocator.dupe(u8, "Hook enforcement is additive; does not replace ryk run supervision."));
@@ -1092,10 +1110,39 @@ fn evaluateHookForTestWithOptions(
     ci_mode: bool,
     shell_evaluator: ?ShellCommandEvaluatorFn,
 ) !HookResponse {
-    if (std.fs.path.isAbsolute(workspace_root)) {
+    if (std.mem.eql(u8, workspace_root, "/tmp/ryk-hook-test")) {
         std.Io.Dir.cwd().createDirPath(std.testing.io, workspace_root) catch {};
     }
     return evaluateHook(std.testing.io, allocator, workspace_root, @tagName(host), policy_value, host, event, payload, ci_mode, shell_evaluator);
+}
+
+test "evaluateHookForTestWithOptions does not mkdir arbitrary absolute workspace_root" {
+    const bogus = "/tmp/ryk-must-not-create-hook-ws-47bb";
+    std.Io.Dir.cwd().deleteTree(std.testing.io, bogus) catch {};
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, bogus) catch {};
+
+    var policy_obj = try core_api.loadPolicyPreset(std.testing.allocator, .strict);
+    defer policy_obj.deinit();
+    var empty_obj = try std.json.ObjectMap.init(std.testing.allocator, &.{}, &.{});
+    defer empty_obj.deinit(std.testing.allocator);
+
+    var result = evaluateHookForTestWithOptions(
+        std.testing.allocator,
+        bogus,
+        @ptrCast(@alignCast(policy_obj)),
+        .claude,
+        .SessionStart,
+        std.json.Value{ .object = empty_obj },
+        false,
+        null,
+    ) catch null;
+    if (result) |*r| r.deinit(std.testing.allocator);
+
+    std.Io.Dir.cwd().access(std.testing.io, bogus, .{}) catch |err| {
+        try std.testing.expect(err == error.FileNotFound);
+        return;
+    };
+    return error.TestUnexpectedResult;
 }
 
 fn evaluatePreToolUseForTest(
@@ -4118,6 +4165,8 @@ test "hook codex shell deny uses exit code 2" {
 
 test "hook pre-eval fail-closed gate covers PreToolUse PermissionRequest and Codex" {
     try std.testing.expect(shouldFailClosedOnPreEval(.codex, .SessionStart));
+    try std.testing.expect(shouldFailClosedOnPreEval(.codex, .PostToolUse));
+    try std.testing.expect(shouldFailClosedOnPreEval(.codex, .Stop));
     try std.testing.expect(shouldFailClosedOnPreEval(.codex, .PreToolUse));
     try std.testing.expect(shouldFailClosedOnPreEval(.claude, .PreToolUse));
     try std.testing.expect(shouldFailClosedOnPreEval(.claude, .PermissionRequest));

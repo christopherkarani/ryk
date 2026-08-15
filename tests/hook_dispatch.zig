@@ -152,14 +152,34 @@ fn runRyk(
     stdin_data: []const u8,
     env_map: ?*const std.process.Environ.Map,
 ) !HookRunResult {
+    return runRykIn(allocator, args, stdin_data, env_map, null);
+}
+
+fn runRykIn(
+    allocator: std.mem.Allocator,
+    args: []const []const u8,
+    stdin_data: []const u8,
+    env_map: ?*const std.process.Environ.Map,
+    cwd: ?[]const u8,
+) !HookRunResult {
     const io = std.testing.io;
-    var child = try std.process.spawn(io, .{
-        .argv = args,
-        .stdin = .pipe,
-        .stdout = .pipe,
-        .stderr = .pipe,
-        .environ_map = env_map,
-    });
+    var child = if (cwd) |cwd_path|
+        try std.process.spawn(io, .{
+            .argv = args,
+            .cwd = .{ .path = cwd_path },
+            .stdin = .pipe,
+            .stdout = .pipe,
+            .stderr = .pipe,
+            .environ_map = env_map,
+        })
+    else
+        try std.process.spawn(io, .{
+            .argv = args,
+            .stdin = .pipe,
+            .stdout = .pipe,
+            .stderr = .pipe,
+            .environ_map = env_map,
+        });
 
     if (child.stdin) |stdin| {
         stdin.writeStreamingAll(io, stdin_data) catch |err| switch (err) {
@@ -383,6 +403,35 @@ test "host hook contracts: Claude allow/deny, Codex exit 2, Cursor empty stdin" 
         try std.testing.expect(std.mem.indexOf(u8, result.stdout, "\"permissionDecision\":\"deny\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, result.stdout, "hook payload was empty") != null);
     }
+}
+
+test "codex SessionStart fails closed when workspace policy is broken" {
+    // Informational shortcut must not turn a discover failure into allow.
+    // Codex SessionStart is shouldFailClosedOnPreEval — exit 2 + sentinel.
+    try std.testing.expect(fileExists(ryk_bin));
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, ".ryk");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = ".ryk/policy.yaml",
+        .data = ":::not-valid-policy:::\n",
+    });
+    const cwd = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(cwd);
+    const ryk_abs = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ryk_bin, allocator);
+    defer allocator.free(ryk_abs);
+
+    const payload =
+        \\{"version":1,"host":"codex","event":"SessionStart","payload":{}}
+    ;
+    const result = try runRykIn(allocator, &.{ ryk_abs, "hook", "codex", "SessionStart" }, payload, null, cwd);
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    try std.testing.expectEqual(codex_deny_exit_code, result.code);
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "[[RYKAN-V-GUARD]]") != null);
 }
 
 test "phase2e Claude PreToolUse invalid JSON fails closed with block JSON" {
