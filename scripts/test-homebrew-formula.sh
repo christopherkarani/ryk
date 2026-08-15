@@ -18,7 +18,7 @@ FORMULA="packaging/homebrew/Formula/ryk.rb"
 UPDATER="scripts/update-homebrew-tap.sh"
 PLATFORMS=(darwin-arm64 darwin-amd64 linux-arm64 linux-amd64)
 
-WORK="$(mktemp -d -t ryk-brew-test)"
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/ryk-brew-test.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 
 pass() { printf '  ok   %s\n' "$*"; }
