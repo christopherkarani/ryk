@@ -1,0 +1,12 @@
+{
+  "hookEventName": "pre_tool_use",
+  "sessionId": "ryk-fixture",
+  "cwd": "/tmp",
+  "workspaceRoot": "/tmp",
+  "toolName": "run_terminal_cmd",
+  "toolUseId": "fixture-danger",
+  "toolInput": {
+    "command": "rm -rf /"
+  },
+  "toolInputTruncated": false
+}

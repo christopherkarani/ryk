@@ -1,0 +1,4 @@
+{
+  "command": "git status",
+  "cwd": "/tmp"
+}
