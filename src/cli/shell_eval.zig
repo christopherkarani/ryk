@@ -19,6 +19,7 @@ const pack_config = @import("pack_config.zig");
 const fm_steward_client = @import("fm_steward_client.zig");
 const telemetry = @import("../telemetry.zig");
 const supervisor = core.supervisor;
+const host_launch = @import("host_launch.zig");
 
 pub const ShellCommandEvent = struct {
     command: []const u8,
@@ -1448,6 +1449,33 @@ pub fn evaluateCommand(
 
     const classification = intercept.commands.classifyArgv(argv);
 
+    // Product host launch (`ryk hermes` / `ryk run -- hermes`) is not a user
+    // shell command. Mediation is plugin hooks, not evaluating argv0 as a
+    // generic word under commands.default deny / strict permit refuse.
+    if (argv.len > 0 and host_launch.isHostLaunchAlias(std.fs.path.basename(argv[0]))) {
+        const owned_reason = try allocator.dupe(u8, "trusted host launch alias");
+        errdefer allocator.free(owned_reason);
+        const explanation = try allocator.dupe(u8, "host launch alias is not a shell command");
+        errdefer allocator.free(explanation);
+        return .{
+            .classification = classification,
+            .policy_evaluation = .{
+                .decision = .{
+                    .result = .allow,
+                    .reason = owned_reason,
+                    .ci_may_proceed = true,
+                },
+                .explanation = explanation,
+            },
+            .decision = .{
+                .result = .allow,
+                .reason = owned_reason,
+                .ci_may_proceed = true,
+            },
+            .owned_reason = owned_reason,
+        };
+    }
+
     // Prefer audit workspace_root when present so run/shim bind packs/stores to session
     // root (M-9). Null keeps walk-up residual for bare evaluate callers.
     const shell_event = ShellCommandEvent{
@@ -1717,6 +1745,54 @@ pub fn mockDaemonProtocolMismatchEvaluator(allocator: std.mem.Allocator, shell_e
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+test "trusted host alias argv is not CommandDenied under strict/unattended commands-default-deny" {
+    const allocator = std.testing.allocator;
+    // Unattended / builtin:strict shape: non-empty permit, host name not listed.
+    const permit = [_][]const u8{ "git status", "ls *", "pwd", "which *", "ryk version" };
+
+    for (host_launch.host_launch_aliases) |host| {
+        var decision = try evaluateCommand(
+            allocator,
+            .strict,
+            &.{host},
+            null,
+            mockDaemonAllowEvaluator,
+            null,
+            null,
+            &permit,
+        );
+        defer decision.deinit(allocator);
+        try std.testing.expectEqual(core.decision.DecisionResult.allow, decision.decision.result);
+        try std.testing.expect(!decision.fail_closed);
+    }
+
+    var rm = try evaluateCommand(
+        allocator,
+        .strict,
+        &.{ "rm", "-rf", "/" },
+        null,
+        mockDaemonDenyEvaluator,
+        null,
+        null,
+        &permit,
+    );
+    defer rm.deinit(allocator);
+    try std.testing.expectEqual(core.decision.DecisionResult.deny, rm.decision.result);
+
+    var force_push = try evaluateCommand(
+        allocator,
+        .strict,
+        &.{ "git", "push", "--force" },
+        null,
+        mockDaemonDenyEvaluator,
+        null,
+        null,
+        &permit,
+    );
+    defer force_push.deinit(allocator);
+    try std.testing.expectEqual(core.decision.DecisionResult.deny, force_push.decision.result);
+}
 
 test "shell_eval allows safe command via mock daemon" {
     const allocator = std.testing.allocator;
