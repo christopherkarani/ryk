@@ -32,6 +32,7 @@
 
 ### Fixed
 
+* **Windows `ryk run` reaches child launch again.** New session audit logs now open with the read access required by Windows handle metadata queries, so EOF resynchronization no longer fails with `AccessDenied` before shim installation.
 * **`ryk explain` / `ryk test` force-push Why no longer recommends `--force-with-lease`.** Pack reasons for `core.git:push-force-long` and `push-force-short` now point at a fast-forward `git push`. `--force-with-lease` stays force-equivalent and denied. Deny of `--force`, `-f`, lease, `--force-if-includes`, `+refspec`, `--delete`, `--mirror`, and `:ref` is unchanged.
 * **Bare `ryk` empty/whitespace stdin on a non-TTY hook entry is fail-closed.** `src/cli/mod.zig` used to map `agent_hook.command`'s blank stdin (`NotAgentHookInput`) to help + exit 0. Hosts that treat exit 0 / non-JSON as allow skipped the gate. Empty and whitespace-only stdin now emit dual-contract deny JSON and exit 2. A failed stdin TTY probe enters hook mode (same deny path) instead of help. Interactive TTY with no args still shows help. This is the bare `ryk` stdin hook entry only — not `ryk hook <host>`.
 * **`ryk start` no longer fails a working setup for expected host leftovers.** Claude install smoke now reads the live `permissionDecision` JSON (deny is a pass; ask is not). Cursor deferred and an unowned Pi extension are skips, not hard failures. Install/doctor hook probes pass `--probe` so they evaluate as usual but do not mint allow-once redeem codes onto the operator TTY.

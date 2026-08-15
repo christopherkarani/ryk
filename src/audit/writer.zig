@@ -37,7 +37,7 @@ pub const SessionWriter = struct {
         try std.Io.Dir.cwd().createDirPath(io, session_dir_path);
         const events_path = try std.fs.path.join(allocator, &.{ session_dir_path, "events.jsonl" });
         defer allocator.free(events_path);
-        const events_file = try std.Io.Dir.cwd().createFile(io, events_path, .{ .exclusive = true });
+        const events_file = try std.Io.Dir.cwd().createFile(io, events_path, .{ .read = true, .exclusive = true });
         errdefer events_file.close(io);
 
         return .{
@@ -236,7 +236,7 @@ fn jsonNullableStringEquals(value: std.json.Value, expected: ?[]const u8) bool {
     return value == .null;
 }
 
-test "session writer creates directory and writes deterministic JSONL" {
+test "session writer creates a readable audit log and writes deterministic JSONL" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -266,6 +266,8 @@ test "session writer creates directory and writes deterministic JSONL" {
 
     var session_writer = try SessionWriter.init(std.testing.io, std.testing.allocator, session);
     defer session_writer.deinit();
+    var first_byte: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), try session_writer.events_file.readPositionalAll(std.testing.io, &first_byte, 0));
     try session_writer.appendEvent(ev);
 
     const rel_events_path = try std.fs.path.join(std.testing.allocator, &.{ ".ryk", "sessions", session.id.slice(), "events.jsonl" });
