@@ -129,8 +129,8 @@ interpret_deny() {
       stdout_is_block "$stdout"
       ;;
     pi)
-      # Pi evaluate deny is exit 2 + decision deny. Exit 2 with empty stdout is not a pass.
-      stdout_is_block "$stdout"
+      # Pi evaluate deny requires decision deny/block JSON. Exit 2 with empty stdout is not a pass.
+      stdout_is_block "$stdout" || return 1
       ;;
     *)
       [[ "$code" == "0" ]] || return 1

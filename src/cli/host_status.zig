@@ -242,8 +242,8 @@ pub fn interpretSmokeOutcome(
         return std.mem.eql(u8, decision, "allow");
     }
     if (std.mem.eql(u8, expected, "block")) {
-        // Codex and Grok deny with exit 2; stdout JSON may be intentionally empty.
-        if (std.mem.eql(u8, host, "codex") or std.mem.eql(u8, host, "grok")) {
+        // Codex deny: exit 2 + stderr sentinel; stdout JSON is intentionally empty.
+        if (std.mem.eql(u8, host, "codex")) {
             if (exit_code == 2) return true;
             // Defensive: accept decision=block JSON if a host version emits it.
             if (exit_code == 0) {
@@ -251,7 +251,15 @@ pub fn interpretSmokeOutcome(
             }
             return false;
         }
+        // Grok deny: exit 2 + native {"decision":"deny"}. Empty stdout is not a proven deny.
+        if (std.mem.eql(u8, host, "grok")) {
+            if (exit_code != 2) return false;
+            const decision = extractDecision(stdout) orelse return false;
+            return smokeDecisionIsBlock(host, decision);
+        }
         _ = stderr;
+        // Pi/Cursor doctor smoke is skipped; if this helper is called, exit-2
+        // with empty/no JSON is not a proven deny (same as any other host).
         if (exit_code != 0) return false;
         const decision = extractDecision(stdout) orelse return false;
         return smokeDecisionIsBlock(host, decision);
@@ -261,9 +269,12 @@ pub fn interpretSmokeOutcome(
 
 fn smokeDecisionIsBlock(host: []const u8, decision: []const u8) bool {
     if (std.mem.eql(u8, decision, "block")) return true;
+    // Host-aware deny only — do not treat deny as block globally.
     // Claude PreToolUse emits host-native permissionDecision: deny (exit 0).
+    // Grok PreToolUse emits native decision: deny (exit 2).
     // ask is not a successful deny — hosts must not treat approval-required as blocked.
     if (std.mem.eql(u8, host, "claude") and std.mem.eql(u8, decision, "deny")) return true;
+    if (std.mem.eql(u8, host, "grok") and std.mem.eql(u8, decision, "deny")) return true;
     return false;
 }
 
@@ -731,6 +742,9 @@ test "interpretSmokeOutcome block for flexible hosts uses decision JSON" {
     try std.testing.expect(interpretSmokeOutcome("hermes", "block", 0, "{\n  \"decision\": \"block\"\n}\n", ""));
     try std.testing.expect(interpretSmokeOutcome("opencode", "block", 0, "{\"decision\":\"block\",\"reason\":\"x\"}", ""));
     try std.testing.expect(!interpretSmokeOutcome("openclaw", "block", 0, "{\"decision\":\"allow\"}", ""));
+    // deny is host-aware (Claude/Grok only) — not a global block synonym.
+    try std.testing.expect(!interpretSmokeOutcome("hermes", "block", 0, "{\"decision\":\"deny\"}", ""));
+    try std.testing.expect(!interpretSmokeOutcome("openclaw", "block", 0, "{\"decision\":\"deny\"}", ""));
 }
 
 test "interpretSmokeOutcome accepts Claude host-native permissionDecision JSON" {
@@ -760,10 +774,13 @@ test "hook smoke argv is a probe so start does not mint redeem codes" {
     try std.testing.expectEqualStrings("--probe", argv[4]);
 }
 
-test "Grok host status uses raw PreToolUse fixtures and exit-two deny" {
+test "Grok host status uses raw PreToolUse fixtures and exit-two deny JSON" {
     try std.testing.expectEqualStrings("PreToolUse", shellGate("grok"));
-    try std.testing.expect(interpretSmokeOutcome("grok", "block", 2, "", ""));
+    try std.testing.expect(!interpretSmokeOutcome("grok", "block", 2, "", ""));
     try std.testing.expect(!interpretSmokeOutcome("grok", "block", 0, "", ""));
+    try std.testing.expect(interpretSmokeOutcome("grok", "block", 2, "{\"decision\":\"deny\"}", ""));
+    try std.testing.expect(!interpretSmokeOutcome("grok", "block", 2, "{\"decision\":\"ask\"}", ""));
+    try std.testing.expect(!interpretSmokeOutcome("grok", "block", 0, "{\"decision\":\"deny\"}", ""));
 
     const fixture = try buildHookFixture(std.testing.allocator, "grok", "PreToolUse", "git status");
     defer std.testing.allocator.free(fixture);
@@ -779,6 +796,23 @@ test "interpretSmokeOutcome codex deny uses exit code 2" {
     try std.testing.expect(interpretSmokeOutcome("codex", "block", 2, "", "[[RYKAN-V-GUARD]] blocked."));
     try std.testing.expect(!interpretSmokeOutcome("codex", "block", 0, "", "error"));
     try std.testing.expect(interpretSmokeOutcome("codex", "block", 0, "{\"decision\":\"block\"}", ""));
+}
+
+test "interpretSmokeOutcome Pi and Cursor empty exit-two is not a proven deny" {
+    try std.testing.expect(!interpretSmokeOutcome("pi", "block", 2, "", ""));
+    try std.testing.expect(!interpretSmokeOutcome("pi", "block", 2, "{\"decision\":\"deny\"}", ""));
+    try std.testing.expect(!interpretSmokeOutcome("cursor", "block", 2, "", ""));
+    try std.testing.expect(!interpretSmokeOutcome("cursor", "block", 0, "{\"permission\":\"deny\"}", ""));
+}
+
+test "doctor smoke pair skips Cursor and Pi" {
+    const pi = try runHostSmokePair(std.testing.allocator, "pi");
+    try std.testing.expectEqual(SmokeOutcome.not_run, pi.allow);
+    try std.testing.expectEqual(SmokeOutcome.not_run, pi.deny);
+
+    const cursor = try runHostSmokePair(std.testing.allocator, "cursor");
+    try std.testing.expectEqual(SmokeOutcome.not_run, cursor.allow);
+    try std.testing.expectEqual(SmokeOutcome.not_run, cursor.deny);
 }
 
 test "buildHookFixture embeds host event and command" {

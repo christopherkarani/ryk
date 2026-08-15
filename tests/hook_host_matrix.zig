@@ -177,12 +177,28 @@ fn parseDecision(allocator: std.mem.Allocator, stdout: []const u8) ![]const u8 {
 }
 
 fn isAllow(decision: []const u8) bool {
-    return std.mem.eql(u8, decision, "allow") or std.mem.eql(u8, decision, "context_only");
+    // context_only is observe/advisory — not a successful allow for this gate.
+    return std.mem.eql(u8, decision, "allow");
 }
 
 fn isBlocked(decision: []const u8) bool {
     // ask/warn are not a successful deny — approval-required is not blocked.
     return std.mem.eql(u8, decision, "block") or std.mem.eql(u8, decision, "deny");
+}
+
+test "matrix allow/deny helpers reject ask warn and context_only" {
+    try std.testing.expect(isAllow("allow"));
+    try std.testing.expect(!isAllow("context_only"));
+    try std.testing.expect(!isAllow("ask"));
+    try std.testing.expect(!isAllow("warn"));
+    try std.testing.expect(!isAllow("block"));
+
+    try std.testing.expect(isBlocked("block"));
+    try std.testing.expect(isBlocked("deny"));
+    try std.testing.expect(!isBlocked("ask"));
+    try std.testing.expect(!isBlocked("warn"));
+    try std.testing.expect(!isBlocked("allow"));
+    try std.testing.expect(!isBlocked("context_only"));
 }
 
 fn expectSafeAllow(allocator: std.mem.Allocator, case: HostCase, result: HookRun) !void {
