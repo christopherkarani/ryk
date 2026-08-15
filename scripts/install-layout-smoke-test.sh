@@ -35,15 +35,6 @@ assert_contains() {
   fi
 }
 
-assert_json_field() {
-  local haystack="$1"
-  local key="$2"
-  local value="$3"
-  if ! grep -Eq "\"${key}\"[[:space:]]*:[[:space:]]*\"${value}\"" <<<"${haystack}"; then
-    fail "expected JSON field ${key}=${value}"
-  fi
-}
-
 OS="$(detect_os)"
 ARCH="$(detect_arch)"
 [[ "${OS}" != "unsupported" ]] || fail "unsupported host OS for smoke test"
@@ -94,11 +85,18 @@ safe_fixture="${REPO_ROOT}/tests/plugin-fixtures/claude/pre_tool_use_command_saf
 [[ -f "${safe_fixture}" ]] || fail "missing safe hook fixture"
 
 # Shell PreToolUse is owned by in-process Zig shell_engine (not a daemon IPC path).
+# Claude tool-gating stdout is host-shaped hookSpecificOutput.permissionDecision
+# (deny/allow), not generic ryk {"decision":"block"}. See
+# docs/integrations/host-decision-mapping.md.
 dangerous_output="$("${RYK_BIN}" hook claude PreToolUse <"${dangerous_fixture}")"
-assert_json_field "${dangerous_output}" "decision" "block"
+if ! grep -Eq '"permissionDecision"[[:space:]]*:[[:space:]]*"deny"' <<<"${dangerous_output}"; then
+  fail "dangerous Claude PreToolUse did not emit permissionDecision=deny"
+fi
 
 safe_output="$("${RYK_BIN}" hook claude PreToolUse <"${safe_fixture}")"
-assert_json_field "${safe_output}" "decision" "allow"
+if ! grep -Eq '"permissionDecision"[[:space:]]*:[[:space:]]*"allow"' <<<"${safe_output}"; then
+  fail "safe Claude PreToolUse did not emit permissionDecision=allow"
+fi
 # Daemon-unavailable fail-closed narrative is obsolete for shell hooks.
 if [[ "${safe_output}" == *"daemon unavailable"* ]]; then
   fail "safe hook decision unexpectedly cited daemon unavailable (shell_engine path)"
