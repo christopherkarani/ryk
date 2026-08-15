@@ -15,8 +15,8 @@ test {
     _ = packs_tui;
 }
 
-/// Embedded oracle pack definitions (same source as `shell_engine.registry`).
-const packs_json = @embedFile("../shell_engine/oracle_packs.json");
+/// Inflated oracle pack definitions (same gzip as `shell_engine.registry`).
+const oracle_embed = @import("../shell_engine/oracle_embed.zig");
 
 const Options = struct {
     filter: ?[]const u8 = null,
@@ -60,6 +60,7 @@ const Catalog = struct {
     /// Owns pattern view arrays (not pattern field strings — those borrow JSON).
     owned_pattern_slices: std.ArrayListUnmanaged([]PatternView) = .empty,
     json_parsed: std.json.Parsed(std.json.Value),
+    inflated_json: []u8,
 
     fn deinit(self: *Catalog) void {
         for (self.owned_strings.items) |s| self.allocator.free(s);
@@ -68,6 +69,7 @@ const Catalog = struct {
         self.owned_pattern_slices.deinit(self.allocator);
         self.allocator.free(self.packs);
         self.json_parsed.deinit();
+        self.allocator.free(self.inflated_json);
         self.* = undefined;
     }
 };
@@ -469,7 +471,9 @@ fn usageExit(stderr: anytype, message: []const u8) u8 {
 // ── Catalog load + enable-state (oracle + pack_config) ──────────────────────
 
 fn loadCatalog(allocator: std.mem.Allocator) !Catalog {
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, packs_json, .{});
+    const inflated = try oracle_embed.inflateAlloc(allocator);
+    errdefer allocator.free(inflated);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, inflated, .{});
     errdefer parsed.deinit();
     if (parsed.value != .array) return error.BadPacksJson;
 
@@ -520,8 +524,11 @@ fn loadCatalog(allocator: std.mem.Allocator) !Catalog {
     }
 
     const packs = try list.toOwnedSlice(allocator);
+    errdefer allocator.free(packs);
     // Sort by id for stable list/json (product UX; matches prior daemon-friendly sort).
     std.mem.sort(PackView, packs, {}, lessThanPackView);
+
+    if (packs.len == 0) return error.BadPacksJson;
 
     return .{
         .allocator = allocator,
@@ -529,6 +536,7 @@ fn loadCatalog(allocator: std.mem.Allocator) !Catalog {
         .owned_strings = owned_strings,
         .owned_pattern_slices = owned_pattern_slices,
         .json_parsed = parsed,
+        .inflated_json = inflated,
     };
 }
 

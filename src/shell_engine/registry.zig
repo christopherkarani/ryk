@@ -2,9 +2,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const regex_pcre = @import("regex_pcre.zig");
+const oracle_embed = @import("oracle_embed.zig");
 const Severity = @import("types.zig").Severity;
-
-const packs_json = @embedFile("oracle_packs.json");
 
 pub const Hit = struct {
     pack_id: []const u8,
@@ -216,6 +215,10 @@ fn initOnce(load_all: bool) !void {
 
     const a = g_arena.allocator();
 
+    // Inflate into the process arena so pattern strings can borrow the JSON.
+    // Inflate failure is RegistryInitFailed (deny), never an empty allow.
+    const packs_json = oracle_embed.inflateAlloc(a) catch return error.RegistryInitFailed;
+
     var packs_list: std.ArrayList(CompiledPack) = .empty;
     errdefer {
         // C-heap regexes are not owned by the arena — free before arena teardown.
@@ -223,8 +226,9 @@ fn initOnce(load_all: bool) !void {
         packs_list.deinit(a);
     }
 
-    // Scan pack objects instead of parsing the full 300KB oracle. Hook processes
-    // only need core.* + system.disk (~36KB). Strings stay borrowed from embed.
+    // Scan pack objects instead of parsing the full inflated oracle. Hook
+    // processes only need core.* + system.disk. Strings stay borrowed from the
+    // arena-owned inflated JSON.
     var pos = skipJsonWs(packs_json, 0);
     if (pos >= packs_json.len or packs_json[pos] != '[') return error.BadPacksJson;
     pos += 1;
@@ -801,7 +805,26 @@ test "lazy compile still denies git reset and allows a keyword miss" {
     try std.testing.expect(miss != .deny);
 }
 
+test "empty inflated packs array is fail-closed (not empty-allow)" {
+    // gzip -n of "[]". Inflate succeeds (it is an array) but loads zero packs.
+    // finishInit maps g_packs.len == 0 to RegistryInitFailed → matchInfraDeny.
+    const empty_arr_gz = [_]u8{
+        0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0x8b, 0x8e,
+        0x05, 0x00, 0x29, 0xbb, 0x4c, 0x0d, 0x02, 0x00, 0x00, 0x00,
+    };
+    const json = try oracle_embed.inflateSlice(std.testing.allocator, &empty_arr_gz);
+    defer std.testing.allocator.free(json);
+    try std.testing.expectEqualStrings("[]", json);
+    var pos = skipJsonWs(json, 0);
+    try std.testing.expect(json[pos] == '[');
+    pos = skipJsonWs(json, pos + 1);
+    try std.testing.expect(json[pos] == ']');
+    try std.testing.expect(matchInfraDeny() == .deny);
+}
+
 test "oracle json scanner finds four default packs" {
+    const packs_json = try oracle_embed.inflateAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(packs_json);
     var n: usize = 0;
     var pos = skipJsonWs(packs_json, 0);
     try std.testing.expect(packs_json[pos] == '[');
@@ -997,4 +1020,3 @@ test "s-engine: MatchOptions can skip multiple rule ids" {
     try std.testing.expect(disk == .deny);
     try std.testing.expectEqualStrings("system.disk", disk.deny.pack_id);
 }
-

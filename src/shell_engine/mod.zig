@@ -17,6 +17,7 @@ pub const allowlist_store = @import("allowlist_store.zig");
 /// Allow-once pending + active JSONL stores (exact command + scope).
 pub const allow_once = @import("allow_once.zig");
 pub const registry = @import("registry.zig");
+pub const oracle_embed = @import("oracle_embed.zig");
 pub const segments = @import("segments.zig");
 pub const normalize = @import("normalize.zig");
 pub const sanitize = @import("sanitize.zig");
@@ -3452,6 +3453,7 @@ test "s-engine: multiple permanent kind=rule ids all skip (not first-only)" {
 test {
     _ = allowlist;
     _ = registry;
+    _ = oracle_embed;
     _ = segments;
     _ = normalize;
     _ = sanitize;

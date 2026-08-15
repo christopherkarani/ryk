@@ -218,12 +218,18 @@ pub fn writeDoctorPacksSectionWithConfig(
     }
 }
 
-/// Embedded oracle pack definitions (same source as shell_engine.registry / packs CLI).
-const packs_json = @embedFile("../shell_engine/oracle_packs.json");
+/// Inflated oracle pack definitions (same gzip as shell_engine.registry / packs CLI).
+const oracle_embed = @import("../shell_engine/oracle_embed.zig");
 
 /// Query packs inventory in-process (Zig registry + pack_config). Never requires daemon.
 /// RT-12: doctor packs summary must stay available when daemon is unhealthy.
+///
+/// Doctor UX may report `known=false` when inflate/parse fails. That fail-open
+/// inventory line must not be copied into the eval path (registry.initOnce
+/// maps the same failure to RegistryInitFailed → deny).
 pub fn queryPacksSummaryInProcess(io: std.Io, allocator: std.mem.Allocator) !PacksSummary {
+    const packs_json = oracle_embed.inflateAlloc(allocator) catch return unknownPacksSummary();
+    defer allocator.free(packs_json);
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, packs_json, .{}) catch {
         return unknownPacksSummary();
     };

@@ -29,8 +29,8 @@ test {
     _ = allowlist_browse;
 }
 
-/// Same oracle as shell_engine.registry / packs CLI — known rule ids for validate --strict.
-const packs_json = @embedFile("../shell_engine/oracle_packs.json");
+/// Same gzip oracle as shell_engine.registry / packs CLI — known rule ids for validate --strict.
+const oracle_embed = @import("../shell_engine/oracle_embed.zig");
 
 const usage_text =
     \\Usage: ryk allowlist add <rule-id> -r|--reason <reason> [--project|--user] [--expires <iso>]
@@ -922,6 +922,7 @@ fn validateErrName(err: allowlist_store.ValidateError) []const u8 {
 
 const KnownRuleIds = struct {
     gpa: std.mem.Allocator,
+    inflated_json: []u8,
     parsed: std.json.Parsed(std.json.Value),
     ids: []const []const u8,
     owned_slice: [][]const u8,
@@ -930,12 +931,15 @@ const KnownRuleIds = struct {
         for (self.owned_slice) |s| self.gpa.free(s);
         self.gpa.free(self.owned_slice);
         self.parsed.deinit();
+        self.gpa.free(self.inflated_json);
         self.* = undefined;
     }
 };
 
 fn collectKnownRuleIds(gpa: std.mem.Allocator) !KnownRuleIds {
-    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, packs_json, .{});
+    const inflated = try oracle_embed.inflateAlloc(gpa);
+    errdefer gpa.free(inflated);
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, inflated, .{});
     errdefer parsed.deinit();
     if (parsed.value != .array) return error.BadPacksJson;
 
@@ -967,8 +971,15 @@ fn collectKnownRuleIds(gpa: std.mem.Allocator) !KnownRuleIds {
     }
 
     const owned = try list.toOwnedSlice(gpa);
+    errdefer {
+        for (owned) |s| gpa.free(s);
+        gpa.free(owned);
+    }
+    // --strict must not treat a missing oracle as "no known rules" (empty-allow).
+    if (owned.len == 0) return error.EmptyOracleRuleIds;
     return .{
         .gpa = gpa,
+        .inflated_json = inflated,
         .parsed = parsed,
         .ids = owned,
         .owned_slice = owned,
