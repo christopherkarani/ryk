@@ -113,6 +113,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    ryk_core_engine_mod.link_libc = true;
 
     const ryk_core_mod = b.addModule("ryk_core", .{
         .root_source_file = b.path("packages/core/src/root.zig"),
@@ -217,6 +218,8 @@ pub fn build(b: *std.Build) void {
         }),
         .filters = test_filters,
     });
+    // util.zig realpath helpers (user allowlist under-root) use libc realpath.
+    core_engine_tests.root_module.link_libc = true;
     const run_core_engine_tests_only = addRunTestTerminal(b, core_engine_tests);
 
     const core_contract_tests = b.addTest(.{
