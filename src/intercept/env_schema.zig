@@ -44,18 +44,22 @@ const Builder = struct {
     name: []u8,
     class: ?VarClass = null,
     grant: ?[]u8 = null,
+    // Once true, name/grant belong to a Variable (or were already freed).
+    // Never poison the slices: a second deinit must be a no-op, not a GPF.
+    taken: bool = false,
 
     fn deinit(self: *Builder, allocator: std.mem.Allocator) void {
+        if (self.taken) return;
+        self.taken = true;
         allocator.free(self.name);
         if (self.grant) |grant| allocator.free(grant);
-        self.* = undefined;
     }
 
     fn intoVariable(self: *Builder) !Variable {
         const class = self.class orelse return error.InvalidEnvSchema;
         if (class == .public and self.grant != null) return error.InvalidEnvSchema;
         const variable: Variable = .{ .name = self.name, .class = class, .grant = self.grant };
-        self.* = undefined;
+        self.taken = true;
         return variable;
     }
 };

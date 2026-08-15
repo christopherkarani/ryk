@@ -59,6 +59,8 @@ pub const SpawnError = error{
     MountVerificationFailed,
     /// Parent sealed more `.exec` grants than the wire limit.
     TooManyExecPaths,
+    /// Workspace-view bootstrap: inherited-FD scrub failed after attach.
+    FdScrubFailed,
 };
 
 /// Match core.process.StdioBehavior without importing core (module boundary).
@@ -225,7 +227,8 @@ fn forkApplyWorkspaceViewAndExec(
     const target_cwd = cwd orelse compiled.workspace_root;
     // Same precreate as the Landlock-only path: bootstrap expand needs a
     // directory RW leaf or applySelf fails closed (empty box).
-    _ = session_tmp.ensureWorkspaceSessionTmp(compiled.workspace_root);
+    if (!session_tmp.ensureWorkspaceSessionTmp(compiled.workspace_root))
+        return error.ApplyFailed;
     const spawned = linux_workspace_view_spawn.spawnWorkspaceView(.{
         .io = io,
         .allocator = std.heap.page_allocator,
@@ -266,11 +269,14 @@ fn mapWorkspaceViewSpawnError(err: anyerror) SpawnError {
         error.FuseDaemonStartFailed => error.FuseDaemonStartFailed,
         error.FuseInitFailed => error.FuseInitFailed,
         error.NamespaceSetupFailed => error.NamespaceSetupFailed,
+        error.UserMappingFailed => error.NamespaceSetupFailed,
         error.LandlockUnavailable => error.LandlockUnavailable,
         error.LandlockAttachFailed => error.LandlockAttachFailed,
         error.CapabilityLockdownFailed => error.CapabilityLockdownFailed,
         error.MountVerificationFailed => error.MountVerificationFailed,
         error.TooManyExecPaths => error.TooManyExecPaths,
+        error.FdScrubFailed => error.FdScrubFailed,
+        error.ExecPreflightFailed, error.UnresolvedExecutable => error.ExecFailed,
         else => error.ApplyFailed,
     };
 }
@@ -477,6 +483,16 @@ fn runChildAfterFork(
 fn preflightExecTarget(path: [*:0]const u8) bool {
     switch (builtin.os.tag) {
         .windows, .wasi => return true,
+        .linux => {
+            // Landlock mediates open(2), not access(2). Using access() here
+            // promoted an ungranted launch binary (handshake "ok", exec later
+            // fails). Open the target after restrict_self instead.
+            const linux = std.os.linux;
+            const fd = linux.open(path, .{ .CLOEXEC = true, .ACCMODE = .RDONLY }, 0);
+            if (linux.errno(fd) != .SUCCESS) return false;
+            _ = linux.close(@intCast(fd));
+            return true;
+        },
         else => {
             // POSIX: R_OK=4, X_OK=1 (portable constants; libc access).
             const R_OK: c_int = 4;

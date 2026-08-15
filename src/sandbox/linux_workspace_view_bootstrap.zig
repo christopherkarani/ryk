@@ -12,6 +12,7 @@ const mount = @import("linux_workspace_view_mount.zig");
 const workspace_view = @import("linux_workspace_view.zig");
 const capabilities = @import("linux_capabilities.zig");
 const landlock = @import("landlock.zig");
+const session_tmp = @import("session_tmp.zig");
 const fd_scrub = @import("fd_scrub.zig");
 
 pub const internal_command = "__ryk_workspace_view_bootstrap";
@@ -233,6 +234,12 @@ fn runLinux(allocator: std.mem.Allocator, fds: BootstrapFds) !void {
 
     capabilities.lockdownCurrentProcess() catch
         return response.fail(.capability_lockdown_failed);
+
+    // Enumerate after the FUSE overmount so `.ryk-tmp` is a visible RW leaf.
+    // Parent prepare also creates it on the backing store; this is belt-and-suspenders
+    // for empty-backpack workspaces that otherwise fail closed (no RW surface).
+    if (!session_tmp.ensureWorkspaceSessionTmp(request.workspace_root))
+        return response.fail(.landlock_attach_failed);
 
     var plan = landlock.buildChildLandlockPlan(allocator, &compiled) catch
         return response.fail(.landlock_attach_failed);

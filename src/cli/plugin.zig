@@ -2774,10 +2774,13 @@ test "OpenClaw config binding is exact, idempotent, read-back verified, and fail
     defer std.testing.allocator.free(root);
     const script = try std.fs.path.join(std.testing.allocator, &.{ root, "openclaw" });
     defer std.testing.allocator.free(script);
+    // Portable /bin/sh (dash on Ubuntu, bash on macOS). Do not use printf \\"
+    // escapes — they are unspecified on dash and break JSON read-back.
+    // config get --json emits a JSON string; config set writes $4 as the root.
     const script_body = "#!/bin/sh\n" ++
         "state=\"$(dirname \"$0\")/state\"\n" ++
         "if [ \"$1\" = config ] && [ \"$2\" = set ]; then printf '%s' \"$*\" > \"$(dirname \"$0\")/argv\"; printf '%s' \"$4\" > \"$state\"; exit 0; fi\n" ++
-        "if [ \"$1\" = config ] && [ \"$2\" = get ]; then printf '\\\"%s\\\"\\n' \"$(cat \"$state\")\"; exit 0; fi\n" ++
+        "if [ \"$1\" = config ] && [ \"$2\" = get ]; then printf '\"%s\"\\n' \"$(cat \"$state\")\"; exit 0; fi\n" ++
         "exit 23\n";
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "openclaw", .data = script_body });
     if (builtin.os.tag != .windows) {

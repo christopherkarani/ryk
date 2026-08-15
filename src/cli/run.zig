@@ -2761,6 +2761,9 @@ test "run with-host-secrets is loud and retains host canary through sandbox atta
     }
     const policy_path = try tmp.dir.realPathFileAlloc(std.testing.io, "policy.yaml", std.testing.allocator);
     defer std.testing.allocator.free(policy_path);
+    // Pre-create the child output so Landlock expand has an RW leaf. Walk-only
+    // workspace roots do not grant MAKE_REG, so a new file at the root is denied.
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "child-env.txt", .data = "" });
 
     var current = std.process.Environ.Map.init(std.testing.allocator);
     defer current.deinit();
@@ -5527,6 +5530,8 @@ test "approval presentation redacts argv while evaluation and execution retain o
             \\
         );
         try tmp.dir.setFilePermissions(std.testing.io, "capture-argv.sh", @enumFromInt(0o755), .{});
+        // Pre-create so Landlock expand grants RW on the output leaf.
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "received-argv.txt", .data = "" });
     }
 
     shell_eval.test_last_evaluate_command = null;
