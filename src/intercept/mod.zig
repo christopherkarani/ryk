@@ -17,5 +17,7 @@ pub const approvals = @import("approvals.zig");
 test {
     if (enable_http) {
         _ = @import("provider_gateway_tests.zig");
+    } else {
+        _ = @import("provider_gateway_stub.zig");
     }
 }

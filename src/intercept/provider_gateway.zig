@@ -2,17 +2,13 @@ const std = @import("std");
 const builtin = @import("builtin");
 const session_secrets = @import("session_secrets.zig");
 const protocol = @import("provider_gateway_protocol.zig");
+const types = @import("provider_gateway_types.zig");
 
-pub const Provider = session_secrets.Provider;
-pub const Limits = protocol.Limits;
+pub const Provider = types.Provider;
+pub const Limits = types.Limits;
 const ParsedInbound = protocol.ParsedInbound;
-pub const AuditKind = enum { phantom_swap, phantom_denied };
-pub const AuditEvent = struct {
-    kind: AuditKind,
-    provider: Provider,
-    env_var: []const u8,
-    reason_code: []const u8,
-};
+pub const AuditKind = types.AuditKind;
+pub const AuditEvent = types.AuditEvent;
 
 const ProviderConfig = struct {
     logical_host: []const u8,

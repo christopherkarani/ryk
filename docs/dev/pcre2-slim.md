@@ -12,7 +12,10 @@ always includes `pcre2_ucd.c` (116 KiB of property tables when Unicode is on),
 `pcre2_dfa_match.c`, `pcre2_substitute.c`, convert/serialize, and UTF helpers.
 
 Slim is therefore a **documented fork of that build**, not a one-liner on
-`b.dependency("pcre2").artifact("pcre2-8")`.
+`b.dependency("pcre2").artifact("pcre2-8")`. `build/pcre2_slim.zig` fetches
+the tarball with `b.dependency("pcre2", .{})` (source paths only) and
+`build.zig` shares one slim `pcre2-8` per target across the CLI and host
+test modules.
 
 ## What we compile
 
@@ -42,6 +45,8 @@ Pack patterns are byte-oriented (POSIX classes such as `[:alnum:]`, not `\p{L}`)
 `UNICODE=false` must be proven with:
 
 - `./scripts/zig build test-shell-engine` (oracle corpus + PCRE unit tests)
+- `./scripts/zig build check-http-slim` (stub fail-closed tests, no TLS)
+- `./scripts/zig build -Dhttp=false check` (full CLI against the stubs)
 - `./zig-out/bin/ryk redteam --ci`
 
 `\p{…}` / `\P{…}` must **fail compile** (`error.CompileFailed`), never compile

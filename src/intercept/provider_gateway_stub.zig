@@ -1,41 +1,21 @@
 //! Slim stand-in for `provider_gateway.zig` when `-Dhttp=false`.
-//! No `std.http` / TLS. Production `ryk run` fail-closes if a provider
-//! secret would have required the real gateway.
+//! No `std.http` / TLS. Types come from `provider_gateway_types.zig` so the
+//! stub cannot drift from the real Limits/audit contract. Production
+//! `ryk run` fail-closes if a provider secret would have required the real
+//! gateway (`listen` returns `error.HttpDisabled`).
 
 const std = @import("std");
 const session_secrets = @import("session_secrets.zig");
+const types = @import("provider_gateway_types.zig");
 
-pub const Provider = session_secrets.Provider;
-
-pub const Limits = struct {
-    request_head: usize = 32 * 1024,
-    request_body: usize = 32 * 1024 * 1024,
-    response_head: usize = 32 * 1024,
-    response_body: usize = 64 * 1024 * 1024,
-    io_timeout_ms: u32 = 5_000,
-    upstream_timeout_ms: u32 = 30_000,
-};
-
-pub const AuditKind = enum { phantom_swap, phantom_denied };
-pub const AuditEvent = struct {
-    kind: AuditKind,
-    provider: Provider,
-    env_var: []const u8,
-    reason_code: []const u8,
-};
+pub const Provider = types.Provider;
+pub const Limits = types.Limits;
+pub const AuditKind = types.AuditKind;
+pub const AuditEvent = types.AuditEvent;
 
 pub const Runtime = struct {
     pub fn bindUrl(_: Runtime) []const u8 {
         return "";
-    }
-    pub fn bindPort(_: Runtime) u16 {
-        return 0;
-    }
-    pub fn provider(_: Runtime) Provider {
-        return .anthropic;
-    }
-    pub fn isServing(_: Runtime) bool {
-        return false;
     }
     pub fn isHealthy(_: Runtime) bool {
         return false;
@@ -66,5 +46,3 @@ pub fn listen(
 ) !Runtime {
     return error.HttpDisabled;
 }
-
-pub const testing = struct {};

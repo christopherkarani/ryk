@@ -18,13 +18,10 @@ pub fn addLibrary(
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
 ) SlimPcre2 {
-    // Fetch the pinned tarball only. Do not link upstream's artifact — that
-    // build has no flag to drop UNICODE/UCD/DFA/substitute.
-    const pcre2_dep = b.dependency("pcre2", .{
-        .target = target,
-        .optimize = optimize,
-        .linkage = .static,
-    });
+    // Fetch the pinned tarball only. Do not request upstream's artifact —
+    // that build has no flag to drop UNICODE/UCD/DFA/substitute, and passing
+    // target/optimize/linkage would instantiate the fat library + pcre2test.
+    const pcre2_dep = b.dependency("pcre2", .{});
 
     const rt = target.result;
     const is_unix = rt.os.tag != .windows;
