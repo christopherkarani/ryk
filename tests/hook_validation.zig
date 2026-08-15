@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const exit_codes = @import("ryk").cli.exit_codes;
 
 const ryk_bin = "./zig-out/bin/ryk";
@@ -548,11 +549,11 @@ test "phase2f shell tool with empty command fails closed before daemon evaluatio
     try expectHookDecision(allocator, "claude", "block", result);
 }
 
-test "bare ryk empty/whitespace stdin on non-TTY hook entry fails closed; TTY still gets help" {
+test "bare ryk empty/whitespace stdin on non-TTY hook entry fails closed" {
     // Fail-open: src/cli/mod.zig used to map agent_hook.command's empty stdin
     // (NotAgentHookInput) to help + exit 0. Hosts that treat exit 0 / non-JSON
-    // as allow skipped the gate. Garbage JSON already denied + exit 2.
-    if (!fileExists(ryk_bin)) return;
+    // as allow skipped the gate. Missing binary must fail, not skip.
+    try std.testing.expect(fileExists(ryk_bin));
 
     const allocator = std.testing.allocator;
     const blank_cases = [_][]const u8{ "", "   ", "\n", "\t\r\n  " };
@@ -565,17 +566,40 @@ test "bare ryk empty/whitespace stdin on non-TTY hook entry fails closed; TTY st
         try std.testing.expect(std.mem.indexOf(u8, result.stdout, "\"permission\":\"deny\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, result.stdout, "\"permissionDecision\":\"deny\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, result.stdout, "\"continue\":false") != null);
+        try std.testing.expect(std.mem.indexOf(u8, result.stdout, "hook payload was empty") != null);
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, std.mem.trim(u8, result.stdout, "\n"), .{});
         defer parsed.deinit();
         try std.testing.expect(parsed.value == .object);
     }
+}
 
+test "bare ryk on a TTY still prints help" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (!fileExists(ryk_bin)) return error.SkipZigTest;
+    if (!python3PtyAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
     const tty = try runRykOnTty(allocator, ryk_bin);
     defer allocator.free(tty.stdout);
     defer allocator.free(tty.stderr);
     try std.testing.expectEqual(exit_codes.success, tty.code);
     try std.testing.expect(std.mem.indexOf(u8, tty.stdout, "Common tasks") != null);
     try std.testing.expect(std.mem.indexOf(u8, tty.stdout, "\"permission\":\"deny\"") == null);
+}
+
+fn python3PtyAvailable() bool {
+    const io = std.testing.io;
+    var child = std.process.spawn(io, .{
+        .argv = &.{ "python3", "-c", "import pty" },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    }) catch return false;
+    const term = child.wait(io) catch return false;
+    return switch (term) {
+        .exited => |c| c == 0,
+        else => false,
+    };
 }
 
 fn runRykOnTty(allocator: std.mem.Allocator, bin: []const u8) !HookRunResult {

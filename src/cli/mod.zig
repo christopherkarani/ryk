@@ -723,6 +723,31 @@ fn testRunWithCwd(cwd: std.Io.Dir, argv: []const []const u8, stdout: anytype, st
     return runWithCwd(std.testing.io, &env_map, cwd, argv, stdout, stderr);
 }
 
+test "bare ryk empty stdin on non-TTY hook entry is deny JSON + exit 2, not help" {
+    // Locks src/cli/mod.zig argv.len==0 → agent_hook.command. Restoring
+    // NotAgentHookInput → help + exit 0 fails here whenever the test runner
+    // stdin is a pipe (CI / `zig test`). TTY runners still get help + 0.
+    var stdout_buf: [8192]u8 = undefined;
+    var stderr_buf: [256]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+
+    const enter_hook = agent_hook.shouldEnter(std.testing.io);
+    const code = try testRun(&.{}, &stdout_writer, &stderr_writer);
+    const out = stdout_writer.buffered();
+    if (enter_hook) {
+        try std.testing.expectEqual(agent_hook.fail_closed_deny_exit_code, code);
+        try std.testing.expect(std.mem.indexOf(u8, out, "\"permission\":\"deny\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "\"permissionDecision\":\"deny\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "hook payload was empty") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "Common tasks") == null);
+    } else {
+        try std.testing.expectEqual(exit_codes.success, code);
+        try std.testing.expect(std.mem.indexOf(u8, out, "Common tasks") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "\"permission\":\"deny\"") == null);
+    }
+}
+
 test "help output is grouped, complete, and excludes hidden commands" {
     var stdout_buf: [16384]u8 = undefined;
     var stderr_buf: [256]u8 = undefined;
