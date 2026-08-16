@@ -372,8 +372,9 @@ test "kill server after accept is fail-closed deny not in-process allow" {
     const sock_z = try std.testing.allocator.dupeZ(u8, sock);
     defer std.testing.allocator.free(sock_z);
 
-    const thread = try std.Thread.spawn(.{}, acceptThenClose, .{sock});
-    try waitForSocket(sock, 50);
+    // Keep accepting so the readiness probe cannot consume the only hang-up.
+    const hang = try startHangServer(sock);
+    defer stopHangServer(sock, hang);
 
     _ = setenv("RYK_HOOK_SOCKET", sock_z, 1);
     defer _ = unsetenv("RYK_HOOK_SOCKET");
@@ -385,7 +386,6 @@ test "kill server after accept is fail-closed deny not in-process allow" {
         .event = "PreToolUse",
         .payload_json = "{}",
     });
-    thread.join();
     if (result) |*resp| {
         var owned = resp.*;
         owned.deinit(std.testing.allocator);
@@ -396,15 +396,12 @@ test "kill server after accept is fail-closed deny not in-process allow" {
 
     const grok_payload = try readFile(std.testing.allocator, grok_safe);
     defer std.testing.allocator.free(grok_payload);
-    const dummy = try std.Thread.spawn(.{}, acceptThenClose, .{sock});
-    try waitForSocket(sock, 50);
     const run = try runRykHook(
         std.testing.allocator,
         &.{ ryk_bin, "hook", "grok", "PreToolUse" },
         grok_payload,
         sock,
     );
-    dummy.join();
     defer std.testing.allocator.free(run.stdout);
     defer std.testing.allocator.free(run.stderr);
     try std.testing.expectEqual(@as(u8, 2), run.code);
@@ -413,7 +410,32 @@ test "kill server after accept is fail-closed deny not in-process allow" {
         std.mem.indexOf(u8, run.stdout, "block") != null);
 }
 
-fn acceptThenClose(socket_path: []const u8) void {
+fn startHangServer(sock: []const u8) !struct { stop: *std.atomic.Value(bool), thread: std.Thread } {
+    const stop = try std.testing.allocator.create(std.atomic.Value(bool));
+    stop.* = std.atomic.Value(bool).init(false);
+    const thread = try std.Thread.spawn(.{}, acceptThenCloseLoop, .{ sock, stop });
+    errdefer {
+        stop.store(true, .unordered);
+        if (daemon_uds.connectUnixSocket(sock)) |fd| {
+            _ = std.c.close(fd);
+        } else |_| {}
+        thread.join();
+        std.testing.allocator.destroy(stop);
+    }
+    try waitForSocket(sock, 50);
+    return .{ .stop = stop, .thread = thread };
+}
+
+fn stopHangServer(sock: []const u8, server: anytype) void {
+    server.stop.store(true, .unordered);
+    if (daemon_uds.connectUnixSocket(sock)) |fd| {
+        _ = std.c.close(fd);
+    } else |_| {}
+    server.thread.join();
+    std.testing.allocator.destroy(server.stop);
+}
+
+fn acceptThenCloseLoop(socket_path: []const u8, stop: *std.atomic.Value(bool)) void {
     const parent = std.fs.path.dirname(socket_path) orelse return;
     std.Io.Dir.cwd().createDirPath(std.testing.io, parent) catch {};
     const listen_fd = daemon_uds.bindListenUnixSocket(socket_path, 8) catch return;
@@ -421,10 +443,19 @@ fn acceptThenClose(socket_path: []const u8) void {
         _ = std.c.close(listen_fd);
         daemon_uds.unlinkUnixSocketPath(socket_path);
     }
-    var addr: std.c.sockaddr.un = undefined;
-    var addr_len: u32 = @sizeOf(std.c.sockaddr.un);
-    const client_fd = std.c.accept(listen_fd, @ptrCast(&addr), &addr_len);
-    if (client_fd >= 0) _ = std.c.close(client_fd);
+    while (!stop.load(.unordered)) {
+        var fds = [_]std.posix.pollfd{.{
+            .fd = listen_fd,
+            .events = 0x0001,
+            .revents = 0,
+        }};
+        _ = std.posix.poll(fds[0..], 50) catch continue;
+        if (fds[0].revents & 0x0001 == 0) continue;
+        var addr: std.c.sockaddr.un = undefined;
+        var addr_len: u32 = @sizeOf(std.c.sockaddr.un);
+        const client_fd = std.c.accept(listen_fd, @ptrCast(&addr), &addr_len);
+        if (client_fd >= 0) _ = std.c.close(client_fd);
+    }
 }
 
 test "host matrix helpers still compile against server types" {
