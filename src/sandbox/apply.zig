@@ -42,7 +42,6 @@ pub const ensureWorkspaceSessionTmp = session_tmp.ensureWorkspaceSessionTmp;
 pub const claude_code_tmpdir_env = session_tmp.claude_code_tmpdir_env;
 pub const claudeCodeTmpAccepts = session_tmp.claudeCodeTmpAccepts;
 pub const ensureClaudeCodeTmpLeaves = session_tmp.ensureClaudeCodeTmpLeaves;
-pub const requireClaudeCodeTmpLeavesFromEnvEntries = session_tmp.requireClaudeCodeTmpLeavesFromEnvEntries;
 
 /// Re-export mode for callers that only touch apply.
 pub const OsSandboxMode = posture.OsSandboxMode;
@@ -522,19 +521,33 @@ pub fn prepareAttachEnvironment(
     var attach_tmp: AttachSessionTmp = .{ .allocator = allocator, .path = preferred };
     errdefer attach_tmp.deinit();
 
+    // Claude parent-walks the tmp base with lstat (nofollow). If the workspace
+    // path is a symlink, mint the realpath so the string Claude checks has no
+    // symlink ancestors. Fail closed if the canonical path is not a real dir.
+    var real_buf: [std.fs.max_path_bytes]u8 = undefined;
+    if (realpathInto(io, attach_tmp.path, &real_buf)) |real| {
+        if (!claudeCodeTmpAccepts(real)) return error.SessionTmpPrepareFailed;
+        if (!std.mem.eql(u8, real, attach_tmp.path)) {
+            const owned = try allocator.dupe(u8, real);
+            allocator.free(attach_tmp.path);
+            attach_tmp.path = owned;
+        }
+    }
+    const minted = attach_tmp.path;
+    if (!claudeCodeTmpAccepts(minted)) return error.SessionTmpPrepareFailed;
+
     var staged = try env_map.clone(env_map.allocator);
     defer staged.deinit();
-    try applyIsolatedToolCaches(io, allocator, &staged, preferred);
+    try applyIsolatedToolCaches(io, allocator, &staged, minted);
 
-    try staged.put("TMPDIR", preferred);
-    try staged.put("TMP", preferred);
-    try staged.put("TEMP", preferred);
+    try staged.put("TMPDIR", minted);
+    try staged.put("TMP", minted);
+    try staged.put("TEMP", minted);
     // Claude Code `lstat`s `{CLAUDE_CODE_TMPDIR|TMPDIR}/claude-{uid}` and refuses
     // a missing path or attacker-planted symlink. Mint the env to the verified
-    // session temp and pre-create the leaf on the backing store. The child
-    // recreates `{TMPDIR}/claude-0` after FUSE/OS attach (the inode Claude sees).
-    if (!ensureClaudeCodeTmpLeaves(preferred)) return error.SessionTmpPrepareFailed;
-    try staged.put(claude_code_tmpdir_env, preferred);
+    // canonical session temp and pre-create the leaf as a real directory.
+    if (!ensureClaudeCodeTmpLeaves(minted)) return error.SessionTmpPrepareFailed;
+    try staged.put(claude_code_tmpdir_env, minted);
 
     // Host-global Git configuration can contain credentials and remains denied.
     // Point Git at inert global config/ignore files so ordinary repository probes
@@ -3568,6 +3581,33 @@ test "prepareAttachEnvironment overwrites host CLAUDE_CODE_TMPDIR with session t
     try std.testing.expectEqualStrings(prepared.path, env_map.get(claude_code_tmpdir_env).?);
     try std.testing.expect(claudeCodeTmpAccepts(env_map.get(claude_code_tmpdir_env).?));
     try std.testing.expect(!std.mem.eql(u8, env_map.get(claude_code_tmpdir_env).?, "/tmp/evil-planted-claude-tmp"));
+}
+
+test "prepareAttachEnvironment mints realpath TMPDIR when workspace is a symlink" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    try tmp.dir.createDir(io, "real-ws", .default_dir);
+    try tmp.dir.symLink(io, "real-ws", "link-ws", .{ .is_directory = true });
+    const real_root = try tmp.dir.realPathFileAlloc(io, "real-ws", std.testing.allocator);
+    defer std.testing.allocator.free(real_root);
+    const parent = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(parent);
+    const symlink_ws = try std.fs.path.join(std.testing.allocator, &.{ parent, "link-ws" });
+    defer std.testing.allocator.free(symlink_ws);
+
+    var env_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer env_map.deinit();
+    var prepared = try prepareAttachEnvironment(std.testing.allocator, &env_map, symlink_ws);
+    defer prepared.deinit();
+
+    const tmpdir = env_map.get("TMPDIR") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.startsWith(u8, tmpdir, real_root));
+    try std.testing.expect(std.mem.indexOf(u8, tmpdir, "/link-ws/") == null);
+    try std.testing.expectEqualStrings(tmpdir, env_map.get(claude_code_tmpdir_env).?);
+    try std.testing.expect(claudeCodeTmpAccepts(tmpdir));
 }
 
 test "prepareAttachEnvironment creates a fresh cache namespace per launch" {

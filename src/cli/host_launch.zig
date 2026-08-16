@@ -36,15 +36,41 @@ pub fn isExactHostLaunchArgv0(argv0: []const u8) bool {
     return isHostLaunchAlias(argv0);
 }
 
+/// `ryk <host> -- <agent-args>` uses `--` as ryk punctuation, not agent argv.
+/// A leftover `--` after the host makes Claude see `-- --help` instead of
+/// `--help`, skip its help fast path, and hit the tmpdir lstat check.
+pub fn agentRestAfterHostSeparator(rest: []const []const u8) []const []const u8 {
+    if (rest.len > 0 and std.mem.eql(u8, rest[0], "--")) return rest[1..];
+    return rest;
+}
+
+/// When `argv` is `[host, "--", …]` for an exact launch alias, return an owned
+/// `[host, …]` slice (caller frees). Null when there is no separator to drop.
+pub fn allocArgvWithoutHostSeparator(
+    allocator: std.mem.Allocator,
+    argv: []const []const u8,
+) error{OutOfMemory}!?[]const []const u8 {
+    if (argv.len < 2) return null;
+    if (!isExactHostLaunchArgv0(argv[0])) return null;
+    if (!std.mem.eql(u8, argv[1], "--")) return null;
+    const out = try allocator.alloc([]const u8, argv.len - 1);
+    out[0] = argv[0];
+    if (argv.len > 2) @memcpy(out[1..], argv[2..]);
+    return out;
+}
+
 /// Builds argv for `run_command.command`: `["--", host] ++ rest`.
+/// Drops a leading `--` from `rest` so `ryk claude -- --help` becomes
+/// `ryk run -- claude --help` (same agent argv as the working run form).
 /// Caller owns and must free the returned slice (not the pointed-to strings).
 /// Does not inject security flags: the run-level agent-primary default selects
 /// empty backpack after parsing, so flags after the host remain agent argv.
 pub fn buildRunArgv(allocator: std.mem.Allocator, host: []const u8, rest: []const []const u8) ![]const []const u8 {
-    const out = try allocator.alloc([]const u8, rest.len + 2);
+    const agent_rest = agentRestAfterHostSeparator(rest);
+    const out = try allocator.alloc([]const u8, agent_rest.len + 2);
     out[0] = "--";
     out[1] = host;
-    if (rest.len > 0) @memcpy(out[2..], rest);
+    if (agent_rest.len > 0) @memcpy(out[2..], agent_rest);
     return out;
 }
 
@@ -102,29 +128,45 @@ test "isHostLaunchAlias exact allowlist only" {
     try std.testing.expect(!isHostLaunchAlias("pi2"));
 }
 
-test "ryk claude -- --help rewrite stays agent help-only" {
+test "ryk claude -- --help rewrite matches ryk run -- claude --help" {
     const host_config_grants = @import("../sandbox/host_config_grants.zig");
     const argv = try buildRunArgv(std.testing.allocator, "claude", &.{ "--", "--help" });
     defer std.testing.allocator.free(argv);
-    try std.testing.expectEqual(@as(usize, 4), argv.len);
+    try std.testing.expectEqual(@as(usize, 3), argv.len);
     try std.testing.expectEqualStrings("--", argv[0]);
     try std.testing.expectEqualStrings("claude", argv[1]);
-    try std.testing.expectEqualStrings("--", argv[2]);
-    try std.testing.expectEqualStrings("--help", argv[3]);
+    try std.testing.expectEqualStrings("--help", argv[2]);
     try std.testing.expect(host_config_grants.isAgentHelpOrVersionOnly(argv[1..]));
 }
 
-test "ryk grok -- --help rewrite stays agent help-only" {
+test "ryk grok -- --help rewrite matches ryk run -- grok --help" {
     const host_config_grants = @import("../sandbox/host_config_grants.zig");
     const argv = try buildRunArgv(std.testing.allocator, "grok", &.{ "--", "--help" });
     defer std.testing.allocator.free(argv);
-    try std.testing.expectEqual(@as(usize, 4), argv.len);
+    try std.testing.expectEqual(@as(usize, 3), argv.len);
     try std.testing.expectEqualStrings("--", argv[0]);
     try std.testing.expectEqualStrings("grok", argv[1]);
-    try std.testing.expectEqualStrings("--", argv[2]);
-    try std.testing.expectEqualStrings("--help", argv[3]);
-    // After `ryk run` consumes the first `--`, command_argv is grok + separator + help.
+    try std.testing.expectEqualStrings("--help", argv[2]);
     try std.testing.expect(host_config_grants.isAgentHelpOrVersionOnly(argv[1..]));
+}
+
+test "allocArgvWithoutHostSeparator drops leftover -- after exact host" {
+    const stripped = (try allocArgvWithoutHostSeparator(
+        std.testing.allocator,
+        &.{ "claude", "--", "--help" },
+    )) orelse return error.TestUnexpectedResult;
+    defer std.testing.allocator.free(stripped);
+    try std.testing.expectEqual(@as(usize, 2), stripped.len);
+    try std.testing.expectEqualStrings("claude", stripped[0]);
+    try std.testing.expectEqualStrings("--help", stripped[1]);
+    try std.testing.expect(try allocArgvWithoutHostSeparator(
+        std.testing.allocator,
+        &.{ "claude", "--help" },
+    ) == null);
+    try std.testing.expect(try allocArgvWithoutHostSeparator(
+        std.testing.allocator,
+        &.{ "./claude", "--", "--help" },
+    ) == null);
 }
 
 test "isExactHostLaunchArgv0 rejects basename paths" {

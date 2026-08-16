@@ -2,8 +2,8 @@
 //!
 //! Parent ryk stays free. Child installs Landlock (Linux) or Seatbelt (macOS)
 //! then execs the agent. Child order: setpgid → stdio → apply → chdir →
-//! Claude session-tmp leaf → preflight → fd_scrub (keep `{0,1,2,status_w}`)
-//! → status_ok → close status_w → execve. Scrub runs before the handshake so the parent never
+//! preflight → fd_scrub (keep `{0,1,2,status_w}`) → status_ok → close
+//! status_w → execve. Scrub runs before the handshake so the parent never
 //! promotes attach while inherited FDs are still open; after status_ok only
 //! the write end is closed (no second full scrub).
 //!
@@ -456,11 +456,6 @@ fn runChildAfterFork(
         };
         if (chdir_failed) failExit(status_w);
     }
-
-    // After OS attach: create `{TMPDIR}/claude-0` in the child-visible FS.
-    // Parent pre-create is not the inode Claude `lstat`s after Seatbelt/Landlock.
-    // No-op when TMPDIR is not a minted session path; fail closed on a plant.
-    if (!session_tmp.ensureClaudeCodeTmpLeavesFromEnvp(envp.ptr.ptr)) failExit(status_w);
 
     const path = argv_z[0] orelse failExit(status_w);
     if (!preflightExecTarget(path)) failExit(status_w);

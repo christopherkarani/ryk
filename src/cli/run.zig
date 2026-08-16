@@ -1284,6 +1284,17 @@ fn commandWithStdioAndEnv(io: std.Io, argv: []const []const u8, stdout: anytype,
         plan.argv
     else
         options.command_argv;
+    var host_separator_stripped: ?[]const []const u8 = null;
+    defer if (host_separator_stripped) |a| allocator.free(a);
+    // `ryk <host> -- --help` must spawn the same agent argv as
+    // `ryk run -- <host> --help`. A leftover `--` is ryk punctuation.
+    const planned_argv_for_launch = blk: {
+        if (try host_launch.allocArgvWithoutHostSeparator(allocator, planned_argv)) |stripped| {
+            host_separator_stripped = stripped;
+            break :blk stripped;
+        }
+        break :blk planned_argv;
+    };
     var launch_argv_owned: ?[]const []const u8 = null;
     defer if (launch_argv_owned) |a| sandbox.apply.freeExpandedShellWrapperArgv(allocator, a);
     const expand_shell_wrapper = secret_boundary == .empty_backpack and codex_mcp_plan == null;
@@ -1291,7 +1302,7 @@ fn commandWithStdioAndEnv(io: std.Io, argv: []const []const u8, stdout: anytype,
         launch_argv_owned = sandbox.apply.rewriteOsAttachLaunchArgv(
             io,
             allocator,
-            planned_argv,
+            planned_argv_for_launch,
             &filtered_env.env_map,
             .{
                 .expand_shell_wrapper = expand_shell_wrapper,
@@ -6682,8 +6693,9 @@ test "empty backpack grok alias -- --help with official config.toml does not fai
     try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "cannot read host agent login/config") == null);
 }
 
-// Issue #198: `ryk claude -- --help` must leave a real session tmp that Claude's
-// CLAUDE_CODE_TMPDIR / `{tmpdir}/claude-{uid}` lstat check accepts.
+// Issue #198: alias `ryk claude -- --help` must spawn the same argv as
+// `ryk run -- claude --help` (no leftover `--`). Claude's `--help` fast path
+// prints Usage; `-- --help` skips that path and hits the tmpdir lstat check.
 test "empty backpack claude alias -- --help session tmp passes Claude tmpdir check" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     try skipLinuxWorkspaceViewSelfExec();
@@ -6739,7 +6751,7 @@ test "empty backpack claude alias -- --help session tmp passes Claude tmpdir che
     var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
     var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
     const code = try commandForTestWithEnvAndShellEvaluator(
-        &.{ "--workspace", root, "--mode", "observe", "--", "claude", "--", "--help" },
+        &.{ "--workspace", root, "--mode", "observe", "--", "claude", "--help" },
         &stdout_writer,
         &stderr_writer,
         .ignore,
@@ -6749,6 +6761,23 @@ test "empty backpack claude alias -- --help session tmp passes Claude tmpdir che
     try std.testing.expectEqual(exit_codes.success, code);
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "Usage: claude") != null);
     try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "attacker-planted symlink") == null);
+
+    // Leftover `ryk claude -- --help` separator must strip to the same spawn argv.
+    var leftover_stdout: [8192]u8 = undefined;
+    var leftover_stderr: [4096]u8 = undefined;
+    var leftover_out: std.Io.Writer = .fixed(&leftover_stdout);
+    var leftover_err: std.Io.Writer = .fixed(&leftover_stderr);
+    const leftover_code = try commandForTestWithEnvAndShellEvaluator(
+        &.{ "--workspace", root, "--mode", "observe", "--", "claude", "--", "--help" },
+        &leftover_out,
+        &leftover_err,
+        .ignore,
+        &current,
+        shell_eval.mockDaemonAllowEvaluator,
+    );
+    try std.testing.expectEqual(exit_codes.success, leftover_code);
+    try std.testing.expect(std.mem.indexOf(u8, leftover_out.buffered(), "Usage: claude") != null);
+    try std.testing.expect(std.mem.indexOf(u8, leftover_err.buffered(), "attacker-planted symlink") == null);
 }
 
 test "planted cwd ./claude stays CommandDenied under strict" {
