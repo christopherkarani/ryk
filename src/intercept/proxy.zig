@@ -154,6 +154,9 @@ pub const Runtime = struct {
 /// On `Runtime.deinit` / stop, active client FDs are force-shutdown so reclaim does
 /// not wait this full budget.
 const tunnel_idle_ms: usize = 300_000;
+/// Cap in-memory proxy audit trail (M011). Older events dropped FIFO.
+/// Mirrors telemetry max_queue_events style bound — not a durability store.
+const max_audit_events: usize = 256;
 
 const State = struct {
     allocator: std.mem.Allocator,
@@ -188,6 +191,11 @@ const State = struct {
         const io = self.threaded.io();
         try self.audit_mutex.lock(io);
         defer self.audit_mutex.unlock(io);
+        // Drop oldest when at cap so long proxy sessions cannot grow unbounded (M011).
+        while (self.audit_events.items.len >= max_audit_events) {
+            const old = self.audit_events.orderedRemove(0);
+            old.deinit(self.allocator);
+        }
         try self.audit_events.append(self.allocator, .{
             .event_type = event_type,
             .target = owned_target,

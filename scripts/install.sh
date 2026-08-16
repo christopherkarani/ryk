@@ -14,8 +14,10 @@ set -eu
 #   RYK_SHARE_DIR     Runtime share root (default: ~/.local/share/ryk — kept in 5a)
 #   RYK_BASE_URL       Override release base URL
 #   RYK_ARTIFACT_DIR Offline install from a local dist/ folder
-#   RYK_INSTALL_FORCE=1 Allow overwriting a non-product file at the destination
-#   RYK_INSTALL_QUIET=1 Suppress non-error UI (still installs; prints activation line)
+#   RYK_INSTALL_FORCE=1 Allow overwriting a non-ryk file at the destination
+#                       (`ryk update --force` sets this). A valid ryk binary is
+#                       overwrite-safe without FORCE.
+#   RYK_INSTALL_QUIET=1 Suppress non-error UI (still installs; no leftover homework)
 #   RYK_INSTALL_SKIP_ONBOARD=1  Skip post-install ensure
 #   RYK_RELEASE_PUBKEY   Override the release signing key (testing only)
 #   RYK_INSTALL_ALLOW_UNSIGNED=1  Accept checksum-only trust (announced, not silent)
@@ -39,7 +41,7 @@ if [ -f "$0" ] 2>/dev/null; then
 fi
 
 # ── Presentation ─────────────────────────────────────────────────────────────
-# Brand + named steps + activation hero. Quiet / NO_COLOR / pipe degrade cleanly.
+# Brand + named steps + optional host hint. Quiet / NO_COLOR / pipe degrade cleanly.
 # Glyphs align with src/tui/render.zig (active/done use success green).
 
 QUIET=0
@@ -173,9 +175,9 @@ reject_symlink_parents() {
   reject_symlink_components "$(dirname "$checked_path")" "$checked_label"
 }
 
-# Contract: /^    eval / — always printed, including quiet.
-print_activation() {
-  printf '    eval "$(%s env)"\n' "$1"
+# Optional one-line next step. Not homework: no eval / doctor --fix.
+print_host_hint() {
+  printf '    ryk claude\n'
 }
 
 # ── Release signing ──────────────────────────────────────────────────────────
@@ -359,7 +361,9 @@ cleanup() {
       rm -rf "$runtime_backup" 2>/dev/null || true
     fi
   fi
-  rm -rf "$TMP_DIR"
+  if [ -n "${TMP_DIR:-}" ]; then
+    rm -rf "$TMP_DIR"
+  fi
 }
 trap cleanup EXIT INT TERM
 
@@ -557,6 +561,31 @@ managed_runtime_version() {
   printf '%s\n' "$managed_version"
 }
 
+# Conservative product identity. Never executes dest (it may be attacker-controlled
+# and inherit the installer environment). Never follows a symlink. Regular files
+# named ryk/ryk.exe pass only when they are a native image (ELF/PE/Mach-O) and
+# contain the in-binary marker `safety_boundary_version` (real 0.2.18+). Unsure
+# dest → not a product binary (caller refuses + RYK_INSTALL_FORCE=1). Do not
+# treat every ELF as ryk, and do not treat a wrapper comment as identity.
+is_ryk_product_binary() {
+  _ryk_id_path="$1"
+  [ -n "$_ryk_id_path" ] || return 1
+  [ -L "$_ryk_id_path" ] && return 1
+  [ -f "$_ryk_id_path" ] || return 1
+  case "${_ryk_id_path##*/}" in
+    ryk|ryk.exe) ;;
+    *) return 1 ;;
+  esac
+  command -v dd >/dev/null 2>&1 || return 1
+  command -v od >/dev/null 2>&1 || return 1
+  _ryk_hdr=$(dd if="$_ryk_id_path" bs=4 count=1 2>/dev/null | od -An -tx1 | tr -d ' \n' | tr 'A-F' 'a-f')
+  case "$_ryk_hdr" in
+    7f454c46*|4d5a*|cffaedfe*|cefaedfe*|feedface*|feedfacf*|cafebabe*|bebafeca*) ;;
+    *) return 1 ;;
+  esac
+  grep -a -F -q 'safety_boundary_version' "$_ryk_id_path" 2>/dev/null
+}
+
 validate_binary_destination() {
   validate_destination="$1"
   reject_symlink_parents "$validate_destination" "binary destination"
@@ -574,10 +603,14 @@ validate_binary_destination() {
     [ -f "$validate_destination" ] ||
       fail "refusing non-file binary destination path: $validate_destination" \
         "Choose a path whose final target is a regular file or an existing ryk symlink."
-    if [ "${RYK_INSTALL_FORCE:-0}" != "1" ] && ! managed_runtime_version >/dev/null; then
-      fail "refusing to overwrite non-ryk file at $validate_destination" \
-        "Set RYK_INSTALL_FORCE=1 to replace it, or choose another install dir."
+    if [ "${RYK_INSTALL_FORCE:-0}" = "1" ]; then
+      return 0
     fi
+    if is_ryk_product_binary "$validate_destination"; then
+      return 0
+    fi
+    fail "refusing to overwrite non-ryk file at $validate_destination" \
+      "RYK_INSTALL_FORCE=1"
   fi
 }
 
@@ -831,12 +864,9 @@ ensure_resource_root_entry() {
 # previous_version may be empty (fresh), a semver (upgrade/reinstall), or "installed".
 print_success() {
   previous_version="$1"
-  quoted_destination="$2"
-  missing_dashboard="$3"
-  onboarding_ran="${4:-0}"
+  missing_dashboard="$2"
 
   if [ "$QUIET" -eq 1 ]; then
-    print_activation "$quoted_destination"
     return 0
   fi
 
@@ -853,12 +883,7 @@ print_success() {
   fi
 
   printf '\n'
-  print_activation "$quoted_destination"
-
-  if [ "$onboarding_ran" -eq 0 ]; then
-    printf '\n'
-    printf '    ryk doctor --fix --from-install\n'
-  fi
+  print_host_hint
 
   if [ "$missing_dashboard" -eq 1 ]; then
     printf '\n'
@@ -1019,7 +1044,6 @@ summarize_ensure_receipt() {
   printf '%s' "policy ready · hosts configured · verify deferred"
 }
 
-ONBOARDING_RAN=0
 ENSURE_MODE=doctor_fix
 if [ "${RYK_INSTALL_SKIP_ONBOARD:-0}" != "1" ]; then
   step_active "Set up protection"
@@ -1061,7 +1085,6 @@ Re-run the installer after resolving the host integration error."
   fi
   _ensure_detail="$(summarize_ensure_receipt "$TMP_DIR/.onboarding.out")"
   step_done "Set up protection" "$_ensure_detail"
-  ONBOARDING_RAN=1
 fi
 
 MISSING_DASHBOARD=0
@@ -1069,4 +1092,4 @@ if [ ! -d "$RESOURCE_ROOT/ryk-dashboard-ui" ]; then
   MISSING_DASHBOARD=1
 fi
 
-print_success "$PREVIOUS_VERSION" "$(shell_quote "$DESTINATION")" "$MISSING_DASHBOARD" "$ONBOARDING_RAN"
+print_success "$PREVIOUS_VERSION" "$MISSING_DASHBOARD"

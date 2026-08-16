@@ -63,9 +63,9 @@ function Write-StepActive([string]$Label) {
     Write-Ui ("  > " + $Label) Green
 }
 
-function Write-Activation {
-    # Always printed (including quiet) so automation can hand off to ryk env.
-    Write-Host "    ryk env   # then evaluate the set commands (or copy them for cmd.exe)"
+function Write-HostHint {
+    # Optional one-line next step. Not leftover homework.
+    Write-Host "    ryk claude"
 }
 
 function Fail($Message, $Remediation = $null) {
@@ -127,23 +127,66 @@ Refuse to install a corrupted or tampered archive.
     }
 }
 
-# Returns $null when path is missing or not ryk; otherwise @{ Version = <semver or $null> }.
-# Product detection uses the stable version --json contract, not the human banner.
-function Get-ExistingProductInfo($Path) {
-    if (-not (Test-Path -LiteralPath $Path)) { return $null }
+function Test-IsNativeExecutableImage([string]$Path) {
+    $stream = $null
     try {
-        $output = & $Path version --json 2>$null | Out-String
+        $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        if (-not $stream.CanSeek) { return $false }
+        $hdr = New-Object byte[] 4
+        $n = $stream.Read($hdr, 0, 4)
+        if ($n -ge 2 -and $hdr[0] -eq 0x4D -and $hdr[1] -eq 0x5A) { return $true }
+        if ($n -lt 4) { return $false }
+        if ($hdr[0] -eq 0x7F -and $hdr[1] -eq 0x45 -and $hdr[2] -eq 0x4C -and $hdr[3] -eq 0x46) { return $true }
+        $machO = @(
+            @(0xCF, 0xFA, 0xED, 0xFE),
+            @(0xCE, 0xFA, 0xED, 0xFE),
+            @(0xFE, 0xED, 0xFA, 0xCE),
+            @(0xFE, 0xED, 0xFA, 0xCF),
+            @(0xCA, 0xFE, 0xBA, 0xBE),
+            @(0xBE, 0xBA, 0xFE, 0xCA)
+        )
+        foreach ($magic in $machO) {
+            if ($hdr[0] -eq $magic[0] -and $hdr[1] -eq $magic[1] -and $hdr[2] -eq $magic[2] -and $hdr[3] -eq $magic[3]) {
+                return $true
+            }
+        }
+        return $false
     } catch {
-        return $null
+        return $false
+    } finally {
+        if ($null -ne $stream) { $stream.Dispose() }
     }
-    if ($LASTEXITCODE -ne 0) { return $null }
-    if (-not ($output -match '"product"\s*:\s*"ryk"')) {
-        return $null
+}
+
+function Test-HasRykProductMarker([string]$Path) {
+    $stream = $null
+    try {
+        $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        if (-not $stream.CanSeek) { return $false }
+        $limit = [Math]::Min($stream.Length, [int64](64 * 1024 * 1024))
+        if ($limit -le 0) { return $false }
+        $buf = New-Object byte[] $limit
+        $n = $stream.Read($buf, 0, [int]$limit)
+        if ($n -le 0) { return $false }
+        return [System.Text.Encoding]::ASCII.GetString($buf, 0, $n).Contains("safety_boundary_version")
+    } catch {
+        return $false
+    } finally {
+        if ($null -ne $stream) { $stream.Dispose() }
     }
-    $version = $null
-    $m = [regex]::Match($output, '\d+\.\d+\.\d+')
-    if ($m.Success) { $version = $m.Value }
-    return @{ Version = $version }
+}
+
+# Conservative product identity matching scripts/install.sh. Never executes dest.
+# Basename ryk/ryk.exe, native image (PE/ELF/Mach-O), and safety_boundary_version.
+# Reparse/symlink dest is not identity — caller allows and replaces the link.
+function Test-IsRykProductBinary($Path) {
+    if (-not (Test-Path -LiteralPath $Path)) { return $false }
+    $item = Get-Item -LiteralPath $Path -Force
+    if ($item.PSIsContainer) { return $false }
+    if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { return $false }
+    if ($item.Name -ne "ryk" -and $item.Name -ne "ryk.exe") { return $false }
+    if (-not (Test-IsNativeExecutableImage $Path)) { return $false }
+    return Test-HasRykProductMarker $Path
 }
 
 function Install-RuntimeAssets($ExtractRoot) {
@@ -235,12 +278,10 @@ function Invoke-InstallEnsure($Destination) {
 
 function Write-SuccessReceipt {
     param(
-        [string]$PreviousVersion,
-        [string]$Destination
+        [string]$PreviousVersion
     )
 
     if ($Quiet) {
-        Write-Activation
         return
     }
 
@@ -252,21 +293,8 @@ function Write-SuccessReceipt {
     } else {
         Write-Ui ("  +  ryk v" + $Version + " installed") Green
     }
-    Write-Ui "  CLI + runtime ready (shell_engine in-process)" DarkGray
     Write-Host ""
-    Write-Ui "  Activate this session" White
-    Write-Ui "  (InstallDir may not be on PATH yet)" DarkGray
-    Write-Host ""
-    Write-Activation
-    Write-Host ""
-    Write-Ui "  Profile exports were also written for future sessions." DarkGray
-    Write-Host ""
-    Write-Ui "  Protection setup completed via doctor --fix --from-install." DarkGray
-
-    Write-Host ""
-    Write-Ui "  Details" DarkGray
-    Write-Ui ("    binary   " + $Destination) DarkGray
-    Write-Ui ("    assets   " + $CurrentLink + " -> " + $ResourceRoot) DarkGray
+    Write-HostHint
     Write-Host ""
 }
 
@@ -280,12 +308,15 @@ New-Item -ItemType Directory -Path $tempDir | Out-Null
 
 $destination = Join-Path $InstallDir "ryk.exe"
 
-# Empty = fresh; semver or "installed" = existing CLI at destination.
+# Empty = fresh; "installed" = existing product binary (markers only; never exec dest).
 $previousVersion = $null
-$existingCli = Get-ExistingProductInfo $destination
-if ($existingCli) {
-    $previousVersion = $existingCli.Version
-    if (-not $previousVersion) { $previousVersion = "installed" }
+if (Test-Path -LiteralPath $destination) {
+    $existingItem = Get-Item -LiteralPath $destination -Force
+    if (-not $existingItem.PSIsContainer -and -not ($existingItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+        if (Test-IsRykProductBinary $destination) {
+            $previousVersion = "installed"
+        }
+    }
 }
 
 if (-not $Quiet) {
@@ -346,9 +377,20 @@ try {
 
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
     $force = $env:RYK_INSTALL_FORCE -eq "1"
-    if ((Test-Path -LiteralPath $destination) -and -not $force) {
-        if (-not (Get-ExistingProductInfo $destination)) {
-            Fail "refusing to overwrite non-ryk file at $destination" "Set RYK_INSTALL_FORCE=1 to replace it."
+    if (Test-Path -LiteralPath $destination) {
+        $destItem = Get-Item -LiteralPath $destination -Force
+        if ($destItem.PSIsContainer) {
+            Fail "refusing directory binary destination path: $destination" "Choose a path whose final target is a regular file or an existing ryk symlink."
+        }
+        $isReparse = [bool]($destItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint)
+        if ($isReparse) {
+            try {
+                [System.IO.File]::Delete($destination)
+            } catch {
+                Fail "could not replace destination reparse point: $destination" "Remove the existing link and retry."
+            }
+        } elseif (-not $force -and -not (Test-IsRykProductBinary $destination)) {
+            Fail "refusing to overwrite non-ryk file at $destination" "RYK_INSTALL_FORCE=1"
         }
     }
     Copy-Item -LiteralPath $binary.FullName -Destination $destination -Force
@@ -371,7 +413,7 @@ try {
     Invoke-InstallEnsure $destination
     Write-StepDone "Set up protection" "doctor --fix --from-install"
 
-    Write-SuccessReceipt -PreviousVersion $previousVersion -Destination $destination
+    Write-SuccessReceipt -PreviousVersion $previousVersion
 } finally {
     Remove-Item -LiteralPath $tempDir -Recurse -Force -ErrorAction SilentlyContinue
 }

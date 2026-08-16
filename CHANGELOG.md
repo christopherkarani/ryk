@@ -1,5 +1,9 @@
 # Changelog
 
+## [Unreleased]
+
+Nothing pending.
+
 ## [0.2.19] - 2026-08-16
 
 ## What's Changed
@@ -61,7 +65,7 @@
 
 **Full Changelog**: https://github.com/christopherkarani/ryk/compare/v1.2.17...v0.2.18
 
-## [Unreleased]
+## Notes for 0.2.18–0.2.19
 
 ### Changed
 
@@ -77,6 +81,7 @@
 
 ### Fixed
 
+* **`ryk replay --tui` on a pipe falls back to linear, not EXIT 2 (#217).** No colour TTY, `--plain`, `--no-rich`, or `NO_COLOR` prints a one-line `using linear report` note and continues as the linear command would. `--tui --json` stays rejected (frozen machine output). Doctor already did this; default doctor stays linear. No new TUI. `history` remains a hide-list stub.
 * **`ryk hook --help` documents that Pi is not a hook host.** Usage stays the six `Host.parse` hosts (`codex|claude|grok|opencode|openclaw|hermes`). Pi remains a launch alias and uses `ryk evaluate` / the bundled extension. Cursor is still not a hook host. The lock test now requires that honesty line and rejects `ryk hook pi`.
 * **Dashboard GET `/terminal/` is a directory index.** `formatListenUrl` prints `http://127.0.0.1:7742/terminal/`; a single trailing slash now maps to the `terminal` prefix (then `terminal/index.html` / SPA fallback) instead of failing `isSafeStaticPath` as an empty segment. Sibling trailing-slash views (`/activity/`) share the helper. `//`, `/terminal//`, and `..` still 404.
 * **`ryk start` banner names the written policy posture.** Default create still seeds generic-agent / DCG `mode: strict`. The setup-path line and first-run receipt now say `strict` (or `Ask` when the YAML is ask) instead of a hardcoded “Ask on risk (auto)”. Quiet success, one next action, no box-drawing walls. install ≠ start.
@@ -262,7 +267,7 @@ The product was previously named Orca.
 
 **Full Changelog**: https://github.com/christopherkarani/ryk/compare/v1.2.8...v1.2.9
 
-## Unreleased
+## Notes (1.2.9 brand cut)
 
 ### Breaking
 - **Brand hard cut — Rykan V / `ryk` only (no legacy-brand compatibility).**
@@ -406,6 +411,3 @@ The product was previously named Orca.
 - Prepared Orca production release metadata and artifact contract.
 - Added checksum, release-manifest, SBOM inventory hook, optional signing hook status, install guidance, GitHub release draft, tagging instructions, release checklist, and production-readiness report.
 
-## Previous Phases
-
-Earlier releases established the current policy engine, shell evaluator, host integrations, audit and replay tooling, red-team checks, and release process.

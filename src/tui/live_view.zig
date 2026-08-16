@@ -16,9 +16,10 @@ const vaxis = @import("vaxis");
 /// `vaxis.tty.Tty` is a stub) — it is verified manually via subprocess, matching
 /// the established note in `prompt.zig`.
 ///
-/// Opt-in only. The CLI commands reject `--live`/`--tui` on non-TTY and on
-/// `--json`/`--robot` (machine) output, so this module never enters the
-/// alt-screen on a pipe (invariant: non-TTY → plain text; `--json` frozen).
+/// Opt-in only. The CLI commands fall back to linear output on non-TTY /
+/// `--plain` / `--no-rich` / `NO_COLOR`, and reject `--json`/`--robot`
+/// (machine) combinations, so this module never enters the alt-screen on a
+/// pipe (invariant: non-TTY → plain text; `--json` frozen).
 pub const Lines = []const []const u8;
 
 /// Keys the live loop reacts to (mirrors `prompt.zig`'s `KeyAction` shape).
@@ -105,9 +106,9 @@ pub const RefreshFn = *const fn (io: std.Io, ctx: *anyopaque) ?Lines;
 /// and leave the alt-screen on every exit path. Terminal state (alt buffer,
 /// cursor visibility) is restored via `defer` on return AND on any error.
 ///
-/// Real-TTY only. The CLI commands must reject non-TTY / `--json` callers before
-/// invoking this. In `builtin.is_test` the raw TTY loop is comptime-gated out
-/// (vaxis.tty.Tty is a stub there); tests cover `renderFrame` directly.
+/// Real-TTY only. The CLI commands must fall back to linear (or reject `--json`)
+/// before invoking this. In `builtin.is_test` the raw TTY loop is comptime-gated
+/// out (vaxis.tty.Tty is a stub there); tests cover `renderFrame` directly.
 pub fn run(
     io: std.Io,
     stdout: anytype,
