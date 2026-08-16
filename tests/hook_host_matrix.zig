@@ -137,11 +137,15 @@ fn runRyk(allocator: std.mem.Allocator, case: HostCase, stdin_data: ?[]const u8)
     var argv_buf: [4][]const u8 = undefined;
     const args = argvFor(case, &argv_buf);
     const io = std.testing.io;
+    var env_map = try std.process.Environ.createMap(std.process.environ, allocator);
+    defer env_map.deinit();
+    try env_map.put("RYK_HOOK_SERVER", "0");
     var child = try std.process.spawn(io, .{
         .argv = args,
         .stdin = if (stdin_data != null) .pipe else .ignore,
         .stdout = .pipe,
         .stderr = .pipe,
+        .environ_map = &env_map,
     });
 
     if (stdin_data) |data| {
