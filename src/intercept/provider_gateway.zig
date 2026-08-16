@@ -121,6 +121,21 @@ pub const testing = if (builtin.is_test) struct {
     }
 } else struct {};
 
+/// Cap in-memory gateway audit trail (M012). Older events dropped FIFO.
+/// Mirrors intercept proxy max_audit_events — not a durability store.
+const max_audit_events: usize = 256;
+
+fn appendCappedAuditEvent(
+    allocator: std.mem.Allocator,
+    events: *std.ArrayList(AuditEvent),
+    event: AuditEvent,
+) !void {
+    while (events.items.len >= max_audit_events) {
+        _ = events.orderedRemove(0);
+    }
+    try events.append(allocator, event);
+}
+
 const State = struct {
     allocator: std.mem.Allocator,
     server: std.Io.net.Server,
@@ -148,7 +163,7 @@ const State = struct {
         const io = self.threaded.io();
         try self.audit_mutex.lock(io);
         defer self.audit_mutex.unlock(io);
-        try self.audit_events.append(self.allocator, .{
+        try appendCappedAuditEvent(self.allocator, &self.audit_events, .{
             .kind = kind,
             .provider = self.provider,
             .env_var = config.env_var,
@@ -652,4 +667,23 @@ fn wake(io: std.Io, port: u16) void {
     const address = std.Io.net.IpAddress.parse("127.0.0.1", port) catch return;
     var stream = address.connect(io, .{ .mode = .stream }) catch return;
     stream.close(io);
+}
+
+test "gateway audit trail drops oldest events at cap" {
+    const allocator = std.testing.allocator;
+    var events: std.ArrayList(AuditEvent) = .empty;
+    defer events.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < max_audit_events + 8) : (i += 1) {
+        try appendCappedAuditEvent(allocator, &events, .{
+            .kind = .phantom_swap,
+            .provider = .anthropic,
+            .env_var = "ANTHROPIC_API_KEY",
+            .reason_code = if (i == 0) "first" else "later",
+        });
+    }
+
+    try std.testing.expectEqual(max_audit_events, events.items.len);
+    try std.testing.expectEqualStrings("later", events.items[0].reason_code);
 }
