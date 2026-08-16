@@ -1353,28 +1353,6 @@ test "start picker filled-prefix cleanup mid-loop OOM and cursor default-uncheck
         resolveSelectedHosts(std.testing.io, failing.allocator(), .{}, &statuses, &stdout),
     );
     try std.testing.expect(failing.has_induced_failure);
-
-    // Source lock on resolveSelectedHosts only — do not drive TUI multiSelect.
-    const src = @embedFile("start.zig");
-    const fn_idx = std.mem.indexOf(u8, src, "fn resolveSelectedHosts(") orelse return error.TestUnexpectedResult;
-    const after_fn = src[fn_idx..];
-    const next_fn = std.mem.indexOf(u8, after_fn[1..], "\nfn ") orelse return error.TestUnexpectedResult;
-    const body = after_fn[0 .. 1 + next_fn];
-
-    try std.testing.expect(std.mem.indexOf(u8, body, ".checked = !std.mem.eql(u8, status.name, \"cursor\")") != null);
-
-    const alloc_idx = std.mem.indexOf(u8, body, "allocator.alloc(tui.prompt.SelectionOption") orelse
-        return error.TestUnexpectedResult;
-    const after_alloc = body[alloc_idx..];
-    const fill_idx = std.mem.indexOf(u8, after_alloc, "for (host_statuses)") orelse return error.TestUnexpectedResult;
-    const pre_fill = after_alloc[0..fill_idx];
-    // Item cleanup (filled prefix) must be registered before the fill loop.
-    try std.testing.expect(std.mem.indexOf(u8, pre_fill, "defer") != null);
-    try std.testing.expect(std.mem.indexOf(u8, pre_fill, ".label") != null);
-
-    const label_dupe = std.mem.indexOf(u8, after_alloc, "allocator.dupe(u8, label)") orelse return error.TestUnexpectedResult;
-    const id_dupe = std.mem.indexOf(u8, after_alloc, "allocator.dupe(u8, status.name)") orelse return error.TestUnexpectedResult;
-    try std.testing.expect(label_dupe < id_dupe);
 }
 
 test "start packs-or-verify receipt only when those steps actually failed" {

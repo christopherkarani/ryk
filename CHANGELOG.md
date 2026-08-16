@@ -2,7 +2,7 @@
 
 ## [Unreleased]
 
-Nothing pending.
+* **OpenClaw leftover unused policy `ask` is permit.** Attended `ryk hook openclaw` and the OpenClaw plugin rewrite residual unused `ask` to allow. Unattended / `--ci` still hardens leftover `ask` to block. Explicit deny, stage, SoftBlock, and FM steward ask never become allow. Grok leftover unused `ask` is permit on the same wire.
 
 ## [0.2.19] - 2026-08-16
 

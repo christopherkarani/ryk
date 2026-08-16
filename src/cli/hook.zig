@@ -655,7 +655,7 @@ fn hookCommand(io: std.Io, host: Host, event: Event, original_event_name: []cons
     if (result.decision == .stage and unattended) {
         result.decision = .block;
     } else if (result.ask_origin.mayPermitOnCodingHost()) {
-        result.decision = wireCodingHostAsk(host, result.decision, unattended);
+        result.decision = wireCodingHostAsk(result.decision, unattended);
     } else if (result.decision == .ask) {
         // SoftBlock / FM: OpenCode and Hermes treat leftover ask as proceed,
         // so the hook wire denies instead of emitting ask.
@@ -818,24 +818,13 @@ fn isCodexDenyOutput(host: Host, decision: PluginDecision) bool {
     return host == .codex and decision == .block;
 }
 
-/// Leftover unused policy ask is permit so agents work. OpenClaw / Grok keep
-/// their documented veto (no resume contract / exit-2 deny). Stage, SoftBlock,
-/// and FM steward ask never enter this helper as remappable leftover ask.
-fn codingHostPermitsResidualAsk(host: Host) bool {
-    return switch (host) {
-        .claude, .codex, .opencode, .hermes => true,
-        .grok, .openclaw => false,
-    };
-}
-
 /// Wire leftover unused policy `ask` only. `.stage`, `.block`, and `.allow`
-/// are unchanged. Unattended / CI: leftover ask → block. Attended coding
-/// hosts: leftover ask → allow.
-fn wireCodingHostAsk(host: Host, decision: PluginDecision, unattended: bool) PluginDecision {
+/// are unchanged. Unattended / CI: leftover ask → block. Attended hook hosts
+/// (every `Host` value) permit leftover unused ask so agents can work.
+/// Stage, SoftBlock, and FM steward ask never enter this helper.
+fn wireCodingHostAsk(decision: PluginDecision, unattended: bool) PluginDecision {
     if (decision != .ask) return decision;
-    if (unattended) return .block;
-    if (codingHostPermitsResidualAsk(host)) return .allow;
-    return .ask;
+    return if (unattended) .block else .allow;
 }
 
 fn usesExitTwoDenyOutput(host: Host, decision: PluginDecision) bool {
@@ -844,6 +833,8 @@ fn usesExitTwoDenyOutput(host: Host, decision: PluginDecision) bool {
     // enforceable non-allow contract is exit 2, so escalation and evaluator
     // errors must block just like an explicit deny.
     if (host == .grok) {
+        // Leftover unused ask is remapped to allow before emit. A raw `.ask`
+        // here is the fail-closed residual (must not reach attended leftover-ask).
         return decision == .block or decision == .ask or decision == .stage or decision == .err;
     }
     return false;
@@ -3266,6 +3257,7 @@ test "hook recognizes Grok as a PreToolUse host with exit-two deny semantics" {
     try std.testing.expectEqual(Host.grok, Host.parse("grok").?);
     try std.testing.expect(shouldFailClosedOnPreEval(.grok, .PreToolUse));
     try std.testing.expectEqual(codex_deny_exit_code, hookExitCode(.grok, .block, false));
+    // Raw leftover `.ask` must not reach emit: wireCodingHostAsk remaps it first.
     try std.testing.expectEqual(codex_deny_exit_code, hookExitCode(.grok, .ask, false));
     try std.testing.expectEqual(codex_deny_exit_code, hookExitCode(.grok, .err, false));
     try std.testing.expectEqual(exit_codes.success, hookExitCode(.grok, .allow, false));
@@ -6434,33 +6426,19 @@ test "hook Claude maps residual ask to permissionDecision allow never deny" {
 }
 
 test "coding hosts permit residual ask unless unattended" {
-    try std.testing.expect(codingHostPermitsResidualAsk(.claude));
-    try std.testing.expect(codingHostPermitsResidualAsk(.codex));
-    try std.testing.expect(codingHostPermitsResidualAsk(.opencode));
-    try std.testing.expect(codingHostPermitsResidualAsk(.hermes));
-    try std.testing.expect(!codingHostPermitsResidualAsk(.openclaw));
-    try std.testing.expect(!codingHostPermitsResidualAsk(.grok));
-
-    try std.testing.expectEqual(PluginDecision.allow, wireCodingHostAsk(.claude, .ask, false));
-    try std.testing.expectEqual(PluginDecision.allow, wireCodingHostAsk(.codex, .ask, false));
-    try std.testing.expectEqual(PluginDecision.allow, wireCodingHostAsk(.opencode, .ask, false));
-    try std.testing.expectEqual(PluginDecision.allow, wireCodingHostAsk(.hermes, .ask, false));
-    try std.testing.expectEqual(PluginDecision.block, wireCodingHostAsk(.claude, .ask, true));
-    try std.testing.expectEqual(PluginDecision.block, wireCodingHostAsk(.hermes, .ask, true));
-    try std.testing.expectEqual(PluginDecision.ask, wireCodingHostAsk(.openclaw, .ask, false));
-    try std.testing.expectEqual(PluginDecision.block, wireCodingHostAsk(.claude, .block, false));
-    try std.testing.expectEqual(PluginDecision.allow, wireCodingHostAsk(.claude, .allow, true));
+    try std.testing.expectEqual(PluginDecision.allow, wireCodingHostAsk(.ask, false));
+    try std.testing.expectEqual(PluginDecision.block, wireCodingHostAsk(.ask, true));
+    try std.testing.expectEqual(PluginDecision.block, wireCodingHostAsk(.block, false));
+    try std.testing.expectEqual(PluginDecision.allow, wireCodingHostAsk(.allow, true));
 }
 
 test "fromDecisionResult stage plus wireCodingHostAsk is not allow" {
     const staged = PluginDecision.fromDecisionResult(.stage, false);
     try std.testing.expectEqual(PluginDecision.stage, staged);
-    try std.testing.expect(wireCodingHostAsk(.claude, staged, false) != .allow);
-    try std.testing.expect(wireCodingHostAsk(.hermes, staged, false) != .allow);
-    try std.testing.expectEqual(PluginDecision.stage, wireCodingHostAsk(.claude, staged, false));
-    try std.testing.expectEqual(PluginDecision.stage, wireCodingHostAsk(.hermes, staged, false));
+    try std.testing.expect(wireCodingHostAsk(staged, false) != .allow);
+    try std.testing.expectEqual(PluginDecision.stage, wireCodingHostAsk(staged, false));
     try std.testing.expectEqual(PluginDecision.block, PluginDecision.fromDecisionResult(.stage, true));
-    try std.testing.expectEqual(PluginDecision.block, wireCodingHostAsk(.claude, .block, false));
+    try std.testing.expectEqual(PluginDecision.block, wireCodingHostAsk(.block, false));
     try std.testing.expectEqualStrings("ask", claudePermissionDecisionString(.stage));
     try std.testing.expect(!std.mem.eql(u8, claudePermissionDecisionString(.stage), "allow"));
 }
@@ -6474,13 +6452,13 @@ test "unattended env lookup hardens coding-host residual ask" {
         }
     };
     const from_ci = env_util.unattendedFromLookup(Lookup{ .key = "CI", .value = "1" });
-    try std.testing.expectEqual(PluginDecision.block, wireCodingHostAsk(.claude, .ask, from_ci));
+    try std.testing.expectEqual(PluginDecision.block, wireCodingHostAsk(.ask, from_ci));
     const attended = env_util.unattendedFromLookup(Lookup{ .key = "CI", .value = "0" });
-    try std.testing.expectEqual(PluginDecision.allow, wireCodingHostAsk(.claude, .ask, attended));
+    try std.testing.expectEqual(PluginDecision.allow, wireCodingHostAsk(.ask, attended));
 }
 
 test "hook emit after wire rewrite is allow for attended Hermes" {
-    const wired = wireCodingHostAsk(.hermes, .ask, false);
+    const wired = wireCodingHostAsk(.ask, false);
     try std.testing.expectEqual(PluginDecision.allow, wired);
     const result = HookResponse{
         .decision = wired,
@@ -6500,9 +6478,42 @@ test "hook emit after wire rewrite is allow for attended Hermes" {
     try std.testing.expect(std.mem.indexOf(u8, out, "\"decision\": \"ask\"") == null);
 }
 
+test "hook emit after wire rewrite is allow for attended Grok and OpenClaw" {
+    const attended = wireCodingHostAsk(.ask, false);
+    try std.testing.expectEqual(PluginDecision.allow, attended);
+    try std.testing.expectEqual(exit_codes.success, hookExitCode(.grok, attended, false));
+    try std.testing.expectEqual(exit_codes.success, hookExitCode(.openclaw, attended, false));
+    try std.testing.expect(agentEmitShape(.grok, .PreToolUse, attended) != .grok_deny_json);
+    try std.testing.expectEqual(AgentEmitShape.generic_json, agentEmitShape(.openclaw, .PreToolUse, attended));
+
+    const oc_result = HookResponse{
+        .decision = attended,
+        .risk = .low,
+        .category = "command",
+        .reason = "residual ask",
+        .rule = null,
+        .message = "residual ask",
+        .redactions = &.{},
+        .host_limitations = &.{},
+    };
+    var oc_buf: [2048]u8 = undefined;
+    var oc_out: std.Io.Writer = .fixed(&oc_buf);
+    try writeHookResponse(&oc_out, oc_result);
+    const oc_json = oc_out.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, oc_json, "\"decision\": \"allow\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, oc_json, "\"decision\": \"ask\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, oc_json, "\"decision\": \"block\"") == null);
+
+    const ci = wireCodingHostAsk(.ask, true);
+    try std.testing.expectEqual(PluginDecision.block, ci);
+    try std.testing.expectEqual(codex_deny_exit_code, hookExitCode(.grok, ci, true));
+    try std.testing.expectEqual(AgentEmitShape.grok_deny_json, agentEmitShape(.grok, .PreToolUse, ci));
+    try std.testing.expectEqual(AgentEmitShape.generic_json, agentEmitShape(.openclaw, .PreToolUse, ci));
+}
+
 test "hook emit after wire does not allow staged writes" {
     const staged = PluginDecision.fromDecisionResult(.stage, false);
-    const wired_claude = wireCodingHostAsk(.claude, staged, false);
+    const wired_claude = wireCodingHostAsk(staged, false);
     try std.testing.expect(wired_claude != .allow);
     try std.testing.expectEqualStrings("ask", claudePermissionDecisionString(wired_claude));
 
@@ -6521,7 +6532,7 @@ test "hook emit after wire does not allow staged writes" {
     try std.testing.expect(std.mem.indexOf(u8, claude_json, "\"permissionDecision\":\"allow\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, claude_json, "\"permissionDecision\":\"ask\"") != null);
 
-    const wired_hermes = wireCodingHostAsk(.hermes, staged, false);
+    const wired_hermes = wireCodingHostAsk(staged, false);
     try std.testing.expect(wired_hermes != .allow);
     const hermes_result = HookResponse{
         .decision = wired_hermes,
@@ -6841,55 +6852,34 @@ test "s-once-cli: hook deny → pending code → redeem → evaluate allows once
     }
 }
 
-fn hookResponseOomFreePendingLists(
-    allocator: std.mem.Allocator,
-    redactions: *std.ArrayList(RedactionEntry),
-    limitations: *std.ArrayList([]const u8),
-) void {
-    for (redactions.items) |entry| entry.deinit(allocator);
-    redactions.deinit(allocator);
-    for (limitations.items) |item| allocator.free(item);
-    limitations.deinit(allocator);
-}
-
 fn hookResponseOomSeedLists(
     allocator: std.mem.Allocator,
     redactions: *std.ArrayList(RedactionEntry),
     limitations: *std.ArrayList([]const u8),
 ) !void {
-    // Named seed must stay non-empty (hits toOwnedSlice transfer). Blocks drop
-    // errdefer after a successful append so a later OOM is not a double-free.
-    {
-        const field = try allocator.dupe(u8, "prompt");
-        errdefer allocator.free(field);
-        const reason = try allocator.dupe(u8, "potential secret detected");
-        errdefer allocator.free(reason);
-        try redactions.append(allocator, .{
-            .field = field,
-            .reason = reason,
-        });
-    }
-    {
-        const limitation = try allocator.dupe(u8, "Hook enforcement is additive; does not replace ryk run supervision.");
-        errdefer allocator.free(limitation);
-        try limitations.append(allocator, limitation);
-    }
+    // Named seed must stay non-empty (hits toOwnedSlice transfer).
+    try appendOwnedRedaction(allocator, redactions, "prompt", "potential secret detected");
+    try appendOwnedLimitation(
+        allocator,
+        limitations,
+        "Hook enforcement is additive; does not replace ryk run supervision.",
+    );
 }
 
 fn hookResponseOomSeedListsOomProbe(allocator: std.mem.Allocator) !void {
     var redactions: std.ArrayList(RedactionEntry) = .empty;
     var limitations: std.ArrayList([]const u8) = .empty;
-    errdefer hookResponseOomFreePendingLists(allocator, &redactions, &limitations);
+    errdefer deinitHookLists(allocator, &redactions, &limitations);
     try hookResponseOomSeedLists(allocator, &redactions, &limitations);
     try std.testing.expectEqual(@as(usize, 1), redactions.items.len);
     try std.testing.expectEqual(@as(usize, 1), limitations.items.len);
-    hookResponseOomFreePendingLists(allocator, &redactions, &limitations);
+    deinitHookLists(allocator, &redactions, &limitations);
 }
 
 fn takeOwnedHookListsOomProbe(allocator: std.mem.Allocator) !void {
     var redactions: std.ArrayList(RedactionEntry) = .empty;
     var limitations: std.ArrayList([]const u8) = .empty;
-    errdefer hookResponseOomFreePendingLists(allocator, &redactions, &limitations);
+    errdefer deinitHookLists(allocator, &redactions, &limitations);
     try hookResponseOomSeedLists(allocator, &redactions, &limitations);
 
     const lists = try takeOwnedHookLists(allocator, &redactions, &limitations);
@@ -6915,7 +6905,7 @@ fn takeOwnedHookListsOomProbe(allocator: std.mem.Allocator) !void {
 fn makeFailClosedHookResponseOomProbe(allocator: std.mem.Allocator) !void {
     var redactions: std.ArrayList(RedactionEntry) = .empty;
     var limitations: std.ArrayList([]const u8) = .empty;
-    errdefer hookResponseOomFreePendingLists(allocator, &redactions, &limitations);
+    errdefer deinitHookLists(allocator, &redactions, &limitations);
     try hookResponseOomSeedLists(allocator, &redactions, &limitations);
 
     var result = try makeFailClosedHookResponse(
@@ -6952,7 +6942,7 @@ fn makeFailClosedHookResponseOomProbe(allocator: std.mem.Allocator) !void {
 fn makeInformationalResponseOomProbe(allocator: std.mem.Allocator) !void {
     var redactions: std.ArrayList(RedactionEntry) = .empty;
     var limitations: std.ArrayList([]const u8) = .empty;
-    errdefer hookResponseOomFreePendingLists(allocator, &redactions, &limitations);
+    errdefer deinitHookLists(allocator, &redactions, &limitations);
     try hookResponseOomSeedLists(allocator, &redactions, &limitations);
 
     var result = try makeInformationalResponse(
@@ -6988,7 +6978,7 @@ fn makeInformationalResponseOomProbe(allocator: std.mem.Allocator) !void {
 fn makeFileNormalizationBlockResponseOomProbe(allocator: std.mem.Allocator) !void {
     var redactions: std.ArrayList(RedactionEntry) = .empty;
     var limitations: std.ArrayList([]const u8) = .empty;
-    errdefer hookResponseOomFreePendingLists(allocator, &redactions, &limitations);
+    errdefer deinitHookLists(allocator, &redactions, &limitations);
     try hookResponseOomSeedLists(allocator, &redactions, &limitations);
 
     var result = try makeFileNormalizationBlockResponse(
@@ -7023,15 +7013,17 @@ fn hookResponseOomFailAtZeroIsOutOfMemory(comptime call: anytype) !void {
     const allocator = failing.allocator();
     var redactions: std.ArrayList(RedactionEntry) = .empty;
     var limitations: std.ArrayList([]const u8) = .empty;
-    defer hookResponseOomFreePendingLists(allocator, &redactions, &limitations);
+    defer deinitHookLists(allocator, &redactions, &limitations);
     try std.testing.expectError(error.OutOfMemory, call(allocator, &redactions, &limitations));
     try std.testing.expect(failing.has_induced_failure);
 }
 
-test "HookResponseOom makeFailClosedHookResponse OOM ownership" {
+test "HookResponseOom builders OOM ownership" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, hookResponseOomSeedListsOomProbe, .{});
     try std.testing.checkAllAllocationFailures(std.testing.allocator, takeOwnedHookListsOomProbe, .{});
     try std.testing.checkAllAllocationFailures(std.testing.allocator, makeFailClosedHookResponseOomProbe, .{});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, makeInformationalResponseOomProbe, .{});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, makeFileNormalizationBlockResponseOomProbe, .{});
     try hookResponseOomFailAtZeroIsOutOfMemory(struct {
         fn call(
             allocator: std.mem.Allocator,
@@ -7048,12 +7040,6 @@ test "HookResponseOom makeFailClosedHookResponse OOM ownership" {
             );
         }
     }.call);
-}
-
-test "HookResponseOom makeInformationalResponse OOM ownership" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, hookResponseOomSeedListsOomProbe, .{});
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, takeOwnedHookListsOomProbe, .{});
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, makeInformationalResponseOomProbe, .{});
     try hookResponseOomFailAtZeroIsOutOfMemory(struct {
         fn call(
             allocator: std.mem.Allocator,
@@ -7072,12 +7058,6 @@ test "HookResponseOom makeInformationalResponse OOM ownership" {
             );
         }
     }.call);
-}
-
-test "HookResponseOom makeFileNormalizationBlockResponse OOM ownership" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, hookResponseOomSeedListsOomProbe, .{});
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, takeOwnedHookListsOomProbe, .{});
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, makeFileNormalizationBlockResponseOomProbe, .{});
     try hookResponseOomFailAtZeroIsOutOfMemory(struct {
         fn call(
             allocator: std.mem.Allocator,
@@ -7093,61 +7073,6 @@ test "HookResponseOom makeFileNormalizationBlockResponse OOM ownership" {
             );
         }
     }.call);
-}
-
-test "makeInformationalResponse OOM ownership does not leak lists" {
-    var saw_oom = false;
-    var saw_success = false;
-    var fail_index: usize = 0;
-    while (fail_index < 16) : (fail_index += 1) {
-        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
-        const allocator = failing.allocator();
-        var redactions: std.ArrayList(RedactionEntry) = .empty;
-        var limitations: std.ArrayList([]const u8) = .empty;
-        defer {
-            for (redactions.items) |entry| entry.deinit(allocator);
-            redactions.deinit(allocator);
-            for (limitations.items) |item| allocator.free(item);
-            limitations.deinit(allocator);
-        }
-        const limit_a = allocator.dupe(u8, "limit-a") catch {
-            saw_oom = true;
-            continue;
-        };
-        limitations.append(allocator, limit_a) catch {
-            allocator.free(limit_a);
-            saw_oom = true;
-            continue;
-        };
-        const limit_b = allocator.dupe(u8, "limit-b") catch {
-            saw_oom = true;
-            continue;
-        };
-        limitations.append(allocator, limit_b) catch {
-            allocator.free(limit_b);
-            saw_oom = true;
-            continue;
-        };
-        var result = makeInformationalResponse(
-            allocator,
-            .allow,
-            .low,
-            "session",
-            "informational event",
-            "ack",
-            &redactions,
-            &limitations,
-        ) catch |err| {
-            try std.testing.expectEqual(error.OutOfMemory, err);
-            saw_oom = true;
-            continue;
-        };
-        result.deinit(allocator);
-        saw_success = true;
-        break;
-    }
-    try std.testing.expect(saw_oom);
-    try std.testing.expect(saw_success);
 }
 
 test "collectDaemonSuggestionTexts OOM ownership does not leak suggestion buffers" {

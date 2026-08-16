@@ -266,18 +266,19 @@ pub fn evaluatePayloadWithModeOpts(
         .ask => {
             const unattended = opts.unattended orelse env_util.getenvUnattended() or mode == .ci;
             const leftover = decision.ask_origin.mayPermitOnCodingHost();
-            if (!leftover) {
+            if (unattended) {
+                // Leftover unused ask and hold outcomes (SoftBlock / FM) harden.
+                const reason = try core_api.redactAlloc(allocator, decision.owned_reason);
+                defer allocator.free(reason);
+                try writeDeny(stdout, format, reason);
+            } else if (leftover) {
+                try writeAllow(stdout, format);
+            } else {
                 // SoftBlock / FM: hold on Claude-compatible agent_hook; Cursor
                 // has no ask channel so writeAsk denies.
                 const reason = try core_api.redactAlloc(allocator, decision.owned_reason);
                 defer allocator.free(reason);
                 try writeAsk(stdout, format, reason);
-            } else if (unattended) {
-                const reason = try core_api.redactAlloc(allocator, decision.owned_reason);
-                defer allocator.free(reason);
-                try writeDeny(stdout, format, reason);
-            } else {
-                try writeAllow(stdout, format);
             }
         },
         // observe is intentional warn-allow (proceed while recording risk).
