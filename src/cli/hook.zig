@@ -1195,6 +1195,7 @@ test "hookNeedsWorkspaceRoot keeps fail-closed walks and skips informational her
     try std.testing.expect(!hookNeedsWorkspaceRoot(.hermes, .SessionStart, "post_llm_call"));
     try std.testing.expect(hookNeedsWorkspaceRoot(.hermes, .SessionStart, "subagent_stop"));
     try std.testing.expect(hookNeedsWorkspaceRoot(.hermes, .SessionStart, "on_session_start"));
+
 }
 
 fn evaluateInformationalEvent(
@@ -3836,6 +3837,39 @@ test "isHermesInformationalEvent identifies informational events" {
     try std.testing.expect(isHermesInformationalEvent("subagent_stop"));
     try std.testing.expect(!isHermesInformationalEvent("pre_tool_call"));
     try std.testing.expect(!isHermesInformationalEvent("on_session_start"));
+}
+
+test "hook informational events skip workspace walk except hermes activity writers" {
+    // OpenCode / OpenClaw informational already short-circuit before resolve.
+    try std.testing.expect(!hookNeedsWorkspaceRoot(.opencode, .SessionStart, "permission.replied"));
+    try std.testing.expect(!hookNeedsWorkspaceRoot(.opencode, .SessionStart, "file.edited"));
+    try std.testing.expect(!hookNeedsWorkspaceRoot(.opencode, .SessionStart, "command.executed"));
+    try std.testing.expect(!hookNeedsWorkspaceRoot(.openclaw, .SessionStart, "permission.after"));
+    try std.testing.expect(!hookNeedsWorkspaceRoot(.openclaw, .SessionStart, "session.end"));
+
+    // Hermes informational that does not record activity skips the ancestor walk.
+    try std.testing.expect(!hookNeedsWorkspaceRoot(.hermes, .SessionStart, "post_llm_call"));
+
+    // subagent_stop records feed activity and still resolves the workspace.
+    try std.testing.expect(hookNeedsWorkspaceRoot(.hermes, .SessionStart, "subagent_stop"));
+}
+
+test "hook informational skip keeps PreToolUse PermissionRequest workspace walk" {
+    try std.testing.expect(hookNeedsWorkspaceRoot(.claude, .PreToolUse, "PreToolUse"));
+    try std.testing.expect(hookNeedsWorkspaceRoot(.claude, .PermissionRequest, "PermissionRequest"));
+    try std.testing.expect(hookNeedsWorkspaceRoot(.codex, .PreToolUse, "PreToolUse"));
+    try std.testing.expect(hookNeedsWorkspaceRoot(.codex, .PermissionRequest, "PermissionRequest"));
+    try std.testing.expect(hookNeedsWorkspaceRoot(.hermes, .PreToolUse, "pre_tool_call"));
+    try std.testing.expect(hookNeedsWorkspaceRoot(.opencode, .PreToolUse, "tool.execute.before"));
+    try std.testing.expect(hookNeedsWorkspaceRoot(.openclaw, .PreToolUse, "tool.before"));
+
+    // fail-closed PreToolUse hosts still walk; Hermes session writers still walk.
+    try std.testing.expect(hookNeedsWorkspaceRoot(.codex, .SessionStart, "SessionStart"));
+    try std.testing.expect(hookNeedsWorkspaceRoot(.hermes, .SessionStart, "on_session_start"));
+    try std.testing.expect(hookNeedsWorkspaceRoot(.hermes, .SessionEnd, "on_session_end"));
+    try std.testing.expect(!isOpenCodeInformationalEvent("tool.execute.before"));
+    try std.testing.expect(!isHermesInformationalEvent("pre_tool_call"));
+    try std.testing.expect(!isOpenClawInformationalEvent("tool.before"));
 }
 
 test "hermes correlation extracts nested identifiers and prefers parent for subagents" {
