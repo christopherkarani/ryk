@@ -13,7 +13,7 @@
     },
     "host": {
       "type": "string",
-      "enum": ["hermes", "openclaw", "opencode", "claude", "codex", "pi", "other"]
+      "enum": ["hermes", "openclaw", "opencode", "claude", "codex", "pi", "grok", "other"]
     },
     "tool_path": {
       "type": "object",

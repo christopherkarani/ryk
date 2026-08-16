@@ -1186,7 +1186,7 @@ fn writeHermesFailOpenWarning(io: std.Io, stdout: anytype, context: IntegrationC
 
 fn writePiNote(stdout: anytype) !void {
     try stdout.writeAll("\nPi: bundled extension setup is managed by `ryk doctor --fix` (no npm step).\n");
-    try stdout.writeAll("  Process env/network isolation: ryk run -- pi · verify: ryk doctor\n");
+    try stdout.writeAll("  Process env/network isolation: ryk run -- pi (doctor is a probe, not live attach)\n");
 }
 
 fn writeBrokenEvaluatorWarning(io: std.Io, stdout: anytype, context: IntegrationContext) !void {
@@ -2963,6 +2963,8 @@ test "MessageMigrate doctor production teaches doctor --fix repair door" {
     const window_end = @min(prod.len, pi_idx + 200);
     const pi_window = prod[pi_idx..window_end];
     try std.testing.expect(std.mem.indexOf(u8, pi_window, "doctor --fix") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pi_window, "probe") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pi_window, "verify: ryk doctor") == null);
     try std.testing.expect(std.mem.indexOf(u8, pi_window, messageMigrateForbiddenStartNeedle()) == null);
 }
 

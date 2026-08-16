@@ -433,19 +433,81 @@ function wellKnownRykBins(platform: NodeJS.Platform): string[] {
   return out;
 }
 
+type StickyIdentity = {
+  dev: number;
+  ino: number;
+  size: number;
+  mtimeMs: number;
+  mtimeNs?: bigint;
+};
+
+/** Process-local skip of `version --json` after a successful resolve-time attest.
+ * Path / workspace checks still run every call. Not TOCTOU-safe. Residual:
+ * same-size metadata-preserving swap. Failures are never cached. */
+const stickyAttestCache = new Map<string, StickyIdentity>();
+
+function statIdentity(stat: {
+  dev: number;
+  ino: number;
+  size: number;
+  mtimeMs: number;
+  mtimeNs?: bigint;
+}): StickyIdentity {
+  return {
+    dev: stat.dev,
+    ino: stat.ino,
+    size: stat.size,
+    mtimeMs: stat.mtimeMs,
+    mtimeNs: typeof stat.mtimeNs === 'bigint' ? stat.mtimeNs : undefined,
+  };
+}
+
+function identityMatches(cached: StickyIdentity, stat: {
+  dev: number;
+  ino: number;
+  size: number;
+  mtimeMs: number;
+  mtimeNs?: bigint;
+}): boolean {
+  if (cached.dev !== stat.dev || cached.ino !== stat.ino || cached.size !== stat.size) {
+    return false;
+  }
+  if (typeof cached.mtimeNs === 'bigint' && typeof stat.mtimeNs === 'bigint') {
+    return cached.mtimeNs === stat.mtimeNs;
+  }
+  return cached.mtimeMs === stat.mtimeMs;
+}
+
+/** RYK_BIN pins and workspace override always re-run `version --json`. */
+function forceFullIdentityProbe(): boolean {
+  return process.env.RYK_ALLOW_WORKSPACE_BIN === '1' ||
+    Boolean(process.env.RYK_BIN?.trim());
+}
+
 function attestRykCandidate(path: string, cwd?: string): boolean {
   if (!existsSync(path) || isWorkspaceCandidate(path, cwd)) return false;
   try {
-    if (!statSync(path).isFile()) return false;
+    const stat = statSync(path);
+    if (!stat.isFile()) return false;
+    const canonical = canonicalPath(path);
+    const fullProbe = forceFullIdentityProbe();
+    if (!fullProbe) {
+      const cached = stickyAttestCache.get(canonical);
+      if (cached && identityMatches(cached, stat)) return true;
+    }
     const output = execFileSync(path, ['version', '--json'], {
       encoding: 'utf-8',
       timeout: 3000,
       stdio: ['ignore', 'pipe', 'ignore'],
     }).trim();
     const identity = JSON.parse(output) as { product?: unknown; version?: unknown };
-    return identity.product === 'ryk' &&
+    const ok = identity.product === 'ryk' &&
       typeof identity.version === 'string' &&
       RYK_VERSION_RE.test(identity.version);
+    if (ok && !fullProbe) {
+      stickyAttestCache.set(canonical, statIdentity(stat));
+    }
+    return ok;
   } catch {
     return false;
   }

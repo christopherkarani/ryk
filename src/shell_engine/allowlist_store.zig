@@ -195,7 +195,188 @@ pub fn loadFile(
     };
 }
 
+/// In-process cache of **raw** `loadMerged` layers only (not ProductShellStores).
+/// Callers always receive a deep copy. M-10 strip and `allow_once_path` stay
+/// outside this cache so every product load re-applies them.
+const merged_cache_path_max: usize = 4096;
+
+const LayerObs = struct {
+    const Kind = enum { absent, missing, present, unreadable };
+    kind: Kind,
+    inode: std.Io.File.INode = 0,
+    size: u64 = 0,
+    mtime_ns: i96 = 0,
+    mode: std.posix.mode_t = 0,
+
+    fn coarse(self: LayerObs) bool {
+        return self.kind == .present and @mod(self.mtime_ns, std.time.ns_per_s) == 0;
+    }
+
+    fn eql(a: LayerObs, b: LayerObs) bool {
+        if (a.kind != b.kind) return false;
+        if (a.kind != .present) return true;
+        return a.inode == b.inode and a.size == b.size and a.mtime_ns == b.mtime_ns and a.mode == b.mode;
+    }
+};
+
+fn observeLayer(runtime_io: std.Io, path: ?[]const u8) LayerObs {
+    const p = path orelse return .{ .kind = .absent };
+    const st = std.Io.Dir.cwd().statFile(runtime_io, p, .{}) catch |err| switch (err) {
+        error.FileNotFound => return .{ .kind = .missing },
+        else => return .{ .kind = .unreadable },
+    };
+    return .{
+        .kind = .present,
+        .inode = st.inode,
+        .size = st.size,
+        .mtime_ns = st.mtime.toNanoseconds(),
+        .mode = st.permissions.toMode(),
+    };
+}
+
+fn layerCacheable(obs: LayerObs, path: ?[]const u8) bool {
+    if (obs.kind == .unreadable) return false;
+    if (obs.coarse()) return false;
+    if (path) |p| if (p.len > merged_cache_path_max) return false;
+    return true;
+}
+
+const MergedCache = struct {
+    var mu: std.Io.Mutex = .init;
+    var occupied: bool = false;
+    var user_path_buf: [merged_cache_path_max]u8 = undefined;
+    var user_path_len: usize = 0;
+    var user_path_set: bool = false;
+    var project_path_buf: [merged_cache_path_max]u8 = undefined;
+    var project_path_len: usize = 0;
+    var project_path_set: bool = false;
+    var user_obs: LayerObs = .{ .kind = .absent };
+    var project_obs: LayerObs = .{ .kind = .absent };
+    var store: Store = .{};
+    var corrupt: bool = false;
+
+    fn clear(runtime_io: std.Io) void {
+        mu.lockUncancelable(runtime_io);
+        defer mu.unlock(runtime_io);
+        clearLocked();
+    }
+
+    fn clearLocked() void {
+        store.deinit(std.heap.page_allocator);
+        occupied = false;
+        user_path_len = 0;
+        user_path_set = false;
+        project_path_len = 0;
+        project_path_set = false;
+        user_obs = .{ .kind = .absent };
+        project_obs = .{ .kind = .absent };
+        corrupt = false;
+    }
+
+    fn pathsMatchLocked(user_path: ?[]const u8, project_path: ?[]const u8) bool {
+        if (!pathSlotMatch(user_path_set, user_path_buf[0..user_path_len], user_path)) return false;
+        if (!pathSlotMatch(project_path_set, project_path_buf[0..project_path_len], project_path)) return false;
+        return true;
+    }
+
+    fn copyIfHit(
+        runtime_io: std.Io,
+        gpa: std.mem.Allocator,
+        user_path: ?[]const u8,
+        project_path: ?[]const u8,
+        user_id: LayerObs,
+        project_id: LayerObs,
+    ) !?LoadOutcome {
+        if (!layerCacheable(user_id, user_path) or !layerCacheable(project_id, project_path)) return null;
+        mu.lockUncancelable(runtime_io);
+        defer mu.unlock(runtime_io);
+        if (!occupied) return null;
+        if (!pathsMatchLocked(user_path, project_path)) return null;
+        if (!LayerObs.eql(user_obs, user_id) or !LayerObs.eql(project_obs, project_id)) return null;
+        const copy = try cloneStore(gpa, store);
+        if (builtin.is_test) testing_merged_cache_hits += 1;
+        return .{ .store = copy, .corrupt = corrupt };
+    }
+
+    fn put(
+        runtime_io: std.Io,
+        user_path: ?[]const u8,
+        project_path: ?[]const u8,
+        user_id: LayerObs,
+        project_id: LayerObs,
+        outcome: LoadOutcome,
+    ) void {
+        mu.lockUncancelable(runtime_io);
+        defer mu.unlock(runtime_io);
+        const can_cache = layerCacheable(user_id, user_path) and layerCacheable(project_id, project_path);
+        if (!can_cache) {
+            if (pathsMatchLocked(user_path, project_path)) clearLocked();
+            return;
+        }
+        const cloned = cloneStore(std.heap.page_allocator, outcome.store) catch {
+            clearLocked();
+            return;
+        };
+        clearLocked();
+        writePathSlot(&user_path_buf, &user_path_len, &user_path_set, user_path);
+        writePathSlot(&project_path_buf, &project_path_len, &project_path_set, project_path);
+        user_obs = user_id;
+        project_obs = project_id;
+        store = cloned;
+        corrupt = outcome.corrupt;
+        occupied = true;
+    }
+};
+
+fn pathSlotMatch(set: bool, stored: []const u8, path: ?[]const u8) bool {
+    if (path) |p| {
+        if (!set) return false;
+        return std.mem.eql(u8, stored, p);
+    }
+    return !set;
+}
+
+fn writePathSlot(buf: *[merged_cache_path_max]u8, len: *usize, set: *bool, path: ?[]const u8) void {
+    if (path) |p| {
+        @memcpy(buf[0..p.len], p);
+        len.* = p.len;
+        set.* = true;
+    } else {
+        len.* = 0;
+        set.* = false;
+    }
+}
+
+fn cloneStore(gpa: std.mem.Allocator, src: Store) !Store {
+    if (src.entries.len == 0) return .{ .entries = &.{}, .owned = false };
+    const entries = try gpa.alloc(PermanentEntry, src.entries.len);
+    errdefer gpa.free(entries);
+    var n: usize = 0;
+    errdefer for (entries[0..n]) |e| freeEntry(gpa, e);
+    for (src.entries) |e| {
+        entries[n] = try cloneEntry(gpa, e);
+        n += 1;
+    }
+    return .{ .entries = entries, .owned = true };
+}
+
 pub fn loadMerged(
+    runtime_io: std.Io,
+    gpa: std.mem.Allocator,
+    user_path: ?[]const u8,
+    project_path: ?[]const u8,
+) !LoadOutcome {
+    const user_id = observeLayer(runtime_io, user_path);
+    const project_id = observeLayer(runtime_io, project_path);
+    if (try MergedCache.copyIfHit(runtime_io, gpa, user_path, project_path, user_id, project_id)) |hit| {
+        return hit;
+    }
+    const outcome = try loadMergedUncached(runtime_io, gpa, user_path, project_path);
+    MergedCache.put(runtime_io, user_path, project_path, user_id, project_id, outcome);
+    return outcome;
+}
+
+fn loadMergedUncached(
     runtime_io: std.Io,
     gpa: std.mem.Allocator,
     user_path: ?[]const u8,
@@ -229,161 +410,6 @@ pub fn loadMerged(
         .store = .{ .entries = entries, .owned = true },
         .corrupt = corrupt,
     };
-}
-
-const FileStamp = struct {
-    exists: bool,
-    inode: std.Io.File.INode,
-    size: u64,
-    mtime_ns: i96,
-};
-
-const MergedCache = struct {
-    user_path: []u8,
-    user_stamp: FileStamp,
-    project_path: []u8,
-    project_stamp: FileStamp,
-    entries: []PermanentEntry,
-    corrupt: bool,
-};
-
-// Zig 0.16: std.atomic.Mutex (not Thread.Mutex).
-var merged_cache_mu: std.atomic.Mutex = .unlocked;
-var merged_cache: ?MergedCache = null;
-
-fn lockMergedCache() void {
-    while (!merged_cache_mu.tryLock()) {
-        std.atomic.spinLoopHint();
-    }
-}
-
-fn missingStamp() FileStamp {
-    return .{ .exists = false, .inode = 0, .size = 0, .mtime_ns = 0 };
-}
-
-fn stampPath(runtime_io: std.Io, path: ?[]const u8) FileStamp {
-    const p = path orelse return missingStamp();
-    const file = std.Io.Dir.cwd().openFile(runtime_io, p, .{}) catch return missingStamp();
-    defer file.close(runtime_io);
-    const st = file.stat(runtime_io) catch return missingStamp();
-    return .{
-        .exists = true,
-        .inode = st.inode,
-        .size = st.size,
-        .mtime_ns = st.mtime.nanoseconds,
-    };
-}
-
-fn stampsEqual(a: FileStamp, b: FileStamp) bool {
-    return a.exists == b.exists and a.inode == b.inode and a.size == b.size and a.mtime_ns == b.mtime_ns;
-}
-
-fn pathOrEmpty(path: ?[]const u8) []const u8 {
-    return path orelse "";
-}
-
-fn freeMergedCacheLocked() void {
-    const gpa = std.heap.page_allocator;
-    if (merged_cache) |*old| {
-        gpa.free(old.user_path);
-        gpa.free(old.project_path);
-        for (old.entries) |e| freeEntry(gpa, e);
-        if (old.entries.len > 0) gpa.free(old.entries);
-        merged_cache = null;
-    }
-}
-
-pub fn resetMergedCacheForTests() void {
-    lockMergedCache();
-    defer merged_cache_mu.unlock();
-    freeMergedCacheLocked();
-}
-
-fn cloneStoreEntries(gpa: std.mem.Allocator, entries: []const PermanentEntry) ![]PermanentEntry {
-    if (entries.len == 0) return &.{};
-    const out = try gpa.alloc(PermanentEntry, entries.len);
-    var n: usize = 0;
-    errdefer {
-        for (out[0..n]) |e| freeEntry(gpa, e);
-        gpa.free(out);
-    }
-    for (entries, 0..) |e, i| {
-        out[i] = try cloneEntry(gpa, e);
-        n += 1;
-    }
-    return out;
-}
-
-fn storeMergedCache(
-    user_path: ?[]const u8,
-    user_stamp: FileStamp,
-    project_path: ?[]const u8,
-    project_stamp: FileStamp,
-    outcome: LoadOutcome,
-) void {
-    const gpa = std.heap.page_allocator;
-    const user_owned = gpa.dupe(u8, pathOrEmpty(user_path)) catch return;
-    const project_owned = gpa.dupe(u8, pathOrEmpty(project_path)) catch {
-        gpa.free(user_owned);
-        return;
-    };
-    const entries_owned = cloneStoreEntries(gpa, outcome.store.entries) catch {
-        gpa.free(user_owned);
-        gpa.free(project_owned);
-        return;
-    };
-    lockMergedCache();
-    defer merged_cache_mu.unlock();
-    freeMergedCacheLocked();
-    merged_cache = .{
-        .user_path = user_owned,
-        .user_stamp = user_stamp,
-        .project_path = project_owned,
-        .project_stamp = project_stamp,
-        .entries = entries_owned,
-        .corrupt = outcome.corrupt,
-    };
-}
-
-fn cloneFromMergedCache(
-    gpa: std.mem.Allocator,
-    user_path: ?[]const u8,
-    user_stamp: FileStamp,
-    project_path: ?[]const u8,
-    project_stamp: FileStamp,
-) ?LoadOutcome {
-    lockMergedCache();
-    defer merged_cache_mu.unlock();
-    const cached = merged_cache orelse return null;
-    if (!std.mem.eql(u8, cached.user_path, pathOrEmpty(user_path))) return null;
-    if (!std.mem.eql(u8, cached.project_path, pathOrEmpty(project_path))) return null;
-    if (!stampsEqual(cached.user_stamp, user_stamp)) return null;
-    if (!stampsEqual(cached.project_stamp, project_stamp)) return null;
-    const entries = cloneStoreEntries(gpa, cached.entries) catch return null;
-    return .{
-        .store = .{
-            .entries = entries,
-            .owned = entries.len > 0,
-        },
-        .corrupt = cached.corrupt,
-    };
-}
-
-/// Product evaluate cache: skip TOML re-parse when both allowlist files are
-/// unchanged (inode/size/mtime). A changed file — including revocation —
-/// misses and reloads. CLI mutation paths keep using `loadMerged`.
-pub fn loadMergedCached(
-    runtime_io: std.Io,
-    gpa: std.mem.Allocator,
-    user_path: ?[]const u8,
-    project_path: ?[]const u8,
-) !LoadOutcome {
-    const user_stamp = stampPath(runtime_io, user_path);
-    const project_stamp = stampPath(runtime_io, project_path);
-    if (cloneFromMergedCache(gpa, user_path, user_stamp, project_path, project_stamp)) |hit| return hit;
-    const outcome = try loadMerged(runtime_io, gpa, user_path, project_path);
-    storeMergedCache(user_path, user_stamp, project_path, project_stamp, outcome);
-    return outcome;
 }
 
 fn absorbLayer(
@@ -750,7 +776,29 @@ const ParseError = error{
     OutOfMemory,
 };
 
+var testing_parse_toml_count: u32 = 0;
+var testing_merged_cache_hits: u32 = 0;
+
+/// Test-only counters for the in-process loadMerged cache. Product builds
+/// see an empty namespace so the symbols cannot be used as a side channel.
+pub const cache_test = if (builtin.is_test) struct {
+    pub fn reset(runtime_io: std.Io) void {
+        testing_parse_toml_count = 0;
+        testing_merged_cache_hits = 0;
+        MergedCache.clear(runtime_io);
+    }
+
+    pub fn parseTomlCount() u32 {
+        return testing_parse_toml_count;
+    }
+
+    pub fn mergedCacheHits() u32 {
+        return testing_merged_cache_hits;
+    }
+} else struct {};
+
 fn parseToml(gpa: std.mem.Allocator, raw: []const u8, layer: Layer) ParseError!Store {
+    if (builtin.is_test) testing_parse_toml_count += 1;
     var list: std.ArrayListUnmanaged(PermanentEntry) = .empty;
     errdefer {
         for (list.items) |e| freeEntry(gpa, e);
@@ -1737,41 +1785,169 @@ test "s2-store: empty path layers merge cleanly" {
     try testing.expectEqual(@as(usize, 0), merged.store.entries.len);
 }
 
-test "s2-store: loadMergedCached invalidates after revocation rewrite" {
-    resetMergedCacheForTests();
-    defer resetMergedCacheForTests();
+// ── loadMerged in-process cache (raw layers; deep copy; no last-good) ────────
 
+const s2_cache_user_toml =
+    \\schema_version = 1
+    \\
+    \\[[entries]]
+    \\kind = "command"
+    \\command = "git status"
+    \\reason = "s2-store-cache user command marker"
+    \\created_at = "2026-07-25T12:00:00Z"
+    \\scope = "user"
+    \\
+;
+
+const s2_cache_project_toml =
+    \\schema_version = 1
+    \\
+    \\[[entries]]
+    \\kind = "command"
+    \\command = "npm test"
+    \\reason = "s2-store-cache project command stays raw"
+    \\created_at = "2026-07-25T12:00:00Z"
+    \\scope = "project"
+    \\
+    \\[[entries]]
+    \\kind = "rule"
+    \\id = "core.git:reset-hard"
+    \\reason = "s2-store-cache project rule marker"
+    \\created_at = "2026-07-25T12:00:00Z"
+    \\scope = "project"
+    \\
+;
+
+test "s2-store: second loadMerged does not re-parse unchanged files" {
+    cache_test.reset(io);
     var tmp = try tmpRoot();
     defer {
         allocator.free(tmp.path);
         tmp.dir.cleanup();
     }
-    const project_path = try joinPath(tmp.path, "project-allowlist.toml");
+    const user_path = try joinPath(tmp.path, "user.toml");
+    defer allocator.free(user_path);
+    const project_path = try joinPath(tmp.path, "project.toml");
     defer allocator.free(project_path);
+    try writeFileAbsolute(user_path, s2_cache_user_toml);
+    try writeFileAbsolute(project_path, s2_cache_project_toml);
 
-    try addEntry(io, allocator, project_path, .project, .{
-        .kind = .rule,
-        .id = "core.git:reset-hard",
-        .reason = "temporary project exception for reset-hard",
-        .created_at = "2026-07-25T10:00:00Z",
-    }, null);
+    var first = try loadMerged(io, allocator, user_path, project_path);
+    defer first.store.deinit(allocator);
+    try testing.expect(!first.corrupt);
+    const parsed_after_first = cache_test.parseTomlCount();
+    try testing.expect(parsed_after_first > 0);
+    const hits_after_first = cache_test.mergedCacheHits();
 
-    {
-        var first = try loadMergedCached(io, allocator, null, project_path);
-        defer first.store.deinit(allocator);
-        try testing.expect(!first.corrupt);
-        try testing.expect(first.store.matchRule("core.git:reset-hard", far_future) != null);
+    var second = try loadMerged(io, allocator, user_path, project_path);
+    defer second.store.deinit(allocator);
+    try testing.expect(!second.corrupt);
+    try testing.expectEqual(parsed_after_first, cache_test.parseTomlCount());
+    try testing.expectEqual(hits_after_first + 1, cache_test.mergedCacheHits());
+    try testing.expect(second.store.matchCommand("git status", far_future) != null);
+    try testing.expect(second.store.matchCommand("npm test", far_future) != null);
+}
+
+test "s2-store: loadMerged cache returns a deep copy" {
+    cache_test.reset(io);
+    var tmp = try tmpRoot();
+    defer {
+        allocator.free(tmp.path);
+        tmp.dir.cleanup();
     }
-    {
-        var cached = try loadMergedCached(io, allocator, null, project_path);
-        defer cached.store.deinit(allocator);
-        try testing.expect(cached.store.matchRule("core.git:reset-hard", far_future) != null);
+    const path = try joinPath(tmp.path, "user.toml");
+    defer allocator.free(path);
+    try writeFileAbsolute(path, s2_cache_user_toml);
+
+    var first = try loadMerged(io, allocator, path, null);
+    var second = try loadMerged(io, allocator, path, null);
+    defer second.store.deinit(allocator);
+
+    try testing.expect(first.store.owned);
+    try testing.expect(second.store.owned);
+    try testing.expect(first.store.entries.ptr != second.store.entries.ptr);
+    try testing.expectEqualStrings(first.store.entries[0].reason, second.store.entries[0].reason);
+    try testing.expect(first.store.entries[0].reason.ptr != second.store.entries[0].reason.ptr);
+
+    first.store.deinit(allocator);
+    try testing.expect(second.store.matchCommand("git status", far_future) != null);
+    try testing.expectEqualStrings("s2-store-cache user command marker", second.store.entries[0].reason);
+}
+
+test "s2-store: loadMerged cache keeps raw project kind=command" {
+    cache_test.reset(io);
+    var tmp = try tmpRoot();
+    defer {
+        allocator.free(tmp.path);
+        tmp.dir.cleanup();
     }
+    const project_path = try joinPath(tmp.path, "project.toml");
+    defer allocator.free(project_path);
+    try writeFileAbsolute(project_path, s2_cache_project_toml);
 
-    const removed = try removeEntry(io, allocator, project_path, .project, "core.git:reset-hard");
-    try testing.expect(removed);
+    var first = try loadMerged(io, allocator, null, project_path);
+    defer first.store.deinit(allocator);
+    const parsed_after_first = cache_test.parseTomlCount();
+    try testing.expect(first.store.matchCommand("npm test", far_future) != null);
 
-    var after = try loadMergedCached(io, allocator, null, project_path);
-    defer after.store.deinit(allocator);
-    try testing.expect(after.store.matchRule("core.git:reset-hard", far_future) == null);
+    var second = try loadMerged(io, allocator, null, project_path);
+    defer second.store.deinit(allocator);
+
+    try testing.expect(second.store.matchCommand("npm test", far_future) != null);
+    try testing.expect(second.store.matchRule("core.git:reset-hard", far_future) != null);
+    try testing.expectEqual(parsed_after_first, cache_test.parseTomlCount());
+    try testing.expect(cache_test.mergedCacheHits() >= 1);
+}
+
+test "s2-store: same-size corrupt replace is empty+corrupt not last-good" {
+    cache_test.reset(io);
+    var tmp = try tmpRoot();
+    defer {
+        allocator.free(tmp.path);
+        tmp.dir.cleanup();
+    }
+    const path = try joinPath(tmp.path, "user.toml");
+    defer allocator.free(path);
+    try writeFileAbsolute(path, s2_cache_user_toml);
+
+    var first = try loadMerged(io, allocator, path, null);
+    defer first.store.deinit(allocator);
+    try testing.expect(!first.corrupt);
+    try testing.expect(first.store.matchCommand("git status", far_future) != null);
+
+    const garbage = try allocator.alloc(u8, s2_cache_user_toml.len);
+    defer allocator.free(garbage);
+    @memset(garbage, 'x');
+    try writeFileAbsolute(path, garbage);
+    try testing.expectEqual(s2_cache_user_toml.len, garbage.len);
+
+    var second = try loadMerged(io, allocator, path, null);
+    defer second.store.deinit(allocator);
+    try testing.expect(second.corrupt);
+    try testing.expectEqual(@as(usize, 0), second.store.entries.len);
+    try testing.expect(second.store.matchCommand("git status", far_future) == null);
+}
+
+test "s2-store: unlink after cache hit is empty not last-good" {
+    cache_test.reset(io);
+    var tmp = try tmpRoot();
+    defer {
+        allocator.free(tmp.path);
+        tmp.dir.cleanup();
+    }
+    const path = try joinPath(tmp.path, "user.toml");
+    defer allocator.free(path);
+    try writeFileAbsolute(path, s2_cache_user_toml);
+
+    var first = try loadMerged(io, allocator, path, null);
+    defer first.store.deinit(allocator);
+    try testing.expect(first.store.matchCommand("git status", far_future) != null);
+
+    try std.Io.Dir.cwd().deleteFile(io, path);
+
+    var second = try loadMerged(io, allocator, path, null);
+    defer second.store.deinit(allocator);
+    try testing.expect(!second.corrupt);
+    try testing.expectEqual(@as(usize, 0), second.store.entries.len);
+    try testing.expect(second.store.matchCommand("git status", far_future) == null);
 }
