@@ -1,0 +1,159 @@
+{
+  "repo": "christopherkarani/ryk",
+  "pin": "430c13e6",
+  "date": "2026-08-16",
+  "note": "Apply with issues:write. This agent's token returned 403 on comment and label PATCH.",
+  "promote": [
+    {
+      "number": 398,
+      "labels": ["enhancement", "triage:confirmed", "ready-for-eng", "agent-filed", "area:cli", "priority:p0"],
+      "comment": "**Triage: confirmed → ready-for-eng (P0). No factory:auto.**\n\nStatic confirm: PreToolUse still pays JSON parse → `resolveWorkspaceRoot` → `discoverPolicy` → pack/allowlist loads → evaluate before the hook response. Policy byte cache + lazy pack compile already landed; hook is still one-shot per process, so in-process cache does not amortize across invocations.\n\nRemaining: long-lived evaluator, or reorder cheap rejects without weakening fail-closed / M-9 workspace binding. Superset of #391 / #392 / #397 / #399.\n\n**No factory:auto.** Architecture + security sequencing."
+    },
+    {
+      "number": 397,
+      "labels": ["enhancement", "triage:confirmed", "ready-for-eng", "factory:auto", "agent-filed", "area:cli", "area:security", "priority:p0"],
+      "comment": "**Triage: confirmed → ready-for-eng + factory:auto (P0)**\n\nStatic confirm: 86 packs / 830 safe / 794 destructive (1624) still match `oracle_packs.json`. Upfront compile of all 1624 is already fixed (`ensurePatternCompiled` is lazy). First init still gzip-inflates the full oracle and scans pack object boundaries; hook `default_packs_only` materializes the 4 default packs only.\n\nScope: default-pack-only embed/catalog so hook cold start skips full-oracle inflate. Do not change match semantics."
+    },
+    {
+      "number": 394,
+      "labels": ["enhancement", "triage:confirmed", "ready-for-eng", "agent-filed", "area:cli", "priority:p0"],
+      "comment": "**Triage: confirmed → ready-for-eng (P0). No factory:auto.**\n\nStatic confirm: `SessionWriter.appendEvent` still `events_file.sync` on every event. Full-chain `readExistingState` is **not** every append — only when `stat` size != `synced_size` (shim interleave).\n\nRemaining is a product durability tradeoff (batch/async fsync vs P0-5 hash-chain). Do not auto-drop fsync.\n\n**No factory:auto.**"
+    },
+    {
+      "number": 396,
+      "labels": ["enhancement", "triage:confirmed", "ready-for-eng", "factory:auto", "agent-filed", "area:cli", "area:security", "priority:p1"],
+      "comment": "**Triage: confirmed → ready-for-eng + factory:auto (P1)**\n\nStatic confirm: each candidate still `evalOne` → `matchDeny` on raw + normalized; each is a full active-pack walk (keyword/prefix gated, lazy compile). Compound `; | $()` multiplies candidates.\n\nScope: share match state / short-circuit after first global deny. Golden corpus must stay green. Do not skip hidden segments."
+    },
+    {
+      "number": 392,
+      "labels": ["enhancement", "triage:confirmed", "ready-for-eng", "factory:auto", "agent-filed", "area:cli", "area:security", "priority:p1"],
+      "comment": "**Triage: confirmed → ready-for-eng + factory:auto (P1)**\n\nStatic confirm: `zigEvaluator` → `loadPackIdsForWorkspace` re-reads/parses TOML every eval; project scope may also `mergeUserBaselineDisabled`. No mtime cache (unlike policy file cache).\n\nScope: process-local cache keyed by path+mtime. Fail-closed on unreadable/oversized config unchanged."
+    },
+    {
+      "number": 391,
+      "labels": ["enhancement", "triage:confirmed", "ready-for-eng", "factory:auto", "agent-filed", "area:cli", "area:security", "priority:p1"],
+      "comment": "**Triage: confirmed → ready-for-eng + factory:auto (P1)**\n\nStatic confirm: `loadProductShellStores` → `loadMerged` reads+TOML-parses user and project allowlists every `zigEvaluator`. No cache.\n\nScope: mtime/inode cache with same corrupt fail-closed. Distinct from #425 (strip rebuild) and #417 (linear match)."
+    },
+    {
+      "number": 404,
+      "labels": ["enhancement", "triage:confirmed", "ready-for-eng", "agent-filed", "area:cli", "area:security", "priority:p1"],
+      "comment": "**Triage: confirmed → ready-for-eng (P1). No factory:auto.**\n\nStatic confirm: double lock/load on consume is already fixed (P001 single `matchAllowOnce` pass). Remaining: `writeAllowOnceFile` still full JSONL rewrite + temp `sync` + rename.\n\nScope: tombstone/append consume + compaction. Keep single-use + 0600 + M-15 restore.\n\n**No factory:auto.** Durability / single-use semantics."
+    },
+    {
+      "number": 402,
+      "labels": ["enhancement", "triage:confirmed", "ready-for-eng", "factory:auto", "agent-filed", "area:cli", "area:ux", "priority:p1"],
+      "comment": "**Triage: confirmed → ready-for-eng + factory:auto (P1)**\n\nStatic confirm: `loadRecentFromPath` tail-reads, dupes each line, `parseFromSlice` Value, per-field dupes. Distinct from #437 (O(S×F) enrich). Both real.\n\nScope: parse into struct without Value tree; optional index before enrich. Do not change feed schema."
+    },
+    {
+      "number": 395,
+      "labels": ["enhancement", "triage:confirmed", "ready-for-eng", "agent-filed", "area:cli", "priority:p1"],
+      "comment": "**Triage: confirmed → ready-for-eng (P1). No factory:auto.**\n\nStatic confirm: `appendRecordAtPath` exclusive lock + flush + `sync`; `appendRecordBestEffort` also writes the global dashboard (second lock+fsync). Called from hook/shell_eval before return.\n\nScope: background/coalesce best-effort feed; do not silently drop lock ordering/rotation.\n\n**No factory:auto.**"
+    },
+    {
+      "number": 417,
+      "labels": ["enhancement", "triage:confirmed", "ready-for-eng", "factory:auto", "agent-filed", "area:cli", "area:security", "priority:p2"],
+      "comment": "**Triage: confirmed → ready-for-eng + factory:auto (P2)**\n\nStatic confirm: `matchCommand`/`matchRule` linear scan; `collectPermanentRuleSkipIds` walks all entries every eval. #425 shrinks command entries at load, not the rule-skip scan.\n\nScope: hash maps at load. Same equality/expiry. Keep 1MB file cap."
+    },
+    {
+      "number": 401,
+      "labels": ["enhancement", "triage:confirmed", "ready-for-eng", "agent-filed", "area:cli", "area:security", "priority:p2"],
+      "comment": "**Triage: confirmed → ready-for-eng (P2). No factory:auto.**\n\nStatic confirm: `globMatchAt` `*` backtracks every next index. Typical trailing `*` is O(n+m); separated multi-star is O(n^k), not generic exponential. Issue overstated the common case; adversarial patterns still real.\n\nScope: DP glob or cap/reject multi-internal-`*`. Preserve overflow→match fail-closed.\n\n**No factory:auto.**"
+    },
+    {
+      "number": 400,
+      "labels": ["enhancement", "triage:confirmed", "ready-for-eng", "factory:auto", "agent-filed", "area:cli", "area:security", "priority:p2"],
+      "comment": "**Triage: confirmed → ready-for-eng + factory:auto (P2)**\n\nStatic confirm: `matchesCommand` reserves two 16KiB stack buffers every call; memcpy only when normalize runs. `findMatch` is one frame per rule, not stacked 16KB×N.\n\nScope: fast-path without large locals; normalize command once per eval. Preserve overflow→match."
+    },
+    {
+      "number": 362,
+      "labels": ["bug", "triage:confirmed", "ready-for-eng", "factory:auto", "agent-filed", "area:zig", "priority:p2"],
+      "comment": "**Triage: confirmed → ready-for-eng + factory:auto (P2)**\n\nStatic confirm: `getSelectedLabels` dupes then `append` with no errdefer. `list.deinit` does not free elements. No production callers (test-only) — still a broken ownership contract.\n\nScope: `errdefer allocator.free(owned)` before append."
+    },
+    {
+      "number": 373,
+      "labels": ["bug", "triage:confirmed", "ready-for-eng", "factory:auto", "agent-filed", "area:zig", "priority:p2"],
+      "comment": "**Triage: confirmed → ready-for-eng + factory:auto (P2)**\n\nStatic confirm: `SessionApprovals.allowForSession` appends with no max cap; `contains` is linear. M001 dual-dupe is already errdefer-fixed.\n\nScope: cap/ring + evict oldest. Do not change allow-session semantics for in-cap entries."
+    },
+    {
+      "number": 371,
+      "labels": ["bug", "triage:confirmed", "ready-for-eng", "factory:auto", "agent-filed", "area:zig", "priority:p2"],
+      "comment": "**Triage: confirmed → ready-for-eng + factory:auto (P2)**\n\nStatic confirm: `State.record` appends `audit_events` with no cap; `deinit` frees the list buffer only (payloads are static). `snapshotAuditEvents` dupes the whole slice.\n\nScope: ring/max. Do not change audit kind/reason codes."
+    },
+    {
+      "number": 364,
+      "labels": ["bug", "triage:confirmed", "ready-for-eng", "factory:auto", "agent-filed", "area:zig", "priority:p2"],
+      "comment": "**Triage: confirmed → ready-for-eng + factory:auto (P2)**\n\nStatic confirm: prompt-secret path `redactions.append(.{ .field = dupe(\"prompt\"), .reason = dupe(...) })` with no errdefer between dupes (`hook.zig` ~1232).\n\nScope: errdefer / static slices for literals. Same class as #365."
+    },
+    {
+      "number": 365,
+      "labels": ["bug", "triage:confirmed", "ready-for-eng", "factory:auto", "agent-filed", "area:zig", "priority:p2"],
+      "comment": "**Triage: confirmed → ready-for-eng + factory:auto (P2)**\n\nStatic confirm: `recordDaemonMetadataRedaction` dual-dupe in one append, no errdefer (`hook.zig` ~1741).\n\nScope: errdefer or static reason. Pair with #364."
+    },
+    {
+      "number": 405,
+      "labels": ["enhancement", "triage:confirmed", "ready-for-eng", "agent-filed", "area:cli", "area:security", "priority:p2"],
+      "comment": "**Triage: confirmed → ready-for-eng (P2). No factory:auto.**\n\nStatic confirm: `zigEvaluator` still `synthesizeDaemonResponseFromZig` → `Stringify.valueAlloc` then `parseFromSlice(DaemonResponse)`. In-process Zig backend pays encode/decode for daemon-shaped compatibility.\n\nScope: return Evaluation/DaemonResponse without JSON. Must keep hook/decide field contract.\n\n**No factory:auto.**"
+    },
+    {
+      "number": 406,
+      "labels": ["enhancement", "triage:confirmed", "ready-for-eng", "agent-filed", "area:cli", "priority:p2"],
+      "comment": "**Triage: confirmed → ready-for-eng (P2). No factory:auto.**\n\nStatic confirm: informational and enforcement paths still dupe limitation strings and `writeHookResponse` stringify every call.\n\nScope: intern static limitation strings; reuse buffers. Do not change host JSON shapes.\n\n**No factory:auto.**"
+    },
+    {
+      "number": 399,
+      "labels": ["enhancement", "triage:confirmed", "ready-for-eng", "agent-filed", "area:cli", "priority:p2"],
+      "comment": "**Triage: confirmed → ready-for-eng (P2). No factory:auto.**\n\nStatic confirm: `resolveWorkspaceRoot` realPath + per-level `.git` and `.ryk/policy.yaml` access. Component of #398; still residual when `workspace_root` is null (`shell_eval` M-9 comment).\n\nScope: pass bound workspace from hook/run; cache walk in-process. Do not weaken M-9 (nested marker hijack).\n\n**No factory:auto.**"
+    }
+  ],
+  "close": [
+    {
+      "number": 280,
+      "state": "closed",
+      "state_reason": "completed",
+      "labels": ["bug", "agent-filed", "area:cli", "priority:p2"],
+      "comment": "**Triage: not-real — not sending to engineering.**\n\nCurrent `init.zig` returns `exit_codes.general` on `PathAlreadyExists`; unit test asserts second run exits 1. Claim that `ryk init` exits 0 when policy exists is stale vs main."
+    },
+    {
+      "number": 287,
+      "state": "closed",
+      "state_reason": "not_planned",
+      "labels": ["bug", "agent-filed", "area:cli", "priority:p1"],
+      "comment": "**Triage: overstated — not sending to engineering.**\n\n`--json` + `ready:false` + exit 0 is intentional (`readiness.exitCode` only gates in `--check`). Documented in help and `docs/cli-reference.md`. CI gate is `ryk doctor --check` / `--check --json`."
+    },
+    {
+      "number": 294,
+      "state": "closed",
+      "state_reason": "not_planned",
+      "labels": ["agent-filed", "area:zig", "area:security", "priority:p1"],
+      "comment": "**Triage: not-real — not sending to engineering.**\n\n`defaultClient()` selects production on `builtin.os.tag == .macos`. FM layer never calls the client on `.block` (`shell_eval_fm.zig`). Stub cannot soften deny. Compile-time assert would be defense-in-depth only, not a live bug."
+    },
+    {
+      "number": 298,
+      "state": "closed",
+      "state_reason": "completed",
+      "labels": ["agent-filed", "area:zig", "area:security", "priority:p1"],
+      "comment": "**Triage: already-fixed — not sending to engineering.**\n\nFeed write path uses `core_api.redactAlloc` / `redactStringBounded` → `audit.redact_bridge`. `tests/dashboard_feed_redaction.zig` asserts secrets do not persist. No remaining drift vs audit."
+    },
+    {
+      "number": 299,
+      "state": "closed",
+      "state_reason": "not_planned",
+      "labels": ["agent-filed", "area:security", "priority:p1"],
+      "comment": "**Triage: not-real — not sending to engineering.**\n\nCheck path resolves then discards secrets; messages use `safeErrorClass` / static strings. Tests in `src/intercept/credentials.zig` and `src/cli/plugin.zig` assert no raw prefixes. No current leak path."
+    },
+    {
+      "number": 302,
+      "state": "closed",
+      "state_reason": "completed",
+      "labels": ["agent-filed", "area:zig", "area:security", "priority:p1"],
+      "comment": "**Triage: already-fixed — not sending to engineering.**\n\nSeatbelt profile render failure → `.failed`. `--os-sandbox on` and child attach failures fail closed (`RequireFailed`, no unboxed launch). `--os-sandbox auto` prepare-time degrade is a loud WARNING by product design, not a silent escape."
+    },
+    {
+      "number": 311,
+      "state": "closed",
+      "state_reason": "not_planned",
+      "labels": ["agent-filed", "area:ux", "area:security", "priority:p1"],
+      "comment": "**Triage: overstated — not sending to engineering.**\n\nAsk/no-resume is a documented host-capability matrix (`docs/integrations/host-decision-mapping.md`) plus `ryk doctor --deadlock-check`. Not a missing enforcement bug. Optional launch-warn/doctor column is UX polish, not P1 ready-for-eng."
+    }
+  ]
+}

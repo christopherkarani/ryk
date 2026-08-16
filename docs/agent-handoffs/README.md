@@ -4,6 +4,8 @@
 **Triage date:** 2026-08-16  
 **Method:** three adversarial explore agents + dependency analyst against current source (not issue text).
 
+**Wave 2 (2026-08-16):** PERF/MEM/security `needs-triage` review — 20 confirmed → ready-for-eng, 7 rejected. See [wave-2-ready-for-eng.md](wave-2-ready-for-eng.md).
+
 ## Verdict summary
 
 | Issue | Verdict | Action |
