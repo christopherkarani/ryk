@@ -77,6 +77,25 @@ These four packs do not share choke-point files and can start together:
 - [phases/phase-2.md](phases/phase-2.md) — help / copy
 - [phases/phase-3.md](phases/phase-3.md) — polish
 
+## Related-issue tags (`cluster:*`)
+
+Validated open work is grouped so agents can see siblings. Each cluster shares one GitHub label. Index: [issues/CLUSTERS.md](issues/CLUSTERS.md). Machine file: [`.github/issue-clusters.json`](../../.github/issue-clusters.json).
+
+| Label | Issues |
+| --- | --- |
+| `cluster:mcp-memory` | #451 #347 #363 #385 |
+| `cluster:redaction` | #366 #364 #365 |
+| `cluster:files-index` | #376 #375 #384 |
+| `cluster:doctor-start` | #205 #218 |
+| `cluster:cli-chrome` | #215 #207 #208 #216 #239 |
+| `cluster:stop-plugins` | #345 #206 |
+| `cluster:errdefer` | #367 #374 #378 #379 #383 |
+| `cluster:gateway-audit` | #371 |
+| `cluster:release-signing` | #326 |
+| `cluster:mcp-docs` | #317 |
+
+Stamp labels: `GITHUB_ISSUES_TOKEN=… ./scripts/apply-issue-clusters.sh`
+
 ## Kickoff Canvas
 
 Interactive one-button launcher: [`ryk-issue-kickoff.canvas.tsx`](ryk-issue-kickoff.canvas.tsx) (also written to the Cursor canvases directory for live Kick off agent buttons). Each button opens a Composer chat with the pack prompt preloaded and @mentions the canvas.

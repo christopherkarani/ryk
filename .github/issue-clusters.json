@@ -1,0 +1,112 @@
+{
+  "clusters": {
+    "mcp-memory": {
+      "label": "cluster:mcp-memory",
+      "color": "6F42C1",
+      "description": "MCP proxy/tools ownership (UAF, dual-dupe)",
+      "summary": "MCP JSON/tool ownership bugs. #451 is in flight (PR #454) on requestServerForClient. #347 is the same proxy file — wait for #451 or stack on it. #363 and #385 are src/mcp/tools.zig and can be one PR in parallel with proxy work.",
+      "issues": [451, 347, 363, 385],
+      "primary_files": ["src/mcp/proxy.zig", "src/mcp/tools.zig", "src/mcp/jsonrpc.zig"],
+      "coordinate": "sequential-proxy",
+      "conflicts_with": [],
+      "in_flight": [451]
+    },
+    "redaction": {
+      "label": "cluster:redaction",
+      "color": "B60205",
+      "description": "Secret redaction dual-dupe / missing errdefer",
+      "summary": "Same dual-dupe pattern on secret text in decide + hook. One agent, one PR. Do not weaken redaction or fail-closed.",
+      "issues": [366, 364, 365],
+      "primary_files": ["src/cli/decide.zig", "src/cli/hook.zig"],
+      "coordinate": "one-pr",
+      "conflicts_with": []
+    },
+    "files-index": {
+      "label": "cluster:files-index",
+      "color": "0E8A16",
+      "description": "Staged-files index multi-field ownership",
+      "summary": "StagedEntry / index.upsert builds several owned fields before errdefer entry.deinit. Fix stage-write, stage-delete, and loadIndex together.",
+      "issues": [376, 375, 384],
+      "primary_files": ["src/cli/files.zig"],
+      "coordinate": "one-pr",
+      "conflicts_with": []
+    },
+    "doctor-start": {
+      "label": "cluster:doctor-start",
+      "color": "1D76DB",
+      "description": "Doctor walls + start/doctor daemon honesty",
+      "summary": "Shared doctor/start remediation voice. Already packed as PR-3. #218 is in review — do not open a second doctor-voice PR.",
+      "issues": [205, 218],
+      "also_closed_as_duplicate": [236, 278],
+      "primary_files": ["src/cli/doctor.zig", "src/cli/start.zig", "src/cli/onboarding.zig"],
+      "coordinate": "one-pr",
+      "conflicts_with": ["cli-chrome"],
+      "in_flight": [218],
+      "handoff": "docs/agent-handoffs/issues/PR-3-205-218.md"
+    },
+    "cli-chrome": {
+      "label": "cluster:cli-chrome",
+      "color": "BFDADC",
+      "description": "First-run CLI chrome (banner, help, packs, color)",
+      "summary": "Presentation-only. #215 owns the banner gate (PR-1) — land it before other chrome that touches shouldShowBanner. #207 leftover help nexts (PR-4). #208 packs dump and #216 DENY color (PR-8). #239 test/explain Next loop is the same Decision-block family.",
+      "issues": [215, 207, 208, 216, 239],
+      "also_closed_as_duplicate": [234, 235, 238],
+      "primary_files": ["src/cli/mod.zig", "src/cli/help.zig", "src/cli/packs.zig", "src/cli/shell_test.zig", "src/cli/explain_render.zig"],
+      "coordinate": "banner-first",
+      "conflicts_with": ["doctor-start"],
+      "handoff": "docs/agent-handoffs/README.md"
+    },
+    "stop-plugins": {
+      "label": "cluster:stop-plugins",
+      "color": "0052CC",
+      "description": "ryk stop plugin removal + host-list honesty",
+      "summary": "#345 is the real stop bug (IsDir continue skips deleteTree on Codex/Claude plugin dirs). #206 is stop --help advertising cursor (PR-5, with #212). Same disable/help surface — do not rewrite removeKnownPluginPaths in two PRs.",
+      "issues": [345, 206],
+      "also_closed_as_duplicate": [233, 262],
+      "primary_files": ["src/cli/disable.zig", "src/cli/help.zig", "src/cli/uninstall.zig"],
+      "coordinate": "bug-then-copy",
+      "conflicts_with": ["cli-chrome"],
+      "handoff": "docs/agent-handoffs/issues/PR-5-206-212.md"
+    },
+    "errdefer": {
+      "label": "cluster:errdefer",
+      "color": "FEF2C0",
+      "description": "Zig dual-dupe / missing errdefer (scattered loci)",
+      "summary": "Same ownership pattern, different files — parallel OK, one locus per PR. Do not start a repo-wide lint sweep from this cluster.",
+      "issues": [367, 374, 378, 379, 383],
+      "primary_files": ["src/cli/doctor.zig", "src/cli/network_eval.zig", "src/cli/redteam.zig", "src/dashboard/license.zig", "src/tui/reasons.zig"],
+      "coordinate": "parallel-loci",
+      "conflicts_with": ["doctor-start"]
+    },
+    "gateway-audit": {
+      "label": "cluster:gateway-audit",
+      "color": "D93F0B",
+      "description": "provider_gateway unbounded audit_events",
+      "summary": "Long-lived intercept gateway list growth. Isolated from MCP proxy memory. Cap or ring-buffer; do not deep-free static payloads.",
+      "issues": [371],
+      "primary_files": ["src/intercept/provider_gateway.zig"],
+      "coordinate": "solo",
+      "conflicts_with": []
+    },
+    "release-signing": {
+      "label": "cluster:release-signing",
+      "color": "FC6D26",
+      "description": "Provision release signing / minisig attach",
+      "summary": "Checksum-only curl|sh until the production minisign pubkey replaces RYK_RELEASE_PUBKEY_UNPROVISIONED. Wire release.yml minisig attach. Do not fail-close install.sh while the sentinel pubkey is in tree. Not factory:auto.",
+      "issues": [326],
+      "primary_files": ["keys/ryk-release-minisign.pub", "scripts/install.sh", ".github/workflows/release.yml", "docs/release-signing.md"],
+      "coordinate": "solo",
+      "conflicts_with": []
+    },
+    "mcp-docs": {
+      "label": "cluster:mcp-docs",
+      "color": "0075CA",
+      "description": "MCP docs ask-default and .ryk/mcp manifests",
+      "summary": "docs/mcp.md vs live ask default and manifest path. Copy only. Do not change proxy fail-closed behavior here.",
+      "issues": [317],
+      "primary_files": ["docs/mcp.md"],
+      "coordinate": "solo",
+      "conflicts_with": ["mcp-memory"]
+    }
+  }
+}
