@@ -279,9 +279,11 @@ fn isOpaqueSecretLabel(label: []const u8) bool {
         std.mem.eql(u8, label, "secret:aws_access_key");
 }
 
-// `@` `+` `#` split leftover jwt / AKIA beside a vendor token. `/` stays out:
-// it is standard base64, and splitting it would drop URL-embedded entropy.
-const embedded_token_delims = " \t\r\n?&=|,;:\"'()[]{}<>@+#";
+// `@` `#` split leftover jwt / AKIA beside a vendor token. `+` and `/` stay
+// out of the first pass: both are standard base64, and splitting them drops
+// URL/prose high-entropy below the 32-char floor.
+const embedded_token_delims = " \t\r\n?&=|,;:\"'()[]{}<>@#";
+const leftover_glue_delims = embedded_token_delims ++ "+/";
 
 fn tokenHasOpaqueSecret(token: []const u8) bool {
     const match = classifySecretValue(token) orelse return false;
@@ -294,9 +296,9 @@ fn containsOpaqueSecret(value: []const u8) bool {
     while (tokens.next()) |raw_token| {
         if (tokenHasOpaqueSecret(std.mem.trim(u8, raw_token, ":"))) return true;
     }
-    // Second pass: leftover jwt / AKIA glued with `/`. Skip high_entropy so a
-    // slash-split base64 blob is not discarded after the first pass missed it.
-    var slash_tokens = std.mem.tokenizeAny(u8, value, embedded_token_delims ++ "/");
+    // Second pass: leftover jwt / AKIA glued with `+` or `/`. Skip high_entropy
+    // so a split base64 blob is not discarded after the first pass missed it.
+    var slash_tokens = std.mem.tokenizeAny(u8, value, leftover_glue_delims);
     while (slash_tokens.next()) |raw_token| {
         if (classifySecretValue(std.mem.trim(u8, raw_token, ":"))) |match| {
             if (isOpaqueSecretLabel(match.label) and !std.mem.eql(u8, match.label, "secret:high_entropy"))
@@ -759,7 +761,7 @@ fn classifyEmbeddedSecretToken(value: []const u8) ?RedactionMatch {
         const token = std.mem.trim(u8, raw_token, ":");
         if (classifySecretValue(token)) |match| return match;
     }
-    var slash_tokens = std.mem.tokenizeAny(u8, value, embedded_token_delims ++ "/");
+    var slash_tokens = std.mem.tokenizeAny(u8, value, leftover_glue_delims);
     while (slash_tokens.next()) |raw_token| {
         const token = std.mem.trim(u8, raw_token, ":");
         if (classifySecretValue(token)) |match| {
@@ -1150,7 +1152,7 @@ test "vendor tokens are redacted when embedded mid-string" {
         try expectSpanRedaction(case.value, case.expected);
     }
 
-    // Alloc span-replaces. Bounded classifies `@`/`+`/`#`-split tokens and
+    // Alloc span-replaces. Bounded classifies `@`/`#`-split tokens and
     // whole-redacts the vendor label (more conservative; leftover jwt cannot leak).
     const glued = [_]struct { value: []const u8, expected_alloc: []const u8, expected_bounded: []const u8 }{
         .{ .value = "note@xoxb-fakeSynthetic@here", .expected_alloc = "note@[REDACTED]@here", .expected_bounded = "[REDACTED:secret:slack_token]" },
@@ -1267,6 +1269,7 @@ test "opaque secrets beside vendor or sas spans redact the whole alloc value" {
         "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJmYWtlIn0.c2lnbmF0dXJl+xoxb-fakeSynthetic",
         "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJmYWtlIn0.c2lnbmF0dXJl#xoxb-fakeSynthetic",
         "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJmYWtlIn0.c2lnbmF0dXJl/xoxb-fakeSynthetic",
+        "Aa0Bb1Cc2Dd3Ee4Ff5Gg6Hh7+Ii8Jj9Kk xoxb-fakeSynthetic",
     };
     for (leftover_glue) |glued| {
         const glued_owned = try redactAlloc(std.testing.allocator, glued);
@@ -1803,20 +1806,26 @@ test "redactor closes base64 slash short jwt prefix and url-embedded classes" {
     // Extend existing synthetic fixtures only — no invented raw secrets.
     const cases = [_][]const u8{
         "Aa0Bb1Cc2Dd3Ee4Ff5Gg6Hh7/Ii8Jj9Kk",
+        "Aa0Bb1Cc2Dd3Ee4Ff5Gg6Hh7+Ii8Jj9Kk",
         "eyJhbGc.eyJzdWI.c2lnbmF0dXJl",
         "ghp_fakeSynthetic",
         "sk-fakeSynthetic",
         // Query-embedded forms (userinfo `scheme://user:pw@host` is already closed).
         "https://example.invalid/?q=ghp_fakeSynthetic",
         "https://example.invalid/?state=Aa0Bb1Cc2Dd3Ee4Ff5Gg6Hh7/Ii8Jj9Kk",
+        "https://example.invalid/?state=Aa0Bb1Cc2Dd3Ee4Ff5Gg6Hh7+Ii8Jj9Kk",
+        "note Aa0Bb1Cc2Dd3Ee4Ff5Gg6Hh7+Ii8Jj9Kk here",
     };
     const raw_markers = [_][]const u8{
         "Aa0Bb1Cc2Dd3Ee4Ff5Gg6Hh7/Ii8Jj9Kk",
+        "Aa0Bb1Cc2Dd3Ee4Ff5Gg6Hh7+Ii8Jj9Kk",
         "eyJhbGc.eyJzdWI.c2lnbmF0dXJl",
         "ghp_fakeSynthetic",
         "sk-fakeSynthetic",
         "ghp_fakeSynthetic",
         "Aa0Bb1Cc2Dd3Ee4Ff5Gg6Hh7/Ii8Jj9Kk",
+        "Aa0Bb1Cc2Dd3Ee4Ff5Gg6Hh7+Ii8Jj9Kk",
+        "Aa0Bb1Cc2Dd3Ee4Ff5Gg6Hh7+Ii8Jj9Kk",
     };
     for (cases, raw_markers) |value, secret| {
         const owned = try redactAlloc(std.testing.allocator, value);
