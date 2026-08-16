@@ -142,13 +142,30 @@ pub fn stringifyRequest(allocator: std.mem.Allocator, req: Request) ![]u8 {
     try w.writeAll(",\"session_id\":");
     try writeJsonString(w, req.session_id);
     try w.writeAll(",\"payload\":");
-    if (req.payload_json.len == 0) {
-        try w.writeAll("{}");
-    } else {
-        try w.writeAll(req.payload_json);
-    }
+    try writePayloadField(allocator, w, req.payload_json);
     try w.writeAll("}\n");
     return out.toOwnedSlice();
+}
+
+/// NDJSON is one request per line. Pretty-printed host fixtures must be compacted
+/// (or JSON-string-escaped) so `readLineFd` does not truncate at the first newline.
+fn writePayloadField(allocator: std.mem.Allocator, w: anytype, payload_json: []const u8) !void {
+    if (payload_json.len == 0) {
+        try w.writeAll("{}");
+        return;
+    }
+    if (std.mem.indexOfScalar(u8, payload_json, '\n') == null and
+        std.mem.indexOfScalar(u8, payload_json, '\r') == null)
+    {
+        try w.writeAll(payload_json);
+        return;
+    }
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, payload_json, .{}) catch {
+        try writeJsonString(w, payload_json);
+        return;
+    };
+    defer parsed.deinit();
+    try std.json.Stringify.value(parsed.value, .{}, w);
 }
 
 pub fn stringifyResponse(allocator: std.mem.Allocator, resp: Response) ![]u8 {
@@ -193,7 +210,10 @@ pub fn parseRequest(allocator: std.mem.Allocator, line: []const u8) !ParsedReque
     const method = jsonString(obj, "method") orelse return error.InvalidRequest;
     var payload_json: []const u8 = "";
     if (obj.get("payload")) |payload| {
-        payload_json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
+        payload_json = switch (payload) {
+            .string => |s| try allocator.dupe(u8, s),
+            else => try std.json.Stringify.valueAlloc(allocator, payload, .{}),
+        };
     }
     return .{
         .parsed = parsed,
@@ -350,6 +370,23 @@ test "request round-trip keeps method and payload" {
     defer parsed.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("ping", parsed.request.method);
     try std.testing.expectEqual(@as(u64, 7), parsed.request.id);
+}
+
+test "stringifyRequest writes pretty payload as one NDJSON line" {
+    const raw = try stringifyRequest(std.testing.allocator, .{
+        .id = 1,
+        .method = "hook",
+        .host = "grok",
+        .event = "PreToolUse",
+        .payload_json = "{\n  \"hookEventName\": \"pre_tool_use\",\n  \"cwd\": \"/tmp\"\n}",
+    });
+    defer std.testing.allocator.free(raw);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, raw, "\n"));
+    try std.testing.expect(std.mem.endsWith(u8, raw, "\n"));
+    var parsed = try parseRequest(std.testing.allocator, raw);
+    defer parsed.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.request.payload_json, "hookEventName") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.request.payload_json, "pre_tool_use") != null);
 }
 
 test "socketPathAlloc includes uid and bin hash" {

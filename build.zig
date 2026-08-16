@@ -402,6 +402,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "ryk", .module = ryk_mod },
             },
         }),
+        .filters = test_filters,
     });
     const run_hook_server_tests = addRunTestTerminal(b, hook_server_tests);
     run_hook_server_tests.step.dependOn(&install_ryk.step);
