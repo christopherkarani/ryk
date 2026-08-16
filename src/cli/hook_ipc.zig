@@ -312,7 +312,7 @@ pub fn writeAllFd(io: std.Io, fd: std.posix.fd_t, bytes: []const u8, timeout_ms:
         }};
         const rc = std.posix.poll(fds[0..], pollTimeoutMs(remaining)) catch return error.SocketWriteFailed;
         if (rc <= 0) return error.SocketWriteFailed;
-        const n = std.c.write(fd, bytes.ptr + written, bytes.len - written);
+        const n = socketSend(fd, bytes[written..]);
         if (n <= 0) return error.SocketWriteFailed;
         written += @intCast(n);
     }
@@ -323,18 +323,43 @@ pub fn readLineFd(io: std.Io, allocator: std.mem.Allocator, fd: std.posix.fd_t, 
     var read_buf: std.ArrayList(u8) = .empty;
     errdefer read_buf.deinit(allocator);
     const deadline = nowMs(io) + timeout_ms;
-    var byte: [1]u8 = undefined;
+    var chunk: [4096]u8 = undefined;
     while (true) {
         const remaining = deadline -| nowMs(io);
         if (remaining == 0) return error.SocketReadFailed;
         try waitReadable(fd, remaining);
-        const n = std.c.read(fd, &byte, 1);
+        const n = std.c.read(fd, &chunk, chunk.len);
         if (n <= 0) return error.SocketReadFailed;
-        if (read_buf.items.len >= max_line_bytes) return error.SocketReadFailed;
-        try read_buf.append(allocator, byte[0]);
-        if (byte[0] == '\n') break;
+        const got: usize = @intCast(n);
+        if (read_buf.items.len + got > max_line_bytes) return error.SocketReadFailed;
+        try read_buf.appendSlice(allocator, chunk[0..got]);
+        if (std.mem.indexOfScalar(u8, chunk[0..got], '\n') != null) break;
     }
     return read_buf.toOwnedSlice(allocator);
+}
+
+fn socketSend(fd: std.posix.fd_t, bytes: []const u8) isize {
+    if (comptime builtin.os.tag == .linux) {
+        const msg_nosignal: c_int = 0x4000;
+        return std.c.send(fd, bytes.ptr, bytes.len, msg_nosignal);
+    }
+    return std.c.write(fd, bytes.ptr, bytes.len);
+}
+
+/// Keep a reset peer from delivering SIGPIPE to hook-serve.
+pub fn ignoreSigpipe() void {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    const ignore: std.posix.Sigaction = .{
+        .handler = .{ .handler = std.posix.SIG.IGN },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(.PIPE, &ignore, null);
+}
+
+pub fn setNoSigpipe(fd: std.posix.fd_t) void {
+    if (comptime builtin.os.tag != .macos) return;
+    _ = std.posix.system.fcntl(fd, std.posix.F.SETNOSIGPIPE, @as(usize, 1));
 }
 
 fn nowMs(io: std.Io) u64 {

@@ -12,6 +12,7 @@ const ensure = @import("ensure.zig");
 const pack_state = @import("pack_state.zig");
 const plugin = @import("plugin.zig");
 const host_ask_resume = @import("host_ask_resume.zig");
+const hook_client = @import("hook_client.zig");
 const shell_eval = @import("shell_eval.zig");
 const build_options = @import("build_options");
 const env_util = @import("../env_util.zig");
@@ -261,6 +262,7 @@ pub fn runStart(
         ensure_outcome.policy_created,
     );
     setup_succeeded = true;
+    hook_client.prewarmBestEffort(io, allocator);
     return exit_codes.success;
 }
 

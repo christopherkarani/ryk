@@ -387,7 +387,7 @@ fn hookCommand(io: std.Io, host: Host, event: Event, original_event_name: []cons
         return code;
     }
 
-    return evaluateFromPayload(io, allocator, host, event, original_event_name, payload_text, ci_mode, null, stdout, stderr);
+    return evaluateFromPayload(io, allocator, host, event, original_event_name, payload_text, ci_mode, null, null, stdout, stderr);
 }
 
 fn tryHookServer(
@@ -449,6 +449,7 @@ pub fn evaluateForServer(
     ci: bool,
     probe: bool,
     workspace_override: ?[]const u8,
+    cached_policy: ?*const core_api.LoadedPolicy,
 ) !hook_ipc.HostEmit {
     const host = Host.parse(host_name) orelse return failClosedEmit(allocator, "unknown host");
     const event = resolveEvent(host, event_name) orelse return failClosedEmit(allocator, "unknown event");
@@ -471,6 +472,7 @@ pub fn evaluateForServer(
         payload_text,
         ci,
         workspace_override,
+        cached_policy,
         &stdout_buf.writer,
         &stderr_buf.writer,
     );
@@ -517,6 +519,7 @@ fn evaluateFromPayload(
     payload_text: []const u8,
     ci_mode: bool,
     workspace_override: ?[]const u8,
+    cached_policy: ?*const core_api.LoadedPolicy,
     stdout: anytype,
     stderr: anytype,
 ) !u8 {
@@ -710,19 +713,21 @@ fn evaluateFromPayload(
         if (fail_closed_pre_eval) {
             // Codex informational events used to fail-closed on discover failure.
             // Do not turn a broken workspace policy into allow.
-            var loaded = core_api.discoverPolicy(io, allocator, null, root) catch {
-                return try emitPreEvalFailClosed(
-                    allocator,
-                    host,
-                    event,
-                    stdout,
-                    stderr,
-                    "hook",
-                    "policy load failed",
-                    "ryk hook: failed to load policy; ryk blocked it before evaluation.",
-                );
-            };
-            loaded.deinit();
+            if (cached_policy == null) {
+                var loaded = core_api.discoverPolicy(io, allocator, null, root) catch {
+                    return try emitPreEvalFailClosed(
+                        allocator,
+                        host,
+                        event,
+                        stdout,
+                        stderr,
+                        "hook",
+                        "policy load failed",
+                        "ryk hook: failed to load policy; ryk blocked it before evaluation.",
+                    );
+                };
+                loaded.deinit();
+            }
         }
         var redactions: std.ArrayList(RedactionEntry) = .empty;
         var limitations: std.ArrayList([]const u8) = .empty;
@@ -746,27 +751,31 @@ fn evaluateFromPayload(
         return hookExitCode(host, result.decision, ci_mode);
     }
 
-    // Load policy
-    var loaded = core_api.discoverPolicy(io, allocator, null, root) catch |err| {
-        if (shouldFailClosedOnPreEval(host, event)) {
-            return try emitPreEvalFailClosed(
-                allocator,
-                host,
-                event,
-                stdout,
-                stderr,
-                "hook",
-                "policy load failed",
-                "ryk hook: failed to load policy; ryk blocked it before evaluation.",
-            );
-        }
-        try stderr.print("ryk hook: failed to load policy: {s}\n", .{@errorName(err)});
-        return exit_codes.general;
+    // Load policy. A server cache hit skips rediscovery; do not deinit cached policy.
+    var discovered: ?core_api.LoadedPolicy = null;
+    defer if (discovered) |*item| item.deinit();
+    const loaded_ptr: *const core_api.LoadedPolicy = cached_policy orelse blk: {
+        discovered = core_api.discoverPolicy(io, allocator, null, root) catch |err| {
+            if (shouldFailClosedOnPreEval(host, event)) {
+                return try emitPreEvalFailClosed(
+                    allocator,
+                    host,
+                    event,
+                    stdout,
+                    stderr,
+                    "hook",
+                    "policy load failed",
+                    "ryk hook: failed to load policy; ryk blocked it before evaluation.",
+                );
+            }
+            try stderr.print("ryk hook: failed to load policy: {s}\n", .{@errorName(err)});
+            return exit_codes.general;
+        };
+        break :blk &(discovered.?);
     };
-    defer loaded.deinit();
 
     // Evaluate via host adapter
-    var result = evaluateHook(io, allocator, root, @tagName(host), loaded.innerPtr(), host, event, hook_payload, ci_mode, null) catch |err| {
+    var result = evaluateHook(io, allocator, root, @tagName(host), loaded_ptr.innerPtr(), host, event, hook_payload, ci_mode, null) catch |err| {
         if (shouldFailClosedOnPreEval(host, event)) {
             return try emitPreEvalFailClosed(
                 allocator,
@@ -790,7 +799,7 @@ fn evaluateFromPayload(
         result.decision.toString(),
         @tagName(result.risk),
         result.category,
-        loaded.mode().toString(),
+        loaded_ptr.mode().toString(),
     );
     telemetry.recordSession(
         @tagName(host),

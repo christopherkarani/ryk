@@ -7,6 +7,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 
+const core_api = @import("ryk_core").api;
+
 const daemon_uds = @import("daemon_uds.zig");
 const exit_codes = @import("exit_codes.zig");
 const help = @import("help.zig");
@@ -72,9 +74,10 @@ const WorkspaceCacheEntry = struct {
     policy_mtime_s: i64,
     pack_mtime_s: i64,
     last_used: u64,
+    loaded: core_api.LoadedPolicy,
 };
 
-/// Fingerprint cache only: evaluate still calls discoverPolicy per request.
+/// Successful policy loads only, keyed by workspace realpath + policy/pack mtimes.
 /// Cap 16 LRU so a long-lived server cannot grow without bound.
 pub const WorkspacePolicyCache = struct {
     allocator: std.mem.Allocator,
@@ -87,7 +90,10 @@ pub const WorkspacePolicyCache = struct {
 
     pub fn deinit(self: *WorkspacePolicyCache) void {
         for (&self.entries) |*slot| {
-            if (slot.*) |entry| self.allocator.free(entry.realpath);
+            if (slot.*) |*entry| {
+                entry.loaded.deinit();
+                self.allocator.free(entry.realpath);
+            }
             slot.* = null;
         }
     }
@@ -100,39 +106,53 @@ pub const WorkspacePolicyCache = struct {
         return n;
     }
 
-    pub fn touch(self: *WorkspacePolicyCache, io: std.Io, workspace: []const u8) void {
-        if (workspace.len == 0) return;
-        const real_z = std.Io.Dir.cwd().realPathFileAlloc(io, workspace, self.allocator) catch return;
+    /// Load or reuse a workspace policy. Load failures are not cached.
+    pub fn getOrLoad(self: *WorkspacePolicyCache, io: std.Io, workspace: []const u8) ?*const core_api.LoadedPolicy {
+        if (workspace.len == 0) return null;
+        const real_z = std.Io.Dir.cwd().realPathFileAlloc(io, workspace, self.allocator) catch return null;
         defer self.allocator.free(real_z);
-        const policy_path = std.fs.path.join(self.allocator, &.{ real_z, ".ryk", "policy.yaml" }) catch return;
+        const policy_path = std.fs.path.join(self.allocator, &.{ real_z, ".ryk", "policy.yaml" }) catch return null;
         defer self.allocator.free(policy_path);
-        const pack_path = std.fs.path.join(self.allocator, &.{ real_z, ".ryk.toml" }) catch return;
+        const pack_path = std.fs.path.join(self.allocator, &.{ real_z, ".ryk.toml" }) catch return null;
         defer self.allocator.free(pack_path);
         const policy_mtime = fileMtimeSecs(io, policy_path);
         const pack_mtime = fileMtimeSecs(io, pack_path);
 
-        self.clock += 1;
         if (self.indexOf(real_z)) |idx| {
             if (self.entries[idx]) |*entry| {
-                entry.policy_mtime_s = policy_mtime;
-                entry.pack_mtime_s = pack_mtime;
-                entry.last_used = self.clock;
+                if (entry.policy_mtime_s == policy_mtime and entry.pack_mtime_s == pack_mtime) {
+                    self.clock += 1;
+                    entry.last_used = self.clock;
+                    return &entry.loaded;
+                }
+                self.clearSlot(idx);
             }
-            return;
         }
 
-        const slot = self.freeOrLru();
-        if (self.entries[slot]) |old| self.allocator.free(old.realpath);
+        var loaded = core_api.discoverPolicy(io, self.allocator, null, real_z) catch return null;
         const owned = self.allocator.dupe(u8, real_z) catch {
-            self.entries[slot] = null;
-            return;
+            loaded.deinit();
+            return null;
         };
+        const slot = self.freeOrLru();
+        self.clearSlot(slot);
+        self.clock += 1;
         self.entries[slot] = .{
             .realpath = owned,
             .policy_mtime_s = policy_mtime,
             .pack_mtime_s = pack_mtime,
             .last_used = self.clock,
+            .loaded = loaded,
         };
+        return &self.entries[slot].?.loaded;
+    }
+
+    fn clearSlot(self: *WorkspacePolicyCache, idx: usize) void {
+        if (self.entries[idx]) |*old| {
+            old.loaded.deinit();
+            self.allocator.free(old.realpath);
+        }
+        self.entries[idx] = null;
     }
 
     fn indexOf(self: *const WorkspacePolicyCache, realpath: []const u8) ?usize {
@@ -173,12 +193,20 @@ pub fn serveLoop(
     stop: ?*std.atomic.Value(bool),
 ) !u8 {
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .macos) return exit_codes.general;
+    hook_ipc.ignoreSigpipe();
     try ensureSocketParentDir(io, socket_path);
-    const listen_fd = try daemon_uds.bindListenUnixSocket(socket_path, hook_ipc.listen_backlog);
+    const listen_fd = daemon_uds.bindListenUnixSocketOpts(socket_path, .{
+        .backlog = hook_ipc.listen_backlog,
+        .fail_if_live = true,
+    }) catch |err| switch (err) {
+        error.SocketAlreadyBound => return exit_codes.success,
+        else => return err,
+    };
     defer {
         _ = std.c.close(listen_fd);
         daemon_uds.unlinkUnixSocketPath(socket_path);
     }
+    hook_ipc.setNoSigpipe(listen_fd);
     chmodPath(socket_path, 0o600);
 
     var cache = WorkspacePolicyCache.init(allocator);
@@ -201,6 +229,7 @@ pub fn serveLoop(
         const client_fd = std.c.accept(listen_fd, @ptrCast(&addr), &addr_len);
         if (client_fd < 0) continue;
         defer _ = std.c.close(client_fd);
+        hook_ipc.setNoSigpipe(client_fd);
 
         last_ms = nowMs(io);
         const shutdown = handleClient(io, allocator, client_fd, self_bin, &cache) catch false;
@@ -221,74 +250,70 @@ fn handleClient(
     self_bin: []const u8,
     cache: *WorkspacePolicyCache,
 ) !bool {
-    const line = hook_ipc.readLineFd(io, allocator, fd, hook_ipc.request_timeout_ms) catch return false;
-    defer allocator.free(line);
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
 
-    var parsed = hook_ipc.parseRequest(allocator, line) catch {
-        const resp = try hook_ipc.stringifyResponse(allocator, .{
+    const line = hook_ipc.readLineFd(io, arena, fd, hook_ipc.request_timeout_ms) catch return false;
+
+    const parsed = hook_ipc.parseRequest(arena, line) catch {
+        const resp = try hook_ipc.stringifyResponse(arena, .{
             .id = 0,
             .exit = 2,
             .stdout = "",
             .stderr = "ryk hook-serve: invalid request",
         });
-        defer allocator.free(resp);
         hook_ipc.writeAllFd(io, fd, resp, hook_ipc.request_timeout_ms) catch {};
         return false;
     };
-    defer parsed.deinit(allocator);
 
     const req = parsed.request;
     if (std.mem.eql(u8, req.method, "shutdown")) {
-        const resp = try hook_ipc.stringifyResponse(allocator, .{
+        const resp = try hook_ipc.stringifyResponse(arena, .{
             .id = req.id,
             .exit = 0,
             .stdout = "",
             .stderr = "",
         });
-        defer allocator.free(resp);
         hook_ipc.writeAllFd(io, fd, resp, hook_ipc.request_timeout_ms) catch {};
         return true;
     }
 
     if (requestMismatches(self_bin, req)) {
-        const resp = try hook_ipc.stringifyResponse(allocator, .{
+        const resp = try hook_ipc.stringifyResponse(arena, .{
             .id = req.id,
             .exit = 2,
             .stdout = "",
             .stderr = "ryk hook-serve: version or binary mismatch",
             .mismatch = true,
         });
-        defer allocator.free(resp);
         hook_ipc.writeAllFd(io, fd, resp, hook_ipc.request_timeout_ms) catch {};
         return false;
     }
 
     if (std.mem.eql(u8, req.method, "ping")) {
-        const resp = try hook_ipc.stringifyResponse(allocator, .{
+        const resp = try hook_ipc.stringifyResponse(arena, .{
             .id = req.id,
             .exit = 0,
             .stdout = hook_ipc.protocol_label,
             .stderr = "",
         });
-        defer allocator.free(resp);
         try hook_ipc.writeAllFd(io, fd, resp, hook_ipc.request_timeout_ms);
         return false;
     }
 
-    const emit = dispatchEvaluate(io, allocator, req, cache) catch hook_ipc.HostEmit{
+    const emit = dispatchEvaluate(io, arena, req, cache) catch hook_ipc.HostEmit{
         .exit = 2,
-        .stdout = try allocator.dupe(u8, ""),
-        .stderr = try allocator.dupe(u8, "ryk hook-serve: evaluation failed"),
+        .stdout = try arena.dupe(u8, ""),
+        .stderr = try arena.dupe(u8, "ryk hook-serve: evaluation failed"),
     };
-    defer emit.deinit(allocator);
 
-    const resp = try hook_ipc.stringifyResponse(allocator, .{
+    const resp = try hook_ipc.stringifyResponse(arena, .{
         .id = req.id,
         .exit = emit.exit,
         .stdout = emit.stdout,
         .stderr = emit.stderr,
     });
-    defer allocator.free(resp);
     try hook_ipc.writeAllFd(io, fd, resp, hook_ipc.request_timeout_ms);
     return false;
 }
@@ -303,10 +328,10 @@ fn dispatchEvaluate(
     const evaluate = @import("evaluate.zig");
     const agent_hook = @import("agent_hook.zig");
 
-    if (req.workspace.len > 0) cache.touch(io, req.workspace);
+    const cached = if (req.workspace.len > 0) cache.getOrLoad(io, req.workspace) else null;
 
     if (std.mem.eql(u8, req.method, "evaluate")) {
-        return evaluate.evaluateForServer(io, allocator, req.payload_json);
+        return evaluate.evaluateForServer(io, allocator, req.payload_json, cached);
     }
     if (std.mem.eql(u8, req.method, "hook")) {
         if (std.mem.eql(u8, req.host, "cursor")) {
@@ -321,6 +346,7 @@ fn dispatchEvaluate(
             req.ci,
             req.probe,
             if (req.workspace.len == 0) null else req.workspace,
+            cached,
         );
     }
     return error.UnknownMethod;
@@ -524,9 +550,65 @@ test "workspace policy cache caps at 16 LRU entries" {
         const path = try std.fs.path.join(std.testing.allocator, &.{ root, name });
         defer std.testing.allocator.free(path);
         try std.Io.Dir.cwd().createDirPath(std.testing.io, path);
-        cache.touch(std.testing.io, path);
+        _ = cache.getOrLoad(std.testing.io, path);
     }
     try std.testing.expectEqual(@as(usize, hook_ipc.workspace_cache_cap), cache.count());
+}
+
+test "hook-serve exits 0 when the socket is already live" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(dir);
+    const sock = try std.fs.path.join(std.testing.allocator, &.{ dir, "hook-already.sock" });
+    defer std.testing.allocator.free(sock);
+
+    var stop = std.atomic.Value(bool).init(false);
+    const thread = try std.Thread.spawn(.{}, testServe, .{ sock, &stop });
+    defer {
+        stop.store(true, .unordered);
+        if (daemon_uds.connectUnixSocket(sock)) |fd| {
+            _ = std.c.close(fd);
+        } else |_| {}
+        thread.join();
+    }
+    try waitForSocket(sock, 50);
+
+    const code = try serveLoop(std.testing.io, std.heap.page_allocator, sock, 30_000, null);
+    try std.testing.expectEqual(exit_codes.success, code);
+
+    const req = try hook_ipc.stringifyRequest(std.testing.allocator, .{ .id = 9, .method = "ping" });
+    defer std.testing.allocator.free(req);
+    const raw = try exchange(std.testing.allocator, sock, req);
+    defer std.testing.allocator.free(raw);
+    var parsed = try hook_ipc.parseResponse(std.testing.allocator, raw);
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u8, 0), parsed.response.exit);
+}
+
+test "workspace policy cache does not store load failures" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const bad = try std.fs.path.join(std.testing.allocator, &.{ root, "bad-policy" });
+    defer std.testing.allocator.free(bad);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, bad);
+    const ryk_dir = try std.fs.path.join(std.testing.allocator, &.{ bad, ".ryk" });
+    defer std.testing.allocator.free(ryk_dir);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, ryk_dir);
+    const policy_path = try std.fs.path.join(std.testing.allocator, &.{ ryk_dir, "policy.yaml" });
+    defer std.testing.allocator.free(policy_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = policy_path,
+        .data = "mode: [this is not valid yaml\n",
+    });
+
+    var cache = WorkspacePolicyCache.init(std.testing.allocator);
+    defer cache.deinit();
+    try std.testing.expect(cache.getOrLoad(std.testing.io, bad) == null);
+    try std.testing.expectEqual(@as(usize, 0), cache.count());
 }
 
 fn waitForSocket(path: []const u8, attempts: u32) !void {

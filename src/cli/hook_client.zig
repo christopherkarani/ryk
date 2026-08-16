@@ -92,7 +92,7 @@ pub fn prewarmBestEffort(io: std.Io, allocator: std.mem.Allocator) void {
     defer allocator.free(bin);
     const socket_path = resolveSocketPath(io, allocator, bin) catch return;
     defer allocator.free(socket_path);
-    if (daemon_uds.connectUnixSocket(socket_path)) |fd| {
+    if (daemon_uds.connectUnixSocketTimeout(socket_path, hook_ipc.connect_timeout_ms)) |fd| {
         _ = std.c.close(fd);
         return;
     } else |_| {}
@@ -121,7 +121,7 @@ pub fn socketPathForDoctor(io: std.Io, allocator: std.mem.Allocator) ![]u8 {
 
 pub fn socketIsLive(path: []const u8) bool {
     if (comptime builtin.os.tag == .windows) return false;
-    const fd = daemon_uds.connectUnixSocket(path) catch return false;
+    const fd = daemon_uds.connectUnixSocketTimeout(path, hook_ipc.connect_timeout_ms) catch return false;
     _ = std.c.close(fd);
     return true;
 }
@@ -137,12 +137,12 @@ fn resolveSocketPath(io: std.Io, allocator: std.mem.Allocator, bin_realpath: []c
 }
 
 fn connectOrSpawn(io: std.Io, allocator: std.mem.Allocator, socket_path: []const u8, bin: []const u8) !std.posix.fd_t {
-    if (daemon_uds.connectUnixSocket(socket_path)) |fd| return fd else |_| {}
+    if (daemon_uds.connectUnixSocketTimeout(socket_path, hook_ipc.connect_timeout_ms)) |fd| return fd else |_| {}
     if (builtin.is_test) return error.Unavailable;
     spawnServe(io, allocator, socket_path, bin) catch {};
     const deadline = std.Io.Timestamp.now(io, .awake).toMilliseconds() + @as(i64, @intCast(hook_ipc.spawn_wait_ms));
     while (std.Io.Timestamp.now(io, .awake).toMilliseconds() < deadline) {
-        if (daemon_uds.connectUnixSocket(socket_path)) |fd| return fd else |_| {}
+        if (daemon_uds.connectUnixSocketTimeout(socket_path, hook_ipc.connect_timeout_ms)) |fd| return fd else |_| {}
         const delay = std.c.timespec{ .sec = 0, .nsec = 5 * std.time.ns_per_ms };
         _ = std.c.nanosleep(&delay, null);
     }
@@ -156,6 +156,16 @@ fn spawnServe(io: std.Io, allocator: std.mem.Allocator, socket_path: []const u8,
     const exe = if (bin.len > 0) bin else (std.process.executablePathAlloc(io, allocator) catch return error.Unavailable);
     defer if (bin.len == 0) allocator.free(exe);
 
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .macos) {
+        spawnDetachedHookServe(exe, socket_path) catch {
+            try spawnAttachedFallback(io, exe, socket_path);
+        };
+        return;
+    }
+    try spawnAttachedFallback(io, exe, socket_path);
+}
+
+fn spawnAttachedFallback(io: std.Io, exe: []const u8, socket_path: []const u8) !void {
     var child = std.process.spawn(io, .{
         .argv = &.{ exe, "hook-serve", "--socket", socket_path },
         .stdin = .ignore,
@@ -172,8 +182,51 @@ fn spawnServe(io: std.Io, allocator: std.mem.Allocator, socket_path: []const u8,
     child.id = null;
 }
 
+fn spawnDetachedHookServe(exe: []const u8, socket_path: []const u8) !void {
+    if (exe.len == 0 or exe.len >= std.fs.max_path_bytes) return error.Unavailable;
+    if (socket_path.len == 0 or socket_path.len >= std.fs.max_path_bytes) return error.Unavailable;
+
+    var exe_z: [std.fs.max_path_bytes]u8 = undefined;
+    var sock_z: [std.fs.max_path_bytes]u8 = undefined;
+    @memcpy(exe_z[0..exe.len], exe);
+    exe_z[exe.len] = 0;
+    @memcpy(sock_z[0..socket_path.len], socket_path);
+    sock_z[socket_path.len] = 0;
+
+    const pid = std.c.fork();
+    if (pid < 0) return error.Unavailable;
+    if (pid > 0) {
+        var status: c_int = 0;
+        _ = std.c.waitpid(pid, &status, 0);
+        return;
+    }
+
+    _ = std.c.setsid();
+    const pid2 = std.c.fork();
+    if (pid2 < 0) std.c._exit(1);
+    if (pid2 > 0) std.c._exit(0);
+
+    const devnull = std.c.open("/dev/null", .{ .ACCMODE = .RDWR });
+    if (devnull >= 0) {
+        _ = std.c.dup2(devnull, 0);
+        _ = std.c.dup2(devnull, 1);
+        _ = std.c.dup2(devnull, 2);
+        if (devnull > 2) _ = std.c.close(devnull);
+    }
+
+    const argv = [_:null]?[*:0]const u8{
+        exe_z[0..exe.len :0],
+        "hook-serve",
+        "--socket",
+        sock_z[0..socket_path.len :0],
+        null,
+    };
+    _ = std.c.execve(exe_z[0..exe.len :0], @ptrCast(&argv), std.c.environ);
+    std.c._exit(127);
+}
+
 fn requestShutdown(io: std.Io, allocator: std.mem.Allocator, socket_path: []const u8, request: hook_ipc.Request) bool {
-    const fd = daemon_uds.connectUnixSocket(socket_path) catch return false;
+    const fd = daemon_uds.connectUnixSocketTimeout(socket_path, hook_ipc.connect_timeout_ms) catch return false;
     defer _ = std.c.close(fd);
     const line = hook_ipc.stringifyRequest(allocator, .{
         .id = request.id,

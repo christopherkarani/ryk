@@ -863,6 +863,10 @@ fn writePolicyFreshnessNotices(stdout: anytype, context: IntegrationContext) !vo
 }
 
 fn writeHookServerLine(io: std.Io, allocator: std.mem.Allocator, stdout: anytype) !void {
+    if (comptime builtin.os.tag == .windows) {
+        try stdout.writeAll("hook server: unavailable on Windows; hooks stay in-process\n\n");
+        return;
+    }
     const path = cli.hook_client.socketPathForDoctor(io, allocator) catch {
         try stdout.writeAll("hook server: not running\n\n");
         return;

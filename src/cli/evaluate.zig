@@ -41,6 +41,8 @@ const EvaluateWireOpts = struct {
     fm_client: ?fm_steward_client.Client = null,
     /// Skip FM soft seatbelt (tests that need pure WP4 matrix only).
     disable_fm: bool = false,
+    /// Server workspace cache hit. Caller owns the policy; do not deinit.
+    cached_policy: ?*const core_api.LoadedPolicy = null,
 };
 
 pub const EvaluateRequest = struct {
@@ -225,10 +227,18 @@ fn tryHookServer(
     return owned.response().exit;
 }
 
-pub fn evaluateForServer(io: std.Io, allocator: std.mem.Allocator, payload: []const u8) !hook_ipc.HostEmit {
+pub fn evaluateForServer(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    payload: []const u8,
+    cached_policy: ?*const core_api.LoadedPolicy,
+) !hook_ipc.HostEmit {
     var stdout_buf: std.Io.Writer.Allocating = .init(allocator);
     errdefer stdout_buf.deinit();
-    const code = try evaluatePayload(io, allocator, payload, &stdout_buf.writer, shellEvalBridge, .process_home, .{});
+    const code = try evaluatePayload(io, allocator, payload, &stdout_buf.writer, shellEvalBridge, .process_home, .{
+        .disable_fm = true,
+        .cached_policy = cached_policy,
+    });
     return .{
         .exit = code,
         .stdout = try stdout_buf.toOwnedSlice(),
@@ -589,20 +599,27 @@ fn writeEvaluationResponse(
 
     var loaded_opt: ?core_api.LoadedPolicy = null;
     defer if (loaded_opt) |*loaded| loaded.deinit();
-    if (wire.mode_override == null or wire.commands_allow_override == null) {
+    if (wire.cached_policy == null and (wire.mode_override == null or wire.commands_allow_override == null)) {
         loaded_opt = core_api.discoverPolicy(io, allocator, null, workspace_root) catch null;
     }
 
+    const discovered: ?*const core_api.LoadedPolicy = if (wire.cached_policy) |cached|
+        cached
+    else if (loaded_opt) |*loaded|
+        loaded
+    else
+        null;
+
     const mode: policy.schema.Mode = if (wire.mode_override) |m|
         m
-    else if (loaded_opt) |loaded|
+    else if (discovered) |loaded|
         resolveEvaluateMode(loaded.mode())
     else
         resolveEvaluateMode(.strict);
 
     const commands_allow: []const []const u8 = if (wire.commands_allow_override) |a|
         a
-    else if (loaded_opt) |loaded|
+    else if (discovered) |loaded|
         loaded.innerPtr().commands.allow
     else
         &.{};
