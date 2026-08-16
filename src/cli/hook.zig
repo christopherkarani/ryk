@@ -1034,6 +1034,58 @@ fn appendOwnedRedaction(
     });
 }
 
+fn appendOwnedLimitation(
+    allocator: std.mem.Allocator,
+    limitations: *std.ArrayList([]const u8),
+    text: []const u8,
+) !void {
+    const owned = try allocator.dupe(u8, text);
+    errdefer allocator.free(owned);
+    try limitations.append(allocator, owned);
+}
+
+fn buildPromptHookResponse(
+    allocator: std.mem.Allocator,
+    decision: PluginDecision,
+    risk: RiskLevel,
+    had_secrets: bool,
+    evaluation_reason: []const u8,
+    rule_id: ?[]const u8,
+    redactions: *std.ArrayList(RedactionEntry),
+    limitations: *std.ArrayList([]const u8),
+) !HookResponse {
+    const category = try allocator.dupe(u8, "prompt");
+    errdefer allocator.free(category);
+    const reason_owned = try allocator.dupe(u8, if (had_secrets)
+        "prompt contains potential secret"
+    else
+        evaluation_reason);
+    errdefer allocator.free(reason_owned);
+    const rule_owned: ?[]const u8 = if (rule_id) |id| try allocator.dupe(u8, id) else null;
+    errdefer if (rule_owned) |id| allocator.free(id);
+    const message_owned = if (had_secrets)
+        try allocator.dupe(u8, "Prompt may contain sensitive data. Review before submitting.")
+    else
+        try buildMessage(allocator, decision, "prompt");
+    errdefer allocator.free(message_owned);
+    const redactions_owned = try redactions.toOwnedSlice(allocator);
+    errdefer {
+        for (redactions_owned) |entry| entry.deinit(allocator);
+        allocator.free(redactions_owned);
+    }
+    const limitations_owned = try limitations.toOwnedSlice(allocator);
+    return .{
+        .decision = decision,
+        .risk = risk,
+        .category = category,
+        .reason = reason_owned,
+        .rule = rule_owned,
+        .message = message_owned,
+        .redactions = redactions_owned,
+        .host_limitations = limitations_owned,
+    };
+}
+
 const HookResponse = struct {
     version: u8 = 1,
     decision: PluginDecision,
@@ -1225,7 +1277,11 @@ fn evaluateHook(
     }
 
     // Add host limitation note
-    try limitations.append(allocator, try allocator.dupe(u8, "Hook enforcement is additive; does not replace ryk run supervision."));
+    try appendOwnedLimitation(
+        allocator,
+        &limitations,
+        "Hook enforcement is additive; does not replace ryk run supervision.",
+    );
 
     switch (event) {
         .SessionStart, .Stop, .SessionEnd, .PostToolUse => {
@@ -1259,22 +1315,16 @@ fn evaluateHook(
 
             const risk: RiskLevel = if (had_secrets) .high else RiskLevel.fromScore(evaluation.decision.risk_score);
 
-            return .{
-                .decision = decision,
-                .risk = risk,
-                .category = try allocator.dupe(u8, "prompt"),
-                .reason = if (had_secrets)
-                    try allocator.dupe(u8, "prompt contains potential secret")
-                else
-                    try allocator.dupe(u8, evaluation.decision.reason),
-                .rule = if (evaluation.matched_rule) |rule| try allocator.dupe(u8, rule.id) else null,
-                .message = if (had_secrets)
-                    try allocator.dupe(u8, "Prompt may contain sensitive data. Review before submitting.")
-                else
-                    try buildMessage(allocator, decision, "prompt"),
-                .redactions = try redactions.toOwnedSlice(allocator),
-                .host_limitations = try limitations.toOwnedSlice(allocator),
-            };
+            return try buildPromptHookResponse(
+                allocator,
+                decision,
+                risk,
+                had_secrets,
+                evaluation.decision.reason,
+                if (evaluation.matched_rule) |rule| rule.id else null,
+                &redactions,
+                &limitations,
+            );
         },
         .PreToolUse => {
             return try evaluatePreToolUse(io, allocator, workspace_root, host_name, policy_value, payload, ci_mode, &redactions, &limitations, shell_evaluator);
@@ -3436,6 +3486,55 @@ fn appendRedactionAllocationFailureProbe(allocator: std.mem.Allocator) !void {
 
 test "hook redaction append cleans up every allocation failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, appendRedactionAllocationFailureProbe, .{});
+}
+
+fn appendLimitationAllocationFailureProbe(allocator: std.mem.Allocator) !void {
+    var limitations: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (limitations.items) |item| allocator.free(item);
+        limitations.deinit(allocator);
+    }
+    try appendOwnedLimitation(
+        allocator,
+        &limitations,
+        "Hook enforcement is additive; does not replace ryk run supervision.",
+    );
+}
+
+test "hook limitation append cleans up every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, appendLimitationAllocationFailureProbe, .{});
+}
+
+fn promptHookResponseAllocationFailureProbe(allocator: std.mem.Allocator) !void {
+    var redactions: std.ArrayList(RedactionEntry) = .empty;
+    errdefer {
+        for (redactions.items) |entry| entry.deinit(allocator);
+        redactions.deinit(allocator);
+    }
+    var limitations: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (limitations.items) |item| allocator.free(item);
+        limitations.deinit(allocator);
+    }
+    try appendOwnedRedaction(allocator, &redactions, "prompt", "potential secret detected");
+    try appendOwnedLimitation(allocator, &limitations, "limit");
+    var response = try buildPromptHookResponse(
+        allocator,
+        .warn,
+        .high,
+        true,
+        "unused",
+        null,
+        &redactions,
+        &limitations,
+    );
+    response.deinit(allocator);
+    redactions.deinit(allocator);
+    limitations.deinit(allocator);
+}
+
+test "hook prompt response cleans up every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, promptHookResponseAllocationFailureProbe, .{});
 }
 
 test "hook claude PreToolUse with file write to protected path returns block" {
