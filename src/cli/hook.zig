@@ -1738,9 +1738,14 @@ fn recordDaemonMetadataRedaction(
     redactions: *std.ArrayList(RedactionEntry),
     field: []const u8,
 ) !void {
+    // Locals + errdefer: dual-dupe in one append orphaned field on reason/append OOM.
+    const owned_field = try allocator.dupe(u8, field);
+    errdefer allocator.free(owned_field);
+    const owned_reason = try allocator.dupe(u8, "daemon evaluator metadata withheld from agent-visible output");
+    errdefer allocator.free(owned_reason);
     try redactions.append(allocator, .{
-        .field = try allocator.dupe(u8, field),
-        .reason = try allocator.dupe(u8, "daemon evaluator metadata withheld from agent-visible output"),
+        .field = owned_field,
+        .reason = owned_reason,
     });
 }
 
@@ -4466,6 +4471,19 @@ test "hook classifies non-shell tool with incidental command as zig native route
     const route = preToolUseRoute(std.json.Value{ .object = payload_obj });
     try std.testing.expectEqual(PreToolUseRoute.zig_native, std.meta.activeTag(route));
     try std.testing.expectEqual(NonShellHookEvent.file_write, route.zig_native);
+}
+
+fn recordDaemonMetadataRedactionAllocationFailureProbe(allocator: std.mem.Allocator) !void {
+    var redactions: std.ArrayList(RedactionEntry) = .empty;
+    defer {
+        for (redactions.items) |entry| entry.deinit(allocator);
+        redactions.deinit(allocator);
+    }
+    try recordDaemonMetadataRedaction(allocator, &redactions, "matched_text_preview");
+}
+
+test "recordDaemonMetadataRedaction daemon metadata redaction cleans up every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, recordDaemonMetadataRedactionAllocationFailureProbe, .{});
 }
 
 test "hook daemon deny redacts matched_text_preview from agent-visible output" {
