@@ -407,6 +407,15 @@ describe('parseHookResponse (fail-closed blocking path)', () => {
     assert.strictEqual(r.reason, 'ryk_unattended_ask');
   });
 
+  it('stage decision is never leftover-ask permit', () => {
+    const r = parseHookResponse(
+      JSON.stringify({ decision: 'stage', reason: 'staged_write' }),
+      true
+    );
+    assert.strictEqual(r.decision, 'block');
+    assert.strictEqual(r.reason, 'ryk_unrecognized_decision');
+  });
+
   it('unrecognized decision on blocking path → block', () => {
     const r = parseHookResponse(
       JSON.stringify({ decision: 'maybe', reason: 'weird' }),

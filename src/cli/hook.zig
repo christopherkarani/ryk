@@ -819,9 +819,9 @@ fn wireCodingHostAsk(decision: PluginDecision, unattended: bool) PluginDecision 
 
 fn usesExitTwoDenyOutput(host: Host, decision: PluginDecision) bool {
     if (host == .codex) return decision == .block;
-    // Grok has no native approval UI for an `ask`/`stage` result. Its only
-    // enforceable non-allow contract is exit 2, so escalation and evaluator
-    // errors must block just like an explicit deny.
+    // Leftover unused ask is remapped to `.allow` before emit. A leaked
+    // `.ask`, plus stage / evaluator error, still has no Grok approval UI —
+    // the only enforceable non-allow contract is exit 2.
     if (host == .grok) {
         // Leftover unused ask is remapped to allow before emit. A raw `.ask`
         // here is the fail-closed residual (must not reach attended leftover-ask).
@@ -6462,6 +6462,9 @@ test "hook emit after wire rewrite is allow for attended Grok and OpenClaw" {
     try std.testing.expectEqual(exit_codes.success, hookExitCode(.openclaw, attended, false));
     try std.testing.expect(agentEmitShape(.grok, .PreToolUse, attended) != .grok_deny_json);
     try std.testing.expectEqual(AgentEmitShape.generic_json, agentEmitShape(.openclaw, .PreToolUse, attended));
+    // Leaked raw `.ask` still fail-closes on the Grok emit helper.
+    try std.testing.expectEqual(codex_deny_exit_code, hookExitCode(.grok, .ask, false));
+    try std.testing.expectEqual(AgentEmitShape.grok_deny_json, agentEmitShape(.grok, .PreToolUse, .ask));
 
     const oc_result = HookResponse{
         .decision = attended,

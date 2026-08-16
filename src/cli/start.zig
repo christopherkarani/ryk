@@ -1153,7 +1153,7 @@ test "host_ask_resume start OpenClaw completion warns about no ask resume" {
     try std.testing.expect(std.mem.indexOf(u8, written, "Setup complete") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "ryk run -- openclaw") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "Ask resume") != null);
-    try std.testing.expect(std.mem.indexOf(u8, written, "hard-blocks ask with no resume") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "ask resume is partial (hook-grade)") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "host-decision-mapping.md") != null);
 }
 

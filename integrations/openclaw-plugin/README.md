@@ -115,7 +115,7 @@ When hooks actually register (not npm CLI-metadata), the plugin calls `ryk hook 
 | `tool.after` | After OpenClaw finishes using a tool | Informational (audit only) |
 | `session.end` | When the session ends | Informational (audit only) |
 
-OpenClaw’s `before_tool_call` result can evolve across host versions. This adapter only relies on the stable blocking shape. Attended leftover unused policy `ask` is permit; unattended leftover `ask` is block. Blocking is effective **only if** `before_tool_call` runs.
+OpenClaw’s `before_tool_call` result can evolve across host versions. This adapter only relies on the stable blocking shape. Attended leftover unused policy `ask` is permit; unattended leftover `ask` is block. Stage, SoftBlock, and FM steward ask never become allow. Blocking is effective **only if** `before_tool_call` runs.
 
 **Do not claim `tool.before` is blocking for metadata/discovery passes** — those passes are **`unprotected`**.
 
@@ -125,7 +125,7 @@ Each hook sends a JSON payload to `ryk hook openclaw <event>` via stdin and read
 
 - empty or whitespace-only stdout → **block**
 - JSON parse failure or missing `decision` → **block**
-- `decision: "ask"` → **allow** when attended (leftover unused policy ask is permit); **block** when unattended / `--ci`
+- `decision: "ask"` → **allow** when attended (leftover unused policy ask is permit); **block** when unattended / `--ci`. There is no OpenClaw ask UI. Stage / SoftBlock / FM ask are remapped to block by `ryk hook` before emit.
 - unrecognized → **block**
 - `decision: "block"` → block
 - `decision: "allow"` / `"warn"` → allow (warn logs only)
@@ -205,7 +205,7 @@ This plugin does not mutate host configuration, so uninstalling is safe.
 - This plugin calls the ryk CLI; it does not reimplement policy logic.
 - No raw secrets are persisted in plugin files.
 - Secrets are redacted from payloads before sending to ryk (keys matching `password`, `token`, `secret`, `api_key`, etc. are replaced with `[REDACTED]`).
-- Blocking hooks fail closed on empty/malformed responses, cyclic or BigInt input, and payloads larger than 1 MiB. Attended leftover unused `ask` is permit; unattended leftover `ask` is block.
+- Blocking hooks fail closed on empty/malformed responses, unrecognized decisions, cyclic or BigInt input, and payloads larger than 1 MiB. Attended leftover unused `ask` is permit; unattended leftover `ask` is block.
 - Child-process error details are withheld from logs so stderr cannot smuggle secrets into operator output.
 - Human logs go to stderr.
 - Unattended mode never prompts.
