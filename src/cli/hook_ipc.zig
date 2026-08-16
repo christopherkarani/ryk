@@ -333,7 +333,10 @@ pub fn readLineFd(io: std.Io, allocator: std.mem.Allocator, fd: std.posix.fd_t, 
         const got: usize = @intCast(n);
         if (read_buf.items.len + got > max_line_bytes) return error.SocketReadFailed;
         try read_buf.appendSlice(allocator, chunk[0..got]);
-        if (std.mem.indexOfScalar(u8, chunk[0..got], '\n') != null) break;
+        if (std.mem.indexOfScalar(u8, read_buf.items, '\n')) |nl| {
+            read_buf.shrinkRetainingCapacity(nl + 1);
+            break;
+        }
     }
     return read_buf.toOwnedSlice(allocator);
 }

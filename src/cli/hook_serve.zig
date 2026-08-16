@@ -8,6 +8,7 @@ const builtin = @import("builtin");
 const build_options = @import("build_options");
 
 const core_api = @import("ryk_core").api;
+const supervisor = @import("ryk_core").core.supervisor;
 
 const daemon_uds = @import("daemon_uds.zig");
 const exit_codes = @import("exit_codes.zig");
@@ -69,10 +70,21 @@ pub fn command(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: an
     return serveLoop(io, std.heap.page_allocator, path, idle_ms, null);
 }
 
+const FileStamp = struct {
+    exists: bool = false,
+    size: u64 = 0,
+    mtime_ns: i96 = 0,
+
+    fn eql(a: FileStamp, b: FileStamp) bool {
+        return a.exists == b.exists and a.size == b.size and a.mtime_ns == b.mtime_ns;
+    }
+};
+
 const WorkspaceCacheEntry = struct {
     realpath: []u8,
-    policy_mtime_s: i64,
-    pack_mtime_s: i64,
+    policy_stamp: FileStamp,
+    pack_stamp: FileStamp,
+    user_stamp: FileStamp,
     last_used: u64,
     loaded: core_api.LoadedPolicy,
 };
@@ -107,20 +119,25 @@ pub const WorkspacePolicyCache = struct {
     }
 
     /// Load or reuse a workspace policy. Load failures are not cached.
+    /// `workspace` may be a subdirectory; the cache key is the walked-up root.
     pub fn getOrLoad(self: *WorkspacePolicyCache, io: std.Io, workspace: []const u8) ?*const core_api.LoadedPolicy {
         if (workspace.len == 0) return null;
-        const real_z = std.Io.Dir.cwd().realPathFileAlloc(io, workspace, self.allocator) catch return null;
-        defer self.allocator.free(real_z);
-        const policy_path = std.fs.path.join(self.allocator, &.{ real_z, ".ryk", "policy.yaml" }) catch return null;
+        const root = supervisor.resolveWorkspaceRoot(io, self.allocator, null, workspace) catch return null;
+        defer self.allocator.free(root);
+        const policy_path = std.fs.path.join(self.allocator, &.{ root, ".ryk", "policy.yaml" }) catch return null;
         defer self.allocator.free(policy_path);
-        const pack_path = std.fs.path.join(self.allocator, &.{ real_z, ".ryk.toml" }) catch return null;
+        const pack_path = std.fs.path.join(self.allocator, &.{ root, ".ryk.toml" }) catch return null;
         defer self.allocator.free(pack_path);
-        const policy_mtime = fileMtimeSecs(io, policy_path);
-        const pack_mtime = fileMtimeSecs(io, pack_path);
+        const policy_stamp = fileStamp(io, policy_path);
+        const pack_stamp = fileStamp(io, pack_path);
+        const user_stamp = userPolicyStamp(io, self.allocator);
 
-        if (self.indexOf(real_z)) |idx| {
+        if (self.indexOf(root)) |idx| {
             if (self.entries[idx]) |*entry| {
-                if (entry.policy_mtime_s == policy_mtime and entry.pack_mtime_s == pack_mtime) {
+                if (FileStamp.eql(entry.policy_stamp, policy_stamp) and
+                    FileStamp.eql(entry.pack_stamp, pack_stamp) and
+                    FileStamp.eql(entry.user_stamp, user_stamp))
+                {
                     self.clock += 1;
                     entry.last_used = self.clock;
                     return &entry.loaded;
@@ -129,8 +146,8 @@ pub const WorkspacePolicyCache = struct {
             }
         }
 
-        var loaded = core_api.discoverPolicy(io, self.allocator, null, real_z) catch return null;
-        const owned = self.allocator.dupe(u8, real_z) catch {
+        var loaded = core_api.discoverPolicy(io, self.allocator, null, root) catch return null;
+        const owned = self.allocator.dupe(u8, root) catch {
             loaded.deinit();
             return null;
         };
@@ -139,8 +156,9 @@ pub const WorkspacePolicyCache = struct {
         self.clock += 1;
         self.entries[slot] = .{
             .realpath = owned,
-            .policy_mtime_s = policy_mtime,
-            .pack_mtime_s = pack_mtime,
+            .policy_stamp = policy_stamp,
+            .pack_stamp = pack_stamp,
+            .user_stamp = user_stamp,
             .last_used = self.clock,
             .loaded = loaded,
         };
@@ -178,11 +196,23 @@ pub const WorkspacePolicyCache = struct {
     }
 };
 
-fn fileMtimeSecs(io: std.Io, path: []const u8) i64 {
-    const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return 0;
+fn fileStamp(io: std.Io, path: []const u8) FileStamp {
+    const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return .{};
     defer file.close(io);
-    const st = file.stat(io) catch return 0;
-    return st.mtime.toSeconds();
+    const st = file.stat(io) catch return .{};
+    return .{
+        .exists = true,
+        .size = st.size,
+        .mtime_ns = st.mtime.nanoseconds,
+    };
+}
+
+fn userPolicyStamp(io: std.Io, allocator: std.mem.Allocator) FileStamp {
+    const home_c = std.c.getenv("HOME") orelse return .{};
+    const home = std.mem.span(home_c);
+    const path = std.fs.path.join(allocator, &.{ home, ".config", "ryk", "policy.yaml" }) catch return .{};
+    defer allocator.free(path);
+    return fileStamp(io, path);
 }
 
 pub fn serveLoop(
@@ -256,12 +286,14 @@ fn handleClient(
 
     const line = hook_ipc.readLineFd(io, arena, fd, hook_ipc.request_timeout_ms) catch return false;
 
-    const parsed = hook_ipc.parseRequest(arena, line) catch {
+    const parsed = hook_ipc.parseRequest(arena, line) catch |err| {
+        const mismatch = err == error.ProtocolMismatch;
         const resp = try hook_ipc.stringifyResponse(arena, .{
             .id = 0,
             .exit = 2,
             .stdout = "",
-            .stderr = "ryk hook-serve: invalid request",
+            .stderr = if (mismatch) "ryk hook-serve: protocol mismatch" else "ryk hook-serve: invalid request",
+            .mismatch = mismatch,
         });
         hook_ipc.writeAllFd(io, fd, resp, hook_ipc.request_timeout_ms) catch {};
         return false;
@@ -499,6 +531,33 @@ fn testServe(socket_path: []const u8, stop: *std.atomic.Value(bool)) void {
 
 fn testServeNoStop(socket_path: []const u8) void {
     _ = serveLoop(std.testing.io, std.heap.page_allocator, socket_path, 30_000, null) catch {};
+}
+
+test "hook-serve reports mismatch for protocol v != 1" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(dir);
+    const sock = try std.fs.path.join(std.testing.allocator, &.{ dir, "hook-proto.sock" });
+    defer std.testing.allocator.free(sock);
+
+    var stop = std.atomic.Value(bool).init(false);
+    const thread = try std.Thread.spawn(.{}, testServe, .{ sock, &stop });
+    defer {
+        stop.store(true, .unordered);
+        if (daemon_uds.connectUnixSocket(sock)) |fd| {
+            _ = std.c.close(fd);
+        } else |_| {}
+        thread.join();
+    }
+    try waitForSocket(sock, 50);
+
+    const raw = try exchange(std.testing.allocator, sock, "{\"v\":2,\"id\":1,\"method\":\"ping\"}\n");
+    defer std.testing.allocator.free(raw);
+    var parsed = try hook_ipc.parseResponse(std.testing.allocator, raw);
+    defer parsed.deinit();
+    try std.testing.expect(parsed.response.mismatch);
 }
 
 test "hook-serve reports mismatch for a different version" {

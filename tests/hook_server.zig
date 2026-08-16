@@ -274,6 +274,44 @@ test "two workspaces do not share a cached policy" {
     try std.testing.expectEqual(@as(u8, 2), bad_resp.response.exit);
 }
 
+test "subdir cwd uses walked-up workspace policy not builtin allow" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(dir);
+    const sock = try std.fs.path.join(std.testing.allocator, &.{ dir, "subdir.sock" });
+    defer std.testing.allocator.free(sock);
+
+    const repo = try std.fs.path.join(std.testing.allocator, &.{ dir, "repo" });
+    defer std.testing.allocator.free(repo);
+    const nested = try std.fs.path.join(std.testing.allocator, &.{ repo, "src" });
+    defer std.testing.allocator.free(nested);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, nested);
+    try writeWorkspacePolicy(std.testing.io, repo, "mode: [this is not valid yaml\n");
+
+    const grok_payload = try readFile(std.testing.allocator, grok_safe);
+    defer std.testing.allocator.free(grok_payload);
+
+    const server = try startServer(sock);
+    defer stopServer(sock, server);
+
+    const req = try hook_ipc.stringifyRequest(std.testing.allocator, .{
+        .id = 1,
+        .method = "hook",
+        .host = "grok",
+        .event = "PreToolUse",
+        .workspace = nested,
+        .payload_json = grok_payload,
+    });
+    defer std.testing.allocator.free(req);
+    const raw = try exchange(std.testing.allocator, sock, req);
+    defer std.testing.allocator.free(raw);
+    var parsed = try hook_ipc.parseResponse(std.testing.allocator, raw);
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u8, 2), parsed.response.exit);
+}
+
 test "probe does not create allow-once pending files" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});

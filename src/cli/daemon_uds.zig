@@ -84,14 +84,16 @@ pub fn connectUnixSocketTimeout(path: []const u8, timeout_ms: ?u64) !std.posix.f
                 .INPROGRESS, .AGAIN, .ALREADY => {
                     var fds = [_]std.posix.pollfd{.{
                         .fd = fd,
-                        .events = 0x0004, // POLLOUT
+                        .events = std.posix.POLL.OUT,
                         .revents = 0,
                     }};
                     const prc = std.posix.poll(fds[0..], @intCast(@min(ms, std.math.maxInt(i32)))) catch
                         return error.SocketConnectFailed;
-                    if (prc <= 0) return error.SocketConnectFailed;
+                    if (prc <= 0) return error.TimedOut;
                     try takeSocketError(fd);
                 },
+                .NOENT => return error.FileNotFound,
+                .CONNREFUSED => return error.ConnectionRefused,
                 else => return error.SocketConnectFailed,
             }
         }
@@ -100,8 +102,16 @@ pub fn connectUnixSocketTimeout(path: []const u8, timeout_ms: ?u64) !std.posix.f
     }
 
     const rc = std.c.connect(fd, @ptrCast(&sockaddr.addr), sockaddr.len);
-    if (rc < 0) return error.SocketConnectFailed;
+    if (rc < 0) return connectErrno();
     return fd;
+}
+
+fn connectErrno() error{ FileNotFound, ConnectionRefused, SocketConnectFailed } {
+    return switch (std.posix.errno(@as(isize, -1))) {
+        .NOENT => error.FileNotFound,
+        .CONNREFUSED => error.ConnectionRefused,
+        else => error.SocketConnectFailed,
+    };
 }
 
 pub const BindUnixSocketOptions = struct {
@@ -116,20 +126,44 @@ pub fn bindListenUnixSocket(path: []const u8, backlog: u31) !std.posix.fd_t {
 
 pub fn bindListenUnixSocketOpts(path: []const u8, opts: BindUnixSocketOptions) !std.posix.fd_t {
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .macos) return error.UnsupportedOs;
-    if (opts.fail_if_live) {
-        if (connectUnixSocketTimeout(path, 50)) |fd| {
-            _ = std.c.close(fd);
-            return error.SocketAlreadyBound;
-        } else |_| {}
+    if (!opts.fail_if_live) {
+        unlinkUnixSocketPath(path);
+        return bindListenFresh(path, opts.backlog);
     }
-    unlinkUnixSocketPath(path);
 
+    const fd = openUnixStreamSocket() catch return error.SocketConnectFailed;
+    const sockaddr = sockaddrUnFromPath(path) catch {
+        _ = std.c.close(fd);
+        return error.InvalidSocketPath;
+    };
+    if (std.c.bind(fd, @ptrCast(&sockaddr.addr), sockaddr.len) == 0) {
+        if (std.c.listen(fd, opts.backlog) < 0) {
+            _ = std.c.close(fd);
+            return error.SocketConnectFailed;
+        }
+        return fd;
+    }
+    _ = std.c.close(fd);
+
+    // Address in use: steal only when the peer is gone. A timeout means live.
+    if (connectUnixSocketTimeout(path, 50)) |live_fd| {
+        _ = std.c.close(live_fd);
+        return error.SocketAlreadyBound;
+    } else |err| switch (err) {
+        error.ConnectionRefused, error.FileNotFound => {
+            unlinkUnixSocketPath(path);
+            return bindListenFresh(path, opts.backlog);
+        },
+        else => return error.SocketAlreadyBound,
+    }
+}
+
+fn bindListenFresh(path: []const u8, backlog: u31) !std.posix.fd_t {
     const fd = try openUnixStreamSocket();
     errdefer _ = std.c.close(fd);
-
     const sockaddr = try sockaddrUnFromPath(path);
     if (std.c.bind(fd, @ptrCast(&sockaddr.addr), sockaddr.len) < 0) return error.SocketConnectFailed;
-    if (std.c.listen(fd, opts.backlog) < 0) return error.SocketConnectFailed;
+    if (std.c.listen(fd, backlog) < 0) return error.SocketConnectFailed;
     return fd;
 }
 
@@ -161,7 +195,7 @@ test "connectUnixSocketTimeout fails fast on a missing path" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     const started = std.Io.Timestamp.now(std.testing.io, .awake).toMilliseconds();
     try std.testing.expectError(
-        error.SocketConnectFailed,
+        error.FileNotFound,
         connectUnixSocketTimeout("/tmp/ryk-uds-missing-connect-timeout.sock", 50),
     );
     const elapsed = std.Io.Timestamp.now(std.testing.io, .awake).toMilliseconds() - started;
@@ -183,7 +217,13 @@ fn takeSocketError(fd: std.posix.fd_t) !void {
     var len: std.c.socklen_t = @sizeOf(i32);
     if (std.c.getsockopt(fd, solSocket(), soError(), @ptrCast(&so_err), &len) < 0)
         return error.SocketConnectFailed;
-    if (so_err != 0) return error.SocketConnectFailed;
+    if (so_err == 0) return;
+    return switch (so_err) {
+        @intFromEnum(std.posix.E.NOENT) => error.FileNotFound,
+        @intFromEnum(std.posix.E.CONNREFUSED) => error.ConnectionRefused,
+        @intFromEnum(std.posix.E.TIMEDOUT) => error.TimedOut,
+        else => error.SocketConnectFailed,
+    };
 }
 
 fn solSocket() c_int {
