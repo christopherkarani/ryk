@@ -77,6 +77,13 @@ These four packs do not share choke-point files and can start together:
 - [phases/phase-2.md](phases/phase-2.md) — help / copy
 - [phases/phase-3.md](phases/phase-3.md) — polish
 
+## Kickoff Canvas
+
+Interactive one-button launcher: [`ryk-issue-kickoff.canvas.tsx`](ryk-issue-kickoff.canvas.tsx) (also written to the Cursor canvases directory for live Kick off agent buttons). Each button opens a Composer chat with the pack prompt preloaded and @mentions the canvas.
+
+**Kick now (parallel):** PR-0 · PR-1 · PR-2 · PR-6  
+**Then:** PR-3 (one agent) → PR-4 · PR-5 · PR-7 · PR-8 · CLOSE
+
 ## Standing product rules (every agent)
 
 - Do **not** reopen #144, #145, #146, #193, #195, #196, #203–#212 as “reopens.”
