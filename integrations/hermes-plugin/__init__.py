@@ -1045,8 +1045,9 @@ def _call_ryk(event: str, data: Any) -> dict[str, Any]:
         )
 
     argv = [ryk, "hook", "hermes", event]
-    # Unattended/CI must pass --ci so residual ryk ask (FM soft, stage→ask)
-    # hardens inside the CLI, not only in the host mapping layer.
+    # Unattended/CI must pass --ci so leftover unused ryk ask hardens inside
+    # the CLI, not only in the host mapping layer. Stage, FM steward ask, and
+    # SoftBlock never ride the leftover-ask permit wire.
     if _is_unattended():
         argv.append("--ci")
     policy_cwd = _policy_workspace_cwd()

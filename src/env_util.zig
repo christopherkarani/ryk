@@ -49,10 +49,50 @@ pub fn getenvBrand(suffix: []const u8) ?[*:0]const u8 {
 pub fn getenvBrandFlagTruthy(suffix: []const u8) bool {
     const raw_c = getenvBrand(suffix) orelse return false;
     const raw = std.mem.span(raw_c);
-    return std.mem.eql(u8, raw, "1") or
-        std.ascii.eqlIgnoreCase(raw, "true") or
-        std.ascii.eqlIgnoreCase(raw, "yes") or
-        std.ascii.eqlIgnoreCase(raw, "on");
+    return envTokenTruthy(raw);
+}
+
+fn envTokenTruthy(raw: []const u8) bool {
+    const value = std.mem.trim(u8, raw, " \t\r\n");
+    return std.mem.eql(u8, value, "1") or
+        std.ascii.eqlIgnoreCase(value, "true") or
+        std.ascii.eqlIgnoreCase(value, "yes") or
+        std.ascii.eqlIgnoreCase(value, "on");
+}
+
+const unattended_env_keys = [_][]const u8{
+    "RYK_UNATTENDED",
+    "RYK_CI",
+    "RYK_NONINTERACTIVE",
+    "CI",
+};
+
+/// True when any unattended/CI signal is a truthy token.
+/// `lookup` must provide `get(key: []const u8) ?[]const u8` (unset → null).
+/// Does not read process env; `getenvUnattended` is the libc wrapper.
+pub fn unattendedFromLookup(lookup: anytype) bool {
+    for (unattended_env_keys) |key| {
+        const raw = lookup.get(key) orelse continue;
+        if (envTokenTruthy(raw)) return true;
+    }
+    return false;
+}
+
+const LibcEnvLookup = struct {
+    fn get(_: @This(), key: []const u8) ?[]const u8 {
+        var buf: [64]u8 = undefined;
+        if (key.len >= buf.len) return null;
+        const zkey = std.fmt.bufPrintZ(&buf, "{s}", .{key}) catch return null;
+        const raw_c = std.c.getenv(zkey.ptr) orelse return null;
+        return std.mem.span(raw_c);
+    }
+};
+
+/// Residual `ask` hardens to deny when the operator asked for unattended/CI.
+/// Coding hosts otherwise permit residual ask so agents can work; explicit deny
+/// is unchanged. Signals: `RYK_UNATTENDED`, `RYK_CI`, `RYK_NONINTERACTIVE`, `CI`.
+pub fn getenvUnattended() bool {
+    return unattendedFromLookup(LibcEnvLookup{});
 }
 
 /// Process home directory across Unix and Windows. Windows PowerShell commonly
@@ -61,6 +101,51 @@ pub fn getenvHome() ?[*:0]const u8 {
     if (std.c.getenv("HOME")) |home| return home;
     if (comptime builtin.os.tag == .windows) return std.c.getenv("USERPROFILE");
     return null;
+}
+
+test "envTokenTruthy accepts 1/true/yes/on and rejects empty or 0" {
+    try std.testing.expect(envTokenTruthy("1"));
+    try std.testing.expect(envTokenTruthy("true"));
+    try std.testing.expect(envTokenTruthy("YES"));
+    try std.testing.expect(envTokenTruthy("On"));
+    try std.testing.expect(!envTokenTruthy(""));
+    try std.testing.expect(!envTokenTruthy("0"));
+    try std.testing.expect(!envTokenTruthy("false"));
+    try std.testing.expect(envTokenTruthy(" 1 "));
+    try std.testing.expect(envTokenTruthy("true\n"));
+}
+
+const TestEnvLookup = struct {
+    pairs: []const struct { []const u8, []const u8 },
+
+    fn get(self: @This(), key: []const u8) ?[]const u8 {
+        for (self.pairs) |pair| {
+            if (std.mem.eql(u8, pair[0], key)) return pair[1];
+        }
+        return null;
+    }
+};
+
+test "unattendedFromLookup each key truthy, falsy, or unset" {
+    const keys = [_][]const u8{ "RYK_UNATTENDED", "RYK_CI", "RYK_NONINTERACTIVE", "CI" };
+    try std.testing.expect(!unattendedFromLookup(TestEnvLookup{ .pairs = &.{} }));
+
+    const truthy = [_][]const u8{ "1", "true", "yes", "on" };
+    for (keys, truthy) |key, value| {
+        try std.testing.expect(unattendedFromLookup(TestEnvLookup{ .pairs = &.{.{ key, value }} }));
+    }
+
+    const falsy = [_][]const u8{ "0", "false", "" };
+    for (keys) |key| {
+        for (falsy) |value| {
+            try std.testing.expect(!unattendedFromLookup(TestEnvLookup{ .pairs = &.{.{ key, value }} }));
+        }
+    }
+
+    // OR: a falsy first key does not mask a later truthy signal.
+    try std.testing.expect(unattendedFromLookup(TestEnvLookup{
+        .pairs = &.{ .{ "RYK_UNATTENDED", "0" }, .{ "CI", "1" } },
+    }));
 }
 
 test "getOwnedFirst prefers first key" {

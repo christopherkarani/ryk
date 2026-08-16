@@ -206,10 +206,10 @@ Responses are written to stdout.
 |---|---|
 | `allow` | `allow` |
 | `deny` | `block` |
-| `ask` | `ask`, or `block` in CI |
+| `ask` | leftover unused policy `ask`, or `block` in CI. Attended coding-host hook wire remaps leftover unused `ask` to `allow`. Stage / FM / SoftBlock are not leftover unused ask. |
 | `observe` | `context_only` |
 | `redact` | `warn` |
-| `stage` | `ask`, or `block` in CI |
+| `stage` | `stage`, or `block` in CI. Never `allow`. Claude `permissionDecision` holds as `ask`. |
 | `broker` | `error` |
 
 ### Examples
