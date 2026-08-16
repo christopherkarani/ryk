@@ -798,6 +798,96 @@ test "secret value detection covers synthetic examples" {
     try std.testing.expect(classifySecretValue("ghp_fakeSynthetic") != null);
     try std.testing.expect(classifySecretValue("sk-fakeSynthetic") != null);
     try std.testing.expect(classifySecretValue("sk-learn") == null);
+    try std.testing.expect(classifySecretValue("xoxb-fakeSynthetic") != null);
+    try std.testing.expect(classifySecretValue("sk_live_fakeSynth") != null);
+    try std.testing.expect(classifySecretValue("hf_fakeSynth") != null);
+    try std.testing.expect(classifySecretValue("glpat-fakeSynthetic") != null);
+    try std.testing.expect(classifySecretValue("sv=2021-06-08&sig=fakeSyntheticAzureSasSigValue") != null);
+}
+
+test "secret value detection covers vendor token shapes" {
+    try expectSecretLabel("xoxb-fakeSynthetic", "secret:slack_token");
+    try expectSecretLabel("xoxp-fakeSynthetic", "secret:slack_token");
+    try expectSecretLabel("xoxa-fakeSynthetic", "secret:slack_token");
+    try expectSecretLabel("xoxs-fakeSynthetic", "secret:slack_token");
+    try expectSecretLabel("xoxe-fakeSynthetic", "secret:slack_token");
+    try expectSecretLabel("sk_live_fakeSynth", "secret:stripe_api_key");
+    try expectSecretLabel("sk_test_fakeSynth", "secret:stripe_api_key");
+    try expectSecretLabel("hf_fakeSynth", "secret:huggingface_token");
+    try expectSecretLabel("glpat-fakeSynthetic", "secret:gitlab_token");
+    try expectSecretLabel("sv=2021-06-08&sig=fakeSyntheticAzureSasSigValue", "secret:azure_sas");
+    try expectSecretLabel(
+        "https://example.invalid/blob?sv=2021-06-08&sig=fakeSyntheticAzureSasSigValue",
+        "secret:azure_sas",
+    );
+    try expectSecretLabel(
+        "https://example.invalid/blob?sig=fakeSyntheticAzureSasSigValue&sv=2021-06-08",
+        "secret:azure_sas",
+    );
+
+    // OpenAI hyphenated `sk-` must not collapse into Stripe's underscore prefixes.
+    try expectSecretLabel("sk-fakeSynthetic", "secret:openai_api_key");
+    try expectSecretLabel("sk-fakeSyntheticOpenAIKey1234567890", "secret:openai_api_key");
+
+    try std.testing.expect(classifySecretValue("sk-learn") == null);
+    try std.testing.expect(classifySecretValue("xox") == null);
+    try std.testing.expect(classifySecretValue("xoxb") == null);
+    try std.testing.expect(classifySecretValue("xoxb-shorttoken") == null);
+    try std.testing.expect(classifySecretValue("hf") == null);
+    try std.testing.expect(classifySecretValue("hf_tooshort") == null);
+    try std.testing.expect(classifySecretValue("glpat") == null);
+    try std.testing.expect(classifySecretValue("glpat_fakeSynthetic") == null);
+    try std.testing.expect(classifySecretValue("sk_live_") == null);
+    try std.testing.expect(classifySecretValue("sk_live_short") == null);
+    try std.testing.expect(classifySecretValue("sk_test_short") == null);
+    try std.testing.expect(classifySecretValue("sv=2021-06-08") == null);
+    try std.testing.expect(classifySecretValue("sig=fakeSyntheticAzureSasSigValue") == null);
+    try std.testing.expect(classifySecretValue("https://example.invalid/?sv=2021-06-08&sig=short") == null);
+}
+
+test "vendor tokens are redacted when embedded mid-string" {
+    const cases = [_]struct { value: []const u8, secret: []const u8 }{
+        .{ .value = "note xoxb-fakeSynthetic here", .secret = "xoxb-fakeSynthetic" },
+        .{ .value = "note xoxp-fakeSynthetic here", .secret = "xoxp-fakeSynthetic" },
+        .{ .value = "charge sk_live_fakeSynth now", .secret = "sk_live_fakeSynth" },
+        .{ .value = "charge sk_test_fakeSynth now", .secret = "sk_test_fakeSynth" },
+        .{ .value = "model hf_fakeSynth ready", .secret = "hf_fakeSynth" },
+        .{ .value = "clone glpat-fakeSynthetic ok", .secret = "glpat-fakeSynthetic" },
+        .{
+            .value = "get https://example.invalid/blob?sv=2021-06-08&sig=fakeSyntheticAzureSasSigValue&sp=r",
+            .secret = "fakeSyntheticAzureSasSigValue",
+        },
+        .{ .value = "prefix XOXB-fakeSynthetic suffix", .secret = "XOXB-fakeSynthetic" },
+        .{ .value = "https://example.invalid/?q=sk_live_fakeSynth", .secret = "sk_live_fakeSynth" },
+    };
+    for (cases) |case| {
+        try expectRedactsSecret(case.value, case.secret);
+    }
+
+    const benign = [_][]const u8{ "sk-learn", "xox", "hf", "glpat", "curl --user-agent ryk /health" };
+    for (benign) |value| {
+        const unchanged = try redactAlloc(std.testing.allocator, value);
+        defer std.testing.allocator.free(unchanged);
+        try std.testing.expectEqualStrings(value, unchanged);
+    }
+}
+
+test "forged REDACTED prefix cannot hide later vendor tokens" {
+    const cases = [_]struct { value: []const u8, secret: []const u8 }{
+        .{ .value = "prefix [REDACTED then xoxb-fakeSynthetic", .secret = "xoxb-fakeSynthetic" },
+        .{ .value = "prefix [REDACTED then sk_live_fakeSynth", .secret = "sk_live_fakeSynth" },
+        .{ .value = "prefix [REDACTED then hf_fakeSynth", .secret = "hf_fakeSynth" },
+        .{ .value = "prefix [REDACTED then glpat-fakeSynthetic", .secret = "glpat-fakeSynthetic" },
+        .{
+            .value = "prefix [REDACTED then https://example.invalid/?sv=2021-06-08&sig=fakeSyntheticAzureSasSigValue",
+            .secret = "fakeSyntheticAzureSasSigValue",
+        },
+        .{ .value = "prefix [REDACTED password: xoxb-fakeSynthetic] suffix", .secret = "xoxb-fakeSynthetic" },
+        .{ .value = "marker [REDACTED] then xoxb-fakeSynthetic", .secret = "xoxb-fakeSynthetic" },
+    };
+    for (cases) |case| {
+        try expectRedactsSecret(case.value, case.secret);
+    }
 }
 
 test "redaction labels are stable and do not include raw value" {
@@ -1173,6 +1263,11 @@ test "only canonical or legacy-known marker labels are opaque" {
         "[REDACTED:env:GITHUB_TOKEN:sha256:deadbeef]",
         "[REDACTED:secret:openai_api_key]",
         "[REDACTED:secret:openai_api_key:sha256:deadbeef]",
+        "[REDACTED:secret:slack_token]",
+        "[REDACTED:secret:stripe_api_key]",
+        "[REDACTED:secret:huggingface_token]",
+        "[REDACTED:secret:gitlab_token]",
+        "[REDACTED:secret:azure_sas]",
     };
     for (valid) |marker| try std.testing.expect(isValidRedactionMarker(marker));
 
@@ -1280,4 +1375,20 @@ test "classify does not hash raw secret fingerprints" {
     const match = classifyString("GITHUB_TOKEN=hunter2") orelse return error.TestExpectedEqual;
     try std.testing.expectEqual([_]u8{0} ** 8, match.fingerprint);
     try std.testing.expectEqualStrings("GITHUB_TOKEN", match.label);
+}
+
+fn expectSecretLabel(value: []const u8, label: []const u8) !void {
+    const match = classifySecretValue(value) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings(label, match.label);
+}
+
+fn expectRedactsSecret(value: []const u8, secret: []const u8) !void {
+    const owned = try redactAlloc(std.testing.allocator, value);
+    defer std.testing.allocator.free(owned);
+    try std.testing.expect(std.mem.indexOf(u8, owned, secret) == null);
+    try std.testing.expect(std.mem.indexOf(u8, owned, redacted_value) != null or std.mem.indexOf(u8, owned, "[REDACTED:") != null);
+
+    var buffer: [512]u8 = undefined;
+    const bounded = redactStringBounded(value, &buffer);
+    try std.testing.expect(std.mem.indexOf(u8, bounded, secret) == null);
 }
