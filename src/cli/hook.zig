@@ -2961,6 +2961,41 @@ test "hook command help and invalid host" {
     try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "unknown host") != null);
 }
 
+test "hook help usage lists every Host.parse allowlist member including grok" {
+    const info = help.findCommand("hook") orelse return error.MissingHookHelp;
+    const open = std.mem.indexOfScalar(u8, info.usage, '<') orelse return error.MissingHostUsageGroup;
+    const close = std.mem.indexOfScalar(u8, info.usage[open..], '>') orelse return error.MissingHostUsageGroup;
+    const listed = info.usage[open + 1 .. open + close];
+
+    inline for (@typeInfo(Host).@"enum".fields) |field| {
+        var found = false;
+        var it = std.mem.splitScalar(u8, listed, '|');
+        while (it.next()) |name| {
+            if (std.mem.eql(u8, name, field.name)) found = true;
+        }
+        if (!found) {
+            std.debug.print("hook --help Usage omits dispatch host '{s}': {s}\n", .{ field.name, info.usage });
+        }
+        try std.testing.expect(found);
+    }
+
+    var listed_it = std.mem.splitScalar(u8, listed, '|');
+    while (listed_it.next()) |name| {
+        if (Host.parse(name) == null) {
+            std.debug.print("hook --help Usage lists non-dispatch host '{s}': {s}\n", .{ name, info.usage });
+        }
+        try std.testing.expect(Host.parse(name) != null);
+    }
+
+    var stdout_buf: [4096]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_buf: [256]u8 = undefined;
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+    const code = try command(std.testing.io, &.{"--help"}, &stdout_writer, &stderr_writer);
+    try std.testing.expectEqual(exit_codes.success, code);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), info.usage) != null);
+}
+
 test "hook recognizes Grok as a PreToolUse host with exit-two deny semantics" {
     try std.testing.expectEqual(Host.grok, Host.parse("grok").?);
     try std.testing.expect(shouldFailClosedOnPreEval(.grok, .PreToolUse));
