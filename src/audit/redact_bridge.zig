@@ -43,16 +43,23 @@ pub fn redactAlloc(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
 pub fn containsStructuredSecret(value: []const u8) bool {
     // Session ids are path keys. `findStructuredSecret` is a free-text scanner
     // and matches `sk-` at every byte, so `task-<uuid>` / `ask-followup-1`
-    // would collapse onto `redacted`. Accept a hit only at an `isKeyStart`
-    // boundary (`-` / `.` count; alnum / `_` do not). Do not change the
-    // scanner itself — glued `blockedsk-…` in commands must still redact.
+    // would collapse onto `redacted`. Accept a hit only when the previous
+    // byte is non-alnum (`-` / `_` / `.` count). Do not change the scanner
+    // itself — glued `blockedsk-…` in commands must still redact.
     var from: usize = 0;
     while (findStructuredSecret(value, from)) |span| {
-        if (isKeyStart(value, span.start)) return true;
+        // Session ids allow `_` as a separator (`sess_…`, OpenCode `ses_…`).
+        // Env-var `isKeyStart` treats `_` as interior, which would keep
+        // `sess_ghp_…`. Alnum-only interior still rejects `task-` / `ask-`.
+        if (isSessionIdTokenBoundary(value, span.start)) return true;
         from = span.start + 1;
     }
     const trimmed = std.mem.trim(u8, value, " \t\r\n");
     return looksLikeAwsAccessKey(trimmed);
+}
+
+fn isSessionIdTokenBoundary(value: []const u8, i: usize) bool {
+    return i == 0 or !std.ascii.isAlphanumeric(value[i - 1]);
 }
 
 const SecretSpan = struct { start: usize, end: usize };
