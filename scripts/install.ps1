@@ -146,6 +146,30 @@ function Get-ExistingProductInfo($Path) {
     return @{ Version = $version }
 }
 
+# Conservative product identity matching scripts/install.sh. Basename must be
+# ryk/ryk.exe. Prefer a cheap marker so a broken product binary is still
+# overwrite-safe; otherwise probe version --json.
+function Test-IsRykProductBinary($Path) {
+    if (-not (Test-Path -LiteralPath $Path)) { return $false }
+    $item = Get-Item -LiteralPath $Path -Force
+    if ($item.PSIsContainer) { return $false }
+    if ($item.Name -ne "ryk" -and $item.Name -ne "ryk.exe") { return $false }
+    try {
+        $reader = [System.IO.StreamReader]::new($Path)
+        try {
+            $chunk = $reader.ReadToEnd()
+        } finally {
+            $reader.Dispose()
+        }
+        if ($chunk -match '"product"\s*:\s*"ryk"' -or $chunk.Contains("safety_boundary_version")) {
+            return $true
+        }
+    } catch {
+        # Fall through to the version probe.
+    }
+    return $null -ne (Get-ExistingProductInfo $Path)
+}
+
 function Install-RuntimeAssets($ExtractRoot) {
     New-Item -ItemType Directory -Force -Path $ResourceRoot | Out-Null
     foreach ($dir in $RuntimeDirs) {
@@ -331,9 +355,13 @@ try {
 
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
     $force = $env:RYK_INSTALL_FORCE -eq "1"
-    if ((Test-Path -LiteralPath $destination) -and -not $force) {
-        if (-not (Get-ExistingProductInfo $destination)) {
-            Fail "refusing to overwrite non-ryk file at $destination" "Set RYK_INSTALL_FORCE=1 to replace it."
+    if (Test-Path -LiteralPath $destination) {
+        $destItem = Get-Item -LiteralPath $destination -Force
+        if ($destItem.PSIsContainer) {
+            Fail "refusing directory binary destination path: $destination" "Choose a path whose final target is a regular file or an existing ryk symlink."
+        }
+        if (-not $force -and -not (Test-IsRykProductBinary $destination)) {
+            Fail "refusing to overwrite non-ryk file at $destination" "ryk update --force"
         }
     }
     Copy-Item -LiteralPath $binary.FullName -Destination $destination -Force

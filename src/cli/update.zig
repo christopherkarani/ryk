@@ -222,6 +222,15 @@ pub fn channelAllowsInstaller(channel: InstallChannel, force: bool) bool {
     };
 }
 
+/// `ryk update --force` must set this on the installer child so a non-ryk
+/// destination can be overwritten (same contract as RYK_INSTALL_FORCE=1).
+pub const install_force_env_key = "RYK_INSTALL_FORCE";
+pub const install_force_env_value = "1";
+
+pub fn forceImpliesInstallForce(force: bool) bool {
+    return force;
+}
+
 pub fn packageManagerHint(channel: InstallChannel) []const u8 {
     return switch (channel) {
         .homebrew, .npm, .scoop, .winget, .curl_installer, .unknown => supported_install_command,
@@ -482,7 +491,7 @@ pub fn command(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: an
         try stdout.print("Updating ryk {s} → {s} via official installer…\n\n", .{ current, target });
     }
 
-    const install_code = runOfficialInstaller(allocator, io, target, args.json, stderr) catch |err| {
+    const install_code = runOfficialInstaller(allocator, io, target, args.json, args.force, stderr) catch |err| {
         telemetry.recordUpdateFailed(@tagName(channel), "installer");
         if (args.json) {
             try writeJsonResult(stdout, .{
@@ -738,12 +747,13 @@ fn runOfficialInstaller(
     io: std.Io,
     target_version: []const u8,
     quiet_json: bool,
+    force: bool,
     stderr: anytype,
 ) !u8 {
     if (builtin.os.tag == .windows) {
-        return runWindowsInstaller(allocator, io, target_version, quiet_json, stderr);
+        return runWindowsInstaller(allocator, io, target_version, quiet_json, force, stderr);
     }
-    return runUnixInstaller(allocator, io, target_version, quiet_json, stderr);
+    return runUnixInstaller(allocator, io, target_version, quiet_json, force, stderr);
 }
 
 fn tempRoot() []const u8 {
@@ -827,6 +837,7 @@ fn runUnixInstaller(
     io: std.Io,
     target_version: []const u8,
     quiet_json: bool,
+    force: bool,
     stderr: anytype,
 ) !u8 {
     // Prefer tag-pinned installer so floating `main` cannot diverge from the release.
@@ -843,7 +854,7 @@ fn runUnixInstaller(
         allocator.free(script_path);
     }
 
-    return try execInstaller(allocator, io, &.{ "sh", script_path }, target_version, quiet_json, true);
+    return try execInstaller(allocator, io, &.{ "sh", script_path }, target_version, quiet_json, true, force);
 }
 
 /// Installer child must not inherit operator overrides that redirect download roots.
@@ -870,6 +881,7 @@ fn execInstaller(
     target_version: []const u8,
     quiet_json: bool,
     skip_onboard: bool,
+    force: bool,
 ) !u8 {
     var env_map = try env_util.createProcessMap(allocator);
     defer env_map.deinit();
@@ -883,6 +895,9 @@ fn execInstaller(
     if (quiet_json) {
         try env_map.put("RYK_INSTALL_QUIET", "1");
         try env_map.put("RYK_INSTALL_QUIET", "1");
+    }
+    if (forceImpliesInstallForce(force)) {
+        try env_map.put(install_force_env_key, install_force_env_value);
     }
 
     const stdio: std.process.SpawnOptions.StdIo = if (quiet_json) .ignore else .inherit;
@@ -905,6 +920,7 @@ fn runWindowsInstaller(
     io: std.Io,
     target_version: []const u8,
     quiet_json: bool,
+    force: bool,
     stderr: anytype,
 ) !u8 {
     const url = try installScriptUrlForVersion(allocator, target_version, true);
@@ -927,6 +943,7 @@ fn runWindowsInstaller(
         target_version,
         quiet_json,
         false,
+        force,
     );
 }
 
@@ -1048,4 +1065,11 @@ test "writeJsonResult escapes hostile target strings" {
     // Escaped quote sequence must appear; raw field-break must not parse as extra key.
     try std.testing.expect(std.mem.indexOf(u8, out, "\\\"pwned\\\"") != null or std.mem.indexOf(u8, out, "\\\",\\\"pwned\\\":\\\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\\n") != null);
+}
+
+test "forceImpliesInstallForce wires RYK_INSTALL_FORCE" {
+    try std.testing.expect(forceImpliesInstallForce(true));
+    try std.testing.expect(!forceImpliesInstallForce(false));
+    try std.testing.expectEqualStrings("RYK_INSTALL_FORCE", install_force_env_key);
+    try std.testing.expectEqualStrings("1", install_force_env_value);
 }

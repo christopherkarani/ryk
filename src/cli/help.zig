@@ -707,7 +707,7 @@ pub const commands =
                 "  --yes              Skip the confirmation prompt.",
                 "  --version <semver> Install a specific release instead of latest.",
                 "  --json             Machine-readable status.",
-                "  --force            Allow curl installer on package-managed installs, or downgrade with --version.",
+                "  --force            Overwrite a non-ryk destination, allow package-managed installs, or downgrade with --version.",
                 "Legacy Homebrew/npm/scoop/winget installs are not upgraded through their package manager.",
                 "Migrate them to the supported curl installer (use --force to overwrite in place).",
                 "See also: docs/install.md",

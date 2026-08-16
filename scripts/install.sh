@@ -14,7 +14,9 @@ set -eu
 #   RYK_SHARE_DIR     Runtime share root (default: ~/.local/share/ryk — kept in 5a)
 #   RYK_BASE_URL       Override release base URL
 #   RYK_ARTIFACT_DIR Offline install from a local dist/ folder
-#   RYK_INSTALL_FORCE=1 Allow overwriting a non-product file at the destination
+#   RYK_INSTALL_FORCE=1 Allow overwriting a non-ryk file at the destination
+#                       (`ryk update --force` sets this). A valid ryk binary is
+#                       overwrite-safe without FORCE.
 #   RYK_INSTALL_QUIET=1 Suppress non-error UI (still installs; no leftover homework)
 #   RYK_INSTALL_SKIP_ONBOARD=1  Skip post-install ensure
 #   RYK_RELEASE_PUBKEY   Override the release signing key (testing only)
@@ -301,7 +303,11 @@ SHARE_DIR="${RYK_SHARE_DIR:-${HOME}/.local/share/ryk}"
 RESOURCE_ROOT="${SHARE_DIR}/${VERSION}"
 CURRENT_LINK="${SHARE_DIR}/current"
 ARTIFACT_DIR="${RYK_ARTIFACT_DIR:-}"
-TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ryk-install.XXXXXX")"
+if [ "${RYK_INSTALL_SOURCE_ONLY:-0}" = "1" ]; then
+  TMP_DIR=""
+else
+  TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ryk-install.XXXXXX")"
+fi
 RUNTIME_DIRS="integrations fixtures schemas policies ryk-pi"
 INSTALL_MARKER=".ryk-installation"
 install_stage=""
@@ -359,9 +365,13 @@ cleanup() {
       rm -rf "$runtime_backup" 2>/dev/null || true
     fi
   fi
-  rm -rf "$TMP_DIR"
+  if [ -n "${TMP_DIR:-}" ]; then
+    rm -rf "$TMP_DIR"
+  fi
 }
-trap cleanup EXIT INT TERM
+if [ "${RYK_INSTALL_SOURCE_ONLY:-0}" != "1" ]; then
+  trap cleanup EXIT INT TERM
+fi
 
 detect_os() {
   case "${RYK_OS_OVERRIDE:-$(uname -s)}" in
@@ -557,6 +567,34 @@ managed_runtime_version() {
   printf '%s\n' "$managed_version"
 }
 
+# Conservative product identity. Never follows or executes a symlink destination
+# (those are replaced without probing). Regular files named ryk/ryk.exe pass when
+# a cheap version-json marker is present or a short `version --json` probe
+# prints product ryk. Do not treat every ELF as ryk.
+is_ryk_product_binary() {
+  _ryk_id_path="$1"
+  [ -n "$_ryk_id_path" ] || return 1
+  [ -L "$_ryk_id_path" ] && return 1
+  [ -f "$_ryk_id_path" ] || return 1
+  case "${_ryk_id_path##*/}" in
+    ryk|ryk.exe) ;;
+    *) return 1 ;;
+  esac
+  if grep -a -E -q '"product"[[:space:]]*:[[:space:]]*"ryk"' "$_ryk_id_path" 2>/dev/null; then
+    return 0
+  fi
+  if grep -a -F -q 'safety_boundary_version' "$_ryk_id_path" 2>/dev/null; then
+    return 0
+  fi
+  _ryk_id_out=""
+  if command -v timeout >/dev/null 2>&1; then
+    _ryk_id_out="$(timeout 2 "$_ryk_id_path" version --json 2>/dev/null || true)"
+  else
+    _ryk_id_out="$("$_ryk_id_path" version --json 2>/dev/null || true)"
+  fi
+  printf '%s' "$_ryk_id_out" | grep -E -q '"product"[[:space:]]*:[[:space:]]*"ryk"'
+}
+
 validate_binary_destination() {
   validate_destination="$1"
   reject_symlink_parents "$validate_destination" "binary destination"
@@ -574,12 +612,23 @@ validate_binary_destination() {
     [ -f "$validate_destination" ] ||
       fail "refusing non-file binary destination path: $validate_destination" \
         "Choose a path whose final target is a regular file or an existing ryk symlink."
-    if [ "${RYK_INSTALL_FORCE:-0}" != "1" ] && ! managed_runtime_version >/dev/null; then
-      fail "refusing to overwrite non-ryk file at $validate_destination" \
-        "Set RYK_INSTALL_FORCE=1 to replace it, or choose another install dir."
+    if [ "${RYK_INSTALL_FORCE:-0}" = "1" ]; then
+      return 0
     fi
+    if managed_runtime_version >/dev/null; then
+      return 0
+    fi
+    if is_ryk_product_binary "$validate_destination"; then
+      return 0
+    fi
+    fail "refusing to overwrite non-ryk file at $validate_destination" \
+      "ryk update --force"
   fi
 }
+
+if [ "${RYK_INSTALL_SOURCE_ONLY:-0}" = "1" ]; then
+  return 0 2>/dev/null || exit 0
+fi
 
 safe_install() {
   source_bin="$1"
