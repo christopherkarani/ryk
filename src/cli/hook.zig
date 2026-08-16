@@ -1374,6 +1374,23 @@ fn evaluateHook(
     }
 }
 
+fn takeOwnedHookLists(
+    allocator: std.mem.Allocator,
+    redactions: *std.ArrayList(RedactionEntry),
+    limitations: *std.ArrayList([]const u8),
+) !struct { redactions: []RedactionEntry, host_limitations: [][]const u8 } {
+    const redactions_owned = try redactions.toOwnedSlice(allocator);
+    errdefer {
+        for (redactions_owned) |entry| entry.deinit(allocator);
+        allocator.free(redactions_owned);
+    }
+    const host_limitations = try limitations.toOwnedSlice(allocator);
+    return .{
+        .redactions = redactions_owned,
+        .host_limitations = host_limitations,
+    };
+}
+
 fn makeInformationalResponse(
     allocator: std.mem.Allocator,
     decision: PluginDecision,
@@ -1384,15 +1401,22 @@ fn makeInformationalResponse(
     redactions: *std.ArrayList(RedactionEntry),
     limitations: *std.ArrayList([]const u8),
 ) !HookResponse {
+    const owned_category = try allocator.dupe(u8, category);
+    errdefer allocator.free(owned_category);
+    const owned_reason = try allocator.dupe(u8, reason);
+    errdefer allocator.free(owned_reason);
+    const owned_message = try allocator.dupe(u8, message);
+    errdefer allocator.free(owned_message);
+    const lists = try takeOwnedHookLists(allocator, redactions, limitations);
     return .{
         .decision = decision,
         .risk = risk,
-        .category = try allocator.dupe(u8, category),
-        .reason = try allocator.dupe(u8, reason),
+        .category = owned_category,
+        .reason = owned_reason,
         .rule = null,
-        .message = try allocator.dupe(u8, message),
-        .redactions = try redactions.toOwnedSlice(allocator),
-        .host_limitations = try limitations.toOwnedSlice(allocator),
+        .message = owned_message,
+        .redactions = lists.redactions,
+        .host_limitations = lists.host_limitations,
     };
 }
 
@@ -2410,15 +2434,22 @@ fn makeFailClosedHookResponse(
     redactions: *std.ArrayList(RedactionEntry),
     limitations: *std.ArrayList([]const u8),
 ) !HookResponse {
+    const owned_category = try allocator.dupe(u8, category);
+    errdefer allocator.free(owned_category);
+    const owned_reason = try allocator.dupe(u8, reason);
+    errdefer allocator.free(owned_reason);
+    const owned_message = try allocator.dupe(u8, message);
+    errdefer allocator.free(owned_message);
+    const lists = try takeOwnedHookLists(allocator, redactions, limitations);
     return .{
         .decision = .block,
         .risk = .high,
-        .category = try allocator.dupe(u8, category),
-        .reason = try allocator.dupe(u8, reason),
+        .category = owned_category,
+        .reason = owned_reason,
         .rule = null,
-        .message = try allocator.dupe(u8, message),
-        .redactions = try redactions.toOwnedSlice(allocator),
-        .host_limitations = try limitations.toOwnedSlice(allocator),
+        .message = owned_message,
+        .redactions = lists.redactions,
+        .host_limitations = lists.host_limitations,
     };
 }
 
@@ -2437,6 +2468,7 @@ fn makeFileNormalizationBlockResponse(
     errdefer allocator.free(rule);
     const message = try buildMessage(allocator, .block, category);
     errdefer allocator.free(message);
+    const lists = try takeOwnedHookLists(allocator, redactions, limitations);
     return .{
         .decision = .block,
         .risk = .critical,
@@ -2444,8 +2476,8 @@ fn makeFileNormalizationBlockResponse(
         .reason = reason,
         .rule = rule,
         .message = message,
-        .redactions = try redactions.toOwnedSlice(allocator),
-        .host_limitations = try limitations.toOwnedSlice(allocator),
+        .redactions = lists.redactions,
+        .host_limitations = lists.host_limitations,
     };
 }
 
@@ -6472,4 +6504,258 @@ test "s-once-cli: hook deny → pending code → redeem → evaluate allows once
         try std.testing.expect(second.decision == .deny);
         try std.testing.expect(second.exception_source == null);
     }
+}
+
+fn hookResponseOomFreePendingLists(
+    allocator: std.mem.Allocator,
+    redactions: *std.ArrayList(RedactionEntry),
+    limitations: *std.ArrayList([]const u8),
+) void {
+    for (redactions.items) |entry| entry.deinit(allocator);
+    redactions.deinit(allocator);
+    for (limitations.items) |item| allocator.free(item);
+    limitations.deinit(allocator);
+}
+
+fn hookResponseOomSeedLists(
+    allocator: std.mem.Allocator,
+    redactions: *std.ArrayList(RedactionEntry),
+    limitations: *std.ArrayList([]const u8),
+) !void {
+    // Named seed must stay non-empty (hits toOwnedSlice transfer). Blocks drop
+    // errdefer after a successful append so a later OOM is not a double-free.
+    {
+        const field = try allocator.dupe(u8, "prompt");
+        errdefer allocator.free(field);
+        const reason = try allocator.dupe(u8, "potential secret detected");
+        errdefer allocator.free(reason);
+        try redactions.append(allocator, .{
+            .field = field,
+            .reason = reason,
+        });
+    }
+    {
+        const limitation = try allocator.dupe(u8, "Hook enforcement is additive; does not replace ryk run supervision.");
+        errdefer allocator.free(limitation);
+        try limitations.append(allocator, limitation);
+    }
+}
+
+fn hookResponseOomSeedListsOomProbe(allocator: std.mem.Allocator) !void {
+    var redactions: std.ArrayList(RedactionEntry) = .empty;
+    var limitations: std.ArrayList([]const u8) = .empty;
+    errdefer hookResponseOomFreePendingLists(allocator, &redactions, &limitations);
+    try hookResponseOomSeedLists(allocator, &redactions, &limitations);
+    try std.testing.expectEqual(@as(usize, 1), redactions.items.len);
+    try std.testing.expectEqual(@as(usize, 1), limitations.items.len);
+    hookResponseOomFreePendingLists(allocator, &redactions, &limitations);
+}
+
+fn takeOwnedHookListsOomProbe(allocator: std.mem.Allocator) !void {
+    var redactions: std.ArrayList(RedactionEntry) = .empty;
+    var limitations: std.ArrayList([]const u8) = .empty;
+    errdefer hookResponseOomFreePendingLists(allocator, &redactions, &limitations);
+    try hookResponseOomSeedLists(allocator, &redactions, &limitations);
+
+    const lists = try takeOwnedHookLists(allocator, &redactions, &limitations);
+    defer {
+        for (lists.redactions) |entry| entry.deinit(allocator);
+        allocator.free(lists.redactions);
+        for (lists.host_limitations) |item| allocator.free(item);
+        allocator.free(lists.host_limitations);
+    }
+    redactions.deinit(allocator);
+    limitations.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), lists.redactions.len);
+    try std.testing.expectEqual(@as(usize, 1), lists.host_limitations.len);
+    try std.testing.expectEqualStrings("prompt", lists.redactions[0].field);
+    try std.testing.expectEqualStrings("potential secret detected", lists.redactions[0].reason);
+    try std.testing.expectEqualStrings(
+        "Hook enforcement is additive; does not replace ryk run supervision.",
+        lists.host_limitations[0],
+    );
+}
+
+fn makeFailClosedHookResponseOomProbe(allocator: std.mem.Allocator) !void {
+    var redactions: std.ArrayList(RedactionEntry) = .empty;
+    var limitations: std.ArrayList([]const u8) = .empty;
+    errdefer hookResponseOomFreePendingLists(allocator, &redactions, &limitations);
+    try hookResponseOomSeedLists(allocator, &redactions, &limitations);
+
+    var result = try makeFailClosedHookResponse(
+        allocator,
+        "command",
+        "evaluation unavailable",
+        "Shell command blocked: ryk shell evaluation unavailable.",
+        &redactions,
+        &limitations,
+    );
+    defer result.deinit(allocator);
+    redactions.deinit(allocator);
+    limitations.deinit(allocator);
+
+    try std.testing.expectEqual(PluginDecision.block, result.decision);
+    try std.testing.expectEqual(RiskLevel.high, result.risk);
+    try std.testing.expect(result.decision != .allow);
+    try std.testing.expect(result.decision != .ask);
+    try std.testing.expectEqualStrings("command", result.category);
+    try std.testing.expectEqualStrings("evaluation unavailable", result.reason);
+    try std.testing.expect(result.rule == null);
+    try std.testing.expectEqualStrings("Shell command blocked: ryk shell evaluation unavailable.", result.message);
+
+    var stdout_buf: [2048]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    try writeHookResponse(&stdout_writer, result);
+    const out = stdout_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"decision\": \"block\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"risk\": \"high\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"decision\": \"allow\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"decision\": \"ask\"") == null);
+}
+
+fn makeInformationalResponseOomProbe(allocator: std.mem.Allocator) !void {
+    var redactions: std.ArrayList(RedactionEntry) = .empty;
+    var limitations: std.ArrayList([]const u8) = .empty;
+    errdefer hookResponseOomFreePendingLists(allocator, &redactions, &limitations);
+    try hookResponseOomSeedLists(allocator, &redactions, &limitations);
+
+    var result = try makeInformationalResponse(
+        allocator,
+        .ask,
+        .high,
+        "session",
+        "informational event",
+        "OpenCode event acknowledged by ryk.",
+        &redactions,
+        &limitations,
+    );
+    defer result.deinit(allocator);
+    redactions.deinit(allocator);
+    limitations.deinit(allocator);
+
+    try std.testing.expectEqual(PluginDecision.ask, result.decision);
+    try std.testing.expect(result.decision != .allow);
+    try std.testing.expectEqual(RiskLevel.high, result.risk);
+    try std.testing.expectEqualStrings("session", result.category);
+    try std.testing.expectEqualStrings("informational event", result.reason);
+    try std.testing.expectEqualStrings("ask", result.decision.toString());
+    try std.testing.expect(!std.mem.eql(u8, result.decision.toString(), "allow"));
+
+    var stdout_buf: [2048]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    try writeHookResponse(&stdout_writer, result);
+    const out = stdout_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"decision\": \"ask\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"decision\": \"allow\"") == null);
+}
+
+fn makeFileNormalizationBlockResponseOomProbe(allocator: std.mem.Allocator) !void {
+    var redactions: std.ArrayList(RedactionEntry) = .empty;
+    var limitations: std.ArrayList([]const u8) = .empty;
+    errdefer hookResponseOomFreePendingLists(allocator, &redactions, &limitations);
+    try hookResponseOomSeedLists(allocator, &redactions, &limitations);
+
+    var result = try makeFileNormalizationBlockResponse(
+        allocator,
+        "file.write",
+        "file.write",
+        &redactions,
+        &limitations,
+    );
+    defer result.deinit(allocator);
+    redactions.deinit(allocator);
+    limitations.deinit(allocator);
+
+    try std.testing.expectEqual(PluginDecision.block, result.decision);
+    try std.testing.expectEqual(RiskLevel.critical, result.risk);
+    try std.testing.expect(result.decision != .allow);
+    try std.testing.expectEqualStrings("file.write", result.category);
+    try std.testing.expectEqualStrings(file_policy_path.outside_workspace_reason, result.reason);
+    try std.testing.expectEqualStrings("builtin.files.write.deny[outside_workspace]", result.rule.?);
+
+    var stdout_buf: [4096]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    try writeHookResponse(&stdout_writer, result);
+    const out = stdout_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"decision\": \"block\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"risk\": \"critical\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"decision\": \"allow\"") == null);
+}
+
+fn hookResponseOomFailAtZeroIsOutOfMemory(comptime call: anytype) !void {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const allocator = failing.allocator();
+    var redactions: std.ArrayList(RedactionEntry) = .empty;
+    var limitations: std.ArrayList([]const u8) = .empty;
+    defer hookResponseOomFreePendingLists(allocator, &redactions, &limitations);
+    try std.testing.expectError(error.OutOfMemory, call(allocator, &redactions, &limitations));
+    try std.testing.expect(failing.has_induced_failure);
+}
+
+test "HookResponseOom makeFailClosedHookResponse OOM ownership" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, hookResponseOomSeedListsOomProbe, .{});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, takeOwnedHookListsOomProbe, .{});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, makeFailClosedHookResponseOomProbe, .{});
+    try hookResponseOomFailAtZeroIsOutOfMemory(struct {
+        fn call(
+            allocator: std.mem.Allocator,
+            redactions: *std.ArrayList(RedactionEntry),
+            limitations: *std.ArrayList([]const u8),
+        ) !HookResponse {
+            return makeFailClosedHookResponse(
+                allocator,
+                "command",
+                "evaluation unavailable",
+                "Shell command blocked: ryk shell evaluation unavailable.",
+                redactions,
+                limitations,
+            );
+        }
+    }.call);
+}
+
+test "HookResponseOom makeInformationalResponse OOM ownership" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, hookResponseOomSeedListsOomProbe, .{});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, takeOwnedHookListsOomProbe, .{});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, makeInformationalResponseOomProbe, .{});
+    try hookResponseOomFailAtZeroIsOutOfMemory(struct {
+        fn call(
+            allocator: std.mem.Allocator,
+            redactions: *std.ArrayList(RedactionEntry),
+            limitations: *std.ArrayList([]const u8),
+        ) !HookResponse {
+            return makeInformationalResponse(
+                allocator,
+                .ask,
+                .high,
+                "session",
+                "informational event",
+                "OpenCode event acknowledged by ryk.",
+                redactions,
+                limitations,
+            );
+        }
+    }.call);
+}
+
+test "HookResponseOom makeFileNormalizationBlockResponse OOM ownership" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, hookResponseOomSeedListsOomProbe, .{});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, takeOwnedHookListsOomProbe, .{});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, makeFileNormalizationBlockResponseOomProbe, .{});
+    try hookResponseOomFailAtZeroIsOutOfMemory(struct {
+        fn call(
+            allocator: std.mem.Allocator,
+            redactions: *std.ArrayList(RedactionEntry),
+            limitations: *std.ArrayList([]const u8),
+        ) !HookResponse {
+            return makeFileNormalizationBlockResponse(
+                allocator,
+                "file.write",
+                "file.write",
+                redactions,
+                limitations,
+            );
+        }
+    }.call);
 }
