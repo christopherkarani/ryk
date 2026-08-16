@@ -199,13 +199,15 @@ pub const host_config_table = [_]HostConfigSpec{
         // Product state only — not whole ~/.grok (worktrees, agent scratch, etc.) (F19).
         // F40: do not RW-grant ~/.grok/bin (host-identity trust root — plantable privilege).
         // Grok CLI 1.0.4 opens ~/.grok/config.toml then ~/.grok/auth.json after
-        // Seatbelt attach (#194 residual). Grant each file only: Seatbelt
-        // path-walk uses ancestor metadata literals on ~/.grok; do not grant
-        // the parent tree (not a trusted prefix).
+        // Seatbelt attach (#194 residual). Then open(active_sessions.lock,
+        // O_RDWR|O_CREAT) (#221). Grant each file only: Seatbelt path-walk uses
+        // ancestor metadata literals on ~/.grok; do not grant the parent tree
+        // (not a trusted prefix). Lock is create/RDWR — not authority write-deny.
         // user-settings.json stays write-denied (F218); not a 1.0.4 load path.
         .home_rel_dirs = &.{
             ".grok/config.toml",
             ".grok/auth.json",
+            ".grok/active_sessions.lock",
             ".grok/skills",
             ".grok/hooks",
             ".grok/sessions",
@@ -1472,8 +1474,10 @@ test "collectHostConfigWriteDenies includes grok 1.0.4 config.toml" {
 }
 
 // Residual after #195: official grok then open(~/.grok/auth.json, O_RDONLY) = EACCES
-// (stat 0600 succeeds). Same file-only class as config.toml — not docs, lock, logs,
-// bin, worktrees, Keychain, or the parent ~/.grok tree.
+// (stat 0600 succeeds). Same file-only class as config.toml — not docs, logs,
+// bin, worktrees, Keychain, or the parent ~/.grok tree. Lock is a sibling file
+// grant (#221); this test still plants it so the auth collect does not expand
+// to docs/logs/bin.
 test "collectHostConfigPaths grants grok 1.0.4 auth.json not docs lock logs or whole ~/.grok" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -1521,21 +1525,18 @@ test "collectHostConfigPaths grants grok 1.0.4 auth.json not docs lock logs or w
     var listed_bare_grok = false;
     var listed_bin = false;
     var listed_docs = false;
-    var listed_lock = false;
     var listed_logs = false;
     for (spec.home_rel_dirs) |rel| {
         if (std.mem.eql(u8, rel, ".grok/auth.json")) listed_auth = true;
         if (std.mem.eql(u8, rel, ".grok")) listed_bare_grok = true;
         if (std.mem.eql(u8, rel, ".grok/bin") or std.mem.startsWith(u8, rel, ".grok/bin/")) listed_bin = true;
         if (std.mem.eql(u8, rel, ".grok/docs") or std.mem.startsWith(u8, rel, ".grok/docs/")) listed_docs = true;
-        if (std.mem.eql(u8, rel, ".grok/active_sessions.lock")) listed_lock = true;
         if (std.mem.eql(u8, rel, ".grok/logs") or std.mem.startsWith(u8, rel, ".grok/logs/")) listed_logs = true;
     }
     try std.testing.expect(listed_auth);
     try std.testing.expect(!listed_bare_grok);
     try std.testing.expect(!listed_bin);
     try std.testing.expect(!listed_docs);
-    try std.testing.expect(!listed_lock);
     try std.testing.expect(!listed_logs);
 
     var listed_auth_authority = false;
@@ -1558,7 +1559,6 @@ test "collectHostConfigPaths grants grok 1.0.4 auth.json not docs lock logs or w
         try std.testing.expect(!std.mem.endsWith(u8, p, "/.grok/worktrees"));
         try std.testing.expect(!std.mem.endsWith(u8, p, "/.grok/worktrees/evil"));
         try std.testing.expect(!std.mem.endsWith(u8, p, "/.grok/docs"));
-        try std.testing.expect(!std.mem.endsWith(u8, p, "/.grok/active_sessions.lock"));
         try std.testing.expect(!std.mem.endsWith(u8, p, "/.grok/logs"));
         try std.testing.expect(!std.mem.endsWith(u8, p, "/.grok/logs/unified.jsonl"));
         try std.testing.expect(std.mem.indexOf(u8, p, "Library/Keychains") == null);
@@ -1584,6 +1584,142 @@ test "collectHostConfigWriteDenies includes grok 1.0.4 auth.json" {
         try std.testing.expect(!std.mem.endsWith(u8, p, "/.grok/docs"));
         try std.testing.expect(!std.mem.endsWith(u8, p, "/.grok/active_sessions.lock"));
         try std.testing.expect(!std.mem.endsWith(u8, p, "/.grok/logs/unified.jsonl"));
+        try std.testing.expect(std.mem.indexOf(u8, p, "Library/Keychains") == null);
+        try std.testing.expect(std.mem.indexOf(u8, p, "/dev/tty") == null);
+    }
+}
+
+// Issue #221: grok 1.0.4 then open(~/.grok/active_sessions.lock, O_RDWR|O_CREAT)
+// = EACCES after config.toml/auth.json PASS. Same file-only class — grant the
+// existing lock as create/RDWR. Do not write-deny it as authority (that would
+// block the open grok actually does). Still skip docs, logs, models_cache,
+// /dev/tty, Keychain, ~/.grok/bin, and the parent ~/.grok tree.
+test "collectHostConfigPaths grants grok 1.0.4 active_sessions.lock create/RDWR not docs logs models_cache or whole ~/.grok" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var home_tmp = std.testing.tmpDir(.{});
+    defer home_tmp.cleanup();
+    const home = try home_tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(home);
+
+    try home_tmp.dir.createDirPath(io, ".grok/worktrees/evil");
+    try home_tmp.dir.createDirPath(io, ".grok/bin");
+    try home_tmp.dir.createDirPath(io, ".grok/docs");
+    try home_tmp.dir.createDirPath(io, ".grok/logs");
+    try home_tmp.dir.createDirPath(io, "Library/Keychains");
+    try home_tmp.dir.writeFile(io, .{
+        .sub_path = ".grok/config.toml",
+        .data = "[cli]\nauto_update = false\n",
+    });
+    try home_tmp.dir.writeFile(io, .{
+        .sub_path = ".grok/auth.json",
+        .data = "{\"accessToken\":\"synthetic\"}\n",
+    });
+    try home_tmp.dir.writeFile(io, .{
+        .sub_path = ".grok/active_sessions.lock",
+        .data = "lock\n",
+    });
+    try home_tmp.dir.writeFile(io, .{
+        .sub_path = ".grok/logs/unified.jsonl",
+        .data = "{}\n",
+    });
+    try home_tmp.dir.writeFile(io, .{
+        .sub_path = ".grok/docs/user-guide.md",
+        .data = "docs\n",
+    });
+    try home_tmp.dir.writeFile(io, .{
+        .sub_path = ".grok/models_cache.json.tmp",
+        .data = "{}\n",
+    });
+    try home_tmp.dir.writeFile(io, .{
+        .sub_path = ".grok/bin/grok",
+        .data = "#!/bin/sh\n",
+    });
+    try home_tmp.dir.writeFile(io, .{
+        .sub_path = "Library/Keychains/login.keychain-db",
+        .data = "secret\n",
+    });
+
+    const spec = specForHost("grok").?;
+    var listed_lock = false;
+    var listed_bare_grok = false;
+    var listed_bin = false;
+    var listed_docs = false;
+    var listed_logs = false;
+    var listed_models_cache = false;
+    var listed_tty = false;
+    for (spec.home_rel_dirs) |rel| {
+        if (std.mem.eql(u8, rel, ".grok/active_sessions.lock")) listed_lock = true;
+        if (std.mem.eql(u8, rel, ".grok")) listed_bare_grok = true;
+        if (std.mem.eql(u8, rel, ".grok/bin") or std.mem.startsWith(u8, rel, ".grok/bin/")) listed_bin = true;
+        if (std.mem.eql(u8, rel, ".grok/docs") or std.mem.startsWith(u8, rel, ".grok/docs/")) listed_docs = true;
+        if (std.mem.eql(u8, rel, ".grok/logs") or std.mem.startsWith(u8, rel, ".grok/logs/")) listed_logs = true;
+        if (std.mem.indexOf(u8, rel, "models_cache") != null) listed_models_cache = true;
+        if (std.mem.indexOf(u8, rel, "/dev/tty") != null) listed_tty = true;
+    }
+    try std.testing.expect(listed_lock);
+    try std.testing.expect(!listed_bare_grok);
+    try std.testing.expect(!listed_bin);
+    try std.testing.expect(!listed_docs);
+    try std.testing.expect(!listed_logs);
+    try std.testing.expect(!listed_models_cache);
+    try std.testing.expect(!listed_tty);
+
+    var listed_lock_authority = false;
+    for (spec.authority_home_rel_files) |rel| {
+        if (std.mem.eql(u8, rel, ".grok/active_sessions.lock")) listed_lock_authority = true;
+        try std.testing.expect(std.mem.indexOf(u8, rel, "models_cache") == null);
+        try std.testing.expect(std.mem.indexOf(u8, rel, "/dev/tty") == null);
+    }
+    try std.testing.expect(!listed_lock_authority);
+
+    const paths = try collectHostConfigPaths(io, allocator, "grok", home);
+    defer freeHostConfigPaths(allocator, paths);
+    try std.testing.expect(paths.len >= 3);
+    var saw_lock = false;
+    var saw_auth = false;
+    var saw_config = false;
+    for (paths) |p| {
+        if (std.mem.endsWith(u8, p, "/.grok/active_sessions.lock")) saw_lock = true;
+        if (std.mem.endsWith(u8, p, "/.grok/auth.json")) saw_auth = true;
+        if (std.mem.endsWith(u8, p, "/.grok/config.toml")) saw_config = true;
+        try std.testing.expect(!std.mem.eql(u8, p, home));
+        try std.testing.expect(!std.mem.endsWith(u8, p, "/.grok"));
+        try std.testing.expect(!std.mem.endsWith(u8, p, "/.grok/bin"));
+        try std.testing.expect(!std.mem.endsWith(u8, p, "/.grok/worktrees"));
+        try std.testing.expect(!std.mem.endsWith(u8, p, "/.grok/worktrees/evil"));
+        try std.testing.expect(!std.mem.endsWith(u8, p, "/.grok/docs"));
+        try std.testing.expect(!std.mem.endsWith(u8, p, "/.grok/docs/user-guide.md"));
+        try std.testing.expect(!std.mem.endsWith(u8, p, "/.grok/logs"));
+        try std.testing.expect(!std.mem.endsWith(u8, p, "/.grok/logs/unified.jsonl"));
+        try std.testing.expect(!std.mem.endsWith(u8, p, "/.grok/models_cache.json.tmp"));
+        try std.testing.expect(std.mem.indexOf(u8, p, "Library/Keychains") == null);
+        try std.testing.expect(std.mem.indexOf(u8, p, "/dev/tty") == null);
+    }
+    try std.testing.expect(saw_lock);
+    try std.testing.expect(saw_auth);
+    try std.testing.expect(saw_config);
+}
+
+test "collectHostConfigWriteDenies skips grok active_sessions.lock so O_RDWR create is not authority-denied" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("HOME", "/Users/synthetic");
+
+    const paths = try collectHostConfigWriteDenies(io, allocator, "grok", "/tmp/ryk-grok-repro", &env_map);
+    defer freeHostConfigWriteDenies(allocator, paths);
+    try std.testing.expect(testingContainsPath(paths, "/Users/synthetic/.grok/auth.json"));
+    try std.testing.expect(testingContainsPath(paths, "/Users/synthetic/.grok/config.toml"));
+    try std.testing.expect(!testingContainsPath(paths, "/Users/synthetic/.grok/active_sessions.lock"));
+    for (paths) |p| {
+        try std.testing.expect(!std.mem.eql(u8, p, "/Users/synthetic"));
+        try std.testing.expect(!std.mem.eql(u8, p, "/Users/synthetic/.grok"));
+        try std.testing.expect(!std.mem.endsWith(u8, p, "/.grok/docs"));
+        try std.testing.expect(!std.mem.endsWith(u8, p, "/.grok/active_sessions.lock"));
+        try std.testing.expect(!std.mem.endsWith(u8, p, "/.grok/logs/unified.jsonl"));
+        try std.testing.expect(!std.mem.endsWith(u8, p, "/.grok/models_cache.json.tmp"));
         try std.testing.expect(std.mem.indexOf(u8, p, "Library/Keychains") == null);
         try std.testing.expect(std.mem.indexOf(u8, p, "/dev/tty") == null);
     }
