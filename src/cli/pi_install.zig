@@ -4,6 +4,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const resource_root = @import("../resource_root.zig");
 const env_util = @import("../env_util.zig");
+const brand = @import("brand.zig");
 
 pub const ownership_marker = "// Managed by ryk. Updates may replace this file; do not edit it directly.\n";
 pub const relative_install_dir = ".pi/agent/extensions/ryk";
@@ -56,6 +57,7 @@ pub fn install(
 ) !InstallResult {
     if (!std.fs.path.isAbsolute(options.home)) return error.InvalidHomePath;
     if (!std.fs.path.isAbsolute(options.ryk_binary)) return error.InvalidRykBinaryPath;
+    if (!brand.isPrimaryInvocation(std.fs.path.basename(options.ryk_binary))) return error.InvalidRykBinary;
 
     const asset_dir = resolveAssetDir(io, allocator, options) catch |err| switch (err) {
         error.ResourceNotFound => return .assets_unavailable,
@@ -127,6 +129,45 @@ pub fn install(
     if (!isCompleteAtHome(io, allocator, options.home)) return error.IncompleteInstall;
     if (!changed) return .already_installed;
     return if (upgraded) .upgraded else .installed;
+}
+
+/// Parse `rykBin` from a managed Pi `index.ts`. Caller owns the returned slice.
+pub fn parseBakedRykBinaryFromIndex(allocator: std.mem.Allocator, source: []const u8) ?[]u8 {
+    const key = "rykBin:";
+    const idx = std.mem.indexOf(u8, source, key) orelse return null;
+    const rest = std.mem.trimStart(u8, source[idx + key.len ..], " \t\r\n");
+    const span = jsonStringSpan(rest) orelse return null;
+    const parsed = std.json.parseFromSlice([]const u8, allocator, span, .{}) catch return null;
+    defer parsed.deinit();
+    return allocator.dupe(u8, parsed.value) catch null;
+}
+
+fn jsonStringSpan(s: []const u8) ?[]const u8 {
+    if (s.len == 0 or s[0] != '"') return null;
+    var i: usize = 1;
+    var escape = false;
+    while (i < s.len) : (i += 1) {
+        if (escape) {
+            escape = false;
+            continue;
+        }
+        if (s[i] == '\\') {
+            escape = true;
+            continue;
+        }
+        if (s[i] == '"') return s[0 .. i + 1];
+    }
+    return null;
+}
+
+/// Read the baked `rykBin` from `$HOME/.pi/agent/extensions/ryk/index.ts`.
+pub fn readBakedRykBinaryAtHome(io: std.Io, allocator: std.mem.Allocator, home: []const u8) ?[]u8 {
+    if (!std.fs.path.isAbsolute(home)) return null;
+    const path = std.fs.path.join(allocator, &.{ home, relative_install_dir, "index.ts" }) catch return null;
+    defer allocator.free(path);
+    const content = readRegularFile(io, allocator, path) catch return null;
+    defer allocator.free(content);
+    return parseBakedRykBinaryFromIndex(allocator, content);
 }
 
 pub fn isCompleteAtHome(io: std.Io, allocator: std.mem.Allocator, home: []const u8) bool {
@@ -521,6 +562,61 @@ test "Pi install returns unavailable without bundled assets and rejects relative
         .ryk_binary = "/opt/ryk/bin/ryk",
         .asset_dir = missing,
     }));
+}
+
+test "Pi parseBakedRykBinaryFromIndex reads product and zig-cache test paths" {
+    const allocator = std.testing.allocator;
+    const product = parseBakedRykBinaryFromIndex(allocator,
+        \\installRykExtension(pi, { rykBin: "/opt/ryk/bin/ryk" });
+    ) orelse return error.TestUnexpectedResult;
+    defer allocator.free(product);
+    try std.testing.expectEqualStrings("/opt/ryk/bin/ryk", product);
+
+    const harness = parseBakedRykBinaryFromIndex(allocator,
+        \\installRykExtension(pi, { rykBin: "/private/tmp/ryk-factory/.zig-cache/o/deadbeef/test" });
+    ) orelse return error.TestUnexpectedResult;
+    defer allocator.free(harness);
+    try std.testing.expectEqualStrings("/private/tmp/ryk-factory/.zig-cache/o/deadbeef/test", harness);
+    try std.testing.expect(parseBakedRykBinaryFromIndex(allocator, "export default function () {}") == null);
+}
+
+test "Pi readBakedRykBinaryAtHome returns the baked rykBin from a temp HOME" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, relative_install_dir);
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = relative_install_dir ++ "/index.ts",
+        .data = ownership_marker ++
+            \\import { installRykExtension } from "./runtime.ts";
+            \\export default function rykPiExtension(pi: Parameters<typeof installRykExtension>[0]): void {
+            \\  installRykExtension(pi, { rykBin: "/private/tmp/ryk-factory/.zig-cache/o/deadbeef/test" });
+            \\}
+            \\
+        ,
+    });
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(home);
+    const baked = readBakedRykBinaryAtHome(std.testing.io, std.testing.allocator, home) orelse
+        return error.TestUnexpectedResult;
+    defer std.testing.allocator.free(baked);
+    try std.testing.expectEqualStrings("/private/tmp/ryk-factory/.zig-cache/o/deadbeef/test", baked);
+}
+
+test "Pi install rejects zig-cache test binary as ryk" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeFixtureAssets(std.testing.io, tmp.dir);
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(home);
+    const asset_dir = try std.fs.path.join(std.testing.allocator, &.{ home, "assets" });
+    defer std.testing.allocator.free(asset_dir);
+
+    try std.testing.expectError(error.InvalidRykBinary, install(std.testing.io, std.testing.allocator, .{
+        .home = home,
+        .ryk_binary = "/private/tmp/ryk-factory/.zig-cache/o/deadbeef/test",
+        .asset_dir = asset_dir,
+    }));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(std.testing.io, ".pi", .{}));
 }
 
 test "Pi install rejects symlinked parent directory traversal" {

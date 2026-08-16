@@ -58,7 +58,7 @@ ryk doctor --deadlock-check
 ryk replay --session last --verify
 ~~~
 
-doctor reports readiness and host capabilities. doctor --check is the automation gate and returns nonzero when core readiness fails. doctor --json is a small readiness document, but a JSON result with ready: false can still exit zero. Use --check when the process exit status is the gate. doctor --fix is a mutating repair path and cannot be combined with --check or --json.
+doctor reports readiness and host capabilities. doctor --check is the automation gate and returns nonzero when core readiness fails. doctor --json is a small readiness document, but a JSON result with ready: false can still exit zero. Use --check when the process exit status is the gate. doctor --fix is a mutating repair path and cannot be combined with --check or --json. Doctor names Pi/Grok hooks that point at a Zig test program or Zig compiler as `wired: broken`. doctor --fix, run as product ryk from a normal terminal, rebinds those hooks to the running ryk binary. A --fix invoked as zig-cache `test` refuses to rewrite hooks and says so.
 
 doctor --deadlock-check replays a standard coding workflow (build, test, package install, git inspection, recovery commands) plus dangerous control samples against the active policy, and reports the mismatches: a normal step that would ask or deny is a deadlock, because several hosts hard-block ask with no resume; a dangerous step that would be allowed is a fence hole. It is read-only, exits nonzero on either kind of mismatch, and cannot be combined with --fix, --check, or --json. Decisions use the same policy-plus-pack precedence a live session applies, so a clean result means the composed surface agrees, not just the YAML.
 
