@@ -96,6 +96,9 @@ fn parseDecision(allocator: std.mem.Allocator, stdout: []const u8) ![]const u8 {
     if (parsed.value.object.get("decision")) |decision| {
         if (decision == .string) return try allocator.dupe(u8, decision.string);
     }
+    if (parsed.value.object.get("permission")) |permission| {
+        if (permission == .string) return try allocator.dupe(u8, permission.string);
+    }
     return error.MissingDecision;
 }
 
@@ -564,6 +567,95 @@ test "one server serves evaluate allow" {
     const decision = try parseDecision(std.testing.allocator, parsed.response.stdout);
     defer std.testing.allocator.free(decision);
     try std.testing.expectEqualStrings("allow", decision);
+}
+
+test "one server permits leftover unused ask on coding hosts" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(dir);
+    const sock = try std.fs.path.join(std.testing.allocator, &.{ dir, "leftover-ask.sock" });
+    defer std.testing.allocator.free(sock);
+    const ws = try std.fs.path.join(std.testing.allocator, &.{ dir, "ask-ws" });
+    defer std.testing.allocator.free(ws);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, ws);
+
+    const policy_text = try readFile(std.testing.allocator, default_policy);
+    defer std.testing.allocator.free(policy_text);
+    const ask_policy = try std.mem.replaceOwned(u8, std.testing.allocator, policy_text, "mode: strict", "mode: ask");
+    defer std.testing.allocator.free(ask_policy);
+    try writeWorkspacePolicy(std.testing.io, ws, ask_policy);
+
+    // High (not critical) pack hit: leftover unused ask on mode=ask, not a hard fence.
+    const leftover_cmd = "git restore README.md";
+    const grok_payload = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"hookEventName\":\"pre_tool_use\",\"sessionId\":\"ryk-fixture\",\"cwd\":\"/tmp\",\"workspaceRoot\":\"/tmp\",\"toolName\":\"run_terminal_cmd\",\"toolUseId\":\"fixture-ask\",\"toolInput\":{{\"command\":\"{s}\"}},\"toolInputTruncated\":false}}",
+        .{leftover_cmd},
+    );
+    defer std.testing.allocator.free(grok_payload);
+    const claude_payload = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"version\":1,\"host\":\"claude\",\"event\":\"PreToolUse\",\"payload\":{{\"tool\":\"Bash\",\"command\":\"{s}\"}}}}",
+        .{leftover_cmd},
+    );
+    defer std.testing.allocator.free(claude_payload);
+
+    const server = try startServer(sock);
+    defer stopServer(sock, server);
+
+    const grok_req = try hook_ipc.stringifyRequest(std.testing.allocator, .{
+        .id = 1,
+        .method = "hook",
+        .host = "grok",
+        .event = "PreToolUse",
+        .workspace = ws,
+        .payload_json = grok_payload,
+    });
+    defer std.testing.allocator.free(grok_req);
+    const grok_raw = try exchange(std.testing.allocator, sock, grok_req);
+    defer std.testing.allocator.free(grok_raw);
+    var grok_resp = try hook_ipc.parseResponse(std.testing.allocator, grok_raw);
+    defer grok_resp.deinit();
+    try std.testing.expectEqual(@as(u8, 0), grok_resp.response.exit);
+    const grok_decision = try parseDecision(std.testing.allocator, grok_resp.response.stdout);
+    defer std.testing.allocator.free(grok_decision);
+    try std.testing.expectEqualStrings("allow", grok_decision);
+
+    const claude_req = try hook_ipc.stringifyRequest(std.testing.allocator, .{
+        .id = 2,
+        .method = "hook",
+        .host = "claude",
+        .event = "PreToolUse",
+        .workspace = ws,
+        .payload_json = claude_payload,
+    });
+    defer std.testing.allocator.free(claude_req);
+    const claude_raw = try exchange(std.testing.allocator, sock, claude_req);
+    defer std.testing.allocator.free(claude_raw);
+    var claude_resp = try hook_ipc.parseResponse(std.testing.allocator, claude_raw);
+    defer claude_resp.deinit();
+    try std.testing.expectEqual(@as(u8, 0), claude_resp.response.exit);
+    const claude_decision = try parseDecision(std.testing.allocator, claude_resp.response.stdout);
+    defer std.testing.allocator.free(claude_decision);
+    try std.testing.expectEqualStrings("allow", claude_decision);
+
+    const ci_req = try hook_ipc.stringifyRequest(std.testing.allocator, .{
+        .id = 3,
+        .method = "hook",
+        .host = "grok",
+        .event = "PreToolUse",
+        .ci = true,
+        .workspace = ws,
+        .payload_json = grok_payload,
+    });
+    defer std.testing.allocator.free(ci_req);
+    const ci_raw = try exchange(std.testing.allocator, sock, ci_req);
+    defer std.testing.allocator.free(ci_raw);
+    var ci_resp = try hook_ipc.parseResponse(std.testing.allocator, ci_raw);
+    defer ci_resp.deinit();
+    try std.testing.expectEqual(@as(u8, 2), ci_resp.response.exit);
 }
 
 test "one server serves cursor allow" {

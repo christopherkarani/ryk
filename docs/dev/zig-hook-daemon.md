@@ -4,7 +4,7 @@ One per-user Zig process, living inside `bin/ryk`, serving Claude, Codex, Grok, 
 
 This is not the removed Rust `ryk-daemon`. No second binary. Release archives must still forbid a file named `ryk-daemon`.
 
-**Goal:** host PreToolUse / `evaluate` p50 under 5ms on a warm Mac, without changing allow / ask / deny.
+**Goal:** host PreToolUse / `evaluate` p50 under 5ms on a warm Mac, without changing host wire decisions. Leftover unused policy `ask` is **allow** on attended coding hosts (same as in-process). SoftBlock, FM steward ask, stage, and explicit deny stay hold/deny. Unattended / `--ci` still hardens leftover `ask` to deny.
 
 ---
 

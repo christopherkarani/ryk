@@ -279,11 +279,12 @@ pub fn evaluatePayloadWithModeOpts(
     // `fm_client` on evaluatePayloadWithModeOpts to exercise the seatbelt.
     // Bare agent-hook has no policy YAML, so permit is empty (matrix + sticky
     // only); sticky is keyed by host session id.
-    // Leftover unused policy ask is permit on Cursor / Claude-compatible
+    // Leftover unused policy ask is allow on attended Cursor / Claude-compatible
     // agent_hook so coding agents can work. SoftBlock, FM steward ask, and
     // staged writes never become allow. Unattended / mode=.ci hardens leftover
-    // ask → deny.
-    // Cursor shell still maps `.ask` → deny (no ask UI); agent_hook keeps `.ask` JSON.
+    // ask → deny. Cursor has no ask UI: leftover unused ask is remapped to
+    // allow before emit; SoftBlock/FM still deny on Cursor and stay ask JSON
+    // on agent_hook.
     const decision = try shell_eval.decisionFromDaemonResultWithPolicy(
         allocator,
         daemon_response.value.result,
