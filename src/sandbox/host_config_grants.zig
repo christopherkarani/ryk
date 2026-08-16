@@ -7,6 +7,9 @@
 //!
 //! Contract:
 //! - Grant only explicit per-host subpaths that already exist on disk (home RW).
+//!   `create_home_rel_files` may add a missing regular file (no parent mkdir)
+//!   when a sibling listed product path already exists; directories, symlinks,
+//!   and hardlinks at those leaves are never granted.
 //! - Paths compile as **RW** so agents can write session/history under their own
 //!   roots — still never bare `$HOME`, bare `~/Library`, or `~/.ssh`.
 //! - Optional **system RO** trees (e.g. `/etc/codex`) are host-scoped, never bare
@@ -209,7 +212,8 @@ pub const host_config_table = [_]HostConfigSpec{
         // ancestor metadata literals on ~/.grok; do not grant the parent tree
         // (not a trusted prefix). Lock is create/RDWR — not authority write-deny.
         // First-run: lock is often missing; collect creates the empty file when
-        // ~/.grok already exists so Landlock can PATH_BENEATH the leaf.
+        // a sibling product path already exists so Landlock can PATH_BENEATH
+        // the leaf. Never grant a directory, symlink, or hardlink at this path.
         // user-settings.json stays write-denied (F218); not a 1.0.4 load path.
         .home_rel_dirs = &.{
             ".grok/config.toml",
@@ -308,7 +312,10 @@ fn canonicalExistingPath(
 ///   `host_identity.resolveHostIdentity`). Do not pass raw argv0 / basename.
 /// - Empty when host is unknown, HOME is empty, or no listed roots exist.
 /// - Skips missing paths (caller may fail closed when a known host has zero grants
-///   and no provider gateway).
+///   and no provider gateway), except `create_home_rel_files` which may create a
+///   missing regular file when a sibling listed product path already exists.
+/// - Create-if-missing leaves are granted only as single-nlink regular files
+///   (no directory tree, symlink retarget, or hardlink inode).
 /// - Never returns bare HOME or `.ssh`.
 /// - Callers compile these as `.rw` (session write) — still narrow trees only.
 ///
@@ -341,19 +348,23 @@ pub fn collectHostConfigPaths(
         if (rel.len == 0) continue;
         // Reject traversal / self-ref components before join (forbid filter is stringy).
         if (relHasUnsafeComponents(rel)) continue;
-        const joined = try std.fs.path.join(allocator, &.{ home, rel });
+        const joined = try std.fs.path.join(allocator, &.{ canonical_home, rel });
         defer allocator.free(joined);
-        if (isForbiddenHostConfigPath(joined, home)) continue;
+        if (isForbiddenHostConfigPath(joined, canonical_home)) continue;
 
         // Only grant paths that exist (dir or file). Missing → skip, unless this
-        // leaf is a create/RDWR file and the parent directory already exists.
+        // leaf is a create/RDWR file and a sibling product path already exists.
         // Create the empty regular file (no mkdir of ~/.grok, no prefix grant)
         // so Landlock can PATH_BENEATH the leaf for O_RDWR|O_CREAT.
-        if (!pathExists(io, joined)) {
-            if (!relIsCreateHomeRelFile(spec, rel) or
-                !siblingGrantedHomeRelExists(io, spec, home, rel) or
-                !ensureCreateRegularFileUnderHome(io, joined, canonical_home))
-                continue;
+        if (relIsCreateHomeRelFile(spec, rel)) {
+            if (!isRegularCreateGrantFile(io, joined)) {
+                if (!siblingGrantedHomeRelExists(io, spec, canonical_home, rel) or
+                    !ensureCreateRegularFileUnderHome(io, joined, canonical_home) or
+                    !isRegularCreateGrantFile(io, joined))
+                    continue;
+            }
+        } else if (!pathExists(io, joined)) {
+            continue;
         }
 
         // Landlock installs PATH_BENEATH rules against resolved targets. Seal the
@@ -1095,10 +1106,23 @@ fn siblingGrantedHomeRelExists(
     return false;
 }
 
+/// True when `path` is a single-nlink regular file opened without following
+/// a final symlink. Directories, symlinks, devices, and hardlinks are false
+/// so create-if-missing leaves cannot become RW tree or inode grants.
+fn isRegularCreateGrantFile(io: std.Io, path: []const u8) bool {
+    if (path.len == 0) return false;
+    const file = std.Io.Dir.openFileAbsolute(io, path, .{ .follow_symlinks = false }) catch return false;
+    defer file.close(io);
+    const st = file.stat(io) catch return false;
+    if (st.kind != .file) return false;
+    if (st.nlink > 1) return false;
+    return true;
+}
+
 /// Create an empty regular file at `path` when missing, without mkdir of the
 /// parent and without following a final symlink. Parent must already exist as
 /// a real directory under `canonical_home` (never bare HOME). Returns true
-/// when `path` exists as a regular openable file afterwards.
+/// when `path` exists as a single-nlink regular file afterwards.
 fn ensureCreateRegularFileUnderHome(
     io: std.Io,
     path: []const u8,
@@ -1106,18 +1130,22 @@ fn ensureCreateRegularFileUnderHome(
 ) bool {
     if (!std.fs.path.isAbsolute(path)) return false;
     if (isForbiddenHostConfigPath(path, canonical_home)) return false;
+    if (isRegularCreateGrantFile(io, path)) return true;
 
     var link_buf: [std.fs.max_path_bytes]u8 = undefined;
     if (std.Io.Dir.readLinkAbsolute(io, path, &link_buf)) |_| {
         return false;
     } else |err| switch (err) {
         error.FileNotFound => {},
-        error.NotLink => return pathExists(io, path),
+        error.NotLink => return false,
         else => return false,
     }
 
     const parent = std.fs.path.dirname(path) orelse return false;
+    const basename = std.fs.path.basename(path);
     if (parent.len <= 1) return false;
+    if (basename.len == 0 or std.mem.eql(u8, basename, ".") or std.mem.eql(u8, basename, "..")) return false;
+    if (std.mem.indexOfScalar(u8, basename, '/') != null) return false;
     if (std.mem.eql(u8, parent, canonical_home)) return false;
     if (!profile.isPathWithin(parent, canonical_home)) return false;
     if (isForbiddenHostConfigPath(parent, canonical_home)) return false;
@@ -1128,16 +1156,18 @@ fn ensureCreateRegularFileUnderHome(
         error.NotLink => {},
         else => return false,
     }
-    if (std.Io.Dir.openDirAbsolute(io, parent, .{ .follow_symlinks = false })) |dir_opened| {
-        var dir = dir_opened;
-        dir.close(io);
-    } else |_| return false;
 
-    const file = std.Io.Dir.createFileAbsolute(io, path, .{
+    var parent_dir = std.Io.Dir.openDirAbsolute(io, parent, .{ .follow_symlinks = false }) catch return false;
+    defer parent_dir.close(io);
+
+    const file = parent_dir.createFile(io, basename, .{
         .exclusive = true,
-        .permissions = std.Io.File.Permissions.fromMode(0o600),
+        .permissions = if (comptime builtin.os.tag == .windows)
+            .default_file
+        else
+            std.Io.File.Permissions.fromMode(0o600),
     }) catch |err| switch (err) {
-        error.PathAlreadyExists => return pathExists(io, path),
+        error.PathAlreadyExists => return isRegularCreateGrantFile(io, path),
         else => return false,
     };
     file.close(io);
@@ -1580,7 +1610,7 @@ test "collectHostConfigWriteDenies includes grok 1.0.4 config.toml" {
 // bin, worktrees, Keychain, or the parent ~/.grok tree. Lock is a sibling file
 // grant (#221); this test still plants it so the auth collect does not expand
 // to docs/logs/bin.
-test "collectHostConfigPaths grants grok 1.0.4 auth.json not docs lock logs or whole ~/.grok" {
+test "collectHostConfigPaths grants grok 1.0.4 auth.json not docs logs or whole ~/.grok" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var home_tmp = std.testing.tmpDir(.{});
@@ -1805,7 +1835,8 @@ test "collectHostConfigPaths grants grok 1.0.4 active_sessions.lock create/RDWR 
 
 // First-run residual after listing the lock in home_rel_dirs: collect still
 // skipped a missing file, so O_RDWR|O_CREAT never had a leaf to grant.
-// Create the empty lock when ~/.grok already exists — file only, no prefix.
+// Create the empty lock when a sibling product path already exists — file
+// only, no prefix.
 test "collectHostConfigPaths creates missing grok active_sessions.lock as file-only not prefix" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -1922,6 +1953,87 @@ test "collectHostConfigPaths does not mkdir ~/.grok to invent a lock" {
     try std.testing.expectEqual(@as(usize, 0), paths.len);
     try std.testing.expect(!pathExists(io, grok_dir));
     try std.testing.expect(!pathExists(io, lock_path));
+}
+
+test "collectHostConfigPaths does not grant grok lock directory as tree" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var home_tmp = std.testing.tmpDir(.{});
+    defer home_tmp.cleanup();
+    const home = try home_tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(home);
+
+    try home_tmp.dir.createDirPath(io, ".grok/active_sessions.lock/nested");
+    try home_tmp.dir.writeFile(io, .{
+        .sub_path = ".grok/config.toml",
+        .data = "[cli]\nauto_update = false\n",
+    });
+
+    const paths = try collectHostConfigPaths(io, allocator, "grok", home);
+    defer freeHostConfigPaths(allocator, paths);
+    for (paths) |p| {
+        try std.testing.expect(!std.mem.endsWith(u8, p, "/.grok/active_sessions.lock"));
+        try std.testing.expect(!std.mem.endsWith(u8, p, "/.grok/active_sessions.lock/nested"));
+        try std.testing.expect(!std.mem.eql(u8, p, home));
+        try std.testing.expect(!std.mem.endsWith(u8, p, "/.grok"));
+    }
+}
+
+test "collectHostConfigPaths does not grant grok lock symlink as tree" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var home_tmp = std.testing.tmpDir(.{});
+    defer home_tmp.cleanup();
+    const home = try home_tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(home);
+
+    try home_tmp.dir.createDirPath(io, ".grok/worktrees/evil");
+    home_tmp.dir.symLink(io, "worktrees", ".grok/active_sessions.lock", .{ .is_directory = true }) catch
+        return error.SkipZigTest;
+    try home_tmp.dir.writeFile(io, .{
+        .sub_path = ".grok/config.toml",
+        .data = "[cli]\nauto_update = false\n",
+    });
+
+    const paths = try collectHostConfigPaths(io, allocator, "grok", home);
+    defer freeHostConfigPaths(allocator, paths);
+    for (paths) |p| {
+        try std.testing.expect(!std.mem.endsWith(u8, p, "/.grok/active_sessions.lock"));
+        try std.testing.expect(!std.mem.endsWith(u8, p, "/.grok/worktrees"));
+        try std.testing.expect(!std.mem.endsWith(u8, p, "/.grok/worktrees/evil"));
+        try std.testing.expect(!std.mem.eql(u8, p, home));
+        try std.testing.expect(!std.mem.endsWith(u8, p, "/.grok"));
+    }
+}
+
+test "collectHostConfigPaths does not grant grok lock hardlink" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var home_tmp = std.testing.tmpDir(.{});
+    defer home_tmp.cleanup();
+    const home = try home_tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(home);
+
+    try home_tmp.dir.createDirPath(io, ".grok");
+    try home_tmp.dir.writeFile(io, .{
+        .sub_path = ".grok/other_inode",
+        .data = "alias\n",
+    });
+    home_tmp.dir.hardLink(".grok/other_inode", home_tmp.dir, ".grok/active_sessions.lock", io, .{}) catch
+        return error.SkipZigTest;
+    try home_tmp.dir.writeFile(io, .{
+        .sub_path = ".grok/config.toml",
+        .data = "[cli]\nauto_update = false\n",
+    });
+
+    const paths = try collectHostConfigPaths(io, allocator, "grok", home);
+    defer freeHostConfigPaths(allocator, paths);
+    for (paths) |p| {
+        try std.testing.expect(!std.mem.endsWith(u8, p, "/.grok/active_sessions.lock"));
+        try std.testing.expect(!std.mem.endsWith(u8, p, "/.grok/other_inode"));
+        try std.testing.expect(!std.mem.eql(u8, p, home));
+        try std.testing.expect(!std.mem.endsWith(u8, p, "/.grok"));
+    }
 }
 
 test "collectHostConfigWriteDenies skips grok active_sessions.lock so O_RDWR create is not authority-denied" {
