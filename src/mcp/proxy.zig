@@ -67,14 +67,7 @@ pub fn runWithServer(
     defer session_approvals.deinit();
 
     var metadata_gates = std.StringHashMap(MetadataGate).init(allocator);
-    defer {
-        var it = metadata_gates.iterator();
-        while (it.next()) |entry| {
-            allocator.free(entry.key_ptr.*);
-            allocator.free(entry.value_ptr.reason);
-        }
-        metadata_gates.deinit();
-    }
+    defer deinitMetadataGates(allocator, &metadata_gates);
 
     while (true) {
         const line = @import("stdio.zig").readMessageLine(client_reader, allocator) catch |err| {
@@ -418,10 +411,14 @@ fn upsertMetadataGate(
     const existing = metadata_gates.getEntry(tool_name);
     if (existing) |entry| {
         if (riskRank(risk) <= riskRank(entry.value_ptr.risk)) return;
+        // Own the replacement before releasing the stored reason. A free-then-dupe
+        // leaves a dangling pointer in the map when the dupe OOMs; runWithServer
+        // teardown then double-frees it.
+        const new_reason = try allocator.dupe(u8, reason);
         allocator.free(entry.value_ptr.reason);
         entry.value_ptr.* = .{
             .risk = risk,
-            .reason = try allocator.dupe(u8, reason),
+            .reason = new_reason,
         };
         return;
     }
@@ -430,6 +427,15 @@ fn upsertMetadataGate(
     const owned_reason = try allocator.dupe(u8, reason);
     errdefer allocator.free(owned_reason);
     try metadata_gates.put(owned_name, .{ .risk = risk, .reason = owned_reason });
+}
+
+fn deinitMetadataGates(allocator: std.mem.Allocator, metadata_gates: *std.StringHashMap(MetadataGate)) void {
+    var it = metadata_gates.iterator();
+    while (it.next()) |entry| {
+        allocator.free(entry.key_ptr.*);
+        allocator.free(entry.value_ptr.reason);
+    }
+    metadata_gates.deinit();
 }
 
 fn requestServerForClient(
@@ -2248,4 +2254,44 @@ test "proxy denies notify with structural to+body under effects.deny" {
     }, &input, &output_writer, .{ .context = &server, .request = FakeServer.request, .notify = FakeServer.notify });
     try std.testing.expect(!server.saw_safe_call);
     try std.testing.expect(std.mem.indexOf(u8, output_writer.buffered(), "\"error\"") != null);
+}
+
+test "upsertMetadataGate upgrade OOM GH347 keeps previous reason owned" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = std.math.maxInt(usize) });
+    const allocator = failing.allocator();
+
+    var metadata_gates = std.StringHashMap(MetadataGate).init(allocator);
+    defer deinitMetadataGates(allocator, &metadata_gates);
+
+    try upsertMetadataGate(allocator, &metadata_gates, "search_issues", .high, "name scan high");
+    try std.testing.expectEqual(@as(u32, 1), metadata_gates.count());
+
+    // Trip the replacement reason dupe on the upgrade arm. The previous
+    // reason must stay owned so runWithServer teardown cannot UAF/double-free.
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(
+        error.OutOfMemory,
+        upsertMetadataGate(allocator, &metadata_gates, "search_issues", .critical, "description scan critical"),
+    );
+    try std.testing.expect(failing.has_induced_failure);
+
+    const entry = metadata_gates.get("search_issues").?;
+    try std.testing.expectEqual(tools.RiskClass.high, entry.risk);
+    try std.testing.expectEqualStrings("name scan high", entry.reason);
+}
+
+test "upsertMetadataGate upgrade GH347 replaces reason only when risk increases" {
+    const allocator = std.testing.allocator;
+    var metadata_gates = std.StringHashMap(MetadataGate).init(allocator);
+    defer deinitMetadataGates(allocator, &metadata_gates);
+
+    try upsertMetadataGate(allocator, &metadata_gates, "search_issues", .high, "name scan high");
+    try upsertMetadataGate(allocator, &metadata_gates, "search_issues", .high, "same rank ignored");
+    try upsertMetadataGate(allocator, &metadata_gates, "search_issues", .medium, "lower rank ignored");
+    try std.testing.expectEqual(tools.RiskClass.high, metadata_gates.get("search_issues").?.risk);
+    try std.testing.expectEqualStrings("name scan high", metadata_gates.get("search_issues").?.reason);
+
+    try upsertMetadataGate(allocator, &metadata_gates, "search_issues", .critical, "description scan critical");
+    try std.testing.expectEqual(tools.RiskClass.critical, metadata_gates.get("search_issues").?.risk);
+    try std.testing.expectEqualStrings("description scan critical", metadata_gates.get("search_issues").?.reason);
 }
