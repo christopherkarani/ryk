@@ -12,7 +12,7 @@ const fm_steward_client = @import("fm_steward_client.zig");
 const exit_codes = @import("exit_codes.zig");
 const feed_writer = @import("feed_writer.zig");
 const help = @import("help.zig");
-const rust_visibility = @import("rust_visibility.zig");
+const rust_visibility = @import("feed_visibility.zig");
 const telemetry = @import("../telemetry.zig");
 
 const max_payload_len = 256 * 1024;

@@ -3,7 +3,7 @@ const builtin = @import("builtin");
 
 const core = @import("ryk_core").core;
 const env_util = @import("../env_util.zig");
-const rust_visibility = @import("rust_visibility.zig");
+const rust_visibility = @import("feed_visibility.zig");
 
 pub const feed_dir_name = "feed";
 pub const feed_file_name = "rust_shell_decisions.jsonl";

@@ -8,7 +8,7 @@ const policy = @import("ryk_core").policy;
 const exit_codes = @import("exit_codes.zig");
 const help = @import("help.zig");
 const shell_eval = @import("shell_eval.zig");
-const rust_visibility = @import("rust_visibility.zig");
+const rust_visibility = @import("feed_visibility.zig");
 
 const ShimOptions = struct {
     command_argv: []const []const u8 = &.{},

@@ -4,7 +4,7 @@ const ryk = @import("ryk");
 const core = ryk.core;
 const dashboard = ryk.dashboard;
 const feed_writer = ryk.cli.feed_writer;
-const rust_visibility = ryk.cli.rust_visibility;
+const rust_visibility = ryk.cli.feed_visibility;
 const shell_eval = ryk.cli.shell_eval;
 
 const fake_secret = "sk-fakeSyntheticOpenAIKey1234567890";
