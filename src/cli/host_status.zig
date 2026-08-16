@@ -162,7 +162,10 @@ pub fn shellGate(host: []const u8) []const u8 {
 pub fn failStance(host: []const u8, hermes_fail_open: bool, wired: []const u8) []const u8 {
     // RT-06: never claim fail-closed (or explicit Hermes fail-open) when unwired.
     // when the host hook is unwired — process-wrap alone is not shell mediation.
-    if (std.mem.eql(u8, wired, "broken")) return "evaluator not product ryk";
+    if (std.mem.eql(u8, wired, "broken")) {
+        if (std.mem.eql(u8, host, "grok")) return "hook not fail-closed";
+        return "evaluator not product ryk";
+    }
     const hook_wired = std.mem.eql(u8, wired, "yes") or std.mem.eql(u8, wired, "partial");
     if (std.mem.eql(u8, host, "hermes")) {
         if (!hook_wired) return "unwired (no fail-closed shell)";
@@ -191,6 +194,9 @@ pub fn formatFix(
         return try allocator.dupe(u8, "ryk doctor --fix  # Cursor auto-wire deferred to W3");
     }
     if (std.mem.eql(u8, wired, "broken")) {
+        if (std.mem.eql(u8, host, "grok")) {
+            return try allocator.dupe(u8, "ryk doctor --fix  # leftover or non-product Grok hook (127 fail-open until rewritten)");
+        }
         return try allocator.dupe(u8, "ryk doctor --fix  # hook is a test/non-product binary, not ryk");
     }
     if (std.mem.eql(u8, host, "pi")) {
@@ -608,8 +614,12 @@ pub fn inspectGrokAtHome(
 ) GrokStatus {
     const baked = grok_install.readBakedRykBinaryAtHome(io, allocator, home);
     defer if (baked) |p| allocator.free(p);
-    const hook_installed = grok_install.installedAtHome(io, allocator, home) or baked != null;
-    const evaluator_ok = if (baked) |p| brand.classifyEvaluator(p).isProduct() else true;
+    const fail_closed = grok_install.installedAtHome(io, allocator, home);
+    const hook_installed = fail_closed or baked != null;
+    const product_ok = if (baked) |p| brand.classifyEvaluator(p).isProduct() else true;
+    // Leftover `…/ryk hook grok PreToolUse` still 127-fail-opens. Product
+    // basename alone is not health — doctor must show broken until the wrapper.
+    const evaluator_ok = fail_closed and product_ok;
     return .{
         .binary_detected = binary_detected,
         .hook_installed = hook_installed,
@@ -994,7 +1004,7 @@ test "Pi status distinguishes host detection from extension installation" {
 test "formatFix and failStance name a test-program bake" {
     const allocator = std.testing.allocator;
     try std.testing.expectEqualStrings("evaluator not product ryk", failStance("pi", false, "broken"));
-    try std.testing.expectEqualStrings("evaluator not product ryk", failStance("grok", false, "broken"));
+    try std.testing.expectEqualStrings("hook not fail-closed", failStance("grok", false, "broken"));
 
     const pi_fix = try formatFix(allocator, "pi", "broken", .{}, false);
     defer allocator.free(pi_fix);
@@ -1004,7 +1014,7 @@ test "formatFix and failStance name a test-program bake" {
     const grok_fix = try formatFix(allocator, "grok", "broken", .{}, false);
     defer allocator.free(grok_fix);
     try std.testing.expect(std.mem.indexOf(u8, grok_fix, "ryk doctor --fix") != null);
-    try std.testing.expect(std.mem.indexOf(u8, grok_fix, "test/non-product") != null);
+    try std.testing.expect(std.mem.indexOf(u8, grok_fix, "127 fail-open") != null);
 }
 
 test "inspectPiAtHome marks a zig-cache rykBin as broken" {
@@ -1035,6 +1045,38 @@ test "inspectPiAtHome without a baked path is not a test-program bake" {
     try std.testing.expect(!status.extension_installed);
     try std.testing.expect(status.evaluator_ok);
     try std.testing.expectEqualStrings("no", status.wiredLabel());
+}
+
+test "inspectGrokAtHome marks leftover product-direct hook as broken" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, grok_install.hooks_relative_dir);
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = grok_install.managed_hook_relative_path,
+        .data =
+        \\{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"/opt/ryk/bin/ryk hook grok PreToolUse","timeout":30}]}]}}
+        \\
+        ,
+    });
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(home);
+    const status = inspectGrokAtHome(std.testing.io, std.testing.allocator, home, true);
+    try std.testing.expect(status.hook_installed);
+    try std.testing.expect(!status.evaluator_ok);
+    try std.testing.expectEqualStrings("broken", status.wiredLabel());
+}
+
+test "inspectGrokAtHome marks product fail-closed wrapper as wired" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(home);
+    const result = try grok_install.installAtHome(std.testing.io, std.testing.allocator, home, "/opt/ryk/bin/ryk");
+    defer result.deinit(std.testing.allocator);
+    const status = inspectGrokAtHome(std.testing.io, std.testing.allocator, home, true);
+    try std.testing.expect(status.hook_installed);
+    try std.testing.expect(status.evaluator_ok);
+    try std.testing.expectEqualStrings("yes", status.wiredLabel());
 }
 
 test "inspectGrokAtHome marks a zig-cache hook as broken" {
