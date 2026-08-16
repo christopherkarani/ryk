@@ -21,7 +21,7 @@ pub fn Spinner(comptime Writer: type) type {
         pub fn tick(self: *@This()) !void {
             const a = theme.active(self.io, self.stdout);
             if (!a.capability.hasColor()) return;
-            // Phase 7 Task F: reduced-motion (colour on, motion off) renders the
+            // Reduced-motion (colour on, motion off) renders the
             // first frame statically with NO synchronized-output controls, then
             // suppresses all further animation. The documented motion proxies
             // (NO_COLOR/TERM=dumb/non-TTY) drop colour too, so this branch is
@@ -108,7 +108,7 @@ fn countSeq(haystack: []const u8, needle: []const u8) usize {
 }
 
 test "spinner reduced-motion emits one static frame with no sync controls" {
-    // Phase 7 Task F: under reduced-motion (colour on, motion off) the spinner
+    // Under reduced-motion (colour on, motion off) the spinner
     // renders exactly one static frame and no synchronized-output controls on
     // any subsequent tick. Colour capability is retained (the frame renders
     // rather than bailing). The only way to reach 'colour on, motion off' in a

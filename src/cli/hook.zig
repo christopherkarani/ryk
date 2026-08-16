@@ -5885,8 +5885,7 @@ fn testJsonStringFieldRaw(haystack: []const u8, key: []const u8) ?[]const u8 {
 //
 // One real pack deny (`git reset --hard` through the real Zig evaluator) is
 // emitted through each host's production wire shape, and the agent-visible
-// field is held to the shared contract from
-// docs/handoffs/shared-short-agent-message-2026-08-11.md: one line, no operator
+// field is held to the shared contract: one line, no operator
 // Recourse/Next walls, still names ryk, never a redeemable allow-once code.
 // Operator detail stays on stderr / structured fields.
 //

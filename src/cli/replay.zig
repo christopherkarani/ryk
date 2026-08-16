@@ -1018,7 +1018,7 @@ test "replay human timeline collapses repeated redactions and json remains exact
 }
 
 // ---------------------------------------------------------------------------
-// Phase 7 Task D: --tui alt-screen view (rejection contracts; the raw TTY loop
+// --tui alt-screen view (rejection contracts; the raw TTY loop
 // is manual-verify per the prompt.zig:19 note). Linear + --json byte contracts
 // must be unchanged when --tui is absent.
 // ---------------------------------------------------------------------------

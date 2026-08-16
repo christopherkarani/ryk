@@ -778,7 +778,7 @@ test "help output is grouped, complete, and excludes hidden commands" {
     try std.testing.expect(std.mem.indexOf(u8, output, "ryk explain") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "ryk replay") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "help --all") != null);
-    // Phase 7 Task E: the --no-rich / RYK_NO_RICH escape hatch is discoverable
+    // The --no-rich / RYK_NO_RICH escape hatch is discoverable
     // from the top-level help (global-options surface).
     try std.testing.expect(std.mem.indexOf(u8, output, "Global options") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "--no-rich") != null);
@@ -1309,7 +1309,7 @@ test "human parser invalid values sanitize terminal controls and suggest valid v
 }
 
 // ---------------------------------------------------------------------------
-// Phase 2 TDD: brand cohesion banner system (written FIRST — RED).
+// Brand cohesion banner system tests.
 // The compact `🛡  ryk · v<version>` header must open every HUMAN command,
 // be suppressed for --json / raw / machine / help-reference paths, and stay
 // byte-identical on --json. Banner marker in the plain-text degrade path is
@@ -2057,7 +2057,7 @@ test "banner suppressed on subcommand --help (doctor --help)" {
 }
 
 // ---------------------------------------------------------------------------
-// TDD tests for "Did you mean?" suggestions (written FIRST — RED, foundation work)
+// "Did you mean?" suggestion tests
 // ---------------------------------------------------------------------------
 
 test "unknown command suggests typo correction" {
@@ -2313,9 +2313,7 @@ test "run dispatch launches child command" {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 3 TDD tests: messaging and help text updates for guided onboarding
-// These tests are written FIRST (RED). They will fail until help text is updated
-// to describe the new default guided behavior and de-emphasize --yes.
+// Messaging and help text updates for guided onboarding
 // ---------------------------------------------------------------------------
 
 test "start help does not advertise protection grade menu or --protection" {

@@ -1452,9 +1452,7 @@ test "start auto default path has no protection grade menu jargon in stdout" {
     try std.testing.expect(std.mem.indexOf(u8, output, "Setup path: strict") != null);
 }
 
-// ---------------------------------------------------------------------------
 // AINA P3 S5 — start/init discovery refresh (DIS-1 / DIS-7 / A-P3-2 / A-P3-3)
-// Spec: planning/2026-08-02-agent-inference-network-allow-spec.md
 
 // AINA P3 discovery refresh is covered thoroughly in init.zig and
 // policy/network_discovered.zig. start re-exports the shared seam only.

@@ -13,9 +13,8 @@
 //! Corpus: deadlock_replay_corpus.jsonl — one JSON object per line:
 //! {"command": "...", "expect": "allow"|"deny", "note": "..."}
 //!
-//! Sources: docs/handoffs/coding-agent-pack-ux-2026-08-11.md (lived Grok
-//! strict off-list refuse session) and
-//! docs/handoffs/coding-agents-day-to-day-plan-2026-08-11.md. Every line must
+//! Corpus exercises lived Grok strict off-list refuse sessions and day-to-day
+//! agent scenarios. Every line must
 //! produce the same product decision on both surfaces: normal work allows,
 //! danger blocks. A failure here means an agent host can deadlock again.
 

@@ -294,7 +294,7 @@ fn commandWithStdioAndEnv(io: std.Io, argv: []const []const u8, stdout: anytype,
 
     // Product path: trusted host key selects overlay (not basename spoof). AINA P3:
     // pass abs workspace_root + parent HOME so launch merges managed + adapter hosts
-    // before empty-backpack scrub (DIS / plan §3.6). Soft-skips if store/home missing.
+    // before empty-backpack scrub (DIS). Soft-skips if store/home missing.
     const parent_home = current_env.get("HOME") orelse "";
     try applyNetworkOverlayWithHostKey(
         allocator,
@@ -1884,7 +1884,7 @@ fn hostKeyFromCommandArgv(options: RunOptions) ?[]const u8 {
     return base;
 }
 
-/// Launch-time discovery context for AINA P3 (plan §3.6 S4).
+/// Launch-time discovery context for AINA P3.
 /// When null, pack-only (P1) path. Product always supplies abs workspace_root + parent HOME.
 pub const DiscoveryLaunchContext = struct {
     io: std.Io,
@@ -4141,7 +4141,7 @@ test "applyNetworkOverlayWithHostKey P3 managed hosts merge for pi with pack flo
 }
 
 test "applyNetworkOverlayWithHostKey P3 launch-time pi adapter discovers auth.x.ai from fixture home" {
-    // Launch-time discoverForHost(pi) must run even when managed file is missing (plan §3.6).
+    // Launch-time discoverForHost(pi) must run even when managed file is missing.
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -5643,7 +5643,7 @@ fn writeLastPointerNoMakePath(allocator: std.mem.Allocator, workspace_root: []co
 }
 
 // ---------------------------------------------------------------------------
-// TDD: first successful run celebration (written FIRST — RED, foundation work)
+// First successful run celebration tests.
 // These exercise isFirstSession + the celebration branch in printSessionEnd.
 // ---------------------------------------------------------------------------
 
@@ -5742,7 +5742,7 @@ test "session end prints final audit chain hash matching summary" {
 }
 
 // ---------------------------------------------------------------------------
-// TDD: Phase 1 — rich guardian block on deny (written FIRST → RED → GREEN).
+// Rich guardian block on deny tests.
 // These exercise renderDenyBlock via the real run.zig deny path. Fixed-buffer
 // writers + std.testing.io force theme.active() to .none, so assertions hold
 // against the plain-text degrade path (the colour path is covered by theme.zig).

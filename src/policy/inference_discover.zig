@@ -1,6 +1,6 @@
 //! Read-only inference host discovery adapters (AINA P3 S2 — pi + opencode).
 //!
-//! Normative: planning/2026-08-02-aina-p3-discovery-plan.md §3.4–3.6;
+//! Read-only inference host discovery adapters for pi and opencode (AINA P3).
 //! SoT: A-P3-1…A-P3-4, DIS-2/4, SEC-3/7.
 //!
 //! Public seam: `discoverForHost(io, allocator, host_key, home) → ![]const []const u8`
@@ -30,14 +30,14 @@ const inference_hostname = @import("inference_hostname.zig");
 const network_eval = @import("network_eval.zig");
 
 // ---------------------------------------------------------------------------
-// Bounds (plan §3.3 / §3.6 — fail-closed soft skip, never panic)
+// Bounds — fail-closed soft skip, never panic
 // ---------------------------------------------------------------------------
 
 /// Max bytes read from a single adapter config file (auth/settings).
 /// Oversize → soft-empty for that file (A-P3 soft skip; no OOM/panic).
 const max_auth_file_bytes: usize = 256 * 1024;
 
-/// Cap discovered hostnames per host adapter (plan §3.3 item 5).
+/// Cap discovered hostnames per host adapter.
 const max_discovered_hosts: usize = 32;
 
 // ---------------------------------------------------------------------------
@@ -191,7 +191,7 @@ fn collectFromPiSettings(
     }
 }
 
-/// Approved adapter URL field names only (plan §3.4) — not arbitrary URL scrape.
+/// Approved adapter URL field names only — not arbitrary URL scrape.
 fn extractApprovedUrlFields(
     allocator: std.mem.Allocator,
     list: *std.ArrayList([]const u8),
@@ -713,7 +713,7 @@ test "inference_discover soft-empty for unknown host_key" {
 }
 
 test "inference_discover soft-empty or truncate when auth file is huge" {
-    // Plan §3.6 / risk: fail-closed size cap — soft skip, do not OOM or panic.
+    // Fail-closed size cap — soft skip, do not OOM or panic.
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     // ~2 MiB of non-JSON filler (well over any reasonable config cap).
