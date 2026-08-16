@@ -34,6 +34,7 @@
 
 ### Fixed
 
+* **Dashboard GET `/terminal/` is a directory index.** `formatListenUrl` prints `http://127.0.0.1:7742/terminal/`; a single trailing slash now maps to the `terminal` prefix (then `terminal/index.html` / SPA fallback) instead of failing `isSafeStaticPath` as an empty segment. Sibling trailing-slash views (`/activity/`) share the helper. `//`, `/terminal//`, and `..` still 404.
 * **`ryk start` banner names the written policy posture.** Default create still seeds generic-agent / DCG `mode: strict`. The setup-path line and first-run receipt now say `strict` (or `Ask` when the YAML is ask) instead of a hardcoded “Ask on risk (auto)”. Quiet success, one next action, no box-drawing walls. install ≠ start.
 * **`ryk hook --help` lists grok.** Dispatch already accepted `ryk hook grok`; the usage host list was a stale subset (`codex|claude|opencode|openclaw|hermes`). Help now matches `Host.parse`, and a lock test keeps the Usage group aligned with that allowlist. Pi stays on `evaluate`; cursor is not a hook host.
 * **Deny/ask copy no longer says Always for session sticky (#146).** The TTY prompt is Once / Session / Never. Session is in-memory for this ryk process; it is not a permanent allowlist write. Host-UI allow stays quiet and is not described as a ryk sticky write (A5). `ryk test` / `ryk explain` name the rule and a safer command on deny. Sticky semantics, fail-closed empty stdin, and allow-once are unchanged.
