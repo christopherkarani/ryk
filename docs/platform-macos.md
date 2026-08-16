@@ -118,7 +118,7 @@ The runtime banner and `sandbox_posture` audit reason explicitly report `UDP/QUI
 
 Proxy startup alone is not enough: without a route-forced OS sandbox session, the child env reports `RYK_PROXY_ROUTE_FORCED=false`, and `--require-backend network_enforce` fails closed.
 
-**Version gate vs CI evidence:** Seatbelt **capability** remains product majors **14–26** inclusive (version-gated). Outside the matrix → unavailable. **CI attach evidence** is currently collected on **macos-14** only (plus Linux amd64 for Landlock); other matrix majors are local/capability until freeze CI jobs cover them — not silently CI-proven for 14–26. Nested re-apply is not supported; children inherit the first successful apply.
+**Version gate vs CI evidence:** Seatbelt **capability** remains product majors **14–26** inclusive (version-gated). Outside the matrix → unavailable. **CI attach evidence** is **linux amd64 (Landlock)** only; Seatbelt attach is local — not silently CI-proven for 14–26. Nested re-apply is not supported; children inherit the first successful apply.
 
 ## Protected Paths
 

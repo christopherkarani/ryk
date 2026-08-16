@@ -272,6 +272,8 @@ test "real FS deny: symlinked host config cannot retarget grant into secret tree
     var ws_tmp = std.testing.tmpDir(.{});
     defer ws_tmp.cleanup();
     try ws_tmp.dir.createDirPath(io, ".ryk");
+    // Same precreate production attach does: empty box has no RW leaf otherwise.
+    try ws_tmp.dir.createDirPath(io, ".ryk-tmp");
     const ws_root = try ws_tmp.dir.realPathFileAlloc(io, ".", allocator);
     defer allocator.free(ws_root);
 
@@ -355,6 +357,7 @@ test "real network route forcing: proxy port allowed and neighboring loopback po
     var ws_tmp = std.testing.tmpDir(.{});
     defer ws_tmp.cleanup();
     try ws_tmp.dir.createDirPath(io, ".ryk");
+    try ws_tmp.dir.createDirPath(io, ".ryk-tmp");
     const ws_root = try ws_tmp.dir.realPathFileAlloc(io, ".", allocator);
     defer allocator.free(ws_root);
 
@@ -927,9 +930,9 @@ test "landlock inheritance: grandchild after nested exec still denies outside an
     const probe_script = try std.fmt.allocPrint(
         allocator,
         \\exec '{s}' -c '
-        \\if test -r "{s}"; then exit 3; fi
+        \\if (exec 3< "{s}"); then exit 3; fi
         \\if (printf x > "{s}"); then exit 6; fi
-        \\if ! test -r "{s}"; then exit 4; fi
+        \\if ! (exec 3< "{s}"); then exit 4; fi
         \\exit 0
         \\'
     ,

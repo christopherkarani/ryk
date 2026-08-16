@@ -92,6 +92,8 @@ printf '%s\n' "$zip_listing" | grep "/bin/ryk.exe$" >/dev/null || fail "Windows 
 
 RYK_RELEASE_PRODUCT=curl "$REPO_ROOT/scripts/verify-release.sh" "$tmp_root/dist" >/dev/null
 
+grep -q 'RYK_TELEMETRY_BUILD_DISABLED' "$REPO_ROOT/scripts/release-dry-run.sh" ||
+  fail "release dry-run does not default telemetry transport disabled without a token"
 assert_absent scripts/build-release.sh 'orca-pi|DUAL_PUBLISH|legacy_cli_alias|install_primary_and_alias'
 assert_absent scripts/cut-release.sh 'publish-npm|publish-homebrew|skip-npm|homebrew-ryk|npm publish|npm whoami'
 assert_absent scripts/install.sh 'LEGACY_|/orca|probe_existing_orca|dual-publish|compatibility alias'

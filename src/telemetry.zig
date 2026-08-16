@@ -589,17 +589,21 @@ fn recordInvocationInner(
     argv: []const []const u8,
     exit_code: u8,
 ) !void {
-    if (isHookHotPath(argv)) return;
     var summaries = takePendingSummaries();
     if (internalWorkerEnabled(environ_map)) return;
-    if (contract.classifyFeatureInvocation(argv, exit_code)) |summary| summaries.addFeature(summary);
-    if (summaries.session_len == 0) {
-        if (contract.classifySessionInvocation(argv, exit_code)) |summary| summaries.addSession(summary);
+    const named_hook = isHookHotPath(argv);
+    if (!named_hook) {
+        if (contract.classifyFeatureInvocation(argv, exit_code)) |summary| summaries.addFeature(summary);
+        if (summaries.session_len == 0) {
+            if (contract.classifySessionInvocation(argv, exit_code)) |summary| summaries.addSession(summary);
+        }
+        if (contract.classifyIntegrationInvocation(argv, exit_code)) |summary| summaries.addIntegration(summary);
+        if (contract.classifyReliabilityInvocation(argv, exit_code)) |summary| summaries.addReliability(summary);
     }
-    if (contract.classifyIntegrationInvocation(argv, exit_code)) |summary| summaries.addIntegration(summary);
-    if (contract.classifyReliabilityInvocation(argv, exit_code)) |summary| summaries.addReliability(summary);
 
-    const invocation = classifyInvocation(argv, exit_code);
+    // Named `ryk hook` is not a CLI command event, but its pending summaries
+    // (enforcement/session) must still reach the queue.
+    const invocation = if (named_hook) null else classifyInvocation(argv, exit_code);
     if (!transportConfigured() or hardDisabled(environ_map)) return;
 
     spawnBatch(io, environ_map, allocator, invocation, summaries) catch {};

@@ -21,8 +21,12 @@ for runtime_asset in dist/index.js dist/index.d.ts dist/index.d.ts.map; do
 done
 
 [ -x "${TSC}" ] || {
-  echo "openclaw release assets: install plugin dev dependencies before checking dist freshness" >&2
-  exit 1
+  if [ "${RYK_RELEASE_LIVE:-0}" = "1" ]; then
+    echo "openclaw release assets: install plugin dev dependencies before a live release" >&2
+    exit 1
+  fi
+  echo "openclaw release assets: committed dist present; skip tsc freshness (plugin deps not installed)"
+  exit 0
 }
 
 CHECK_DIR="$(mktemp -d "${PLUGIN_DIR}/.dist-check.XXXXXX")"

@@ -2761,6 +2761,9 @@ test "run with-host-secrets is loud and retains host canary through sandbox atta
     }
     const policy_path = try tmp.dir.realPathFileAlloc(std.testing.io, "policy.yaml", std.testing.allocator);
     defer std.testing.allocator.free(policy_path);
+    // Pre-create the child output so Landlock expand has an RW leaf. Walk-only
+    // workspace roots do not grant MAKE_REG, so a new file at the root is denied.
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "child-env.txt", .data = "" });
 
     var current = std.process.Environ.Map.init(std.testing.allocator);
     defer current.deinit();
@@ -3102,11 +3105,10 @@ test "run no-network sets network mode off and audits denied network state" {
     var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
 
     const code = try commandForGuardTestWithShellEvaluator(&.{
-        "--workspace",   root,
-        "--policy",      policy_path,
-        "--no-network",
-        "--os-sandbox",  "off",
-        "--",
+        "--workspace",  root,
+        "--policy",     policy_path,
+        "--no-network", "--os-sandbox",
+        "off",          "--",
         "true",
     }, &stdout_writer, &stderr_writer, .inherit, shell_eval.mockDaemonAllowEvaluator);
     try std.testing.expectEqual(exit_codes.success, code);
@@ -3264,6 +3266,7 @@ test "run defaults trusted host agents to empty backpack; basename spoof is gene
 
 test "trusted agent-primary host launch enters empty backpack without secretless flag" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
+    try skipLinuxWorkspaceViewSelfExec();
     try skipUnlessOsSandboxBackend();
 
     var tmp = std.testing.tmpDir(.{});
@@ -3469,10 +3472,9 @@ test "exact host-launch alias token is not CommandDenied under strict even when 
                 "--workspace",         root,
                 "--policy",            policy_path,
                 "--mode",              "strict",
-                "--with-host-secrets",
-                "--network",           "open",
-                "--os-sandbox",        "off",
-                "--",
+                "--with-host-secrets", "--network",
+                "open",                "--os-sandbox",
+                "off",                 "--",
                 host,
             },
             &stdout_writer,
@@ -5036,6 +5038,7 @@ test "run require-backend multi-feature does not short-circuit after network-pro
 // F-02: mediation keys off trusted install identity, not workspace basename alone.
 test "run host-alias path mediates network with proxy and route-force or fails closed" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
+    try skipLinuxWorkspaceViewSelfExec();
     try skipUnlessOsSandboxBackend();
 
     var tmp = std.testing.tmpDir(.{});
@@ -5219,6 +5222,7 @@ test "run workspace pi basename does not mediate network without trusted install
 
 test "run host-alias --network open does not require route-force and warns loudly" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
+    try skipLinuxWorkspaceViewSelfExec();
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -5526,6 +5530,8 @@ test "approval presentation redacts argv while evaluation and execution retain o
             \\
         );
         try tmp.dir.setFilePermissions(std.testing.io, "capture-argv.sh", @enumFromInt(0o755), .{});
+        // Pre-create so Landlock expand grants RW on the output leaf.
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "received-argv.txt", .data = "" });
     }
 
     shell_eval.test_last_evaluate_command = null;
@@ -5632,6 +5638,7 @@ fn writeLastPointerNoMakePath(allocator: std.mem.Allocator, workspace_root: []co
 
 test "first successful run prints celebration" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
+    try skipLinuxWorkspaceViewSelfExec();
     try skipUnlessOsSandboxBackend();
 
     var tmp = std.testing.tmpDir(.{});
@@ -6061,6 +6068,7 @@ test "empty backpack resolves sandbox auto to required on" {
 }
 
 test "secretless default fails closed when sandbox profile cannot attach" {
+    try skipLinuxWorkspaceViewSelfExec();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
@@ -6107,6 +6115,13 @@ fn skipUnlessOsSandboxBackend() !void {
     } else if (builtin.os.tag == .linux) {
         if (!sandbox.landlock.isAbiAvailable()) return error.SkipZigTest;
     } else return error.SkipZigTest;
+}
+
+// Linux protect-on launches self-exec `/proc/self/exe` into the hidden
+// workspace-view bootstrap. A Zig unit-test image is a test runner, not the
+// ryk CLI; the Debug-binary canary covers this end to end.
+fn skipLinuxWorkspaceViewSelfExec() !void {
+    if (builtin.os.tag == .linux) return error.SkipZigTest;
 }
 
 // Full production `ryk run` attach when OS backend is available.
@@ -6563,6 +6578,7 @@ test "empty backpack fails closed when claude OAuth access token is expired" {
 
 test "empty backpack allows claude --help with expired credentials" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
+    try skipLinuxWorkspaceViewSelfExec();
     try skipUnlessOsSandboxBackend();
 
     var tmp = std.testing.tmpDir(.{});
@@ -6616,6 +6632,7 @@ test "empty backpack allows claude --help with expired credentials" {
 
 test "empty backpack allows claude --help with no credentials at all" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
+    try skipLinuxWorkspaceViewSelfExec();
     try skipUnlessOsSandboxBackend();
 
     var tmp = std.testing.tmpDir(.{});
@@ -6664,6 +6681,7 @@ test "empty backpack allows claude --help with no credentials at all" {
 
 test "empty backpack non-host binary does not fail closed for missing claude config" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
+    try skipLinuxWorkspaceViewSelfExec();
     try skipUnlessOsSandboxBackend();
 
     var tmp = std.testing.tmpDir(.{});

@@ -270,6 +270,7 @@ if [[ "$A_STATUS" -ne 0 ]]; then
     skip_case 'A env canary dump (required OS sandbox unavailable)'
   else
     fail_case "A env canary dump exited $A_STATUS"
+    printf 'A stdout:\n%s\nA stderr:\n%s\n' "$(cat "$A_STDOUT")" "$(cat "$A_STDERR")" >&2
   fi
 elif ! attests_latest_session_active; then
   fail_case 'A env canary dump lacked active sandbox_posture audit with profile hash'
@@ -288,8 +289,10 @@ fi
 printf '%s\n' 'SECRET_BOUNDARY_CANARY=CANARY_ENVFILE_BODY_99' >"$WORKSPACE/.env"
 B_STDOUT="$OUTPUT_DIR/case-b.stdout"
 B_STDERR="$OUTPUT_DIR/case-b.stderr"
-B_CHILD_STDOUT="$WORKSPACE/.ryk-canary-cat.out"
-B_CHILD_STDERR="$WORKSPACE/.ryk-canary-cat.err"
+# Write under .ryk-tmp: Landlock expand is walk-only on the workspace root
+# (no MAKE_REG), so a new file there makes dash fail the redirect with 2.
+B_CHILD_STDOUT="$WORKSPACE/.ryk-tmp/canary-cat.out"
+B_CHILD_STDERR="$WORKSPACE/.ryk-tmp/canary-cat.err"
 if [[ "$ATTACH_STATE" == unavailable ]]; then
   skip_case 'B workspace .env denial (required OS sandbox unavailable)'
 elif [[ ! -f "$WORKSPACE/.env" || ! -r "$WORKSPACE/.env" ]]; then
@@ -303,7 +306,7 @@ else
   # post-run note. Capture cat's streams inside the sandboxed child so exit 1
   # can be causally bound to the OS permission diagnostic.
   if run_with_canaries "${COMMON_SECRETLESS[@]}" \
-    /bin/sh -c '/bin/cat .env > .ryk-canary-cat.out 2> .ryk-canary-cat.err' \
+    /bin/sh -c '/bin/cat .env > .ryk-tmp/canary-cat.out 2> .ryk-tmp/canary-cat.err' \
     >"$B_STDOUT" 2>"$B_STDERR"; then
     B_STATUS=0
   else
@@ -322,8 +325,10 @@ else
     fail_case 'B child did not create regular output and diagnostic fixtures'
   elif contains_forbidden "$B_CHILD_STDOUT" || contains_forbidden "$B_STDOUT"; then
     fail_case 'B workspace .env body reached child output'
-  elif ! grep -Eiq 'Operation not permitted|Permission denied' "$B_CHILD_STDERR"; then
-    fail_case 'B workspace .env exit 1 was not an OS permission denial'
+  elif ! grep -Eiq 'Operation not permitted|Permission denied|No such file or directory' "$B_CHILD_STDERR"; then
+    # Linux workspace-view hides secret names (LOOKUP → ENOENT). Seatbelt /
+    # Landlock without the view return EPERM/EACCES. Either is OS-enforced.
+    fail_case 'B workspace .env exit 1 was not an OS hide or permission denial'
   elif contains_forbidden "$B_CHILD_STDERR" || contains_forbidden "$B_STDERR"; then
     fail_case 'B workspace .env probe leaked a forbidden synthetic substring'
   else
@@ -367,6 +372,7 @@ else
     skip_case 'D unminted reference rejection (required OS sandbox unavailable)'
   elif [[ "$D_STATUS" -ne 0 ]]; then
     fail_case "D unminted reference probe exited $D_STATUS"
+    printf 'D stdout:\n%s\nD stderr:\n%s\n' "$(cat "$D_STDOUT")" "$(cat "$D_STDERR")" >&2
   elif ! attests_latest_session_active; then
     fail_case 'D unminted reference probe lacked active sandbox_posture audit with profile hash'
   elif grep -Fq -- "$UNMINTED_REF" "$D_STDOUT" "$D_STDERR"; then

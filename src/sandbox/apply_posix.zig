@@ -59,6 +59,8 @@ pub const SpawnError = error{
     MountVerificationFailed,
     /// Parent sealed more `.exec` grants than the wire limit.
     TooManyExecPaths,
+    /// Workspace-view bootstrap: inherited-FD scrub failed after attach.
+    FdScrubFailed,
 };
 
 /// Match core.process.StdioBehavior without importing core (module boundary).
@@ -223,6 +225,10 @@ fn forkApplyWorkspaceViewAndExec(
 ) SpawnError!SpawnLease {
     const constructed_env = env_map orelse return error.ApplyFailed;
     const target_cwd = cwd orelse compiled.workspace_root;
+    // Same precreate as the Landlock-only path: bootstrap expand needs a
+    // directory RW leaf or applySelf fails closed (empty box).
+    if (!session_tmp.ensureWorkspaceSessionTmp(compiled.workspace_root))
+        return error.ApplyFailed;
     const spawned = linux_workspace_view_spawn.spawnWorkspaceView(.{
         .io = io,
         .allocator = std.heap.page_allocator,
@@ -263,11 +269,14 @@ fn mapWorkspaceViewSpawnError(err: anyerror) SpawnError {
         error.FuseDaemonStartFailed => error.FuseDaemonStartFailed,
         error.FuseInitFailed => error.FuseInitFailed,
         error.NamespaceSetupFailed => error.NamespaceSetupFailed,
+        error.UserMappingFailed => error.NamespaceSetupFailed,
         error.LandlockUnavailable => error.LandlockUnavailable,
         error.LandlockAttachFailed => error.LandlockAttachFailed,
         error.CapabilityLockdownFailed => error.CapabilityLockdownFailed,
         error.MountVerificationFailed => error.MountVerificationFailed,
         error.TooManyExecPaths => error.TooManyExecPaths,
+        error.FdScrubFailed => error.FdScrubFailed,
+        error.ExecPreflightFailed, error.UnresolvedExecutable => error.ExecFailed,
         else => error.ApplyFailed,
     };
 }
@@ -474,6 +483,22 @@ fn runChildAfterFork(
 fn preflightExecTarget(path: [*:0]const u8) bool {
     switch (builtin.os.tag) {
         .windows, .wasi => return true,
+        .linux => {
+            // Landlock mediates open(2), not access(2). Open after restrict_self
+            // so an ungranted path fail-closes the handshake. Then require a
+            // regular file with an execute bit (non-exec workspace payloads
+            // must not promote and later die with execve 127).
+            const linux = std.os.linux;
+            const fd = linux.open(path, .{ .CLOEXEC = true, .ACCMODE = .RDONLY }, 0);
+            if (linux.errno(fd) != .SUCCESS) return false;
+            const fd_i: i32 = @intCast(fd);
+            defer _ = linux.close(fd_i);
+            var stx = std.mem.zeroes(linux.Statx);
+            const stx_rc = linux.statx(fd_i, "", linux.AT.EMPTY_PATH, .{ .TYPE = true, .MODE = true }, &stx);
+            if (linux.errno(stx_rc) != .SUCCESS or !stx.mask.TYPE) return false;
+            if (!linux.S.ISREG(stx.mode)) return false;
+            return stx.mode & 0o111 != 0;
+        },
         else => {
             // POSIX: R_OK=4, X_OK=1 (portable constants; libc access).
             const R_OK: c_int = 4;

@@ -302,11 +302,25 @@ fn syncParentDirectory(io: std.Io, destination_path: []const u8) !void {
     const parent_path = std.fs.path.dirname(destination_path) orelse return error.InvalidDestinationPath;
     var parent = try std.Io.Dir.openDirAbsolute(io, parent_path, .{ .follow_symlinks = false });
     defer parent.close(io);
-    const parent_as_file: std.Io.File = .{
-        .handle = parent.handle,
-        .flags = .{ .nonblocking = false },
-    };
-    try parent_as_file.sync(io);
+    // Zig Io Dir handles are O_PATH. Linux fsync(2) on O_PATH returns EBADF,
+    // and Zig 0.16 File.sync treats that as a programmer-bug panic.
+    const fd = std.posix.openat(parent.handle, ".", .{
+        .ACCMODE = .RDONLY,
+        .DIRECTORY = true,
+        .CLOEXEC = true,
+    }, 0) catch return;
+    defer _ = std.c.close(fd);
+    // Zig 0.16 has no posix.fsync; File.sync on an O_PATH dir panics BADF.
+    if (builtin.os.tag == .linux) {
+        const rc = std.os.linux.fsync(fd);
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => {},
+            .IO => return error.InputOutput,
+            else => {},
+        }
+    } else {
+        _ = std.c.fsync(fd);
+    }
 }
 
 fn writeFixtureAssets(io: std.Io, dir: std.Io.Dir) !void {

@@ -729,6 +729,27 @@ pub fn build(b: *std.Build) void {
             .{ .name = "build_options", .module = build_options_mod },
         },
     });
+    windows_mod.addImport("ryk", windows_mod);
+    const windows_vaxis_mod: ?*std.Build.Module = if (enable_tui) blk: {
+        // Host `vaxis_mod` is compiled for the native target. Cross-check needs
+        // a Windows-targeted libvaxis or `@import("vaxis")` fails the same way
+        // as a missing `ryk` self-import.
+        const win_vaxis_dep = b.lazyDependency("vaxis", .{
+            .target = windows_target,
+            .optimize = optimize,
+            .external_uucode = true,
+        });
+        const win_uucode_dep = b.lazyDependency("uucode", .{
+            .target = windows_target,
+            .optimize = optimize,
+            .fields = @as([]const []const u8, &.{ "east_asian_width", "grapheme_break", "general_category", "is_emoji_presentation" }),
+        });
+        if (win_vaxis_dep == null or win_uucode_dep == null) break :blk null;
+        const win_vaxis = win_vaxis_dep.?.module("vaxis");
+        win_vaxis.addImport("uucode", win_uucode_dep.?.module("uucode"));
+        windows_mod.addImport("vaxis", win_vaxis);
+        break :blk win_vaxis;
+    } else null;
     // Same as host `ryk_mod`: attach once so shell_engine regex links pcre2_shim + static
     // pcre2-8 for the Windows cross compile; do not also link on windows_exe.root_module.
     const windows_pcre2 = pcre2_slim.addLibrary(b, windows_target, optimize);
@@ -746,6 +767,9 @@ pub fn build(b: *std.Build) void {
         }),
     });
     windows_exe.root_module.link_libc = true;
+    if (windows_vaxis_mod) |win_vaxis| {
+        windows_exe.root_module.addImport("vaxis", win_vaxis);
+    }
     const check_windows_step = b.step("check-windows", "Compile ryk for Windows without running it");
     check_windows_step.dependOn(&windows_exe.step);
 
