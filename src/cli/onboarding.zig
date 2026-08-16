@@ -309,6 +309,12 @@ pub fn collectHostStatuses(io: std.Io, allocator: std.mem.Allocator, doctor_repo
     return try list.toOwnedSlice(allocator);
 }
 
+fn appendOwnedCopy(allocator: std.mem.Allocator, list: *std.ArrayList([]const u8), bytes: []const u8) !void {
+    const owned = try allocator.dupe(u8, bytes);
+    errdefer allocator.free(owned);
+    try list.append(allocator, owned);
+}
+
 pub fn parseHostsCsv(allocator: std.mem.Allocator, csv: []const u8) ![][]const u8 {
     var list: std.ArrayList([]const u8) = .empty;
     errdefer {
@@ -321,7 +327,7 @@ pub fn parseHostsCsv(allocator: std.mem.Allocator, csv: []const u8) ![][]const u
         const trimmed = std.mem.trim(u8, token, " \t");
         if (trimmed.len == 0) continue;
         if (!isSupportedHost(trimmed)) return error.UnsupportedHost;
-        try list.append(allocator, try allocator.dupe(u8, trimmed));
+        try appendOwnedCopy(allocator, &list, trimmed);
     }
 
     return try list.toOwnedSlice(allocator);
@@ -696,6 +702,27 @@ test "onboarding parseHostsCsv validates supported hosts" {
     // Day-one product lock (D03/D04): cursor is membership; unknown still rejected.
     // Former cursor → UnsupportedHost inverted in DayOneHost tests below.
     try std.testing.expectError(error.UnsupportedHost, parseHostsCsv(allocator, "unknown-host-xyz"));
+}
+
+fn hostsListOomParseHostsCsvProbe(allocator: std.mem.Allocator) !void {
+    // Multi-host fixture so a later append can fail after an earlier dupe.
+    const hosts = try parseHostsCsv(allocator, "codex,hermes");
+    defer deinitHostList(allocator, hosts);
+    try std.testing.expectEqual(@as(usize, 2), hosts.len);
+    try std.testing.expectEqualStrings("codex", hosts[0]);
+    try std.testing.expectEqualStrings("hermes", hosts[1]);
+}
+
+test "HostsListOom parseHostsCsv OOM ownership" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        hostsListOomParseHostsCsvProbe,
+        .{},
+    );
+
+    try std.testing.expectError(error.UnsupportedHost, parseHostsCsv(std.testing.allocator, "unknown-host-xyz"));
+    // Mid-list reject must still be UnsupportedHost (errdefer frees the prior dupe).
+    try std.testing.expectError(error.UnsupportedHost, parseHostsCsv(std.testing.allocator, "codex,unknown-host-xyz"));
 }
 
 pub fn mockOnboardingEvaluator(allocator: std.mem.Allocator, shell_event: shell_eval.ShellCommandEvent) daemon.DaemonError!std.json.Parsed(daemon.DaemonResponse) {

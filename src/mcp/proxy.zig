@@ -2295,3 +2295,253 @@ test "upsertMetadataGate upgrade replaces reason only when risk increases" {
     try std.testing.expectEqual(tools.RiskClass.critical, metadata_gates.get("search_issues").?.risk);
     try std.testing.expectEqualStrings("description scan critical", metadata_gates.get("search_issues").?.reason);
 }
+
+fn testAllowSamplingPolicy(allocator: std.mem.Allocator) !policy_mod.schema.Policy {
+    return policy_mod.load.parseFromSlice(allocator,
+        \\version: 1
+        \\mode: strict
+        \\mcp:
+        \\  allow:
+        \\    - "fake.local"
+    , "test.yaml");
+}
+
+const OwnershipInvalidJsonServer = struct {
+    fn request(_: *anyopaque, allocator: std.mem.Allocator, _: []const u8) ![]u8 {
+        return allocator.dupe(u8, "not-json");
+    }
+
+    fn notify(_: *anyopaque, _: []const u8) !void {}
+};
+
+const OwnershipResultServer = struct {
+    fn request(_: *anyopaque, allocator: std.mem.Allocator, _: []const u8) ![]u8 {
+        return allocator.dupe(u8, "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}");
+    }
+
+    fn notify(_: *anyopaque, _: []const u8) !void {}
+};
+
+const OwnershipSamplingReadFailServer = struct {
+    saw_client_response: bool = false,
+
+    fn request(_: *anyopaque, allocator: std.mem.Allocator, _: []const u8) ![]u8 {
+        return allocator.dupe(u8, "{\"jsonrpc\":\"2.0\",\"id\":\"srv-1\",\"method\":\"sampling/createMessage\",\"params\":{\"model\":\"local\"}}");
+    }
+
+    fn read(_: *anyopaque, _: std.mem.Allocator) ![]u8 {
+        return error.McpServerClosed;
+    }
+
+    fn notify(context: *anyopaque, line: []const u8) !void {
+        const self: *OwnershipSamplingReadFailServer = @ptrCast(@alignCast(context));
+        if (std.mem.indexOf(u8, line, "\"result\"") != null and std.mem.indexOf(u8, line, "\"srv-1\"") != null) {
+            self.saw_client_response = true;
+        }
+    }
+};
+
+// Finding 9: after framed parse, a sampling-handler error must free the owned
+// line and JSON. Take the allow path so the handler returns
+// McpClientClosedDuringSampling — not default-deny sendServerSamplingError.
+test "mcp proxy oom-ownership: sampling error frees framed line and JSON" {
+    var policy = try testAllowSamplingPolicy(std.testing.allocator);
+    defer policy.deinit();
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .fail_index = std.math.maxInt(usize),
+    });
+    const allocator = failing.allocator();
+    var session_approvals = intercept.approvals.SessionApprovals.init(allocator);
+    defer session_approvals.deinit();
+
+    var server = ServerSamplingFirstServer{};
+    var input: std.Io.Reader = .fixed("");
+    var output_buf: [4096]u8 = undefined;
+    var output_writer: std.Io.Writer = .fixed(&output_buf);
+
+    try std.testing.expectError(error.McpClientClosedDuringSampling, requestServerForClient(
+        allocator,
+        .{
+            .server_name = "fake",
+            .server_command_display = "fake",
+            .policy = &policy,
+            .mode = .strict,
+        },
+        &input,
+        &output_writer,
+        .{
+            .context = &server,
+            .request = ServerSamplingFirstServer.request,
+            .notify = ServerSamplingFirstServer.notify,
+        },
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}",
+        &session_approvals,
+    ));
+    try std.testing.expect(!server.saw_sampling_error);
+    try std.testing.expect(!server.saw_sampling_client_response);
+    try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+}
+
+// Finding 9: parseLine catch-return and a non-sampling success return stay
+// caller-owned. Clearing a live-flag before those returns must not dual-free.
+test "mcp proxy oom-ownership: requestServerForClient successful handoff stays caller-owned" {
+    var policy = try testAllowSamplingPolicy(std.testing.allocator);
+    defer policy.deinit();
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .fail_index = std.math.maxInt(usize),
+    });
+    const allocator = failing.allocator();
+    var session_approvals = intercept.approvals.SessionApprovals.init(allocator);
+    defer session_approvals.deinit();
+
+    var invalid_server = OwnershipInvalidJsonServer{};
+    var invalid_input: std.Io.Reader = .fixed("");
+    var invalid_buf: [256]u8 = undefined;
+    var invalid_writer: std.Io.Writer = .fixed(&invalid_buf);
+    const invalid_response = try requestServerForClient(
+        allocator,
+        .{
+            .server_name = "fake",
+            .server_command_display = "fake",
+            .policy = &policy,
+            .mode = .strict,
+        },
+        &invalid_input,
+        &invalid_writer,
+        .{
+            .context = &invalid_server,
+            .request = OwnershipInvalidJsonServer.request,
+            .notify = OwnershipInvalidJsonServer.notify,
+        },
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}",
+        &session_approvals,
+    );
+    try std.testing.expectEqualStrings("not-json", invalid_response);
+    allocator.free(invalid_response);
+
+    var result_server = OwnershipResultServer{};
+    var result_input: std.Io.Reader = .fixed("");
+    var result_buf: [256]u8 = undefined;
+    var result_writer: std.Io.Writer = .fixed(&result_buf);
+    const result_response = try requestServerForClient(
+        allocator,
+        .{
+            .server_name = "fake",
+            .server_command_display = "fake",
+            .policy = &policy,
+            .mode = .strict,
+        },
+        &result_input,
+        &result_writer,
+        .{
+            .context = &result_server,
+            .request = OwnershipResultServer.request,
+            .notify = OwnershipResultServer.notify,
+        },
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}",
+        &session_approvals,
+    );
+    try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}", result_response);
+    allocator.free(result_response);
+    try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+}
+
+// Finding 9: after a completed sampling iteration the framed line is freed;
+// a later read error must not dual-free it. Successful handoff of the next
+// line stays caller-owned.
+test "mcp proxy oom-ownership: completed sampling iteration does not dual-free" {
+    var policy = try testAllowSamplingPolicy(std.testing.allocator);
+    defer policy.deinit();
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .fail_index = std.math.maxInt(usize),
+    });
+    const allocator = failing.allocator();
+    var session_approvals = intercept.approvals.SessionApprovals.init(allocator);
+    defer session_approvals.deinit();
+
+    var read_fail_server = OwnershipSamplingReadFailServer{};
+    var read_fail_input: std.Io.Reader = .fixed("{\"jsonrpc\":\"2.0\",\"id\":\"srv-1\",\"result\":{\"role\":\"assistant\",\"content\":{\"type\":\"text\",\"text\":\"ok\"}}}\n");
+    var read_fail_buf: [4096]u8 = undefined;
+    var read_fail_writer: std.Io.Writer = .fixed(&read_fail_buf);
+    try std.testing.expectError(error.McpServerClosed, requestServerForClient(
+        allocator,
+        .{
+            .server_name = "fake",
+            .server_command_display = "fake",
+            .policy = &policy,
+            .mode = .strict,
+        },
+        &read_fail_input,
+        &read_fail_writer,
+        .{
+            .context = &read_fail_server,
+            .request = OwnershipSamplingReadFailServer.request,
+            .notify = OwnershipSamplingReadFailServer.notify,
+            .read = OwnershipSamplingReadFailServer.read,
+        },
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}",
+        &session_approvals,
+    ));
+    try std.testing.expect(read_fail_server.saw_client_response);
+
+    var server = ServerSamplingFirstServer{};
+    var input: std.Io.Reader = .fixed("{\"jsonrpc\":\"2.0\",\"id\":\"srv-1\",\"result\":{\"role\":\"assistant\",\"content\":{\"type\":\"text\",\"text\":\"ok\"}}}\n");
+    var output_buf: [4096]u8 = undefined;
+    var output_writer: std.Io.Writer = .fixed(&output_buf);
+    const response = try requestServerForClient(
+        allocator,
+        .{
+            .server_name = "fake",
+            .server_command_display = "fake",
+            .policy = &policy,
+            .mode = .strict,
+        },
+        &input,
+        &output_writer,
+        .{
+            .context = &server,
+            .request = ServerSamplingFirstServer.request,
+            .notify = ServerSamplingFirstServer.notify,
+            .read = ServerSamplingFirstServer.read,
+        },
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}",
+        &session_approvals,
+    );
+    try std.testing.expect(server.saw_sampling_client_response);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"tools\"") != null);
+    allocator.free(response);
+    try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+}
+
+// Finding 10: escalate must dupe the new reason first, then free-and-swap.
+// fail-at-N on the escalate dupe leaves the old reason intact.
+test "mcp proxy oom-ownership: upsertMetadataGate escalate OOM leaves old reason intact" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .fail_index = std.math.maxInt(usize),
+    });
+    const allocator = failing.allocator();
+    var gates = std.StringHashMap(MetadataGate).init(allocator);
+    defer deinitMetadataGates(allocator, &gates);
+
+    try upsertMetadataGate(allocator, &gates, "search_issues", .high, "old reason");
+    const before = gates.get("search_issues").?;
+    try std.testing.expectEqual(tools.RiskClass.high, before.risk);
+    try std.testing.expectEqualStrings("old reason", before.reason);
+
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, upsertMetadataGate(
+        allocator,
+        &gates,
+        "search_issues",
+        .critical,
+        "new reason",
+    ));
+    try std.testing.expect(failing.has_induced_failure);
+
+    const kept = gates.get("search_issues").?;
+    try std.testing.expectEqual(tools.RiskClass.high, kept.risk);
+    try std.testing.expectEqualStrings("old reason", kept.reason);
+}

@@ -151,7 +151,7 @@ Hooks call `ryk hook openclaw <event>` with a JSON payload on stdin. The followi
 | `after_tool_call` | `tool.after` | Post-tool acknowledgment and logging | 10s |
 | `session_end` | `session.end` | Session end handling | 10s |
 
-`before_tool_call` is the enforcement hook. Leftover unused policy `ask` is permit (allow) on the attended path — same coding-host wire as Grok. Unattended mode still maps leftover `ask` to a hard block. Explicit deny, stage, SoftBlock, and FM steward ask never become allow. Metadata/discovery and legacy passes do not enforce because their `api.on` is not proven live; use `ryk run -- openclaw` until the host reports an explicit full runtime.
+`before_tool_call` is the enforcement hook. Attended leftover unused policy `ask` is permit (same coding-host wire as Grok). Unattended / `--ci` still hardens leftover `ask` to block — no tool waits for an absent operator. Stage, SoftBlock, and FM steward ask never become allow. Metadata/discovery and legacy passes do not enforce because their `api.on` is not proven live; use `ryk run -- openclaw` for the wrapper boundary.
 
 ### How hooks call ryk
 

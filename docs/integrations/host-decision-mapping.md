@@ -45,15 +45,15 @@ host `--ci`):
 | **Claude Code** | `PreToolUse` / `PermissionRequest` | `permissionDecision: allow` | `permissionDecision: deny` | **allow** (unattended/`--ci` → deny) | proceed as allow | No | Host-shaped stdout JSON via `hookSpecificOutput` (hook grade; exit 0). Residual ask is permit so agents can work. |
 | **Codex** | `PreToolUse` / `PermissionRequest` | allow | deny | **allow** (unattended/`--ci` → deny) | warn | No | Residual ask is permit; unattended wires ask to block. |
 | **Pi** | tool hooks | allow | deny | **allow** (unattended → auto-deny) | warn | No | Residual ask is permit. `RYK_UNATTENDED` / `CI` auto-denies. |
-| **Grok** | `PreToolUse` (Bash / Read) | exit 0 | `{"decision":"deny","reason":…}` + exit 2 | **allow** (unattended → deny) | exit 0 | **No** | Residual unused ask is permit. **hook** + `ryk grok` **wrapper**. Missing/non-executable `ryk` emits deny JSON + exit 2. See below. |
+| **Grok** | `PreToolUse` (Bash / Read) | exit 0 | `{"decision":"deny","reason":…}` + exit 2 | **allow** (unattended → deny JSON + exit 2) | exit 0 | **No** | Residual unused ask is permit. Stage / SoftBlock / FM / explicit deny stay deny JSON + exit 2. **hook** + `ryk grok` **wrapper**. Missing/non-executable `ryk` emits deny JSON + exit 2. See below. |
 | **Cursor** | `beforeShellExecution` (bare `ryk` stdin hook) | `permission: allow` JSON, exit 0 | `permission: deny` JSON, exit 0 | **allow** (unattended → deny) | log + allow | No | Residual ask is permit. Malformed/oversized/unknown payloads: dual-contract deny JSON + exit 2. |
 
 ### Grok hook fail-closed contract
 
 Official Grok Build treats hook stdout + exit as:
 
-- allow / warn / leftover unused policy `ask` → exit 0 (generic hook JSON from `ryk hook grok`)
-- block / stage / error → `{"decision":"deny","reason":…}` + exit 2 (no resume)
+- allow / warn / leftover unused ask → exit 0 (generic hook JSON from `ryk hook grok`)
+- block / stage / SoftBlock / FM ask / error → `{"decision":"deny","reason":…}` + exit 2 (no resume)
 - unattended / `--ci` leftover `ask` → deny JSON + exit 2
 
 The managed hook command is `/bin/sh -c '…' -- <absolute ryk>`: if the pinned file is missing or not executable, the wrapper prints that deny JSON and exits 2. `ryk doctor --fix` and `ryk start` rewrite legacy direct `…/ryk hook grok PreToolUse` entries (those still fail-open on exit 127).

@@ -27,35 +27,51 @@ pub fn resolveWorkspaceInstallRoot(io: std.Io, allocator: std.mem.Allocator) ![]
     return supervisor.resolveWorkspaceRoot(io, allocator, null, ".") catch try std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator);
 }
 
+const MarketplaceHostLayout = struct {
+    host_label: []const u8,
+    plugin_rel: []const []const u8,
+    marketplace_rel: []const []const u8,
+};
+
+fn marketplaceHostLayout(target: MarketplaceHost) MarketplaceHostLayout {
+    return switch (target) {
+        .codex => .{
+            .host_label = "Codex",
+            .plugin_rel = &.{ ".agents", "plugins", "ryk" },
+            .marketplace_rel = &.{ ".agents", "plugins", "marketplace.json" },
+        },
+        .claude => .{
+            .host_label = "Claude Code",
+            .plugin_rel = &.{ ".claude", "plugins", "ryk" },
+            .marketplace_rel = &.{ ".claude-plugin", "marketplace.json" },
+        },
+    };
+}
+
+fn joinUnderRoot(allocator: std.mem.Allocator, workspace_root: []const u8, rel: []const []const u8) ![]u8 {
+    var parts: [5][]const u8 = undefined;
+    parts[0] = workspace_root;
+    for (rel, 0..) |part, index| {
+        parts[index + 1] = part;
+    }
+    return std.fs.path.join(allocator, parts[0 .. rel.len + 1]);
+}
+
 pub fn marketplaceHostInstallSpec(
     allocator: std.mem.Allocator,
     workspace_root: []const u8,
     target: MarketplaceHost,
     marketplace_json: []const u8,
 ) !MarketplaceHostInstall {
-    return switch (target) {
-        .codex => blk: {
-            const plugin_dest = try std.fs.path.join(allocator, &.{ workspace_root, ".agents", "plugins", "ryk" });
-            errdefer allocator.free(plugin_dest);
-            const marketplace_path = try std.fs.path.join(allocator, &.{ workspace_root, ".agents", "plugins", "marketplace.json" });
-            break :blk .{
-                .host_label = "Codex",
-                .plugin_dest = plugin_dest,
-                .marketplace_path = marketplace_path,
-                .marketplace_json = marketplace_json,
-            };
-        },
-        .claude => blk: {
-            const plugin_dest = try std.fs.path.join(allocator, &.{ workspace_root, ".claude", "plugins", "ryk" });
-            errdefer allocator.free(plugin_dest);
-            const marketplace_path = try std.fs.path.join(allocator, &.{ workspace_root, ".claude-plugin", "marketplace.json" });
-            break :blk .{
-                .host_label = "Claude Code",
-                .plugin_dest = plugin_dest,
-                .marketplace_path = marketplace_path,
-                .marketplace_json = marketplace_json,
-            };
-        },
+    const layout = marketplaceHostLayout(target);
+    const plugin_dest = try joinUnderRoot(allocator, workspace_root, layout.plugin_rel);
+    errdefer allocator.free(plugin_dest);
+    const marketplace_path = try joinUnderRoot(allocator, workspace_root, layout.marketplace_rel);
+    return .{
+        .host_label = layout.host_label,
+        .plugin_dest = plugin_dest,
+        .marketplace_path = marketplace_path,
+        .marketplace_json = marketplace_json,
     };
 }
 
@@ -1168,22 +1184,71 @@ test "marketplace registration validation requires the exact host source" {
     ));
 }
 
-test "marketplaceHostInstallSpec OOM ownership does not leak first path" {
-    var saw_oom = false;
-    var saw_success = false;
-    var fail_index: usize = 0;
-    while (fail_index < 8) : (fail_index += 1) {
-        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
-        const spec = marketplaceHostInstallSpec(failing.allocator(), "/tmp/ws", .codex, "{}") catch |err| {
-            try std.testing.expectEqual(error.OutOfMemory, err);
-            saw_oom = true;
-            continue;
-        };
-        failing.allocator().free(spec.plugin_dest);
-        failing.allocator().free(spec.marketplace_path);
-        saw_success = true;
-        break;
+const marketplace_spec_oom_workspace = "/ws";
+const marketplace_spec_oom_json = "{\"plugins\":[]}";
+
+fn marketplaceSpecOomHostLabel(target: MarketplaceHost) []const u8 {
+    return switch (target) {
+        .codex => "Codex",
+        .claude => "Claude Code",
+    };
+}
+
+fn marketplaceSpecOomDest(target: MarketplaceHost) []const u8 {
+    return switch (target) {
+        .codex => marketplace_spec_oom_workspace ++ std.fs.path.sep_str ++ ".agents" ++ std.fs.path.sep_str ++ "plugins" ++ std.fs.path.sep_str ++ "ryk",
+        .claude => marketplace_spec_oom_workspace ++ std.fs.path.sep_str ++ ".claude" ++ std.fs.path.sep_str ++ "plugins" ++ std.fs.path.sep_str ++ "ryk",
+    };
+}
+
+fn marketplaceSpecOomMarketplace(target: MarketplaceHost) []const u8 {
+    return switch (target) {
+        .codex => marketplace_spec_oom_workspace ++ std.fs.path.sep_str ++ ".agents" ++ std.fs.path.sep_str ++ "plugins" ++ std.fs.path.sep_str ++ "marketplace.json",
+        .claude => marketplace_spec_oom_workspace ++ std.fs.path.sep_str ++ ".claude-plugin" ++ std.fs.path.sep_str ++ "marketplace.json",
+    };
+}
+
+fn marketplaceHostInstallSpecOomProbe(allocator: std.mem.Allocator, target: MarketplaceHost) !void {
+    const spec = try marketplaceHostInstallSpec(
+        allocator,
+        marketplace_spec_oom_workspace,
+        target,
+        marketplace_spec_oom_json,
+    );
+    defer {
+        allocator.free(spec.plugin_dest);
+        allocator.free(spec.marketplace_path);
     }
-    try std.testing.expect(saw_oom);
-    try std.testing.expect(saw_success);
+
+    try std.testing.expectEqualStrings(marketplaceSpecOomHostLabel(target), spec.host_label);
+    try std.testing.expectEqualStrings(marketplaceSpecOomDest(target), spec.plugin_dest);
+    try std.testing.expectEqualStrings(marketplaceSpecOomMarketplace(target), spec.marketplace_path);
+    try std.testing.expectEqual(marketplace_spec_oom_json.ptr, spec.marketplace_json.ptr);
+    try std.testing.expect(spec.plugin_dest.ptr != spec.marketplace_path.ptr);
+}
+
+fn marketplaceHostInstallSpecFirstJoinThenFail(target: MarketplaceHost) !void {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        marketplaceHostInstallSpec(
+            failing.allocator(),
+            marketplace_spec_oom_workspace,
+            target,
+            marketplace_spec_oom_json,
+        ),
+    );
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+}
+
+test "MarketplaceSpecOom marketplaceHostInstallSpec OOM ownership does not leak first path" {
+    inline for ([_]MarketplaceHost{ .codex, .claude }) |target| {
+        try std.testing.checkAllAllocationFailures(
+            std.testing.allocator,
+            marketplaceHostInstallSpecOomProbe,
+            .{target},
+        );
+        try marketplaceHostInstallSpecFirstJoinThenFail(target);
+    }
 }

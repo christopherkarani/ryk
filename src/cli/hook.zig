@@ -509,34 +509,26 @@ fn hookCommand(io: std.Io, host: Host, event: Event, original_event_name: []cons
         }
     }
 
-    // Handle informational OpenCode events that don't need policy evaluation
     if (host == .opencode and isOpenCodeInformationalEvent(request_event)) {
-        var redactions: std.ArrayList(RedactionEntry) = .empty;
-        var limitations: std.ArrayList([]const u8) = .empty;
-        errdefer deinitHookLists(allocator, &redactions, &limitations);
-        try appendLimitation(allocator, &limitations, "Hook enforcement is additive; does not replace ryk run supervision.");
-        try appendLimitation(allocator, &limitations, "OpenCode informational event: no policy evaluation needed.");
-
-        var result = try makeInformationalResponse(allocator, .allow, .low, "session", "informational event", "OpenCode event acknowledged by ryk.", &redactions, &limitations);
-        defer result.deinit(allocator);
-        telemetry.recordSession(@tagName(host), @tagName(event), "success");
-        try writeHookResponse(stdout, result);
-        return exit_codes.success;
+        return writeHostInformationalAck(
+            allocator,
+            stdout,
+            host,
+            event,
+            "OpenCode informational event: no policy evaluation needed.",
+            "OpenCode event acknowledged by ryk.",
+        );
     }
 
-    // Handle informational OpenClaw events that don't need policy evaluation
     if (host == .openclaw and isOpenClawInformationalEvent(request_event)) {
-        var redactions: std.ArrayList(RedactionEntry) = .empty;
-        var limitations: std.ArrayList([]const u8) = .empty;
-        errdefer deinitHookLists(allocator, &redactions, &limitations);
-        try appendLimitation(allocator, &limitations, "Hook enforcement is additive; does not replace ryk run supervision.");
-        try appendLimitation(allocator, &limitations, "OpenClaw informational event: no policy evaluation needed.");
-
-        var result = try makeInformationalResponse(allocator, .allow, .low, "session", "informational event", "OpenClaw event acknowledged by ryk.", &redactions, &limitations);
-        defer result.deinit(allocator);
-        telemetry.recordSession(@tagName(host), @tagName(event), "success");
-        try writeHookResponse(stdout, result);
-        return exit_codes.success;
+        return writeHostInformationalAck(
+            allocator,
+            stdout,
+            host,
+            event,
+            "OpenClaw informational event: no policy evaluation needed.",
+            "OpenClaw event acknowledged by ryk.",
+        );
     }
 
     // Extract payload object
@@ -554,13 +546,11 @@ fn hookCommand(io: std.Io, host: Host, event: Event, original_event_name: []cons
     defer allocator.free(root);
 
     if (host == .hermes and isHermesInformationalEvent(request_event)) {
-        var redactions: std.ArrayList(RedactionEntry) = .empty;
-        var limitations: std.ArrayList([]const u8) = .empty;
-        errdefer deinitHookLists(allocator, &redactions, &limitations);
-        try appendLimitation(allocator, &limitations, "Hook enforcement is additive; does not replace ryk run supervision.");
-        try appendLimitation(allocator, &limitations, "Hermes informational event: no policy evaluation needed.");
-
-        var result = try makeInformationalResponse(allocator, .allow, .low, "session", "informational event", "Hermes event acknowledged by ryk.", &redactions, &limitations);
+        var result = try makeHostInformationalAck(
+            allocator,
+            "Hermes informational event: no policy evaluation needed.",
+            "Hermes event acknowledged by ryk.",
+        );
         defer result.deinit(allocator);
         if (std.mem.eql(u8, request_event, "subagent_stop"))
             recordHermesHookActivity(io, allocator, root, request_event, hook_payload, result);
@@ -590,7 +580,7 @@ fn hookCommand(io: std.Io, host: Host, event: Event, original_event_name: []cons
         var redactions: std.ArrayList(RedactionEntry) = .empty;
         var limitations: std.ArrayList([]const u8) = .empty;
         errdefer deinitHookLists(allocator, &redactions, &limitations);
-        try appendLimitation(allocator, &limitations, "Hook enforcement is additive; does not replace ryk run supervision.");
+        try appendOwnedLimitation(allocator, &limitations, hook_additive_limitation);
         var result = try evaluateInformationalEvent(allocator, event, &redactions, &limitations);
         defer result.deinit(allocator);
         telemetry.recordSession(@tagName(host), @tagName(event), "success");
@@ -655,7 +645,7 @@ fn hookCommand(io: std.Io, host: Host, event: Event, original_event_name: []cons
     if (result.decision == .stage and unattended) {
         result.decision = .block;
     } else if (result.ask_origin.mayPermitOnCodingHost()) {
-        result.decision = wireCodingHostAsk(host, result.decision, unattended);
+        result.decision = wireCodingHostAsk(result.decision, unattended);
     } else if (result.decision == .ask) {
         // SoftBlock / FM: OpenCode and Hermes treat leftover ask as proceed,
         // so the hook wire denies instead of emitting ask.
@@ -818,23 +808,13 @@ fn isCodexDenyOutput(host: Host, decision: PluginDecision) bool {
     return host == .codex and decision == .block;
 }
 
-/// Leftover unused policy ask is permit so agents work. Exhaustive on `Host`
-/// so a new tag cannot silently inherit permit or veto. Stage, SoftBlock, and
-/// FM steward ask never enter this helper as remappable leftover ask.
-fn codingHostPermitsResidualAsk(host: Host) bool {
-    return switch (host) {
-        .claude, .codex, .opencode, .hermes, .grok, .openclaw => true,
-    };
-}
-
 /// Wire leftover unused policy `ask` only. `.stage`, `.block`, and `.allow`
-/// are unchanged. Unattended / CI: leftover ask → block. Attended coding
-/// hosts: leftover ask → allow.
-fn wireCodingHostAsk(host: Host, decision: PluginDecision, unattended: bool) PluginDecision {
+/// are unchanged. Unattended / CI: leftover ask → block. Attended hook hosts
+/// (every `Host` value) permit leftover unused ask so agents can work.
+/// Stage, SoftBlock, and FM steward ask never enter this helper.
+fn wireCodingHostAsk(decision: PluginDecision, unattended: bool) PluginDecision {
     if (decision != .ask) return decision;
-    if (unattended) return .block;
-    if (codingHostPermitsResidualAsk(host)) return .allow;
-    return .ask;
+    return if (unattended) .block else .allow;
 }
 
 fn usesExitTwoDenyOutput(host: Host, decision: PluginDecision) bool {
@@ -843,6 +823,8 @@ fn usesExitTwoDenyOutput(host: Host, decision: PluginDecision) bool {
     // `.ask`, plus stage / evaluator error, still has no Grok approval UI —
     // the only enforceable non-allow contract is exit 2.
     if (host == .grok) {
+        // Leftover unused ask is remapped to allow before emit. A raw `.ask`
+        // here is the fail-closed residual (must not reach attended leftover-ask).
         return decision == .block or decision == .ask or decision == .stage or decision == .err;
     }
     return false;
@@ -904,7 +886,7 @@ fn emitPreEvalFailClosed(
     var redactions: std.ArrayList(RedactionEntry) = .empty;
     var limitations: std.ArrayList([]const u8) = .empty;
     errdefer deinitHookLists(allocator, &redactions, &limitations);
-    try appendLimitation(allocator, &limitations, "Hook enforcement is additive; does not replace ryk run supervision.");
+    try appendOwnedLimitation(allocator, &limitations, hook_additive_limitation);
 
     var result = try makeFailClosedHookResponse(allocator, category, reason, message, &redactions, &limitations);
     defer result.deinit(allocator);
@@ -1049,6 +1031,8 @@ const RiskLevel = enum {
     }
 };
 
+const hook_additive_limitation = "Hook enforcement is additive; does not replace ryk run supervision.";
+
 const RedactionEntry = struct {
     field: []const u8,
     reason: []const u8,
@@ -1095,31 +1079,26 @@ fn buildPromptHookResponse(
     redactions: *std.ArrayList(RedactionEntry),
     limitations: *std.ArrayList([]const u8),
 ) !HookResponse {
-    const category = try allocator.dupe(u8, "prompt");
-    errdefer allocator.free(category);
-    const reason_owned = try allocator.dupe(u8, if (had_secrets)
-        "prompt contains potential secret"
-    else
-        evaluation_reason);
-    errdefer allocator.free(reason_owned);
-    const rule_owned: ?[]const u8 = if (rule_id) |id| try allocator.dupe(u8, id) else null;
-    errdefer if (rule_owned) |id| allocator.free(id);
-    const message_owned = if (had_secrets)
-        try allocator.dupe(u8, "Prompt may contain sensitive data. Review before submitting.")
-    else
-        try buildMessage(allocator, decision, "prompt");
-    errdefer allocator.free(message_owned);
-    const lists = try takeOwnedHookLists(allocator, redactions, limitations);
-    return .{
+    if (had_secrets) {
+        return HookResponse.take(allocator, .{
+            .decision = decision,
+            .risk = risk,
+            .category = "prompt",
+            .reason = "prompt contains potential secret",
+            .rule = rule_id,
+            .message = "Prompt may contain sensitive data. Review before submitting.",
+        }, redactions, limitations);
+    }
+    const message = try buildMessage(allocator, decision, "prompt");
+    defer allocator.free(message);
+    return HookResponse.take(allocator, .{
         .decision = decision,
         .risk = risk,
-        .category = category,
-        .reason = reason_owned,
-        .rule = rule_owned,
-        .message = message_owned,
-        .redactions = lists.redactions,
-        .host_limitations = lists.host_limitations,
-    };
+        .category = "prompt",
+        .reason = evaluation_reason,
+        .rule = rule_id,
+        .message = message,
+    }, redactions, limitations);
 }
 
 const HookResponse = struct {
@@ -1153,6 +1132,42 @@ const HookResponse = struct {
         if (self.remediation_commands.len > 0) allocator.free(self.remediation_commands);
         self.* = undefined;
     }
+
+    fn take(
+        allocator: std.mem.Allocator,
+        fields: struct {
+            decision: PluginDecision,
+            risk: RiskLevel,
+            category: []const u8,
+            reason: []const u8,
+            rule: ?[]const u8 = null,
+            message: []const u8,
+            ask_origin: shell_eval.AskOrigin = .leftover,
+        },
+        redactions: *std.ArrayList(RedactionEntry),
+        limitations: *std.ArrayList([]const u8),
+    ) !HookResponse {
+        const category = try allocator.dupe(u8, fields.category);
+        errdefer allocator.free(category);
+        const reason = try allocator.dupe(u8, fields.reason);
+        errdefer allocator.free(reason);
+        const rule = if (fields.rule) |id| try allocator.dupe(u8, id) else null;
+        errdefer if (rule) |id| allocator.free(id);
+        const message = try allocator.dupe(u8, fields.message);
+        errdefer allocator.free(message);
+        const lists = try takeOwnedHookLists(allocator, redactions, limitations);
+        return .{
+            .decision = fields.decision,
+            .risk = fields.risk,
+            .category = category,
+            .reason = reason,
+            .rule = rule,
+            .message = message,
+            .redactions = lists.redactions,
+            .host_limitations = lists.host_limitations,
+            .ask_origin = fields.ask_origin,
+        };
+    }
 };
 
 fn deinitHookLists(
@@ -1164,14 +1179,6 @@ fn deinitHookLists(
     redactions.deinit(allocator);
     for (limitations.items) |item| allocator.free(item);
     limitations.deinit(allocator);
-}
-
-fn appendLimitation(
-    allocator: std.mem.Allocator,
-    limitations: *std.ArrayList([]const u8),
-    text: []const u8,
-) !void {
-    return appendOwnedLimitation(allocator, limitations, text);
 }
 
 fn takeOwnedHookLists(
@@ -1367,7 +1374,7 @@ fn evaluateHook(
     errdefer deinitHookLists(allocator, &redactions, &limitations);
 
     // Add host limitation note
-    try appendLimitation(allocator, &limitations, "Hook enforcement is additive; does not replace ryk run supervision.");
+    try appendOwnedLimitation(allocator, &limitations, hook_additive_limitation);
 
     switch (event) {
         .SessionStart, .Stop, .SessionEnd, .PostToolUse => {
@@ -1484,25 +1491,16 @@ fn evaluateHook(
             const decision = PluginDecision.fromDecisionResult(evaluation.decision.result, ci_mode);
             const risk = RiskLevel.fromScore(evaluation.decision.risk_score);
 
-            const owned_category = try allocator.dupe(u8, @tagName(explain_kind));
-            errdefer allocator.free(owned_category);
-            const owned_reason = try allocator.dupe(u8, evaluation.decision.reason);
-            errdefer allocator.free(owned_reason);
-            const owned_rule = if (evaluation.matched_rule) |rule| try allocator.dupe(u8, rule.id) else null;
-            errdefer if (owned_rule) |rule| allocator.free(rule);
-            const owned_message = try buildMessage(allocator, decision, permission_kind);
-            errdefer allocator.free(owned_message);
-            const lists = try takeOwnedHookLists(allocator, &redactions, &limitations);
-            return .{
+            const message = try buildMessage(allocator, decision, permission_kind);
+            defer allocator.free(message);
+            return HookResponse.take(allocator, .{
                 .decision = decision,
                 .risk = risk,
-                .category = owned_category,
-                .reason = owned_reason,
-                .rule = owned_rule,
-                .message = owned_message,
-                .redactions = lists.redactions,
-                .host_limitations = lists.host_limitations,
-            };
+                .category = @tagName(explain_kind),
+                .reason = evaluation.decision.reason,
+                .rule = if (evaluation.matched_rule) |rule| rule.id else null,
+                .message = message,
+            }, &redactions, &limitations);
         },
     }
 }
@@ -1517,23 +1515,50 @@ fn makeInformationalResponse(
     redactions: *std.ArrayList(RedactionEntry),
     limitations: *std.ArrayList([]const u8),
 ) !HookResponse {
-    const owned_category = try allocator.dupe(u8, category);
-    errdefer allocator.free(owned_category);
-    const owned_reason = try allocator.dupe(u8, reason);
-    errdefer allocator.free(owned_reason);
-    const owned_message = try allocator.dupe(u8, message);
-    errdefer allocator.free(owned_message);
-    const lists = try takeOwnedHookLists(allocator, redactions, limitations);
-    return .{
+    return HookResponse.take(allocator, .{
         .decision = decision,
         .risk = risk,
-        .category = owned_category,
-        .reason = owned_reason,
-        .rule = null,
-        .message = owned_message,
-        .redactions = lists.redactions,
-        .host_limitations = lists.host_limitations,
-    };
+        .category = category,
+        .reason = reason,
+        .message = message,
+    }, redactions, limitations);
+}
+
+fn makeHostInformationalAck(
+    allocator: std.mem.Allocator,
+    extra_limitation: []const u8,
+    ack_message: []const u8,
+) !HookResponse {
+    var redactions: std.ArrayList(RedactionEntry) = .empty;
+    var limitations: std.ArrayList([]const u8) = .empty;
+    errdefer deinitHookLists(allocator, &redactions, &limitations);
+    try appendOwnedLimitation(allocator, &limitations, hook_additive_limitation);
+    try appendOwnedLimitation(allocator, &limitations, extra_limitation);
+    return makeInformationalResponse(
+        allocator,
+        .allow,
+        .low,
+        "session",
+        "informational event",
+        ack_message,
+        &redactions,
+        &limitations,
+    );
+}
+
+fn writeHostInformationalAck(
+    allocator: std.mem.Allocator,
+    stdout: anytype,
+    host: Host,
+    event: Event,
+    extra_limitation: []const u8,
+    ack_message: []const u8,
+) !u8 {
+    var result = try makeHostInformationalAck(allocator, extra_limitation, ack_message);
+    defer result.deinit(allocator);
+    telemetry.recordSession(@tagName(host), @tagName(event), "success");
+    try writeHookResponse(stdout, result);
+    return exit_codes.success;
 }
 
 fn buildMessage(allocator: std.mem.Allocator, decision: PluginDecision, category: []const u8) ![]const u8 {
@@ -1900,21 +1925,6 @@ fn hookRiskFromShellRisk(shell_risk: shell_eval.RiskLevel) RiskLevel {
     };
 }
 
-fn recordDaemonMetadataRedaction(
-    allocator: std.mem.Allocator,
-    redactions: *std.ArrayList(RedactionEntry),
-    field: []const u8,
-) !void {
-    const owned_field = try allocator.dupe(u8, field);
-    errdefer allocator.free(owned_field);
-    const owned_reason = try allocator.dupe(u8, "daemon evaluator metadata withheld from agent-visible output");
-    errdefer allocator.free(owned_reason);
-    try redactions.append(allocator, .{
-        .field = owned_field,
-        .reason = owned_reason,
-    });
-}
-
 fn buildAgentVisibleDaemonDeny(
     allocator: std.mem.Allocator,
     result: std.json.Value,
@@ -1934,7 +1944,12 @@ fn buildAgentVisibleDaemonDeny(
     ask_origin: shell_eval.AskOrigin = .leftover,
 } {
     if (daemon.responseStringField(result, "matched_text_preview")) |_| {
-        try recordDaemonMetadataRedaction(allocator, redactions, "matched_text_preview");
+        try appendOwnedRedaction(
+            allocator,
+            redactions,
+            "matched_text_preview",
+            "daemon evaluator metadata withheld from agent-visible output",
+        );
     }
 
     const shell_risk = shell_eval.riskLevelFromDaemonSeverity(daemon.responseStringField(result, "severity"));
@@ -2092,24 +2107,14 @@ fn buildRemediationCommands(allocator: std.mem.Allocator, rule_id: ?[]const u8) 
         for (list.items) |s| allocator.free(s);
         list.deinit(allocator);
     }
-    {
-        const owned = try allocator.dupe(u8, "ryk explain \"<command>\"");
-        errdefer allocator.free(owned);
-        try list.append(allocator, owned);
-    }
-    {
-        const owned = try allocator.dupe(u8, "ryk allow-once <code>");
-        errdefer allocator.free(owned);
-        try list.append(allocator, owned);
-    }
+    try appendOwnedLimitation(allocator, &list, "ryk explain \"<command>\"");
+    try appendOwnedLimitation(allocator, &list, "ryk allow-once <code>");
     if (rule_id) |rid| {
         const owned = try std.fmt.allocPrint(allocator, "ryk allowlist add {s} -r \"reason\"", .{rid});
         errdefer allocator.free(owned);
         try list.append(allocator, owned);
     } else {
-        const owned = try allocator.dupe(u8, "ryk allowlist list");
-        errdefer allocator.free(owned);
-        try list.append(allocator, owned);
+        try appendOwnedLimitation(allocator, &list, "ryk allowlist list");
     }
     return try list.toOwnedSlice(allocator);
 }
@@ -2476,25 +2481,16 @@ fn evaluateFilePolicyPreToolUse(
     defer evaluation.deinit(allocator);
 
     const decision = PluginDecision.fromDecisionResult(evaluation.decision.result, ci_mode);
-    const owned_category = try allocator.dupe(u8, cat);
-    errdefer allocator.free(owned_category);
-    const owned_reason = try allocator.dupe(u8, evaluation.decision.reason);
-    errdefer allocator.free(owned_reason);
-    const owned_rule = if (evaluation.matched_rule) |rule| try allocator.dupe(u8, rule.id) else null;
-    errdefer if (owned_rule) |rule| allocator.free(rule);
-    const owned_message = try buildMessage(allocator, decision, cat);
-    errdefer allocator.free(owned_message);
-    const lists = try takeOwnedHookLists(allocator, redactions, limitations);
-    return .{
+    const message = try buildMessage(allocator, decision, cat);
+    defer allocator.free(message);
+    return HookResponse.take(allocator, .{
         .decision = decision,
         .risk = RiskLevel.fromScore(evaluation.decision.risk_score),
-        .category = owned_category,
-        .reason = owned_reason,
-        .rule = owned_rule,
-        .message = owned_message,
-        .redactions = lists.redactions,
-        .host_limitations = lists.host_limitations,
-    };
+        .category = cat,
+        .reason = evaluation.decision.reason,
+        .rule = if (evaluation.matched_rule) |rule| rule.id else null,
+        .message = message,
+    }, redactions, limitations);
 }
 
 fn evaluateNativePreToolUseRoute(
@@ -2564,25 +2560,16 @@ fn evaluateNativePreToolUseRoute(
             const decision = PluginDecision.fromDecisionResult(evaluation.decision.result, ci_mode);
             const risk = RiskLevel.fromScore(evaluation.decision.risk_score);
 
-            const owned_category = try allocator.dupe(u8, "tool");
-            errdefer allocator.free(owned_category);
-            const owned_reason = try allocator.dupe(u8, evaluation.decision.reason);
-            errdefer allocator.free(owned_reason);
-            const owned_rule = if (evaluation.matched_rule) |rule| try allocator.dupe(u8, rule.id) else null;
-            errdefer if (owned_rule) |rule| allocator.free(rule);
-            const owned_message = try buildMessage(allocator, decision, "tool");
-            errdefer allocator.free(owned_message);
-            const lists = try takeOwnedHookLists(allocator, redactions, limitations);
-            return .{
+            const message = try buildMessage(allocator, decision, "tool");
+            defer allocator.free(message);
+            return HookResponse.take(allocator, .{
                 .decision = decision,
                 .risk = risk,
-                .category = owned_category,
-                .reason = owned_reason,
-                .rule = owned_rule,
-                .message = owned_message,
-                .redactions = lists.redactions,
-                .host_limitations = lists.host_limitations,
-            };
+                .category = "tool",
+                .reason = evaluation.decision.reason,
+                .rule = if (evaluation.matched_rule) |rule| rule.id else null,
+                .message = message,
+            }, redactions, limitations);
         },
         else => return error.MissingRequiredField,
     }
@@ -2596,23 +2583,13 @@ fn makeFailClosedHookResponse(
     redactions: *std.ArrayList(RedactionEntry),
     limitations: *std.ArrayList([]const u8),
 ) !HookResponse {
-    const owned_category = try allocator.dupe(u8, category);
-    errdefer allocator.free(owned_category);
-    const owned_reason = try allocator.dupe(u8, reason);
-    errdefer allocator.free(owned_reason);
-    const owned_message = try allocator.dupe(u8, message);
-    errdefer allocator.free(owned_message);
-    const lists = try takeOwnedHookLists(allocator, redactions, limitations);
-    return .{
+    return HookResponse.take(allocator, .{
         .decision = .block,
         .risk = .high,
-        .category = owned_category,
-        .reason = owned_reason,
-        .rule = null,
-        .message = owned_message,
-        .redactions = lists.redactions,
-        .host_limitations = lists.host_limitations,
-    };
+        .category = category,
+        .reason = reason,
+        .message = message,
+    }, redactions, limitations);
 }
 
 fn makeFileNormalizationBlockResponse(
@@ -2622,25 +2599,18 @@ fn makeFileNormalizationBlockResponse(
     redactions: *std.ArrayList(RedactionEntry),
     limitations: *std.ArrayList([]const u8),
 ) !HookResponse {
-    const owned_category = try allocator.dupe(u8, category);
-    errdefer allocator.free(owned_category);
-    const reason = try allocator.dupe(u8, file_policy_path.outside_workspace_reason);
-    errdefer allocator.free(reason);
     const rule = try file_policy_path.outsideWorkspaceRuleId(allocator, rule_category);
-    errdefer allocator.free(rule);
+    defer allocator.free(rule);
     const message = try buildMessage(allocator, .block, category);
-    errdefer allocator.free(message);
-    const lists = try takeOwnedHookLists(allocator, redactions, limitations);
-    return .{
+    defer allocator.free(message);
+    return HookResponse.take(allocator, .{
         .decision = .block,
         .risk = .critical,
-        .category = owned_category,
-        .reason = reason,
+        .category = category,
+        .reason = file_policy_path.outside_workspace_reason,
         .rule = rule,
         .message = message,
-        .redactions = lists.redactions,
-        .host_limitations = lists.host_limitations,
-    };
+    }, redactions, limitations);
 }
 
 // ---------------------------------------------------------------------------
@@ -3120,7 +3090,7 @@ fn mockDaemonProtocolMismatchEvaluator(allocator: std.mem.Allocator, shell_event
 
 fn shellRouteSetup(allocator: std.mem.Allocator, redactions: *std.ArrayList(RedactionEntry), limitations: *std.ArrayList([]const u8)) !void {
     _ = redactions;
-    try appendLimitation(allocator, limitations, "Hook enforcement is additive; does not replace ryk run supervision.");
+    try appendOwnedLimitation(allocator, limitations, hook_additive_limitation);
 }
 
 fn runShellRoute(
@@ -3264,6 +3234,7 @@ test "hook recognizes Grok as a PreToolUse host with exit-two deny semantics" {
     try std.testing.expectEqual(Host.grok, Host.parse("grok").?);
     try std.testing.expect(shouldFailClosedOnPreEval(.grok, .PreToolUse));
     try std.testing.expectEqual(codex_deny_exit_code, hookExitCode(.grok, .block, false));
+    // Raw leftover `.ask` must not reach emit: wireCodingHostAsk remaps it first.
     try std.testing.expectEqual(codex_deny_exit_code, hookExitCode(.grok, .ask, false));
     try std.testing.expectEqual(codex_deny_exit_code, hookExitCode(.grok, .err, false));
     try std.testing.expectEqual(exit_codes.success, hookExitCode(.grok, .allow, false));
@@ -6432,38 +6403,19 @@ test "hook Claude maps residual ask to permissionDecision allow never deny" {
 }
 
 test "coding hosts permit residual ask unless unattended" {
-    try std.testing.expect(codingHostPermitsResidualAsk(.claude));
-    try std.testing.expect(codingHostPermitsResidualAsk(.codex));
-    try std.testing.expect(codingHostPermitsResidualAsk(.opencode));
-    try std.testing.expect(codingHostPermitsResidualAsk(.hermes));
-    try std.testing.expect(codingHostPermitsResidualAsk(.openclaw));
-    try std.testing.expect(codingHostPermitsResidualAsk(.grok));
-
-    try std.testing.expectEqual(PluginDecision.allow, wireCodingHostAsk(.claude, .ask, false));
-    try std.testing.expectEqual(PluginDecision.allow, wireCodingHostAsk(.codex, .ask, false));
-    try std.testing.expectEqual(PluginDecision.allow, wireCodingHostAsk(.opencode, .ask, false));
-    try std.testing.expectEqual(PluginDecision.allow, wireCodingHostAsk(.hermes, .ask, false));
-    try std.testing.expectEqual(PluginDecision.allow, wireCodingHostAsk(.grok, .ask, false));
-    try std.testing.expectEqual(PluginDecision.allow, wireCodingHostAsk(.openclaw, .ask, false));
-    try std.testing.expectEqual(PluginDecision.block, wireCodingHostAsk(.claude, .ask, true));
-    try std.testing.expectEqual(PluginDecision.block, wireCodingHostAsk(.hermes, .ask, true));
-    try std.testing.expectEqual(PluginDecision.block, wireCodingHostAsk(.grok, .ask, true));
-    try std.testing.expectEqual(PluginDecision.block, wireCodingHostAsk(.openclaw, .ask, true));
-    try std.testing.expectEqual(PluginDecision.block, wireCodingHostAsk(.claude, .block, false));
-    try std.testing.expectEqual(PluginDecision.allow, wireCodingHostAsk(.claude, .allow, true));
+    try std.testing.expectEqual(PluginDecision.allow, wireCodingHostAsk(.ask, false));
+    try std.testing.expectEqual(PluginDecision.block, wireCodingHostAsk(.ask, true));
+    try std.testing.expectEqual(PluginDecision.block, wireCodingHostAsk(.block, false));
+    try std.testing.expectEqual(PluginDecision.allow, wireCodingHostAsk(.allow, true));
 }
 
 test "fromDecisionResult stage plus wireCodingHostAsk is not allow" {
     const staged = PluginDecision.fromDecisionResult(.stage, false);
     try std.testing.expectEqual(PluginDecision.stage, staged);
-    try std.testing.expect(wireCodingHostAsk(.claude, staged, false) != .allow);
-    try std.testing.expect(wireCodingHostAsk(.hermes, staged, false) != .allow);
-    try std.testing.expect(wireCodingHostAsk(.openclaw, staged, false) != .allow);
-    try std.testing.expect(wireCodingHostAsk(.grok, staged, false) != .allow);
-    try std.testing.expectEqual(PluginDecision.stage, wireCodingHostAsk(.claude, staged, false));
-    try std.testing.expectEqual(PluginDecision.stage, wireCodingHostAsk(.hermes, staged, false));
+    try std.testing.expect(wireCodingHostAsk(staged, false) != .allow);
+    try std.testing.expectEqual(PluginDecision.stage, wireCodingHostAsk(staged, false));
     try std.testing.expectEqual(PluginDecision.block, PluginDecision.fromDecisionResult(.stage, true));
-    try std.testing.expectEqual(PluginDecision.block, wireCodingHostAsk(.claude, .block, false));
+    try std.testing.expectEqual(PluginDecision.block, wireCodingHostAsk(.block, false));
     try std.testing.expectEqualStrings("ask", claudePermissionDecisionString(.stage));
     try std.testing.expect(!std.mem.eql(u8, claudePermissionDecisionString(.stage), "allow"));
 }
@@ -6477,13 +6429,13 @@ test "unattended env lookup hardens coding-host residual ask" {
         }
     };
     const from_ci = env_util.unattendedFromLookup(Lookup{ .key = "CI", .value = "1" });
-    try std.testing.expectEqual(PluginDecision.block, wireCodingHostAsk(.claude, .ask, from_ci));
+    try std.testing.expectEqual(PluginDecision.block, wireCodingHostAsk(.ask, from_ci));
     const attended = env_util.unattendedFromLookup(Lookup{ .key = "CI", .value = "0" });
-    try std.testing.expectEqual(PluginDecision.allow, wireCodingHostAsk(.claude, .ask, attended));
+    try std.testing.expectEqual(PluginDecision.allow, wireCodingHostAsk(.ask, attended));
 }
 
 test "hook emit after wire rewrite is allow for attended Hermes" {
-    const wired = wireCodingHostAsk(.hermes, .ask, false);
+    const wired = wireCodingHostAsk(.ask, false);
     try std.testing.expectEqual(PluginDecision.allow, wired);
     const result = HookResponse{
         .decision = wired,
@@ -6503,73 +6455,45 @@ test "hook emit after wire rewrite is allow for attended Hermes" {
     try std.testing.expect(std.mem.indexOf(u8, out, "\"decision\": \"ask\"") == null);
 }
 
-test "hook emit after wire rewrite is allow for attended Grok leftover ask" {
-    const wired = wireCodingHostAsk(.grok, .ask, false);
-    try std.testing.expectEqual(PluginDecision.allow, wired);
-    try std.testing.expectEqual(exit_codes.success, hookExitCode(.grok, wired, false));
-    try std.testing.expectEqual(AgentEmitShape.generic_json, agentEmitShape(.grok, .PreToolUse, wired));
+test "hook emit after wire rewrite is allow for attended Grok and OpenClaw" {
+    const attended = wireCodingHostAsk(.ask, false);
+    try std.testing.expectEqual(PluginDecision.allow, attended);
+    try std.testing.expectEqual(exit_codes.success, hookExitCode(.grok, attended, false));
+    try std.testing.expectEqual(exit_codes.success, hookExitCode(.openclaw, attended, false));
+    try std.testing.expect(agentEmitShape(.grok, .PreToolUse, attended) != .grok_deny_json);
+    try std.testing.expectEqual(AgentEmitShape.generic_json, agentEmitShape(.openclaw, .PreToolUse, attended));
     // Leaked raw `.ask` still fail-closes on the Grok emit helper.
     try std.testing.expectEqual(codex_deny_exit_code, hookExitCode(.grok, .ask, false));
     try std.testing.expectEqual(AgentEmitShape.grok_deny_json, agentEmitShape(.grok, .PreToolUse, .ask));
-}
 
-test "hook emit after wire rewrite is deny for unattended Grok leftover ask" {
-    const wired = wireCodingHostAsk(.grok, .ask, true);
-    try std.testing.expectEqual(PluginDecision.block, wired);
-    try std.testing.expectEqual(codex_deny_exit_code, hookExitCode(.grok, wired, true));
-    try std.testing.expectEqual(AgentEmitShape.grok_deny_json, agentEmitShape(.grok, .PreToolUse, wired));
-}
-
-test "hook emit after wire rewrite is allow for attended OpenClaw leftover ask" {
-    const wired = wireCodingHostAsk(.openclaw, .ask, false);
-    try std.testing.expectEqual(PluginDecision.allow, wired);
-    try std.testing.expectEqual(exit_codes.success, hookExitCode(.openclaw, wired, false));
-    try std.testing.expectEqual(AgentEmitShape.generic_json, agentEmitShape(.openclaw, .PreToolUse, wired));
-    const result = HookResponse{
-        .decision = wired,
+    const oc_result = HookResponse{
+        .decision = attended,
         .risk = .low,
-        .category = "test",
+        .category = "command",
         .reason = "residual ask",
         .rule = null,
         .message = "residual ask",
         .redactions = &.{},
         .host_limitations = &.{},
     };
-    var stdout_buf: [2048]u8 = undefined;
-    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
-    try writeHookResponse(&stdout_writer, result);
-    const out = stdout_writer.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"decision\": \"allow\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"decision\": \"ask\"") == null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"decision\": \"block\"") == null);
-}
+    var oc_buf: [2048]u8 = undefined;
+    var oc_out: std.Io.Writer = .fixed(&oc_buf);
+    try writeHookResponse(&oc_out, oc_result);
+    const oc_json = oc_out.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, oc_json, "\"decision\": \"allow\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, oc_json, "\"decision\": \"ask\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, oc_json, "\"decision\": \"block\"") == null);
 
-test "hook emit after wire rewrite is block for unattended OpenClaw leftover ask" {
-    const wired = wireCodingHostAsk(.openclaw, .ask, true);
-    try std.testing.expectEqual(PluginDecision.block, wired);
-    try std.testing.expectEqual(exit_codes.success, hookExitCode(.openclaw, wired, true));
-    try std.testing.expectEqual(AgentEmitShape.generic_json, agentEmitShape(.openclaw, .PreToolUse, wired));
-    const result = HookResponse{
-        .decision = wired,
-        .risk = .low,
-        .category = "test",
-        .reason = "unattended leftover ask",
-        .rule = null,
-        .message = "unattended leftover ask",
-        .redactions = &.{},
-        .host_limitations = &.{},
-    };
-    var stdout_buf: [2048]u8 = undefined;
-    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
-    try writeHookResponse(&stdout_writer, result);
-    const out = stdout_writer.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"decision\": \"block\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"decision\": \"allow\"") == null);
+    const ci = wireCodingHostAsk(.ask, true);
+    try std.testing.expectEqual(PluginDecision.block, ci);
+    try std.testing.expectEqual(codex_deny_exit_code, hookExitCode(.grok, ci, true));
+    try std.testing.expectEqual(AgentEmitShape.grok_deny_json, agentEmitShape(.grok, .PreToolUse, ci));
+    try std.testing.expectEqual(AgentEmitShape.generic_json, agentEmitShape(.openclaw, .PreToolUse, ci));
 }
 
 test "hook emit after wire does not allow staged writes" {
     const staged = PluginDecision.fromDecisionResult(.stage, false);
-    const wired_claude = wireCodingHostAsk(.claude, staged, false);
+    const wired_claude = wireCodingHostAsk(staged, false);
     try std.testing.expect(wired_claude != .allow);
     try std.testing.expectEqualStrings("ask", claudePermissionDecisionString(wired_claude));
 
@@ -6588,7 +6512,7 @@ test "hook emit after wire does not allow staged writes" {
     try std.testing.expect(std.mem.indexOf(u8, claude_json, "\"permissionDecision\":\"allow\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, claude_json, "\"permissionDecision\":\"ask\"") != null);
 
-    const wired_hermes = wireCodingHostAsk(.hermes, staged, false);
+    const wired_hermes = wireCodingHostAsk(staged, false);
     try std.testing.expect(wired_hermes != .allow);
     const hermes_result = HookResponse{
         .decision = wired_hermes,
@@ -6908,59 +6832,248 @@ test "s-once-cli: hook deny → pending code → redeem → evaluate allows once
     }
 }
 
-test "makeInformationalResponse OOM ownership does not leak lists" {
-    var saw_oom = false;
-    var saw_success = false;
-    var fail_index: usize = 0;
-    while (fail_index < 16) : (fail_index += 1) {
-        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
-        const allocator = failing.allocator();
-        var redactions: std.ArrayList(RedactionEntry) = .empty;
-        var limitations: std.ArrayList([]const u8) = .empty;
-        defer {
-            for (redactions.items) |entry| entry.deinit(allocator);
-            redactions.deinit(allocator);
-            for (limitations.items) |item| allocator.free(item);
-            limitations.deinit(allocator);
-        }
-        const limit_a = allocator.dupe(u8, "limit-a") catch {
-            saw_oom = true;
-            continue;
-        };
-        limitations.append(allocator, limit_a) catch {
-            allocator.free(limit_a);
-            saw_oom = true;
-            continue;
-        };
-        const limit_b = allocator.dupe(u8, "limit-b") catch {
-            saw_oom = true;
-            continue;
-        };
-        limitations.append(allocator, limit_b) catch {
-            allocator.free(limit_b);
-            saw_oom = true;
-            continue;
-        };
-        var result = makeInformationalResponse(
-            allocator,
-            .allow,
-            .low,
-            "session",
-            "informational event",
-            "ack",
-            &redactions,
-            &limitations,
-        ) catch |err| {
-            try std.testing.expectEqual(error.OutOfMemory, err);
-            saw_oom = true;
-            continue;
-        };
-        result.deinit(allocator);
-        saw_success = true;
-        break;
+fn hookResponseOomSeedLists(
+    allocator: std.mem.Allocator,
+    redactions: *std.ArrayList(RedactionEntry),
+    limitations: *std.ArrayList([]const u8),
+) !void {
+    // Named seed must stay non-empty (hits toOwnedSlice transfer).
+    try appendOwnedRedaction(allocator, redactions, "prompt", "potential secret detected");
+    try appendOwnedLimitation(
+        allocator,
+        limitations,
+        "Hook enforcement is additive; does not replace ryk run supervision.",
+    );
+}
+
+fn hookResponseOomSeedListsOomProbe(allocator: std.mem.Allocator) !void {
+    var redactions: std.ArrayList(RedactionEntry) = .empty;
+    var limitations: std.ArrayList([]const u8) = .empty;
+    errdefer deinitHookLists(allocator, &redactions, &limitations);
+    try hookResponseOomSeedLists(allocator, &redactions, &limitations);
+    try std.testing.expectEqual(@as(usize, 1), redactions.items.len);
+    try std.testing.expectEqual(@as(usize, 1), limitations.items.len);
+    deinitHookLists(allocator, &redactions, &limitations);
+}
+
+fn takeOwnedHookListsOomProbe(allocator: std.mem.Allocator) !void {
+    var redactions: std.ArrayList(RedactionEntry) = .empty;
+    var limitations: std.ArrayList([]const u8) = .empty;
+    errdefer deinitHookLists(allocator, &redactions, &limitations);
+    try hookResponseOomSeedLists(allocator, &redactions, &limitations);
+
+    const lists = try takeOwnedHookLists(allocator, &redactions, &limitations);
+    defer {
+        for (lists.redactions) |entry| entry.deinit(allocator);
+        allocator.free(lists.redactions);
+        for (lists.host_limitations) |item| allocator.free(item);
+        allocator.free(lists.host_limitations);
     }
-    try std.testing.expect(saw_oom);
-    try std.testing.expect(saw_success);
+    redactions.deinit(allocator);
+    limitations.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), lists.redactions.len);
+    try std.testing.expectEqual(@as(usize, 1), lists.host_limitations.len);
+    try std.testing.expectEqualStrings("prompt", lists.redactions[0].field);
+    try std.testing.expectEqualStrings("potential secret detected", lists.redactions[0].reason);
+    try std.testing.expectEqualStrings(
+        "Hook enforcement is additive; does not replace ryk run supervision.",
+        lists.host_limitations[0],
+    );
+}
+
+fn makeFailClosedHookResponseOomProbe(allocator: std.mem.Allocator) !void {
+    var redactions: std.ArrayList(RedactionEntry) = .empty;
+    var limitations: std.ArrayList([]const u8) = .empty;
+    errdefer deinitHookLists(allocator, &redactions, &limitations);
+    try hookResponseOomSeedLists(allocator, &redactions, &limitations);
+
+    var result = try makeFailClosedHookResponse(
+        allocator,
+        "command",
+        "evaluation unavailable",
+        "Shell command blocked: ryk shell evaluation unavailable.",
+        &redactions,
+        &limitations,
+    );
+    defer result.deinit(allocator);
+    redactions.deinit(allocator);
+    limitations.deinit(allocator);
+
+    try std.testing.expectEqual(PluginDecision.block, result.decision);
+    try std.testing.expectEqual(RiskLevel.high, result.risk);
+    try std.testing.expect(result.decision != .allow);
+    try std.testing.expect(result.decision != .ask);
+    try std.testing.expectEqualStrings("command", result.category);
+    try std.testing.expectEqualStrings("evaluation unavailable", result.reason);
+    try std.testing.expect(result.rule == null);
+    try std.testing.expectEqualStrings("Shell command blocked: ryk shell evaluation unavailable.", result.message);
+
+    var stdout_buf: [2048]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    try writeHookResponse(&stdout_writer, result);
+    const out = stdout_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"decision\": \"block\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"risk\": \"high\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"decision\": \"allow\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"decision\": \"ask\"") == null);
+}
+
+fn makeInformationalResponseOomProbe(allocator: std.mem.Allocator) !void {
+    var redactions: std.ArrayList(RedactionEntry) = .empty;
+    var limitations: std.ArrayList([]const u8) = .empty;
+    errdefer deinitHookLists(allocator, &redactions, &limitations);
+    try hookResponseOomSeedLists(allocator, &redactions, &limitations);
+
+    var result = try makeInformationalResponse(
+        allocator,
+        .ask,
+        .high,
+        "session",
+        "informational event",
+        "OpenCode event acknowledged by ryk.",
+        &redactions,
+        &limitations,
+    );
+    defer result.deinit(allocator);
+    redactions.deinit(allocator);
+    limitations.deinit(allocator);
+
+    try std.testing.expectEqual(PluginDecision.ask, result.decision);
+    try std.testing.expect(result.decision != .allow);
+    try std.testing.expectEqual(RiskLevel.high, result.risk);
+    try std.testing.expectEqualStrings("session", result.category);
+    try std.testing.expectEqualStrings("informational event", result.reason);
+    try std.testing.expectEqualStrings("ask", result.decision.toString());
+    try std.testing.expect(!std.mem.eql(u8, result.decision.toString(), "allow"));
+
+    var stdout_buf: [2048]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    try writeHookResponse(&stdout_writer, result);
+    const out = stdout_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"decision\": \"ask\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"decision\": \"allow\"") == null);
+}
+
+fn makeFileNormalizationBlockResponseOomProbe(allocator: std.mem.Allocator) !void {
+    var redactions: std.ArrayList(RedactionEntry) = .empty;
+    var limitations: std.ArrayList([]const u8) = .empty;
+    errdefer deinitHookLists(allocator, &redactions, &limitations);
+    try hookResponseOomSeedLists(allocator, &redactions, &limitations);
+
+    var result = try makeFileNormalizationBlockResponse(
+        allocator,
+        "file.write",
+        "file.write",
+        &redactions,
+        &limitations,
+    );
+    defer result.deinit(allocator);
+    redactions.deinit(allocator);
+    limitations.deinit(allocator);
+
+    try std.testing.expectEqual(PluginDecision.block, result.decision);
+    try std.testing.expectEqual(RiskLevel.critical, result.risk);
+    try std.testing.expect(result.decision != .allow);
+    try std.testing.expectEqualStrings("file.write", result.category);
+    try std.testing.expectEqualStrings(file_policy_path.outside_workspace_reason, result.reason);
+    try std.testing.expectEqualStrings("builtin.files.write.deny[outside_workspace]", result.rule.?);
+
+    var stdout_buf: [4096]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    try writeHookResponse(&stdout_writer, result);
+    const out = stdout_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"decision\": \"block\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"risk\": \"critical\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"decision\": \"allow\"") == null);
+}
+
+fn hookResponseOomFailAtZeroIsOutOfMemory(comptime call: anytype) !void {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const allocator = failing.allocator();
+    var redactions: std.ArrayList(RedactionEntry) = .empty;
+    var limitations: std.ArrayList([]const u8) = .empty;
+    defer deinitHookLists(allocator, &redactions, &limitations);
+    try std.testing.expectError(error.OutOfMemory, call(allocator, &redactions, &limitations));
+    try std.testing.expect(failing.has_induced_failure);
+}
+
+test "HookResponseOom builders OOM ownership" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, hookResponseOomSeedListsOomProbe, .{});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, takeOwnedHookListsOomProbe, .{});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, makeFailClosedHookResponseOomProbe, .{});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, makeInformationalResponseOomProbe, .{});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, makeFileNormalizationBlockResponseOomProbe, .{});
+    try hookResponseOomFailAtZeroIsOutOfMemory(struct {
+        fn call(
+            allocator: std.mem.Allocator,
+            redactions: *std.ArrayList(RedactionEntry),
+            limitations: *std.ArrayList([]const u8),
+        ) !HookResponse {
+            return makeFailClosedHookResponse(
+                allocator,
+                "command",
+                "evaluation unavailable",
+                "Shell command blocked: ryk shell evaluation unavailable.",
+                redactions,
+                limitations,
+            );
+        }
+    }.call);
+    try hookResponseOomFailAtZeroIsOutOfMemory(struct {
+        fn call(
+            allocator: std.mem.Allocator,
+            redactions: *std.ArrayList(RedactionEntry),
+            limitations: *std.ArrayList([]const u8),
+        ) !HookResponse {
+            return makeInformationalResponse(
+                allocator,
+                .ask,
+                .high,
+                "session",
+                "informational event",
+                "OpenCode event acknowledged by ryk.",
+                redactions,
+                limitations,
+            );
+        }
+    }.call);
+    try hookResponseOomFailAtZeroIsOutOfMemory(struct {
+        fn call(
+            allocator: std.mem.Allocator,
+            redactions: *std.ArrayList(RedactionEntry),
+            limitations: *std.ArrayList([]const u8),
+        ) !HookResponse {
+            return makeFileNormalizationBlockResponse(
+                allocator,
+                "file.write",
+                "file.write",
+                redactions,
+                limitations,
+            );
+        }
+    }.call);
+}
+
+fn collectDaemonSuggestionTextsOomProbe(allocator: std.mem.Allocator, result: std.json.Value) !void {
+    const texts = try collectDaemonSuggestionTexts(allocator, result);
+    for (texts) |text| allocator.free(text);
+    allocator.free(texts);
+}
+
+fn buildRemediationCommandsOomProbe(allocator: std.mem.Allocator) !void {
+    const commands = try buildRemediationCommands(allocator, "rule.example");
+    for (commands) |command_text| allocator.free(command_text);
+    allocator.free(commands);
+}
+
+fn makeHostInformationalAckOomProbe(allocator: std.mem.Allocator) !void {
+    var result = try makeHostInformationalAck(
+        allocator,
+        "OpenCode informational event: no policy evaluation needed.",
+        "OpenCode event acknowledged by ryk.",
+    );
+    result.deinit(allocator);
 }
 
 test "collectDaemonSuggestionTexts OOM ownership does not leak suggestion buffers" {
@@ -6969,44 +7082,17 @@ test "collectDaemonSuggestionTexts OOM ownership does not leak suggestion buffer
     ;
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
     defer parsed.deinit();
-
-    var saw_oom = false;
-    var saw_success = false;
-    var fail_index: usize = 0;
-    while (fail_index < 16) : (fail_index += 1) {
-        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
-        const allocator = failing.allocator();
-        const texts = collectDaemonSuggestionTexts(allocator, parsed.value) catch |err| {
-            try std.testing.expectEqual(error.OutOfMemory, err);
-            saw_oom = true;
-            continue;
-        };
-        for (texts) |text| allocator.free(text);
-        allocator.free(texts);
-        saw_success = true;
-        break;
-    }
-    try std.testing.expect(saw_oom);
-    try std.testing.expect(saw_success);
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        collectDaemonSuggestionTextsOomProbe,
+        .{parsed.value},
+    );
 }
 
 test "buildRemediationCommands OOM ownership does not leak command strings" {
-    var saw_oom = false;
-    var saw_success = false;
-    var fail_index: usize = 0;
-    while (fail_index < 8) : (fail_index += 1) {
-        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
-        const allocator = failing.allocator();
-        const commands = buildRemediationCommands(allocator, "rule.example") catch |err| {
-            try std.testing.expectEqual(error.OutOfMemory, err);
-            saw_oom = true;
-            continue;
-        };
-        for (commands) |command_text| allocator.free(command_text);
-        allocator.free(commands);
-        saw_success = true;
-        break;
-    }
-    try std.testing.expect(saw_oom);
-    try std.testing.expect(saw_success);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, buildRemediationCommandsOomProbe, .{});
+}
+
+test "makeHostInformationalAck OOM ownership does not leak lists" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, makeHostInformationalAckOomProbe, .{});
 }

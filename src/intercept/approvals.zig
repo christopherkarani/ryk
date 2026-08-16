@@ -153,26 +153,6 @@ test "session approval stores exact command for session scope" {
     try std.testing.expect(approvals.contains("npm install"));
 }
 
-test "allowForSession OOM ownership does not leak command or reason" {
-    var saw_oom = false;
-    var saw_success = false;
-    var fail_index: usize = 0;
-    while (fail_index < 8) : (fail_index += 1) {
-        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
-        var approvals = SessionApprovals.init(failing.allocator());
-        defer approvals.deinit();
-        approvals.allowForSession("npm install", "package install") catch |err| {
-            try std.testing.expectEqual(error.OutOfMemory, err);
-            saw_oom = true;
-            continue;
-        };
-        saw_success = true;
-        break;
-    }
-    try std.testing.expect(saw_oom);
-    try std.testing.expect(saw_success);
-}
-
 test "approval prompt supports explain and session allow" {
     var input: std.Io.Reader = .fixed("?\nA\n");
     var output_buf: [1024]u8 = undefined;
@@ -374,4 +354,64 @@ test "parseChoice empty string denies fail-closed" {
     try std.testing.expectEqual(ApprovalChoice.deny, parseChoice("").?);
     // Untrimmed whitespace is invalid input at this layer (returns null → re-prompt).
     try std.testing.expect(parseChoice("   ") == null);
+}
+
+fn countAllowForSessionAllocs() !usize {
+    var counter = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .resize_fail_index = 0,
+    });
+    var approvals = SessionApprovals.init(counter.allocator());
+    defer approvals.deinit();
+    try approvals.allowForSession("npm install", "package install");
+    try std.testing.expect(approvals.contains("npm install"));
+    return counter.allocations;
+}
+
+// Finding 7: command dupe, reason dupe, then append — each can OOM. GPA
+// fail-at-N must stay balanced through the second dupe and the list grow.
+test "allowForSession OOM ownership stays green through second dupe and append" {
+    const alloc_count = try countAllowForSessionAllocs();
+    // command dupe + reason dupe + entries.append grow (remap forced to fail).
+    try std.testing.expect(alloc_count >= 3);
+
+    // Pin the last alloc (append after both dupes). A sweep from 0 REDs on
+    // the second-dupe leak and never reaches the append-drop hole.
+    last_alloc: {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+            .fail_index = alloc_count - 1,
+            .resize_fail_index = 0,
+        });
+        var approvals = SessionApprovals.init(failing.allocator());
+        defer approvals.deinit();
+        approvals.allowForSession("npm install", "package install") catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expect(failing.has_induced_failure);
+            try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+            try std.testing.expect(!approvals.contains("npm install"));
+            break :last_alloc;
+        };
+        return error.TestUnexpectedResult;
+    }
+
+    var saw_oom = false;
+    var fail_at: usize = 0;
+    while (fail_at < alloc_count) : (fail_at += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+            .fail_index = fail_at,
+            .resize_fail_index = 0,
+        });
+        var approvals = SessionApprovals.init(failing.allocator());
+        defer approvals.deinit();
+
+        approvals.allowForSession("npm install", "package install") catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expect(failing.has_induced_failure);
+            try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+            try std.testing.expect(!approvals.contains("npm install"));
+            saw_oom = true;
+            continue;
+        };
+        return error.TestUnexpectedResult;
+    }
+    try std.testing.expect(saw_oom);
 }

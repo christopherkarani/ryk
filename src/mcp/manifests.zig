@@ -353,8 +353,9 @@ fn applySurfaceDefault(target: *?policy_schema.DecisionValue, key: []const u8, v
 }
 
 fn replaceOwned(allocator: std.mem.Allocator, slot: *?[]const u8, value: []const u8) !void {
+    const owned = try allocator.dupe(u8, value);
     if (slot.*) |old| allocator.free(old);
-    slot.* = try allocator.dupe(u8, value);
+    slot.* = owned;
 }
 
 fn parseRisk(value: []const u8) ?tools.RiskClass {
@@ -557,6 +558,9 @@ test "invalid manifest validation rejects unsafe or ambiguous schema" {
         \\  command: github-mcp-server
         \\enterprise_dashboard: true
     , "bad.yaml"));
+    try std.testing.expectError(error.InvalidManifest, parseFromSlice(std.testing.allocator, "", "empty.yaml"));
+    try std.testing.expectError(error.InvalidManifest, parseFromSlice(std.testing.allocator, "   \n\t", "blank.yaml"));
+    try std.testing.expectError(error.InvalidManifest, parseFromSlice(std.testing.allocator, "{}", "json.yaml"));
 }
 
 test "starter manifest omits raw secret values" {
@@ -590,4 +594,163 @@ test "starter manifest redacts server and command and safely quotes yaml scalars
     try std.testing.expect(std.mem.indexOf(u8, parsed.server.name, "admin: true") != null);
     try std.testing.expect(std.mem.indexOf(u8, parsed.server.command, "command: injected") != null);
     try std.testing.expectEqualStrings("plain: value # comment", parsed.server.args[0]);
+}
+
+fn liveServerSlot(builder: *const Builder, key: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, key, "name")) return builder.server_name;
+    if (std.mem.eql(u8, key, "command")) return builder.server_command;
+    if (std.mem.eql(u8, key, "cwd")) return builder.server_cwd;
+    if (std.mem.eql(u8, key, "expected_hash")) return builder.expected_hash;
+    return null;
+}
+
+fn assertApplyServerFieldOomLeavesPrevious(key: []const u8, old: []const u8, new: []const u8) !void {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .fail_index = std.math.maxInt(usize),
+    });
+    const allocator = failing.allocator();
+    var builder = Builder.init(allocator);
+    defer builder.deinit();
+    var list_target: ListTarget = .none;
+
+    try applyServerField(&builder, key, old, &list_target);
+    try std.testing.expectEqualStrings(old, liveServerSlot(&builder, key).?);
+
+    // Next alloc is the replacement dupe. Free-then-dupe leaves this slot
+    // dangling so builder.deinit dual-frees.
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(
+        error.InvalidManifest,
+        applyServerField(&builder, key, new, &list_target),
+    );
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqualStrings(old, liveServerSlot(&builder, key).?);
+}
+
+fn assertParseRepeatedKeyOomIsInvalidManifest(prefix: []const u8, repeated: []const u8) !void {
+    const prefix_allocs = blk: {
+        var counter = std.testing.FailingAllocator.init(std.testing.allocator, .{
+            .fail_index = std.math.maxInt(usize),
+        });
+        var manifest = parseFromSlice(counter.allocator(), prefix, "prefix.yaml") catch {
+            break :blk counter.alloc_index;
+        };
+        manifest.deinit(counter.allocator());
+        return error.TestUnexpectedResult;
+    };
+    try std.testing.expect(prefix_allocs > 0);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .fail_index = prefix_allocs,
+    });
+    try std.testing.expectError(
+        error.InvalidManifest,
+        parseFromSlice(failing.allocator(), repeated, "repeat.yaml"),
+    );
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+}
+
+// Finding 11: repeated YAML keys free the live slot then dupe. fail-at-N on
+// the replacement must leave the previous scalar for builder.deinit, and
+// parseFromSlice must keep remapping that OOM to InvalidManifest.
+test "mcp manifest oom-ownership: replaceOwned on repeated keys (name/command/cwd/expected_hash)" {
+    try assertApplyServerFieldOomLeavesPrevious("name", "old-name", "new-name");
+    try assertApplyServerFieldOomLeavesPrevious("command", "old-cmd", "new-cmd");
+    try assertApplyServerFieldOomLeavesPrevious("cwd", "/old", "/new");
+    try assertApplyServerFieldOomLeavesPrevious("expected_hash", "oldhash", "newhash");
+
+    try assertParseRepeatedKeyOomIsInvalidManifest(
+        \\version: 1
+        \\server:
+        \\  name: old-name
+    ,
+        \\version: 1
+        \\server:
+        \\  name: old-name
+        \\  name: new-name
+    );
+    try assertParseRepeatedKeyOomIsInvalidManifest(
+        \\version: 1
+        \\server:
+        \\  name: n
+        \\  command: old-cmd
+    ,
+        \\version: 1
+        \\server:
+        \\  name: n
+        \\  command: old-cmd
+        \\  command: new-cmd
+    );
+    try assertParseRepeatedKeyOomIsInvalidManifest(
+        \\version: 1
+        \\server:
+        \\  name: n
+        \\  command: c
+        \\  cwd: /old
+    ,
+        \\version: 1
+        \\server:
+        \\  name: n
+        \\  command: c
+        \\  cwd: /old
+        \\  cwd: /new
+    );
+    try assertParseRepeatedKeyOomIsInvalidManifest(
+        \\version: 1
+        \\server:
+        \\  name: n
+        \\  command: c
+        \\  expected_hash: oldhash
+    ,
+        \\version: 1
+        \\server:
+        \\  name: n
+        \\  command: c
+        \\  expected_hash: oldhash
+        \\  expected_hash: newhash
+    );
+}
+
+// Finding 11: pin the helper itself. Seed the slot, fail the next alloc,
+// and require the previous scalar to stay owned.
+test "mcp manifest oom-ownership: replaceOwned leaves previous scalar intact" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .fail_index = std.math.maxInt(usize),
+    });
+    const allocator = failing.allocator();
+
+    var slot: ?[]const u8 = try allocator.dupe(u8, "old");
+    defer if (slot) |old| allocator.free(old);
+
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, replaceOwned(allocator, &slot, "new"));
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqualStrings("old", slot.?);
+
+    failing.fail_index = std.math.maxInt(usize);
+    try replaceOwned(allocator, &slot, "new");
+    try std.testing.expectEqualStrings("new", slot.?);
+}
+
+test "mcp manifest oom-ownership: last repeated key wins" {
+    var manifest = try parseFromSlice(std.testing.allocator,
+        \\version: 1
+        \\server:
+        \\  name: first-name
+        \\  name: last-name
+        \\  transport: stdio
+        \\  command: first-cmd
+        \\  command: last-cmd
+        \\  cwd: /first
+        \\  cwd: /last
+        \\  expected_hash: firsthash
+        \\  expected_hash: lasthash
+    , "repeat.yaml");
+    defer manifest.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("last-name", manifest.server.name);
+    try std.testing.expectEqualStrings("last-cmd", manifest.server.command);
+    try std.testing.expectEqualStrings("/last", manifest.server.cwd.?);
+    try std.testing.expectEqualStrings("lasthash", manifest.server.expected_hash.?);
 }

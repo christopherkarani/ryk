@@ -24,6 +24,24 @@ pub const CheckResult = struct {
     }
 };
 
+/// #378: dual-dupe check rows without leaking `expected` if observed dupe/append fails.
+fn appendCheck(
+    allocator: std.mem.Allocator,
+    checks: *std.ArrayList(CheckResult),
+    expected: []u8,
+    passed: bool,
+    observed_literal: []const u8,
+) !void {
+    errdefer allocator.free(expected);
+    const observed = try allocator.dupe(u8, observed_literal);
+    errdefer allocator.free(observed);
+    try checks.append(allocator, .{
+        .expected = expected,
+        .passed = passed,
+        .observed = observed,
+    });
+}
+
 pub const Observation = struct {
     action: []const u8,
     event_type: []const u8,
@@ -240,39 +258,47 @@ pub fn runFixture(allocator: std.mem.Allocator, fixture: fixtures.Fixture, optio
     for (fixture.expected.input_contains) |expected| {
         const passed = try directoryContains(io, allocator, workspace_root, expected);
         if (!passed) all_checks_passed = false;
-        try checks.append(allocator, .{
-            .expected = try std.fmt.allocPrint(allocator, "input_contains:{s}", .{expected}),
-            .passed = passed,
-            .observed = try allocator.dupe(u8, if (passed) "present in copied fixture input" else "missing from copied fixture input"),
-        });
+        try appendCheck(
+            allocator,
+            &checks,
+            try std.fmt.allocPrint(allocator, "input_contains:{s}", .{expected}),
+            passed,
+            if (passed) "present in copied fixture input" else "missing from copied fixture input",
+        );
     }
     var missing_blocked_it = required_blocked.iterator();
     while (missing_blocked_it.next()) |entry| {
         const passed = entry.value_ptr.*;
         if (!passed) all_checks_passed = false;
-        try checks.append(allocator, .{
-            .expected = try allocator.dupe(u8, entry.key_ptr.*),
-            .passed = passed,
-            .observed = try allocator.dupe(u8, if (passed) "blocked by actual decision" else "missing denied decision"),
-        });
+        try appendCheck(
+            allocator,
+            &checks,
+            try allocator.dupe(u8, entry.key_ptr.*),
+            passed,
+            if (passed) "blocked by actual decision" else "missing denied decision",
+        );
     }
     for (fixture.expected.redacted) |expected| {
         const passed = std.mem.indexOf(u8, events_text, expected) != null or std.mem.indexOf(u8, replay_text, expected) != null;
         if (!passed) all_checks_passed = false;
-        try checks.append(allocator, .{
-            .expected = try std.fmt.allocPrint(allocator, "redacted:{s}", .{expected}),
-            .passed = passed,
-            .observed = try allocator.dupe(u8, if (passed) "redaction marker present" else "redaction marker missing"),
-        });
+        try appendCheck(
+            allocator,
+            &checks,
+            try std.fmt.allocPrint(allocator, "redacted:{s}", .{expected}),
+            passed,
+            if (passed) "redaction marker present" else "redaction marker missing",
+        );
     }
     for (fixture.expected.no_log_contains) |forbidden| {
         const passed = std.mem.indexOf(u8, events_text, forbidden) == null and std.mem.indexOf(u8, replay_text, forbidden) == null;
         if (!passed) all_checks_passed = false;
-        try checks.append(allocator, .{
-            .expected = try std.fmt.allocPrint(allocator, "no_log_contains:{s}", .{forbidden}),
-            .passed = passed,
-            .observed = try allocator.dupe(u8, if (passed) "absent from events.jsonl and replay" else "forbidden content found"),
-        });
+        try appendCheck(
+            allocator,
+            &checks,
+            try std.fmt.allocPrint(allocator, "no_log_contains:{s}", .{forbidden}),
+            passed,
+            if (passed) "absent from events.jsonl and replay" else "forbidden content found",
+        );
     }
 
     const session_dir = try allocator.dupe(u8, writer.session_dir_path);
