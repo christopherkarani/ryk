@@ -42,6 +42,7 @@ pub const ensureWorkspaceSessionTmp = session_tmp.ensureWorkspaceSessionTmp;
 pub const claude_code_tmpdir_env = session_tmp.claude_code_tmpdir_env;
 pub const claudeCodeTmpAccepts = session_tmp.claudeCodeTmpAccepts;
 pub const ensureClaudeCodeTmpLeaves = session_tmp.ensureClaudeCodeTmpLeaves;
+pub const requireClaudeCodeTmpLeavesFromEnvEntries = session_tmp.requireClaudeCodeTmpLeavesFromEnvEntries;
 
 /// Re-export mode for callers that only touch apply.
 pub const OsSandboxMode = posture.OsSandboxMode;
@@ -530,7 +531,8 @@ pub fn prepareAttachEnvironment(
     try staged.put("TEMP", preferred);
     // Claude Code `lstat`s `{CLAUDE_CODE_TMPDIR|TMPDIR}/claude-{uid}` and refuses
     // a missing path or attacker-planted symlink. Mint the env to the verified
-    // session temp and pre-create the leaf as a real directory.
+    // session temp and pre-create the leaf on the backing store. The child
+    // recreates `{TMPDIR}/claude-0` after FUSE/OS attach (the inode Claude sees).
     if (!ensureClaudeCodeTmpLeaves(preferred)) return error.SessionTmpPrepareFailed;
     try staged.put(claude_code_tmpdir_env, preferred);
 

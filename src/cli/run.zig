@@ -6707,8 +6707,15 @@ test "empty backpack claude alias -- --help session tmp passes Claude tmpdir che
         try script.writeStreamingAll(std.testing.io,
             \\#!/bin/sh
             \\base="${CLAUDE_CODE_TMPDIR:-${TMPDIR:-/tmp}}"
+            \\# Claude joins the tmp base with claude-{uid}; after userns that is claude-0
+            \\# (process.getuid?.() ?? 0). Check the exact QA leaf first.
+            \\leaf0="$base/claude-0"
             \\leaf="$base/claude-$(id -u)"
-            \\if [ -L "$leaf" ] || [ ! -d "$leaf" ]; then
+            \\if [ -L "$leaf0" ] || [ ! -d "$leaf0" ]; then
+            \\  echo "Temp directory $leaf0 is not a directory (may be an attacker-planted symlink)." >&2
+            \\  exit 1
+            \\fi
+            \\if [ "$leaf" != "$leaf0" ] && { [ -L "$leaf" ] || [ ! -d "$leaf" ]; }; then
             \\  echo "Temp directory $leaf is not a directory (may be an attacker-planted symlink)." >&2
             \\  exit 1
             \\fi

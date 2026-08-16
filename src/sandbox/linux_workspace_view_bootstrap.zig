@@ -243,6 +243,11 @@ fn runLinux(allocator: std.mem.Allocator, fds: BootstrapFds) !void {
     // for empty-backpack workspaces that otherwise fail closed (no RW surface).
     if (!session_tmp.ensureWorkspaceSessionTmp(request.workspace_root))
         return response.fail(.landlock_attach_failed);
+    // Claude `lstat`s `{TMPDIR}/claude-0` after attach. Parent pre-create lands
+    // on the backing store; the leaf Claude sees is the FUSE view. Create that
+    // exact leaf here (nofollow verify). Fail closed on a planted symlink.
+    if (!session_tmp.requireClaudeCodeTmpLeavesFromEnvEntries(request.environ))
+        return response.fail(.landlock_attach_failed);
 
     var plan = landlock.buildChildLandlockPlan(allocator, &compiled) catch
         return response.fail(.landlock_attach_failed);
