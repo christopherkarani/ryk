@@ -441,22 +441,35 @@ fn requestServerForClient(
     request_line: []const u8,
     session_approvals: *intercept.approvals.SessionApprovals,
 ) ![]u8 {
-    var response = try server.request(server.context, allocator, request_line);
+    // Optional so errdefer never frees a non-owned placeholder (M019).
+    var response: ?[]u8 = try server.request(server.context, allocator, request_line);
+    errdefer if (response) |r| allocator.free(r);
     while (true) {
-        var parsed = jsonrpc.parseLine(allocator, response) catch return response;
+        const current = response orelse return error.Unexpected;
+        var parsed = jsonrpc.parseLine(allocator, current) catch {
+            // Non-JSON response: transfer ownership to caller.
+            const out = current;
+            response = null;
+            return out;
+        };
+        errdefer parsed.deinit();
         const method = parsed.method();
         if (method) |method_name| {
             if (jsonrpc.idOf(parsed.value()) != null and sampling.isSamplingMethod(method_name)) {
-                try handleServerOriginatedSampling(allocator, config, client_reader, client_writer, server, parsed.value(), response, session_approvals);
+                // On sampling handler error, free both response and parsed.
+                try handleServerOriginatedSampling(allocator, config, client_reader, client_writer, server, parsed.value(), current, session_approvals);
                 parsed.deinit();
-                allocator.free(response);
+                allocator.free(current);
+                response = null;
                 const read = server.read orelse return error.McpServerOriginatedSamplingRequiresReadableTransport;
                 response = try read(server.context, allocator);
                 continue;
             }
         }
         parsed.deinit();
-        return response;
+        const out = current;
+        response = null;
+        return out;
     }
 }
 
