@@ -53,10 +53,11 @@ pub fn getenvBrandFlagTruthy(suffix: []const u8) bool {
 }
 
 fn envTokenTruthy(raw: []const u8) bool {
-    return std.mem.eql(u8, raw, "1") or
-        std.ascii.eqlIgnoreCase(raw, "true") or
-        std.ascii.eqlIgnoreCase(raw, "yes") or
-        std.ascii.eqlIgnoreCase(raw, "on");
+    const value = std.mem.trim(u8, raw, " \t\r\n");
+    return std.mem.eql(u8, value, "1") or
+        std.ascii.eqlIgnoreCase(value, "true") or
+        std.ascii.eqlIgnoreCase(value, "yes") or
+        std.ascii.eqlIgnoreCase(value, "on");
 }
 
 /// Residual `ask` hardens to deny when the operator asked for unattended/CI.
@@ -86,6 +87,8 @@ test "envTokenTruthy accepts 1/true/yes/on and rejects empty or 0" {
     try std.testing.expect(!envTokenTruthy(""));
     try std.testing.expect(!envTokenTruthy("0"));
     try std.testing.expect(!envTokenTruthy("false"));
+    try std.testing.expect(envTokenTruthy(" 1 "));
+    try std.testing.expect(envTokenTruthy("true\n"));
 }
 
 test "getOwnedFirst prefers first key" {

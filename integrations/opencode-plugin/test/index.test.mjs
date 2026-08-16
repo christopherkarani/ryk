@@ -285,7 +285,7 @@ printf '%s\\n' '{"decision":"block","message":"command blocked"}'
   );
 });
 
-test('permission.ask warn maps to host ask and may toast warning', async () => {
+test('permission.ask warn proceeds without a host ask and may toast warning', async () => {
   const toasts = [];
   await withFakeRyk(
     async (plugin) => {
@@ -293,7 +293,7 @@ test('permission.ask warn maps to host ask and may toast warning', async () => {
       assert.ok(permissionAsk);
       const output = { status: 'ask' };
       await permissionAsk({ sessionID: 'session-1', command: 'echo warn-me' }, output);
-      assert.equal(output.status, 'ask', 'warn must not silent-allow or hard-deny');
+      assert.equal(output.status, 'allow', 'warn must not open a host ask');
       assert.equal(toasts.length, 1);
       assert.equal(toastPayload(toasts[0])?.variant, 'warning');
     },

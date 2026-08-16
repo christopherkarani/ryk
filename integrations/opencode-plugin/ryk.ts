@@ -780,8 +780,8 @@ const PERMISSION_STATUS: Record<string, PermissionAskOutput['status']> = {
   ask: 'allow',
   allow: 'allow',
   context_only: 'allow',
-  // Keep host permission UI for advisory outcomes (do not auto-allow).
-  warn: 'ask',
+  // Advisory: proceed. No host ask UI.
+  warn: 'allow',
 };
 
 function applyPermissionDecision(response: RykResponse, output: PermissionAskOutput): void {
