@@ -84,6 +84,35 @@ fn findStructuredSecret(value: []const u8, from: usize) ?SecretSpan {
             }
         }
 
+        // Vendor prefixes use per-shape floors so Stripe `sk_live_`/`sk_test_`
+        // (underscore) never collide with OpenAI `sk-`, and short false friends
+        // (`xox`, `hf`, `glpat`) stay unclassified.
+        const vendor_prefixes = [_]struct { prefix: []const u8, min_after: usize }{
+            .{ .prefix = "xoxb-", .min_after = 12 },
+            .{ .prefix = "xoxp-", .min_after = 12 },
+            .{ .prefix = "xoxa-", .min_after = 12 },
+            .{ .prefix = "xoxs-", .min_after = 12 },
+            .{ .prefix = "xoxe-", .min_after = 12 },
+            .{ .prefix = "sk_live_", .min_after = 8 },
+            .{ .prefix = "sk_test_", .min_after = 8 },
+            .{ .prefix = "glpat-", .min_after = 12 },
+            .{ .prefix = "hf_", .min_after = 9 },
+        };
+        for (vendor_prefixes) |vendor| {
+            if (startsWithIgnoreCase(value[i..], vendor.prefix)) {
+                var end = i + vendor.prefix.len;
+                while (end < value.len and isTokenChar(value[end])) : (end += 1) {}
+                if (end >= i + vendor.prefix.len + vendor.min_after)
+                    return .{ .start = i, .end = end };
+            }
+        }
+
+        if (startsWithIgnoreCase(value[i..], "sig=") and
+            (i == 0 or value[i - 1] == '?' or value[i - 1] == '&'))
+        {
+            if (azureSasSigAt(value, i)) |span| return span;
+        }
+
         if (!isKeyStart(value, i)) continue;
         const key_start = i;
         var key_end = i;
@@ -191,6 +220,11 @@ fn isKnownSecretMarkerLabel(label: []const u8) bool {
         "github_pat",
         "openai_api_key",
         "anthropic_api_key",
+        "slack_token",
+        "stripe_api_key",
+        "huggingface_token",
+        "gitlab_token",
+        "azure_sas",
         "jwt",
         "high_entropy",
     };
@@ -587,6 +621,21 @@ pub fn classifySecretValue(value: []const u8) ?RedactionMatch {
     if (looksLikeAnthropicKey(trimmed)) {
         return labeledMatch("secret:anthropic_api_key");
     }
+    if (looksLikeSlackToken(trimmed)) {
+        return labeledMatch("secret:slack_token");
+    }
+    if (looksLikeStripeKey(trimmed)) {
+        return labeledMatch("secret:stripe_api_key");
+    }
+    if (looksLikeHuggingFaceToken(trimmed)) {
+        return labeledMatch("secret:huggingface_token");
+    }
+    if (looksLikeGitlabToken(trimmed)) {
+        return labeledMatch("secret:gitlab_token");
+    }
+    if (looksLikeAzureSas(trimmed)) {
+        return labeledMatch("secret:azure_sas");
+    }
     if (looksLikeJwt(trimmed)) {
         return labeledMatch("secret:jwt");
     }
@@ -674,6 +723,91 @@ fn looksLikeOpenAiKey(value: []const u8) bool {
 
 fn looksLikeAnthropicKey(value: []const u8) bool {
     return std.mem.startsWith(u8, value, "sk-ant-") and value.len >= 16;
+}
+
+fn looksLikeSlackToken(value: []const u8) bool {
+    const prefixes = [_][]const u8{ "xoxb-", "xoxp-", "xoxa-", "xoxs-", "xoxe-" };
+    for (prefixes) |prefix| {
+        if (std.mem.startsWith(u8, value, prefix) and value.len >= prefix.len + 12) return true;
+    }
+    return false;
+}
+
+fn looksLikeStripeKey(value: []const u8) bool {
+    return (std.mem.startsWith(u8, value, "sk_live_") or std.mem.startsWith(u8, value, "sk_test_")) and
+        value.len >= 16;
+}
+
+fn looksLikeHuggingFaceToken(value: []const u8) bool {
+    return std.mem.startsWith(u8, value, "hf_") and value.len >= 12;
+}
+
+fn looksLikeGitlabToken(value: []const u8) bool {
+    return std.mem.startsWith(u8, value, "glpat-") and value.len >= 18;
+}
+
+fn looksLikeAzureSas(value: []const u8) bool {
+    var i: usize = 0;
+    while (i < value.len) : (i += 1) {
+        if (startsWithIgnoreCase(value[i..], "sig=") and
+            (i == 0 or value[i - 1] == '?' or value[i - 1] == '&'))
+        {
+            if (azureSasSigAt(value, i) != null) return true;
+        }
+    }
+    return false;
+}
+
+fn azureSasSigAt(value: []const u8, sig_at: usize) ?SecretSpan {
+    const window = queryWindowContaining(value, sig_at);
+    if (!queryHasParam(window, "sv")) return null;
+    const sig_start = sig_at + "sig=".len;
+    var sig_end = sig_start;
+    while (sig_end < value.len and value[sig_end] != '&' and value[sig_end] != '#' and
+        !std.ascii.isWhitespace(value[sig_end])) : (sig_end += 1)
+    {}
+    if (!isConservativeAzureSasSig(value[sig_start..sig_end])) return null;
+    return .{ .start = sig_start, .end = sig_end };
+}
+
+fn queryWindowContaining(value: []const u8, at: usize) []const u8 {
+    var start = at;
+    while (start > 0) {
+        const prev = value[start - 1];
+        if (std.ascii.isWhitespace(prev)) break;
+        start -= 1;
+        if (value[start] == '?') break;
+    }
+    var end = at;
+    while (end < value.len and value[end] != '#' and !std.ascii.isWhitespace(value[end])) : (end += 1) {}
+    return value[start..end];
+}
+
+fn queryHasParam(query: []const u8, name: []const u8) bool {
+    var i: usize = 0;
+    while (i < query.len) : (i += 1) {
+        if (!startsWithIgnoreCase(query[i..], name)) continue;
+        const eq = i + name.len;
+        if (eq >= query.len or query[eq] != '=') continue;
+        if (i == 0 or query[i - 1] == '?' or query[i - 1] == '&') return true;
+    }
+    return false;
+}
+
+fn isConservativeAzureSasSig(sig: []const u8) bool {
+    if (sig.len < 16) return false;
+    var unique = [_]bool{false} ** 256;
+    var unique_count: usize = 0;
+    for (sig) |char| {
+        const ok = std.ascii.isAlphanumeric(char) or char == '_' or char == '-' or
+            char == '/' or char == '+' or char == '=' or char == '%' or char == '.';
+        if (!ok) return false;
+        if (!unique[char]) {
+            unique[char] = true;
+            unique_count += 1;
+        }
+    }
+    return unique_count >= 8;
 }
 
 fn looksLikeJwt(value: []const u8) bool {
