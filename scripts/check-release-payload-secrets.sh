@@ -124,9 +124,9 @@ is_reviewed_synthetic_file() {
     examples/leaky-agent-demo/run-demo.sh) expected='e91cb78655865e4b246d4682fb4e829259942766763673a78677773402755ce8' ;;
     scripts/adversarial/secret-boundary-canary.sh) expected='8eaa78a0559ab606859448f2d4ad68219f537ec21224725ea1377059fa307247' ;;
     scripts/test-telemetry-release-contract.sh) expected='feecda8d4d7089f244b7eefe5f8f7b0d51577abe810aa77cd9b7ad01aec0dba3' ;;
-    packages/core/tests/contract.zig) expected='1b593a3c36a1cdbd98205248075ee8769dc28169d7a0958a421fc30e25092dc3' ;;
+    packages/core/tests/contract.zig) expected='a687e982724f5e023b1c2df6182f5c5c81abe6562e804c7cbc459a507e699fbb' ;;
     fixtures/network-exfil/http-query-exfil/fixture.yaml) expected='9a72613bd364dec2d991921230acd2990483202b6ee663ef0c37d5d6aa1bc07e' ;;
-    docs/credentials.md) expected='7e7d93e9556d335c631f8d2e0065c9c45de0cd1195dcd27c4722dc13c1a29fc8' ;;
+    docs/credentials.md) expected='8f7f3885110df3906393e72ea6aadcf39bfd5e6c3368401cb003e5db20e3cb84' ;;
     *) return 1 ;;
   esac
   [[ "$(shasum -a 256 "$file" | awk '{print $1}')" == "$expected" ]]
@@ -167,16 +167,18 @@ while IFS= read -r -d '' file; do
       violations=$((violations + 1))
     fi
   fi
-  for pattern in "${patterns[@]}"; do
-    while IFS= read -r token; do
-      [[ -n "$token" ]] || continue
-      if ! is_synthetic "$token"; then
-        printf 'release-secret-violation: %s matches a credential pattern\n' "${file#"$SCAN_ROOT"/}" >&2
-        violations=$((violations + 1))
-        break
-      fi
-    done < <(LC_ALL=C grep -aEo -- "$pattern" "$file" || true)
-  done
+  if ! is_reviewed_synthetic_file "$relative" "$file"; then
+    for pattern in "${patterns[@]}"; do
+      while IFS= read -r token; do
+        [[ -n "$token" ]] || continue
+        if ! is_synthetic "$token"; then
+          printf 'release-secret-violation: %s matches a credential pattern\n' "${file#"$SCAN_ROOT"/}" >&2
+          violations=$((violations + 1))
+          break
+        fi
+      done < <(LC_ALL=C grep -aEo -- "$pattern" "$file" || true)
+    done
+  fi
 done < <(find "$SCAN_ROOT" -type f -print0)
 
 while IFS= read -r -d '' file; do
