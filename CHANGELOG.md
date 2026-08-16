@@ -1,5 +1,9 @@
 # Changelog
 
+## [Unreleased]
+
+Nothing pending.
+
 ## [0.2.19] - 2026-08-16
 
 ## What's Changed
@@ -61,7 +65,7 @@
 
 **Full Changelog**: https://github.com/christopherkarani/ryk/compare/v1.2.17...v0.2.18
 
-## [Unreleased]
+## Notes for 0.2.18–0.2.19
 
 ### Changed
 
@@ -263,7 +267,7 @@ The product was previously named Orca.
 
 **Full Changelog**: https://github.com/christopherkarani/ryk/compare/v1.2.8...v1.2.9
 
-## Unreleased
+## Notes (1.2.9 brand cut)
 
 ### Breaking
 - **Brand hard cut — Rykan V / `ryk` only (no legacy-brand compatibility).**
@@ -407,6 +411,3 @@ The product was previously named Orca.
 - Prepared Orca production release metadata and artifact contract.
 - Added checksum, release-manifest, SBOM inventory hook, optional signing hook status, install guidance, GitHub release draft, tagging instructions, release checklist, and production-readiness report.
 
-## Previous Phases
-
-Earlier releases established the current policy engine, shell evaluator, host integrations, audit and replay tooling, red-team checks, and release process.

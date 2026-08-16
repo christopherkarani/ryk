@@ -1,5 +1,8 @@
 <p align="center">
-  <img src="docs/images/ryk-banner.svg" alt="ryk، coding agents کے لیے guardrails" width="100%">
+  <a href="https://rykanv.com/">ویب سائٹ</a> ·
+  <a href="https://discord.gg/uZn9MDUYKx">Discord</a> ·
+  <a href="CONTRIBUTING.md">شراکت</a> ·
+  <a href="SECURITY.md">سیکیورٹی</a>
 </p>
 
 <p align="center">
@@ -9,18 +12,22 @@
 </p>
 
 <p align="center">
-  <a href="https://rykanv.com/">ویب سائٹ</a> ·
-  <a href="https://discord.gg/uZn9MDUYKx">Discord</a> ·
-  <a href="CONTRIBUTING.md">Contributing</a>
+  <a href="https://github.com/christopherkarani/ryk/actions/workflows/build.yml"><img src="https://img.shields.io/github/actions/workflow/status/christopherkarani/ryk/build.yml?label=build" alt="بلڈ کی حیثیت"></a>
+  <a href="https://github.com/christopherkarani/ryk/blob/main/LICENSE"><img src="https://img.shields.io/github/license/christopherkarani/ryk" alt="Apache 2.0 لائسنس"></a>
+  <a href="https://github.com/christopherkarani/ryk"><img src="https://img.shields.io/github/stars/christopherkarani/ryk?style=flat" alt="GitHub stars"></a>
 </p>
 
 # ryk
 
-coding agents کو واضح guardrails کے ساتھ چلائیں۔
+**coding agents کے لیے مقامی guardrails۔**
 
-ryk ایک local control layer ہے جو ان agents کے لیے ہے جنہیں engineers پہلے سے استعمال کرتے ہیں۔ `ryk <agent>` کے ذریعے Pi، Hermes، OpenCode، Codex یا Claude چلائیں۔ Agent اپنا عام terminal اور tools workflow برقرار رکھتا ہے، جبکہ ryk commands، files، environment اور secrets، network requests، MCP actions اور دوسرے effects کو policy کے مطابق evaluate کرتا ہے۔
+Claude Code، Codex، Pi، OpenCode، Hermes، OpenClaw یا Grok کو ایک مقامی binary کے ذریعے چلائیں۔ ryk commands، files، secrets، network اور MCP actions کو آپ کی مشین تک پہنچنے سے پہلے چیک کرتا ہے — allow / ask / deny / observe — اور ثبوت ڈسک پر محفوظ رکھتا ہے۔
 
-ہر action کا فیصلہ `allow`، `ask`، `deny` یا `observe` ہوتا ہے۔ Sessions کا local audit record `ryk dashboard` یا `ryk replay` سے دیکھا جا سکتا ہے۔
+<p align="center">
+  <img src="docs/assets/ryk-deny-demo.gif" alt="ryk OpenCode کے rm -rf / command کو deny کرتا ہے" width="720">
+</p>
+
+<p align="center"><em>Agent <code>rm -rf</code> کی کوشش کرتا ہے۔ ryk اسے deny کر دیتا ہے۔ Session آپ کے laptop پر رہتی ہے۔</em></p>
 
 ## انسٹال کریں
 
@@ -28,58 +35,84 @@ ryk ایک local control layer ہے جو ان agents کے لیے ہے جنہیں
 curl -fsSL https://rykanv.com/install | sh
 ```
 
-`ryk` کو اپنے `PATH` میں فعال کرنے کے بعد `ryk <agent>` کے ذریعے agent چلائیں۔
-
-## Agent چلائیں
+## ایجنٹ شروع کریں
 
 ```sh
-ryk pi
-ryk hermes
-ryk opencode
-ryk codex
-ryk claude
+ryk claude    # or: codex | pi | opencode | openclaw | hermes | grok
 ```
 
-OpenClaw اور Grok کے لیے بھی launch paths موجود ہیں:
+پچھلی agent sessions میں risky commands اور secret جیسے exposure کے لیے scan کریں:
 
 ```sh
-ryk openclaw
-ryk grok
+ryk scan
 ```
 
-جب ضرورت ہو تو local posture دیکھیں:
+اگر ryk نے آپ کو ایک بُری دن سے بچایا ہو تو [repository کو star کریں](https://github.com/christopherkarani/ryk) — اس سے دوسرے engineers کو یہ تلاش کرنے میں مدد ملتی ہے۔
 
-```sh
-ryk doctor
-```
+## آپ کو کیا ملتا ہے
 
-اہم integrations Pi، Hermes، OpenCode، Codex اور Claude کے لیے ہیں۔ Onboarding host discovery کے لیے Cursor کو بھی detect کرتا ہے۔
-
-## Policy کیسے کام کرتی ہے
-
-Local policy commands، files، environment، network اور MCP tools کو cover کرتی ہے۔ Mode فیصلہ کرنے کا طریقہ طے کرتا ہے:
-
-| Mode | رویہ |
+| | |
 | --- | --- |
-| `observe` | فیصلے record کرتا ہے، supported actions کو block نہیں کرتا |
-| `ask` | interactive host پر risky actions کے لیے confirmation لیتا ہے |
-| `strict` | unknown یا risky actions کو rule کی اجازت کے بغیر deny کرتا ہے |
-| `ci` | prompts کے بغیر strict behavior چلاتا ہے |
+| Host integrations | Pi، Hermes، OpenCode، Codex، Claude Code، OpenClaw اور Grok کے لیے launch aliases۔ Cursor host discovery اور اس کے shell hook کے ذریعے supported ہے۔ |
+| OS sandboxing | دستیاب ہونے پر macOS پر Seatbelt اور Linux پر Landlock کے ساتھ خودکار OS filesystem sandboxing۔ Windows پر OS sandbox نہیں (صرف wrapper/hook grade)۔ |
+| Secret redaction | audit اور replay data لکھنے سے پہلے secret جیسے values redact ہوتے ہیں۔ |
+| MCP protection | MCP tool calls مقامی طور پر classify ہوتے ہیں، اور supported stdio servers ryk کے protected proxy سے گزرتے ہیں۔ |
+| 86 safety packs | تباہ کن اور حساس operations کے لیے built-in command patterns، project-level opt-in packs کے ساتھ۔ |
+| Policy decisions | مقامی actions کے لیے `allow`، `ask`، `deny` اور `observe` decisions۔ |
+| Local evidence | localhost dashboard (blocked commands کا Terminal view سمیت) اور sessions، decisions اور audit records کے لیے replay commands۔ |
+| ایک مقامی binary | Zig CLI launch، evaluation، policy checks، host adapters اور diagnostics کا مالک ہے۔ |
 
-Explicit deny کو ترجیح حاصل ہے۔ Safety packs commands اور effects کو classify کرتے ہیں، مگر deny rule کے اوپر permission نہیں دیتے۔
+
+
+### معاون ہوسٹس
+
+| ہوسٹ | داخلی نقطہ | انضمام کا نقطہ |
+| --- | --- | --- |
+| Pi | `ryk pi` | Bundled extension |
+| Hermes | `ryk hermes` | `pre_tool_call` |
+| OpenCode | `ryk opencode` | `tool.execute.before` |
+| Codex | `ryk codex` | `PreToolUse` |
+| Claude Code | `ryk claude` | `PreToolUse` |
+| OpenClaw | `ryk openclaw` | `tool.before` |
+| Grok | `ryk grok` | `PreToolUse` |
+| Cursor | Host discovery اور `cursor-agent` preset | `beforeShellExecution` |
+
+
+
+## پالیسی کیسے کام کرتی ہے
+
+ryk ہر guarded action کو مقامی طور پر evaluate کرتا ہے۔ اہم policy surfaces یہ ہیں:
+
+| سطح | مثالیں |
+| --- | --- |
+| Commands | Shell commands، pipelines، redirects اور interpreters |
+| Files | Workspace files، project control files اور sensitive paths |
+| Environment | Inherited variables اور secret access |
+| Network | Host allowlists اور mediated outbound connections |
+| Tools | effects پر map ہونے والے MCP اور host tool calls |
+
+policy mode response کنٹرول کرتا ہے:
+
+| موڈ | رویہ |
+| --- | --- |
+| `observe` | supported actions کو block کیے بغیر decisions record کرتا ہے |
+| `ask` | جب host انہیں resume کر سکے تو risky actions کے لیے prompt کرتا ہے |
+| `strict` | rule کی اجازت کے بغیر unknown یا risky actions deny کرتا ہے |
+| `ci` | prompts کے بغیر strict behavior چلاتا ہے؛ `ask` deny بن جاتا ہے |
+
+Explicit deny rules کو ترجیح حاصل ہے۔ Safety packs commands اور effects classify کرتے ہیں، مگر deny rule کے اوپر permission نہیں دیتے۔
+
+Built-in preset validate کریں:
 
 ```sh
 ryk policy check --preset ask
-ryk packs
-ryk test "git status"
-ryk explain "rm -rf /"
 ```
 
-مکمل format کے لیے [policy documentation](docs/policy.md) دیکھیں۔
+policy files، priorities اور examples کے لیے [policy reference](docs/policy.md) دیکھیں۔
 
-## Safety packs
+## سیفٹی پیکس
 
-Shell engine میں 86 built-in packs شامل ہیں۔ Core packs default طور پر enabled ہیں، اور project کے مطابق اضافی packs فعال کیے جا سکتے ہیں:
+Safety packs shell evaluator میں focused command coverage بڑھاتے ہیں۔ `core.*` اور `system.disk` جیسے baseline packs default طور پر enabled ہیں۔
 
 ```sh
 ryk packs
@@ -88,55 +121,83 @@ ryk packs enable containers.docker database.postgresql
 ryk packs disable containers.docker
 ```
 
-Git workspace میں project selections `.ryk.toml` میں محفوظ ہوتی ہیں۔ Automation اور diagnostics کے لیے `ryk packs --json` استعمال کریں۔
+Git workspace میں project pack choices `.ryk.toml` میں محفوظ ہوتی ہیں۔ scripts اور diagnostics کے لیے `ryk packs` استعمال کریں۔
 
-## Architecture
+بغیر چلائے command test یا explain کریں:
 
-Launch aliases، host adapters، shell evaluator اور policy engine ایک ہی local decision path استعمال کرتے ہیں۔
+```sh
+ryk test "git status"
+ryk test "rm -rf /" --format json
+ryk explain "rm -rf /"
+```
+
+## ساخت
+
+Launch aliases، host adapters، shell evaluator اور policy engine ایک ہی local decision path share کرتے ہیں۔
 
 <p align="center">
-  <img src="docs/images/ryk-architecture.svg" alt="ryk architecture" width="100%">
+  <img src="docs/images/ryk-architecture.svg" alt="ryk architecture: agent hosts سے local policy کے ذریعے guarded effects اور evidence تک" width="100%">
 </p>
 
-1. Launch boundary agent defaults کے ساتھ session شروع کرتی ہے۔
-2. Host adapters shell اور tool events evaluator تک پہنچاتے ہیں۔
-3. Evaluator policy rules، safety packs اور active mode کو ملاتا ہے۔
-4. Action allow، ask، observe یا deny ہوتا ہے۔
-5. Session evidence local dashboard اور replay کے لیے دستیاب رہتی ہے۔
+1. ایک launch alias agent کو ryk کے session defaults کے ساتھ شروع کرتا ہے۔
+2. Host adapters shell اور tool events evaluator کو بھیجتے ہیں۔
+3. Evaluator policy rules، safety-pack matches اور active mode کو ملاتا ہے۔
+4. ryk action کو allow، ask، observe یا deny کرتا ہے۔
+5. Session dashboard اور replay commands کے لیے local evidence record کرتی ہے۔
 
-## Dashboard
+## ڈیش بورڈ
+
+localhost dashboard شروع کریں:
 
 ```sh
 ryk dashboard
 ```
 
-Browser میں [http://127.0.0.1:7742](http://127.0.0.1:7742) کھولیں۔ Automation کے لیے:
+[http://127.0.0.1:7742](http://127.0.0.1:7742) کھولیں۔ server default طور پر localhost-only ہے اور موجودہ ryk policy اور CLI paths استعمال کرتا ہے۔
+
+smoke tests اور automation کے لیے `--once` ایک request serve کر کے exit ہو جاتا ہے:
 
 ```sh
 ryk dashboard --once
 ```
 
-## Contributing
+## حدود
 
-ryk Zig 0.16.0 سے build ہوتا ہے۔ Code change کے بعد focused checks چلائیں:
+ryk graded mediation ہے، universal OS sandbox نہیں۔ یہ macOS/Linux-first ہے۔ Windows sessions wrapper/hook grade پر چلتی ہیں، OS sandbox کے بغیر۔ absolute-path binaries، non-shimmed tools، non-proxy traffic اور وہ host hooks جو fire نہیں ہوتے، کسی خاص enforcement surface سے باہر رہ سکتے ہیں۔ `ryk doctor` platform capability report کرتا ہے؛ یہ ثابت نہیں کرتا کہ child session OS sandbox سے attach ہوئی، اور Windows کو `OS-enforced` پر promote نہیں کر سکتا۔ مضبوط دعوے کرنے سے پہلے [compatibility matrix](docs/compatibility.md) اور [threat model](docs/threat-model.md) پڑھیں۔
+
+release builds میں opt-in product telemetry شامل ہے: `ryk telemetry enable` چلانے کے بغیر کچھ collect یا send نہیں ہوتا۔ exact payload contract کے لیے [docs/telemetry.md](docs/telemetry.md) دیکھیں۔
+
+## دستاویزات
+
+[documentation index](docs/README.md) سے شروع کریں۔ سب سے مفید guides یہ ہیں:
+
+- [Install and release artifacts](docs/install.md)
+- [Quickstart](docs/quickstart.md)
+- [Commands](docs/commands.md)
+- [Policy](docs/policy.md)
+- [Credentials and secret handling](docs/credentials.md)
+- [MCP](docs/mcp.md)
+- [Platform notes](docs/platform-linux.md)
+- [Windows platform](docs/platform-windows.md)
+
+## شراکت
+
+ryk Zig 0.16.0 سے build ہوتا ہے۔ checkout سے:
 
 ```sh
 ./scripts/zig version
 ./scripts/compile-fast.sh check
-./scripts/zig build
 ./scripts/zig build test-shell-engine
 ```
 
-Pull request سے پہلے [`CONTRIBUTING.md`](CONTRIBUTING.md) پڑھیں۔ Security issues کے لیے [`SECURITY.md`](SECURITY.md) دیکھیں۔
+pull request کھولنے سے پہلے [CONTRIBUTING.md](CONTRIBUTING.md) پڑھیں۔ security issues کے لیے [SECURITY.md](SECURITY.md) استعمال کریں۔
 
-## Community
+## کمیونٹی
 
 - [ویب سائٹ](https://rykanv.com/)
 - [Discord](https://discord.gg/uZn9MDUYKx)
 - [GitHub issues](https://github.com/christopherkarani/ryk/issues)
 
-اگر ryk آپ کے agent workflow میں مفید ہے تو [repository کو star کریں](https://github.com/christopherkarani/ryk)، تاکہ دوسرے engineers بھی اسے تلاش کر سکیں۔
+## لائسنس
 
-## License
-
-Apache 2.0۔ [`LICENSE`](LICENSE) دیکھیں۔
+Apache 2.0۔ [LICENSE](LICENSE) دیکھیں۔
