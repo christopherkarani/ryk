@@ -198,15 +198,22 @@ pub const host_config_table = [_]HostConfigSpec{
         .host = "grok",
         // Product state only — not whole ~/.grok (worktrees, agent scratch, etc.) (F19).
         // F40: do not RW-grant ~/.grok/bin (host-identity trust root — plantable privilege).
-        // user-settings.json is RO via collect paths + authority write-deny (F218).
+        // Grok CLI 1.0.4 opens ~/.grok/config.toml after Seatbelt attach (#194).
+        // Grant the file only: Seatbelt path-walk uses ancestor metadata literals
+        // on ~/.grok; do not grant the parent tree (not a trusted prefix).
+        // user-settings.json stays write-denied (F218); not a 1.0.4 config-load path.
         .home_rel_dirs = &.{
+            ".grok/config.toml",
             ".grok/skills",
             ".grok/hooks",
             ".grok/sessions",
             ".grok/plugins",
             ".grok/mcp",
         },
-        .authority_home_rel_files = &.{".grok/user-settings.json"},
+        .authority_home_rel_files = &.{
+            ".grok/config.toml",
+            ".grok/user-settings.json",
+        },
     },
 };
 
@@ -996,9 +1003,15 @@ pub fn hostUsableAuthPresent(
 
 /// True when argv after the binary is only help/version flags (no prompt / -p).
 /// Bare interactive (`claude` alone) is **not** help-only.
+///
+/// `ryk <host> -- --help` keeps the `--` separator in `command_argv`. Treat `--`
+/// as argv punctuation, not a payload flag, but still require a real help/version
+/// token so bare `["grok", "--"]` stays interactive (empty-backpack fail-closed).
 pub fn isAgentHelpOrVersionOnly(command_argv: []const []const u8) bool {
     if (command_argv.len < 2) return false;
+    var saw_help = false;
     for (command_argv[1..]) |arg| {
+        if (std.mem.eql(u8, arg, "--")) continue;
         if (std.mem.eql(u8, arg, "--help") or
             std.mem.eql(u8, arg, "-h") or
             std.mem.eql(u8, arg, "help") or
@@ -1007,11 +1020,12 @@ pub fn isAgentHelpOrVersionOnly(command_argv: []const []const u8) bool {
             std.mem.eql(u8, arg, "version") or
             std.mem.eql(u8, arg, "-V"))
         {
+            saw_help = true;
             continue;
         }
         return false;
     }
-    return true;
+    return saw_help;
 }
 
 /// True when Claude OAuth is known-expired and the launch is not help/version-only.
@@ -1349,6 +1363,111 @@ test "collectHostConfigPaths grants existing Grok product dirs not whole tree" {
     }
 }
 
+// Issue #194: grok 1.0.4 opens ~/.grok/config.toml after Seatbelt attach.
+// The grant must be the file (plus ancestor metadata from the profile builder),
+// not the parent ~/.grok tree (F19) and not ~/.grok/bin (F40).
+test "collectHostConfigPaths grants grok 1.0.4 config.toml not whole ~/.grok" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var home_tmp = std.testing.tmpDir(.{});
+    defer home_tmp.cleanup();
+    const home = try home_tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(home);
+
+    try home_tmp.dir.createDirPath(io, ".grok/worktrees/evil");
+    try home_tmp.dir.createDirPath(io, ".grok/bin");
+    try home_tmp.dir.createDirPath(io, "Library/Keychains");
+    try home_tmp.dir.writeFile(io, .{
+        .sub_path = ".grok/config.toml",
+        .data = "[cli]\nauto_update = false\n",
+    });
+    try home_tmp.dir.writeFile(io, .{
+        .sub_path = ".grok/bin/grok",
+        .data = "#!/bin/sh\n",
+    });
+    try home_tmp.dir.writeFile(io, .{
+        .sub_path = "Library/Keychains/login.keychain-db",
+        .data = "secret\n",
+    });
+
+    const spec = specForHost("grok").?;
+    var listed_config = false;
+    var listed_bare_grok = false;
+    var listed_bin = false;
+    for (spec.home_rel_dirs) |rel| {
+        if (std.mem.eql(u8, rel, ".grok/config.toml")) listed_config = true;
+        if (std.mem.eql(u8, rel, ".grok")) listed_bare_grok = true;
+        if (std.mem.eql(u8, rel, ".grok/bin") or std.mem.startsWith(u8, rel, ".grok/bin/")) listed_bin = true;
+    }
+    try std.testing.expect(listed_config);
+    try std.testing.expect(!listed_bare_grok);
+    try std.testing.expect(!listed_bin);
+
+    const paths = try collectHostConfigPaths(io, allocator, "grok", home);
+    defer freeHostConfigPaths(allocator, paths);
+    try std.testing.expect(paths.len >= 1);
+    var saw_config = false;
+    for (paths) |p| {
+        if (std.mem.endsWith(u8, p, "/.grok/config.toml")) saw_config = true;
+        try std.testing.expect(!std.mem.eql(u8, p, home));
+        try std.testing.expect(!std.mem.endsWith(u8, p, "/.grok"));
+        try std.testing.expect(!std.mem.endsWith(u8, p, "/.grok/bin"));
+        try std.testing.expect(!std.mem.endsWith(u8, p, "/.grok/worktrees"));
+        try std.testing.expect(!std.mem.endsWith(u8, p, "/.grok/worktrees/evil"));
+        try std.testing.expect(std.mem.indexOf(u8, p, "Library/Keychains") == null);
+    }
+    try std.testing.expect(saw_config);
+
+    // Official 1.0.4 install: config.toml is usable auth for the alias gate.
+    // ~/.grok/bin alone is not (install layout, not product config).
+    try std.testing.expect(hostConfigPresent(io, "grok", home));
+    try std.testing.expect(hostUsableAuthPresent(io, "grok", home));
+}
+
+test "hostUsableAuthPresent grok official config.toml not bin-only install" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var home_tmp = std.testing.tmpDir(.{});
+    defer home_tmp.cleanup();
+    const home = try home_tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(home);
+
+    try home_tmp.dir.createDirPath(io, ".grok/bin");
+    try home_tmp.dir.writeFile(io, .{
+        .sub_path = ".grok/bin/grok",
+        .data = "#!/bin/sh\n",
+    });
+    try std.testing.expect(!hostConfigPresent(io, "grok", home));
+    try std.testing.expect(!hostUsableAuthPresent(io, "grok", home));
+    try std.testing.expect(shouldFailClosedMissingAuth("grok", false, false, false));
+
+    try home_tmp.dir.writeFile(io, .{
+        .sub_path = ".grok/config.toml",
+        .data = "[cli]\nauto_update = false\n",
+    });
+    try std.testing.expect(hostConfigPresent(io, "grok", home));
+    try std.testing.expect(hostUsableAuthPresent(io, "grok", home));
+    try std.testing.expect(!shouldFailClosedMissingAuth("grok", false, false, true));
+}
+
+test "collectHostConfigWriteDenies includes grok 1.0.4 config.toml" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("HOME", "/Users/synthetic");
+
+    const paths = try collectHostConfigWriteDenies(io, allocator, "grok", "/tmp/ryk-grok-repro", &env_map);
+    defer freeHostConfigWriteDenies(allocator, paths);
+    try std.testing.expect(testingContainsPath(paths, "/Users/synthetic/.grok/config.toml"));
+    try std.testing.expect(testingContainsPath(paths, "/Users/synthetic/.grok/user-settings.json"));
+    for (paths) |p| {
+        try std.testing.expect(!std.mem.eql(u8, p, "/Users/synthetic"));
+        try std.testing.expect(!std.mem.eql(u8, p, "/Users/synthetic/.grok"));
+        try std.testing.expect(std.mem.indexOf(u8, p, "Library/Keychains") == null);
+    }
+}
+
 test "isForbiddenHostConfigPath rejects root home and ssh" {
     const home = "/Users/dev";
     try std.testing.expect(isForbiddenHostConfigPath("/", home));
@@ -1518,6 +1637,14 @@ test "hostLoginMaterialPresent requires credentials not only config dir for clau
     try std.testing.expect(isAgentHelpOrVersionOnly(&.{ "claude", "--version" }));
     try std.testing.expect(!isAgentHelpOrVersionOnly(&.{"claude"}));
     try std.testing.expect(!isAgentHelpOrVersionOnly(&.{ "claude", "-p", "x" }));
+    // Documented agent help is `ryk <host> -- --help`. Alias rewrite keeps the
+    // `--` separator in command_argv (`["grok", "--", "--help"]`). That must
+    // still be help-only so the empty-backpack login gate does not fire before
+    // attach (#194 Linux). Bare `--` is interactive, not help.
+    try std.testing.expect(isAgentHelpOrVersionOnly(&.{ "grok", "--", "--help" }));
+    try std.testing.expect(isAgentHelpOrVersionOnly(&.{ "grok", "--", "-h" }));
+    try std.testing.expect(!isAgentHelpOrVersionOnly(&.{ "grok", "--" }));
+    try std.testing.expect(!isAgentHelpOrVersionOnly(&.{ "grok", "--", "-p", "hi" }));
 
     // pi has no markers → config dir alone is enough.
     try home_tmp.dir.createDirPath(io, ".pi");
@@ -1554,6 +1681,10 @@ test "shouldFailClosedMissingAuth edge matrix is host-aware" {
     // Pi / hermes: config only (no gateway substitute).
     try std.testing.expect(shouldFailClosedMissingAuth("pi", true, true, false));
     try std.testing.expect(!shouldFailClosedMissingAuth("pi", false, false, true));
+
+    // Grok: no env-key gateway. Official ~/.grok/config.toml is usable auth.
+    try std.testing.expect(shouldFailClosedMissingAuth("grok", true, true, false));
+    try std.testing.expect(!shouldFailClosedMissingAuth("grok", false, false, true));
 }
 
 test "relHasUnsafeComponents rejects traversal" {

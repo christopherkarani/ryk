@@ -925,6 +925,106 @@ test "resolveHostIdentity trusts HOME/.grok downloads layout via link basename" 
     try std.testing.expectEqualStrings("grok", id.host.?);
 }
 
+// Issue #194: planted ./grok and /tmp/evil/grok must stay generic — the
+// config.toml grant is only for a trusted install identity, never a basename
+// spoof or tmp plant. ~/.grok/ itself is not a trusted prefix.
+test "resolveHostIdentity planted ./grok and /tmp/evil/grok stay generic" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var ws = std.testing.tmpDir(.{});
+    defer ws.cleanup();
+    const ws_path = try ws.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(ws_path);
+    {
+        const f = try ws.dir.createFile(io, "grok", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "#!/bin/sh\necho planted\n");
+        try ws.dir.setFilePermissions(io, "grok", @enumFromInt(0o755), .{});
+    }
+    const workspace_plant = try std.fs.path.join(allocator, &.{ ws_path, "grok" });
+    defer allocator.free(workspace_plant);
+
+    var home_tmp = std.testing.tmpDir(.{});
+    defer home_tmp.cleanup();
+    const home = try home_tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(home);
+    try home_tmp.dir.createDirPath(io, ".grok");
+    try home_tmp.dir.writeFile(io, .{
+        .sub_path = ".grok/config.toml",
+        .data = "[cli]\nauto_update = false\n",
+    });
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("HOME", home);
+    try env_map.put("PATH", "/usr/bin:/bin");
+    try env_map.put("TMPDIR", test_tmpdir_sentinel);
+
+    var ws_id = try resolveHostIdentity(io, allocator, workspace_plant, &env_map, .{
+        .workspace_root = ws_path,
+    });
+    defer ws_id.deinit(allocator);
+    try std.testing.expect(!ws_id.isTrusted());
+    try std.testing.expectEqualStrings("", ws_id.hostKey());
+    const ws_grants = try host_config_grants.collectHostConfigPaths(io, allocator, ws_id.hostKey(), home);
+    defer host_config_grants.freeHostConfigPaths(allocator, ws_grants);
+    try std.testing.expectEqual(@as(usize, 0), ws_grants.len);
+
+    var evil = std.testing.tmpDir(.{});
+    defer evil.cleanup();
+    {
+        const f = try evil.dir.createFile(io, "grok", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "#!/bin/sh\necho evil\n");
+        try evil.dir.setFilePermissions(io, "grok", @enumFromInt(0o755), .{});
+    }
+    const evil_plant = try evil.dir.realPathFileAlloc(io, "grok", allocator);
+    defer allocator.free(evil_plant);
+    var evil_id = try resolveHostIdentity(io, allocator, evil_plant, &env_map, .{
+        .workspace_root = ws_path,
+    });
+    defer evil_id.deinit(allocator);
+    try std.testing.expect(!evil_id.isTrusted());
+    try std.testing.expectEqualStrings("", evil_id.hostKey());
+    const evil_grants = try host_config_grants.collectHostConfigPaths(io, allocator, evil_id.hostKey(), home);
+    defer host_config_grants.freeHostConfigPaths(allocator, evil_grants);
+    try std.testing.expectEqual(@as(usize, 0), evil_grants.len);
+}
+
+test "resolveHostIdentity rejects grok planted under ~/.grok product home (not a trusted prefix)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var home_tmp = std.testing.tmpDir(.{});
+    defer home_tmp.cleanup();
+    const home = try home_tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(home);
+    try home_tmp.dir.createDirPath(io, ".grok/scratch");
+    try home_tmp.dir.writeFile(io, .{
+        .sub_path = ".grok/scratch/grok",
+        .data = "#!/bin/sh\necho planted\n",
+    });
+    try home_tmp.dir.setFilePermissions(
+        io,
+        ".grok/scratch/grok",
+        std.Io.File.Permissions.fromMode(0o755),
+        .{},
+    );
+    const planted = try std.fs.path.join(allocator, &.{ home, ".grok/scratch/grok" });
+    defer allocator.free(planted);
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("HOME", home);
+    try env_map.put("TMPDIR", test_tmpdir_sentinel);
+
+    var id = try resolveHostIdentity(io, allocator, planted, &env_map, .{});
+    defer id.deinit(allocator);
+    try std.testing.expect(!id.isTrusted());
+    try std.testing.expectEqualStrings("", id.hostKey());
+}
+
 test "resolveHostIdentity rejects binary under HOME/.grok/worktrees (not install layout)" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

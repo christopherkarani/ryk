@@ -1067,6 +1067,37 @@ test "codex system ro_paths compile narrow /etc/codex without bare /etc or HOME"
     try std.testing.expect(compiled.hasGrant("/Users/dev/.codex", .rw));
 }
 
+// Issue #194: grok 1.0.4 config load is the file ~/.grok/config.toml.
+// Parent ~/.grok is metadata-walk only (Seatbelt ancestor literals), never a
+// content grant. Receipt stays narrow host-config RW, no bare home.
+test "grok host-config file grant covers config.toml without bare home or keychain" {
+    const allocator = std.testing.allocator;
+    const home = "/Users/dev";
+    const ws = "/tmp/ryk-grok-repro";
+    const grok_config = "/Users/dev/.grok/config.toml";
+    var compiled = try compileProfile(allocator, .{
+        .workspace_root = ws,
+        .system_ro_prefixes = &[_][]const u8{ "/usr", "/bin" },
+        .host_rw_paths = &.{grok_config},
+        .control_roots = &.{grok_config},
+    });
+    defer compiled.deinit();
+
+    try std.testing.expect(compiled.hasGrant(grok_config, .rw));
+    try std.testing.expect(compiled.isGrantedReadable(grok_config));
+    try std.testing.expect(compiled.isControlPath(grok_config));
+    try std.testing.expect(!compiled.isAgentWritable(grok_config));
+    try std.testing.expect(!compiled.hasGrant("/Users/dev/.grok", .rw));
+    try std.testing.expect(!compiled.isGrantedReadable("/Users/dev/.grok/worktrees/evil"));
+    try std.testing.expect(!compiled.isGrantedReadable("/Users/dev/.grok/bin/grok"));
+    try std.testing.expect(!compiled.grantsHome(home));
+    try std.testing.expect(!compiled.isGrantedReadable("/Users/dev/Library/Keychains/login.keychain-db"));
+    try std.testing.expect(!compiled.isGrantedReadable("/Users/dev/.ssh/id_rsa"));
+    try std.testing.expect(compiled.has_host_config_rw);
+    const seatbelt_scope = compiled.effectiveFsScopeSummary(.seatbelt);
+    try std.testing.expect(std.mem.indexOf(u8, seatbelt_scope, "narrow host-config RW, no bare home") != null);
+}
+
 test "host config host_rw_paths compile as RW without HOME or ssh" {
     const allocator = std.testing.allocator;
     const home = "/Users/dev";

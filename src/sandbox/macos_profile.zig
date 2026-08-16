@@ -1157,6 +1157,36 @@ test "SBPL path-walk ancestor metadata for Data-volume Users workspace (M-28)" {
     try std.testing.expect(std.mem.indexOf(u8, sbpl, "(allow file-read* (subpath \"/Users/dev/projects/app\"))") != null);
 }
 
+// Issue #194: Seatbelt must content-grant the file grok 1.0.4 opens
+// (~/.grok/config.toml) and emit ancestor metadata so path-walk can lstat
+// ~/.grok. Must not content-grant bare HOME, ~/.grok/, or Keychain.
+test "SBPL grok config.toml grant covers file plus parent-walk metadata" {
+    const allocator = std.testing.allocator;
+    const grok_config = "/Users/dev/.grok/config.toml";
+    var compiled = try profile.compileProfile(allocator, .{
+        .workspace_root = "/tmp/ryk-grok-repro",
+        .system_ro_prefixes = &[_][]const u8{ "/usr", "/bin" },
+        .host_rw_paths = &.{grok_config},
+        .control_roots = &.{grok_config},
+    });
+    defer compiled.deinit();
+
+    const sbpl = try renderSbplWithOptions(allocator, &compiled, .{
+        .write_deny_literals = &.{grok_config},
+    });
+    defer allocator.free(sbpl);
+
+    try std.testing.expect(std.mem.indexOf(u8, sbpl, "(allow file-read* (subpath \"/Users/dev/.grok/config.toml\"))") != null);
+    // Parent-walk: metadata-only on ~/.grok (and HOME) so open(config.toml) can
+    // lstat intermediates. Not a content grant on those ancestors.
+    try std.testing.expect(std.mem.indexOf(u8, sbpl, "(allow file-read-metadata (literal \"/Users/dev/.grok\"))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sbpl, "(allow file-read-metadata (literal \"/Users/dev\"))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sbpl, "(allow file-read* (subpath \"/Users/dev/.grok\"))\n") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sbpl, "(allow file-read* (subpath \"/Users/dev\"))") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sbpl, "Library/Keychains") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sbpl, "(deny file-write* (literal \"/Users/dev/.grok/config.toml\"))") != null);
+}
+
 test "SBPL host config host_rw_paths emit subpath RW without bare HOME" {
     const allocator = std.testing.allocator;
     const claude_cfg = "/Users/dev/.claude";
