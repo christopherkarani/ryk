@@ -15,7 +15,7 @@ set -eu
 #   RYK_BASE_URL       Override release base URL
 #   RYK_ARTIFACT_DIR Offline install from a local dist/ folder
 #   RYK_INSTALL_FORCE=1 Allow overwriting a non-product file at the destination
-#   RYK_INSTALL_QUIET=1 Suppress non-error UI (still installs; prints activation line)
+#   RYK_INSTALL_QUIET=1 Suppress non-error UI (still installs; no leftover homework)
 #   RYK_INSTALL_SKIP_ONBOARD=1  Skip post-install ensure
 #   RYK_RELEASE_PUBKEY   Override the release signing key (testing only)
 #   RYK_INSTALL_ALLOW_UNSIGNED=1  Accept checksum-only trust (announced, not silent)
@@ -39,7 +39,7 @@ if [ -f "$0" ] 2>/dev/null; then
 fi
 
 # ── Presentation ─────────────────────────────────────────────────────────────
-# Brand + named steps + activation hero. Quiet / NO_COLOR / pipe degrade cleanly.
+# Brand + named steps + optional host hint. Quiet / NO_COLOR / pipe degrade cleanly.
 # Glyphs align with src/tui/render.zig (active/done use success green).
 
 QUIET=0
@@ -173,9 +173,9 @@ reject_symlink_parents() {
   reject_symlink_components "$(dirname "$checked_path")" "$checked_label"
 }
 
-# Contract: /^    eval / — always printed, including quiet.
-print_activation() {
-  printf '    eval "$(%s env)"\n' "$1"
+# Optional one-line next step. Not homework: no eval / doctor --fix.
+print_host_hint() {
+  printf '    ryk claude\n'
 }
 
 # ── Release signing ──────────────────────────────────────────────────────────
@@ -831,12 +831,9 @@ ensure_resource_root_entry() {
 # previous_version may be empty (fresh), a semver (upgrade/reinstall), or "installed".
 print_success() {
   previous_version="$1"
-  quoted_destination="$2"
-  missing_dashboard="$3"
-  onboarding_ran="${4:-0}"
+  missing_dashboard="$2"
 
   if [ "$QUIET" -eq 1 ]; then
-    print_activation "$quoted_destination"
     return 0
   fi
 
@@ -853,12 +850,7 @@ print_success() {
   fi
 
   printf '\n'
-  print_activation "$quoted_destination"
-
-  if [ "$onboarding_ran" -eq 0 ]; then
-    printf '\n'
-    printf '    ryk doctor --fix --from-install\n'
-  fi
+  print_host_hint
 
   if [ "$missing_dashboard" -eq 1 ]; then
     printf '\n'
@@ -1019,7 +1011,6 @@ summarize_ensure_receipt() {
   printf '%s' "policy ready · hosts configured · verify deferred"
 }
 
-ONBOARDING_RAN=0
 ENSURE_MODE=doctor_fix
 if [ "${RYK_INSTALL_SKIP_ONBOARD:-0}" != "1" ]; then
   step_active "Set up protection"
@@ -1061,7 +1052,6 @@ Re-run the installer after resolving the host integration error."
   fi
   _ensure_detail="$(summarize_ensure_receipt "$TMP_DIR/.onboarding.out")"
   step_done "Set up protection" "$_ensure_detail"
-  ONBOARDING_RAN=1
 fi
 
 MISSING_DASHBOARD=0
@@ -1069,4 +1059,4 @@ if [ ! -d "$RESOURCE_ROOT/ryk-dashboard-ui" ]; then
   MISSING_DASHBOARD=1
 fi
 
-print_success "$PREVIOUS_VERSION" "$(shell_quote "$DESTINATION")" "$MISSING_DASHBOARD" "$ONBOARDING_RAN"
+print_success "$PREVIOUS_VERSION" "$MISSING_DASHBOARD"

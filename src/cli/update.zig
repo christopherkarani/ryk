@@ -548,11 +548,9 @@ pub fn command(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: an
         });
     } else if (verified) {
         try stdout.print("\n✅ Update complete: ryk {s} → {s}\n", .{ current, target });
-        try stdout.writeAll("If hosts need rewiring after a major change, run: ryk start\n");
     } else {
         try stdout.print("\n⚠ Installer finished, but could not confirm ryk {s} on PATH.\n", .{target});
         try stdout.writeAll("Open a new shell and run: ryk version\n");
-        try stdout.writeAll("If hosts need rewiring after a major change, run: ryk start\n");
     }
     return exit_codes.success;
 }
