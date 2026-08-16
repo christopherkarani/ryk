@@ -1515,6 +1515,7 @@ test "P0 honesty: default help and help --all omit hide-list and unfinished P0; 
     try std.testing.expect(!helpListsPeerCommand(top, "allow-once"));
     try std.testing.expect(!helpListsPeerCommand(top, "allow"));
     try std.testing.expect(!helpListsPeerCommand(top, "unallow"));
+    try std.testing.expect(!helpListsPeerCommand(top, "hook-serve"));
 
     writer = .fixed(&buf);
     try writeAll(std.testing.io, &writer);
@@ -1532,6 +1533,7 @@ test "P0 honesty: default help and help --all omit hide-list and unfinished P0; 
     try std.testing.expect(helpListsPeerCommand(all, "packs"));
     try std.testing.expect(helpListsPeerCommand(all, "allowlist"));
     try std.testing.expect(helpListsPeerCommand(all, "allow-once"));
+    try std.testing.expect(!helpListsPeerCommand(all, "hook-serve"));
 
     // Explicit full-text: root --all must not teach daemon allowlist wording or
     // promote allow/unallow shortcuts in Common-tasks / remediation copy.
@@ -1615,4 +1617,13 @@ test "cloud help is a localhost dashboard alias and does not sell a control plan
     const rendered = help_writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, rendered, "ryk cloud") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "dashboard --view terminal") != null);
+}
+
+test "hook-serve is hidden and has --help text" {
+    const info = findCommand("hook-serve") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(info.hidden);
+    var buf: [4096]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try std.testing.expect(try writeCommand(std.testing.io, &writer, "hook-serve"));
+    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "ryk hook-serve") != null);
 }

@@ -462,3 +462,148 @@ test "host matrix helpers still compile against server types" {
     try std.testing.expectEqualStrings("ryk-hook-v1", hook_ipc.protocol_label);
     try std.testing.expectEqual(exit_codes.success, @as(u8, 0));
 }
+
+test "version mismatch falls back to in-process allow" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(dir);
+    const sock = try std.fs.path.join(std.testing.allocator, &.{ dir, "mismatch-fallback.sock" });
+    defer std.testing.allocator.free(sock);
+
+    const hang = try startMismatchServer(sock);
+    defer stopHangServer(sock, hang);
+
+    const grok_payload = try readFile(std.testing.allocator, grok_safe);
+    defer std.testing.allocator.free(grok_payload);
+    const run = try runRykHook(
+        std.testing.allocator,
+        &.{ ryk_bin, "hook", "grok", "PreToolUse" },
+        grok_payload,
+        sock,
+    );
+    defer std.testing.allocator.free(run.stdout);
+    defer std.testing.allocator.free(run.stderr);
+    try std.testing.expectEqual(@as(u8, 0), run.code);
+    const decision = try parseDecision(std.testing.allocator, run.stdout);
+    defer std.testing.allocator.free(decision);
+    try std.testing.expectEqualStrings("allow", decision);
+}
+
+test "one server serves evaluate allow" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(dir);
+    const sock = try std.fs.path.join(std.testing.allocator, &.{ dir, "evaluate.sock" });
+    defer std.testing.allocator.free(sock);
+    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+
+    const server = try startServer(sock);
+    defer stopServer(sock, server);
+
+    const payload = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"schema_version\":1,\"request_id\":\"req-1\",\"kind\":\"shell_command\",\"command\":\"git status\",\"cwd\":\"{s}\",\"source\":{{\"host\":\"pi\",\"tool_name\":\"bash\",\"mode\":\"tui\",\"session_id\":\"pi-session-42\"}}}}",
+        .{cwd},
+    );
+    defer std.testing.allocator.free(payload);
+    const req = try hook_ipc.stringifyRequest(std.testing.allocator, .{
+        .id = 1,
+        .method = "evaluate",
+        .workspace = cwd,
+        .payload_json = payload,
+    });
+    defer std.testing.allocator.free(req);
+    const raw = try exchange(std.testing.allocator, sock, req);
+    defer std.testing.allocator.free(raw);
+    var parsed = try hook_ipc.parseResponse(std.testing.allocator, raw);
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u8, 0), parsed.response.exit);
+    const decision = try parseDecision(std.testing.allocator, parsed.response.stdout);
+    defer std.testing.allocator.free(decision);
+    try std.testing.expectEqualStrings("allow", decision);
+}
+
+test "one server serves cursor allow" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(dir);
+    const sock = try std.fs.path.join(std.testing.allocator, &.{ dir, "cursor.sock" });
+    defer std.testing.allocator.free(sock);
+
+    const server = try startServer(sock);
+    defer stopServer(sock, server);
+
+    const payload = try readFile(std.testing.allocator, "tests/plugin-fixtures/cursor/before_shell_execution_command_safe.json");
+    defer std.testing.allocator.free(payload);
+    const req = try hook_ipc.stringifyRequest(std.testing.allocator, .{
+        .id = 1,
+        .method = "hook",
+        .host = "cursor",
+        .event = "beforeShellExecution",
+        .payload_json = payload,
+    });
+    defer std.testing.allocator.free(req);
+    const raw = try exchange(std.testing.allocator, sock, req);
+    defer std.testing.allocator.free(raw);
+    var parsed = try hook_ipc.parseResponse(std.testing.allocator, raw);
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u8, 0), parsed.response.exit);
+}
+
+fn startMismatchServer(sock: []const u8) !struct { stop: *std.atomic.Value(bool), thread: std.Thread } {
+    const stop = try std.testing.allocator.create(std.atomic.Value(bool));
+    stop.* = std.atomic.Value(bool).init(false);
+    const thread = try std.Thread.spawn(.{}, acceptMismatchLoop, .{ sock, stop });
+    errdefer {
+        stop.store(true, .unordered);
+        if (daemon_uds.connectUnixSocket(sock)) |fd| {
+            _ = std.c.close(fd);
+        } else |_| {}
+        thread.join();
+        std.testing.allocator.destroy(stop);
+    }
+    try waitForSocket(sock, 50);
+    return .{ .stop = stop, .thread = thread };
+}
+
+fn acceptMismatchLoop(socket_path: []const u8, stop: *std.atomic.Value(bool)) void {
+    const parent = std.fs.path.dirname(socket_path) orelse return;
+    std.Io.Dir.cwd().createDirPath(std.testing.io, parent) catch {};
+    const listen_fd = daemon_uds.bindListenUnixSocket(socket_path, 8) catch return;
+    defer {
+        _ = std.c.close(listen_fd);
+        daemon_uds.unlinkUnixSocketPath(socket_path);
+    }
+    while (!stop.load(.unordered)) {
+        var fds = [_]std.posix.pollfd{.{
+            .fd = listen_fd,
+            .events = 0x0001,
+            .revents = 0,
+        }};
+        _ = std.posix.poll(fds[0..], 50) catch continue;
+        if (fds[0].revents & 0x0001 == 0) continue;
+        var addr: std.c.sockaddr.un = undefined;
+        var addr_len: u32 = @sizeOf(std.c.sockaddr.un);
+        const client_fd = std.c.accept(listen_fd, @ptrCast(&addr), &addr_len);
+        if (client_fd < 0) continue;
+        defer _ = std.c.close(client_fd);
+        const line = hook_ipc.readLineFd(std.testing.io, std.heap.page_allocator, client_fd, 200) catch continue;
+        defer std.heap.page_allocator.free(line);
+        const resp = hook_ipc.stringifyResponse(std.heap.page_allocator, .{
+            .id = 1,
+            .exit = 2,
+            .stdout = "",
+            .stderr = "ryk hook-serve: version or binary mismatch",
+            .mismatch = true,
+        }) catch continue;
+        defer std.heap.page_allocator.free(resp);
+        hook_ipc.writeAllFd(std.testing.io, client_fd, resp, 200) catch {};
+    }
+}

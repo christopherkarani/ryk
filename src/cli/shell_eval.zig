@@ -2799,7 +2799,7 @@ test "session sticky map caps at 16 LRU entries" {
     try std.testing.expectEqual(@as(usize, session_sticky_map_cap), g_session_sticky_map.count());
 }
 
-test "empty session id shares the default sticky bucket" {
+test "empty session id shares the default session sticky bucket" {
     defer resetSessionStickyStoreForTests();
     resetSessionStickyStoreForTests();
     try std.testing.expect(getSessionStickyStore() == getSessionStickyStoreFor(""));
