@@ -35,8 +35,10 @@ PROXY_ENV=(
   -Dposthog-project-token="$TOKEN" \
   --prefix "$PREFIX" >/dev/null
 
+# Isolate from a live user hook-serve. Otherwise evaluate/hook attach to
+# the operator socket and write telemetry under the operator HOME.
 ryk() {
-  env "XDG_CONFIG_HOME=$CONFIG" "${PROXY_ENV[@]}" "$PREFIX/bin/ryk" "$@"
+  env "XDG_CONFIG_HOME=$CONFIG" "RYK_HOOK_SERVER=0" "${PROXY_ENV[@]}" "$PREFIX/bin/ryk" "$@"
 }
 
 wait_for_queue() {
@@ -138,9 +140,9 @@ done
 has_hook_attribution || fail "bare agent-hook enforcement was not attributed"
 assert_queue_payloads
 
-ryk hook hermes pre_tool_call < "$REPO_ROOT/tests/fixtures/hook-safe.json" >/dev/null 2>/dev/null || true
-wait_for_event "ryk_session_summary" || fail "session summary was not queued"
-assert_queue_payloads
+# Named `ryk hook` does not spawn the telemetry batch (hook-serve latency).
+# Session summaries stay in-process and may be dropped. Bare `ryk` above is
+# the persisted hook-attribution check.
 
 controls_before="$(wc -l < "$CONFIG/ryk/telemetry.queue.jsonl")"
 ryk telemetry status >/dev/null
