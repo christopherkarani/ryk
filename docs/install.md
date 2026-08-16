@@ -144,22 +144,21 @@ curl -fsSL https://rykanv.com/install | sh
 ```
 
 It downloads the matching GitHub Release archive, verifies `checksums.txt`,
-and installs the CLI and runtime assets. The
-installer runs `ryk doctor --fix --from-install`, which creates a coding
-default policy under `$HOME/.ryk/policy.yaml` and seeds the runtime user
-fallback at `~/.config/ryk/policy.yaml` (create-only; never overwrites). That
-user path is what `ryk <agent>` loads when a project has no local
-`.ryk/policy.yaml` — without it, uninited directories fell back to
-`builtin:strict` and could block host launches. The `packaging/` directory
-contains build and container inputs; it is not a user installation channel.
+and installs the CLI and runtime assets. The installer runs
+`ryk doctor --fix --from-install`, which creates a coding default policy
+under `$HOME/.ryk/policy.yaml` and seeds the runtime user fallback at
+`~/.config/ryk/policy.yaml` (create-only; never overwrites). `ryk <agent>`
+loads that user path when a project has no local `.ryk/policy.yaml`. The
+`packaging/` directory contains build and container inputs. It is not a
+user installation channel.
 
 ## macOS Notes
 
-macOS builds provide process supervision, environment filtering, staged writes, PATH/shell shims, MCP stdio proxying, audit/replay, and network policy decisions. Proxy route forcing is available per session when the proxy backend and OS sandbox attach are both active; proxy startup alone is not route forcing. OS filesystem isolation for protected agent children is available through the run engine (`ryk <agent>`; advanced flag: `ryk run --os-sandbox auto|on|off`) using Seatbelt on product majors **14–26** (capability/version gate). **CI attach evidence** is **linux amd64 (Landlock)**; Seatbelt attach is local. Doctor capability probes are not a live session claim; session-attach is proven only after child apply-before-exec succeeds.
+macOS sessions can attach Seatbelt OS filesystem isolation through `ryk <agent>` (advanced flag: `ryk run --os-sandbox auto|on|off`) on macOS 14–26. macOS builds also provide process supervision, environment filtering, staged writes, PATH/shell shims, MCP stdio proxying, audit/replay, and network policy decisions. Proxy route forcing is available per session when the proxy backend and OS sandbox attach are both active. Proxy startup alone is not route forcing. CI attach evidence is linux amd64 (Landlock). Seatbelt attach is local. `ryk doctor` capability probes are not a live session claim. Session attach is proven only after the child sandbox applies before exec succeeds.
 
 ## Linux Notes
 
-Linux builds use backend detection for namespace, seccomp, Landlock, cgroup, and process supervision capability. OS filesystem isolation for protected agent children is available through the run engine (`ryk <agent>`; advanced flag: `ryk run --os-sandbox auto|on|off`) using Landlock when the host supports **ABI ≥ 1** (kernel **5.13+**). **CI attach evidence** is currently **linux amd64**; other cells are local until freeze jobs exist. Doctor Landlock probes are capability evidence only and never alone authorize a session `active` claim. `--os-sandbox on` fails closed when attach cannot complete.
+Linux builds detect namespace, seccomp, Landlock, cgroup, and process supervision capability. OS filesystem isolation for protected agent children is available through the run engine (`ryk <agent>`; advanced flag: `ryk run --os-sandbox auto|on|off`) using Landlock when the host supports **ABI ≥ 3** (kernel **6.2+**). ABI 1/2 lack truncation mediation, so they do not attach; `--os-sandbox on` fails closed below that floor. CI attach evidence is linux amd64. Other cells are local until freeze jobs exist. Doctor Landlock probes are capability evidence only. They do not authorize a session `active` claim.
 
 ## Windows Notes
 

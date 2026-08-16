@@ -37,7 +37,7 @@ Hooks are useful integration points, but they cannot protect actions the host ne
 
 ## Versioning
 
-The repository release version is `1.2.11`. Versioned plugin manifests in the tree are checked against `VERSION` during release verification. Keep the CLI and plugin packages aligned when preparing a release.
+The repository release version is `0.2.19`. Versioned plugin manifests in the tree are checked against `VERSION` during release verification. Keep the CLI and plugin packages aligned when preparing a release.
 
 Official marketplace or registry availability is not recorded here. Check the relevant registry at release time instead of relying on a stale repository claim.
 

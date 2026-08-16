@@ -1,12 +1,6 @@
 # ryk Codex Plugin Integration
 
-This document describes the ryk Codex plugin, how to install it, and how to use it.
-
-## Overview
-
-The ryk Codex plugin is a local integration package that adds ryk skills and lifecycle hooks to Codex. It lives under `integrations/codex-plugin/` in the ryk repository.
-
-The plugin is a thin layer. All policy decisions are made by the ryk CLI. The plugin does not duplicate policy logic.
+The Codex plugin adds ryk skills and lifecycle hooks. It lives in `integrations/codex-plugin/`. The ryk CLI makes every policy decision; the plugin does not copy that logic.
 
 ## Prerequisites
 

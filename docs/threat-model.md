@@ -1,6 +1,6 @@
 # Threat model
 
-This document describes what ryk can protect and where its guarantees stop. The relevant question is always how the agent was launched and which enforcement surfaces are active on that host.
+Guarantees depend on how the agent was launched and which enforcement surfaces are active on that host.
 
 ## Assets
 

@@ -1,6 +1,6 @@
 # Red-team
 
-`ryk redteam` is a **fixture engine self-test**. It exercises ryk’s built-in redteam fixture suite against the internal **`builtin:redteam`** policy preset using **synthetic, in-process** attempts (Zig evaluators).
+`ryk redteam` is a fixture engine self-test. It runs the built-in fixture suite against the `builtin:redteam` preset. Attempts are synthetic and in-process (Zig evaluators).
 
 ## What it is
 
@@ -24,14 +24,14 @@ Current fixture categories include prompt injection, secret exfiltration, shell 
 ## Run
 
 ```sh
-./zig-out/bin/ryk redteam --ci
-./zig-out/bin/ryk redteam fixtures --fixture prompt-injection/readme-env-read --ci
+ryk redteam --ci
+ryk redteam fixtures --fixture prompt-injection/readme-env-read --ci
 ```
 
 ## JSON Output
 
 ```sh
-./zig-out/bin/ryk redteam --json --ci > redteam.json
+ryk redteam --json --ci > redteam.json
 ```
 
 JSON includes a top-level `provenance` object, for example:

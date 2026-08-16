@@ -27,14 +27,14 @@ Day-to-day verification after policy/CLI changes:
 ./scripts/zig build test        # full suite before merge/CI
 ```
 
-Coding agents must follow `AGENTS.md` → **Zig toolchain** and **Fast iteration**.
+For repo builds, use the toolchain notes in `AGENTS.md`.
 
 ## Command Not Found
 
-Build first or put the release binary on `PATH`:
+Install ryk or put the binary on `PATH`, then check it:
 
 ```sh
-./zig-out/bin/ryk version --json
+ryk version --json
 ```
 
 ## Policy Validation Errors
@@ -60,9 +60,9 @@ Run `ryk doctor`. If a feature is `limited`, `wrapper-only`, `observe-only`, or 
 
 ## Doctor vs session sandbox grade
 
-`ryk doctor` answers **“what can this host do?”** (capability probes). It never means a live agent session is attached (strong sandbox is demoted away from probe-only `active`).
+`ryk doctor` reports host capability. It does not mean a live session is attached. Doctor will not show strong sandbox as `active` from a probe alone.
 
-**This session’s** enforcement class is `RYK_SESSION_SANDBOX_GRADE` / the banner `Session grade:` line (`strong-mediated`, `fs-attached`, `wrapper-only`, `unrestricted-escape`). See `docs/platform-macos.md` and `docs/commands.md`.
+This session's enforcement class is `RYK_SESSION_SANDBOX_GRADE` and the banner `Session grade:` line (`strong-mediated`, `fs-attached`, `wrapper-only`, `unrestricted-escape`). See `docs/platform-macos.md` and `docs/commands.md`.
 
 ## Every Pi or Grok tool fail-closes with malformed JSON
 

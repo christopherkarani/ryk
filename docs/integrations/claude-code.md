@@ -1,12 +1,6 @@
 # ryk Claude Code Plugin Integration
 
-This document describes the ryk Claude Code plugin, how to install it, and how to use it.
-
-## Overview
-
-The ryk Claude Code plugin is a local integration package that adds ryk skills and lifecycle hooks to Claude Code. It lives under `integrations/claude-code-plugin/` in the ryk repository.
-
-The plugin is a thin layer. All policy decisions are made by the ryk CLI. The plugin does not duplicate policy logic.
+The Claude Code plugin adds ryk skills and lifecycle hooks. It lives in `integrations/claude-code-plugin/`. The ryk CLI makes every policy decision; the plugin does not copy that logic.
 
 ## Prerequisites
 
@@ -129,7 +123,7 @@ cat tests/plugin-fixtures/claude/pre_tool_use_command_safe.json \
   | ./zig-out/bin/ryk hook claude PreToolUse
 ```
 
-Expected: `allow` decision in valid JSON.
+Expected: valid JSON with `hookSpecificOutput.permissionDecision` set to `allow`.
 
 ### Run redteam
 
@@ -224,7 +218,7 @@ Grade: **hook**. Host-shaped deny works when Claude Code honors `permissionDecis
 
 ## Limitations
 
-- Tool-gate deny/ask is host-shaped hook output; enforcement still depends on Claude Code honoring `permissionDecision` (hook grade, not OS sandbox).
+- Tool-gate `deny` is host-shaped hook output. Claude Code must honor `permissionDecision` for the stop to land. Grade: hook.
 - The strongest protection is the process-level wrapper `ryk run -- <claude-code-command>` (the `ryk claude` launcher uses the same protected path).
 - Plugin installation is a preview/dry-run by default.
 - The plugin does not collect telemetry itself. Hook and machine-readable calls are excluded from release CLI telemetry; user-invoked CLI wrappers may record only the fixed pseudonymous metadata described in [`../telemetry.md`](../telemetry.md).

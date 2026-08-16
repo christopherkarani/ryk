@@ -102,7 +102,7 @@ Each protected spawn sets **`RYK_SESSION_SANDBOX_GRADE`** (and a banner line `Se
 
 **Doctor ≠ session:** `ryk doctor` reports host capability only (probe ≠ live attach; S-GLO-01). Read session grade from the run banner or child env.
 
-**P1–4 operator summary (host aliases):** network mediation by default; workspace `.git` + `.ryk` are OS control write-deny; Pi residual ask is permit unless `CI` / `RYK_UNATTENDED` / `RYK_CI` / `RYK_NONINTERACTIVE`; PATH denylist + `RYK_TOOL_PACK=essentials` under attach.
+On host aliases (`ryk pi`, `ryk claude`, …): network mediation is the default. Workspace `.git` and `.ryk` are OS write-deny control roots. Pi residual ask is permit unless `CI`, `RYK_UNATTENDED`, `RYK_CI`, or `RYK_NONINTERACTIVE`. Under attach, PATH uses the denylist and `RYK_TOOL_PACK=essentials`.
 
 **Escapes:** `--network open`, `RYK_AGENT_NETWORK_DEFAULT=legacy`, `RYK_TOOL_PACK=none`.
 

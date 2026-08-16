@@ -1,6 +1,6 @@
 # Local Dashboard
 
-ryk includes a local-first web dashboard for machine-wide activity and workspace drill-down.
+Open the local dashboard for machine-wide activity or a single workspace.
 
 ```sh
 ryk dashboard
@@ -8,9 +8,9 @@ ryk dashboard --view terminal
 ryk cloud
 ```
 
-`ryk dashboard` now opens the machine-wide view by default. It is no longer tied to the shell's current working directory, so it can be started from `~` or any other directory.
+`ryk dashboard` opens the machine-wide view. Start it from any directory, including `~`.
 
-`ryk cloud` is a thin alias for `ryk dashboard --view terminal`. It binds the same localhost dashboard on port 7742 and prints that URL. It is not a hosted control plane, and install does not start this UI.
+`ryk cloud` is an alias for `ryk dashboard --view terminal`. It binds the same localhost dashboard on port 7742 and prints that URL. It is not a hosted control plane, and install does not start this UI.
 
 Use an explicit workspace for policy, Secretless, integrations, and workspace-scoped actions:
 
@@ -39,7 +39,7 @@ By default it listens only on:
 http://127.0.0.1:7742
 ```
 
-The dashboard is a local control surface over existing ryk behavior. It does not replace the CLI, does not evaluate policy in frontend code, and does not add dashboard-specific accounts, cloud sync, or external services. Release builds may send the fixed pseudonymous CLI telemetry described in [the telemetry contract](telemetry.md); the dashboard has no separate telemetry surface.
+The dashboard calls existing ryk CLI and Core paths. It does not replace the CLI, evaluate policy in frontend code, or add dashboard-specific accounts, cloud sync, or external services. Release builds may send the fixed pseudonymous CLI telemetry described in [the telemetry contract](telemetry.md). The dashboard has no separate telemetry surface.
 
 ## Machine-Wide View
 

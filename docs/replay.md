@@ -11,16 +11,16 @@ ryk writes per-session artifacts under `.ryk/sessions/<session-id>/`.
 
 ## Commands
 
-Bare `ryk replay` loads the **last** session and highlights denied actions. No sessions yet → friendly empty state pointing at Safe Launch (`ryk start` then `ryk <agent>`).
+Bare `ryk replay` loads the last session and highlights denied actions. With no sessions, it prints: run `ryk start` then `ryk <agent>` (for example `ryk claude`).
 
 ```sh
-./zig-out/bin/ryk replay
-./zig-out/bin/ryk replay --json
-./zig-out/bin/ryk replay --only denied
-./zig-out/bin/ryk replay --verify
-./zig-out/bin/ryk replay --tui
-./zig-out/bin/ryk replay --session <id>
-./zig-out/bin/ryk replay --list
+ryk replay
+ryk replay --json
+ryk replay --only denied
+ryk replay --verify
+ryk replay --tui
+ryk replay --session <id>
+ryk replay --list
 ```
 
 ## Alt-screen timeline

@@ -16,7 +16,7 @@ Keep exploit details private until a fix or documented limitation is available. 
 
 ## Security scope
 
-ryk protects local agent runs that go through ryk-managed wrappers, shims, staging, policy checks, audit logging, and the stdio MCP proxy. It reduces blast radius and improves reviewability.
+ryk protects local agent runs that go through ryk-managed wrappers, shims, staging, policy checks, audit logging, and the stdio MCP proxy.
 
 ryk does not make arbitrary malicious code safe, and it does not provide universal transparent filesystem or network enforcement on every operating system. Use `ryk doctor` for local capability status and read the [compatibility matrix](docs/compatibility.md) before making an enforcement claim.
 

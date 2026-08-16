@@ -21,7 +21,7 @@
 
 **Local guardrails for coding agents.**
 
-Run Claude Code, Codex, Pi, OpenCode, Hermes, OpenClaw, or Grok through one local binary. ryk checks commands, files, secrets, network, and MCP actions before they hit your machine — allow / ask / deny / observe — and keeps the evidence on disk.
+Run Claude Code, Codex, Pi, OpenCode, Hermes, OpenClaw, or Grok through one local binary. ryk checks commands, files, secrets, network, and MCP actions before they hit your machine. Decisions are allow, ask, deny, or observe. Evidence stays on disk.
 
 <p align="center">
   <img src="docs/assets/ryk-deny-demo.gif" alt="ryk denying an OpenCode rm -rf / command" width="720">
@@ -96,8 +96,8 @@ The policy mode controls the response:
 | Mode | Behavior |
 | --- | --- |
 | `observe` | Record decisions without blocking supported actions |
-| `ask` | Prompt for risky actions when the host can resume them |
-| `strict` | Deny unknown or risky actions unless a rule allows them |
+| `ask` | Leftover unused policy ask is allow on coding hosts, including Grok and OpenClaw. There is no host ask UI. Unattended/CI hardens leftover ask to deny. |
+| `strict` | Block medium and high pack hits plus the hard fence. Off-list refuse applies only when `commands.allow` is configured. |
 | `ci` | Run strict behavior without prompts; `ask` becomes deny |
 
 Explicit deny rules take priority. Safety packs classify commands and effects, but they do not grant permission past a deny rule.
@@ -142,7 +142,7 @@ The launch aliases, host adapters, shell evaluator, and policy engine share one 
 1. A launch alias starts the agent with ryk's session defaults.
 2. Host adapters send shell and tool events to the evaluator.
 3. The evaluator combines policy rules, safety-pack matches, and the active mode.
-4. ryk allows, asks, observes, or denies the action.
+4. ryk allows, observes, or denies the action. Leftover unused policy ask is allow on coding hosts, including Grok and OpenClaw. Unattended and CI harden leftover ask to deny.
 5. The session records local evidence for the dashboard and replay commands.
 
 ## Dashboard
@@ -163,7 +163,7 @@ ryk dashboard --once
 
 ## Limits
 
-ryk is graded mediation, not a universal OS sandbox. It is macOS/Linux-first. Windows sessions run at wrapper/hook grade with no OS sandbox. Absolute-path binaries, non-shimmed tools, non-proxy traffic, and host hooks that do not fire can sit outside a particular enforcement surface. `ryk doctor` reports platform capability; it does not prove that a child session attached to an OS sandbox, and it cannot promote Windows to `OS-enforced`. Read the [compatibility matrix](docs/compatibility.md) and [threat model](docs/threat-model.md) before making a stronger claim.
+ryk is graded mediation: hook, wrapper, proxy, or OS-enforced. It is macOS/Linux-first. Windows sessions run at wrapper/hook grade with no OS sandbox. Absolute-path binaries, non-shimmed tools, non-proxy traffic, and host hooks that do not fire can sit outside a particular enforcement surface. `ryk doctor` reports platform capability. It does not prove that a child session attached to an OS sandbox, and it cannot promote Windows to `OS-enforced`. Read the [compatibility matrix](docs/compatibility.md) and [threat model](docs/threat-model.md) before making a stronger claim.
 
 Release builds include opt-in product telemetry: nothing is collected or sent unless you run `ryk telemetry enable`. See [docs/telemetry.md](docs/telemetry.md) for the exact payload contract.
 

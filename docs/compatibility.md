@@ -4,7 +4,7 @@ Use `ryk doctor` for the authoritative report on a specific machine. This matrix
 
 ## Protection grades (canonical)
 
-ryk is **graded mediation**, not a universal OS sandbox. Public product language uses these grades:
+Protection is graded by surface. Public product language uses these grades:
 
 | Grade | Meaning | Typical ryk surface |
 | --- | --- | --- |
@@ -15,7 +15,7 @@ ryk is **graded mediation**, not a universal OS sandbox. Public product language
 
 **Default public launch posture (`ryk <agent>`):** typically **`wrapper`**, plus optional OS filesystem session-attach through the run engine. Host **`hook`** applies only when hooks fire and honor veto. **`proxy`** applies only to traffic that traverses a ryk proxy. **`OS-enforced`** FS isolation requires a successful Landlock (Linux) or Seatbelt (macOS) attach for that child — not a doctor capability probe.
 
-**What can still bypass `wrapper` mediation:** absolute-path binaries outside the shim list (including `/bin/rm`), `command -p`, shell aliases/functions, nested absolute `node`/`python` exec, outer allowed `bash ./script` until a child hits a shimmed name, non-shimmed tools, agents started outside `ryk <agent>` / advanced run / hooks, non-proxy HTTP clients, non-firing host hooks, and direct syscalls. High-risk bare PATH names (`rm`, `mv`, `cp`, `chmod`, `dd`) are shimmed when the session installs PATH shims; that does **not** close absolute-path residual without process-exec policy (product Q3).
+**What can still bypass `wrapper` mediation:** absolute-path binaries outside the shim list (including `/bin/rm`), `command -p`, shell aliases/functions, nested absolute `node`/`python` exec, outer allowed `bash ./script` until a child hits a shimmed name, non-shimmed tools, agents started outside `ryk <agent>` / advanced run / hooks, non-proxy HTTP clients, non-firing host hooks, and direct syscalls. High-risk bare PATH names (`rm`, `mv`, `cp`, `chmod`, `dd`) are shimmed when the session installs PATH shims; that does **not** close the absolute-path residual without process-exec policy.
 
 ### Vocabulary map
 
@@ -33,7 +33,7 @@ Doctor / platform reports are **not** a second taxonomy. Map them to grades:
 | Host hooks that fire and honor veto | primarily `hook` (+ daemon for shell eval) | Depends on host install path; hooks alone are not process wrap |
 | Host aliases / advanced run engine / PATH shims | primarily `wrapper` | Not kernel firewall; absolute paths may bypass |
 
-Reserve marketing “firewall” / “maximum protection” for a **verified** multi-grade or **`OS-enforced`** posture. See also [threat-model.md](threat-model.md).
+Call a posture multi-grade or `OS-enforced` only when those surfaces actually attached. See also [threat-model.md](threat-model.md).
 
 ---
 
@@ -71,4 +71,4 @@ Reserve marketing “firewall” / “maximum protection” for a **verified** m
 
 **In-shim audit under OS attach (evidence honesty):** when a session attaches Seatbelt/Landlock, the control root (`.ryk`) is write-denied to the child *by design*, so PATH shims cannot append to the session audit log. The parent records this as an `audit_degraded` event at session end, and `ryk replay` / `ryk doctor` surface degraded sessions. If a shim instead finds the audit file unwritable while the control root is writable (tamper-shaped, e.g. `chmod 000 events.jsonl`), the shim **fails closed**: the allowed exec is denied rather than run unaudited.
 
-**Capability matrix vs CI attach evidence:** Landlock/Seatbelt version gates (Linux ABI ≥ 1; macOS product majors 14–26) describe **where attach may run**. Continuous **CI attach evidence** today is **linux amd64** only; Seatbelt and other OS/arch/major cells are local — do not treat every gated major as CI-proven.
+**Capability matrix vs CI attach evidence:** Landlock/Seatbelt version gates (Linux ABI ≥ 3; macOS product majors 14–26) describe **where attach may run**. Continuous **CI attach evidence** today is **linux amd64** only; Seatbelt and other OS/arch/major cells are local — do not treat every gated major as CI-proven.

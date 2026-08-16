@@ -1,10 +1,10 @@
 # Credential Guardrails
 
-ryk implements defense-in-depth credential protection across eight layers. This document describes how each layer works, what patterns are detected, and how to configure credential management.
+Credential protection uses eight layers. Each section below covers what it matches, what it blocks, and how to configure it.
 
 ## Overview
 
-When you run an AI agent through ryk, your environment variables, files, and network requests may contain sensitive credentials. ryk detects and protects these automatically—before they reach the agent process, before they are written to disk, and (for non-allowlisted destinations) before they leave your machine. **Allowlisted HTTPS** still completes by default: network exfiltration detection is **annotate/audit only** (findings are recorded; there is no config switch that denies allowlisted hosts for secret-like URL surfaces).
+Env vars, files, and network requests can carry credentials. ryk detects those values before they reach the child process, before they are written to disk, and (for non-allowlisted destinations) before they leave the machine. **Allowlisted HTTPS** still completes by default: network exfiltration detection is **annotate/audit only** (findings are recorded; there is no config switch that denies allowlisted hosts for secret-like URL surfaces).
 
 The protection layers are:
 
@@ -98,12 +98,12 @@ Before launching the agent process, ryk filters the environment variables based 
 | Mode | Behavior |
 |------|----------|
 | `strict` / `ci` / `redteam` | Removes all secret-like env vars. Only explicitly allowed vars pass through. |
-| `ask` | Removes secret-like vars unless explicitly allowed. Prompts for risky ones. |
+| `ask` | Follows `env.inherit`, `env.allow`, and deny patterns. Secret-like names are not force-stripped. There is no env prompt. |
 | `observe` | Passes all vars through but records redactions for audit. |
 
 ### Secret Boundary (empty backpack)
 
-**Trusted** agent-primary host launches enter the **empty-backpack** secret boundary by default when the resolved launch binary is a trusted install of a host-launch alias (`claude`, `codex`, `pi`, `opencode`, `openclaw`, `hermes`):
+**Trusted** agent-primary host launches enter the **empty-backpack** secret boundary by default when the resolved launch binary is a trusted install of a host-launch alias (`claude`, `codex`, `pi`, `opencode`, `openclaw`, `hermes`, `grok`):
 
 ```bash
 ryk claude
@@ -148,7 +148,7 @@ Inherited stdin/stdout/stderr (FDs 0/1/2) are user-directed, pre-opened capabili
 | Network proxy | CONNECT policy proxy is separate; current route-forced proxy + provider gateway combination fails closed |
 | OS sandbox | Required for empty backpack; Linux protect-on uses a FUSE workspace view + Landlock |
 
-The default applies only to the agent-primary aliases (`claude`, `codex`, `pi`, `opencode`, `openclaw`, and `hermes`). Generic `ryk run` commands remain unchanged unless `--secretless` is explicit. Unrelated raw credentials such as `GITHUB_TOKEN` remain absent inside the boundary.
+The default applies only to the agent-primary aliases (`claude`, `codex`, `pi`, `opencode`, `openclaw`, `hermes`, and `grok`). Generic `ryk run` commands remain unchanged unless `--secretless` is explicit. Unrelated raw credentials such as `GITHUB_TOKEN` remain absent inside the boundary.
 
 **Recommended day-1 agent path (usable credentials):**
 
@@ -285,7 +285,7 @@ credentials:
 
 ## 5. Network Exfiltration Detection
 
-**File**: `src/intercept/network.zig`
+**Files**: `src/policy/network_eval.zig` (exfil scoring), `src/intercept/proxy.zig` (CONNECT records findings; annotate/audit only).
 
 ryk scans **visible** network surfaces for secret-like values and flags potential exfiltration. Default policy is **annotate/audit only**: findings do not flip allowlisted destinations to deny. There is no body/query DLP on TLS without a MITM architecture (explicit non-goal).
 
@@ -342,7 +342,7 @@ network:
 
 **File**: `src/intercept/commands.zig`
 
-ryk classifies commands by risk and denies credential inspection attempts automatically.
+When a host hook or `ryk evaluate` sees the command, shell_engine denies exact `.env` peeks such as `cat .env` (hook grade). `cat` is not PATH-shimmed, so `/bin/cat` and agents started outside ryk bypass that surface.
 
 ### Credential Inspection Risk Class
 

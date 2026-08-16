@@ -55,7 +55,7 @@ The proxy forwards only an explicit allowlist of known-safe, side-effect-free me
 
 - `initialize` — protocol handshake
 - `ping` — keepalive (no params, no side effects; forwarded unaudited)
-- `notifications/*` — spec notification channel (forwarded, audited)
+- `notifications/initialized`, `notifications/cancelled`, `notifications/progress`, `notifications/message`, and `notifications/…/list_changed` are forwarded without policy gating. Other `notifications/*` methods, including vendor names such as `notifications/vendor.do`, are denied and audited.
 - `tools/list`, `resources/list`, `prompts/list` — read-only discovery (responses inspected/audited)
 
 Every other method is denied with a JSON-RPC error and an audited `mcp_unknown_method` deny event. This includes `completion/complete` (argument content would leave the client unmediated), `logging/setLevel` (server side effect), vendor/extension namespaces such as `vendor/private`, and any future spec method until it is reviewed and allowlisted. A request-shaped message without an `id` that is not a `notifications/*` method is likewise denied rather than forwarded.

@@ -8,7 +8,7 @@ ryk includes a network decision engine and wrapper/proxy-mediated hooks.
 
 - `off`: deny network decisions.
 - `allowlist`: allow only configured destinations.
-- `ask`: ask interactively where supported.
+- `ask`: leftover ask for unmatched destinations. CI and off convert it to deny. Proxy 403s leftover ask. Coding hosts permit leftover ask. Custom ryk run stays decision_only unless you pass --network-backend proxy.
 - `observe`: log decisions.
 - `open`: allow decisions (and, for host aliases, **unrestricted OS egress**).
 
@@ -20,7 +20,7 @@ ryk includes a network decision engine and wrapper/proxy-mediated hooks.
 
 ## Agent host defaults
 
-Host aliases (`ryk pi`, `ryk claude`, `ryk codex`, `ryk opencode`, `ryk openclaw`, `ryk hermes`) default to **mediated** network:
+Host aliases (`ryk pi`, `ryk claude`, `ryk codex`, `ryk opencode`, `ryk openclaw`, `ryk hermes`, `ryk grok`) default to **mediated** network:
 
 1. Policy mode **allowlist** (when `--network` is omitted)
 2. Network **backend = proxy**
@@ -111,7 +111,7 @@ The `credentials.use` value is a reference name for policy, audit, and external 
 
 - **UDP / QUIC / WebRTC** are not day-one route-forced on either platform (Landlock leaves UDP unrestricted; Seatbelt proxy-port rules are TCP-oriented).
 - Pre-existing connections outside the child process are out of scope.
-- Tools that ignore `HTTP(S)_PROXY` still cannot dial arbitrary TCP hosts when route-force is active; absolute `/usr/bin/curl` is covered by OS rules, not shim theater.
+- Tools that ignore `HTTP(S)_PROXY` still cannot dial arbitrary TCP hosts when route-force is active. Absolute `/usr/bin/curl` is covered by those OS rules.
 
 ## Exfiltration Heuristics
 
@@ -154,7 +154,7 @@ Adapters emit **hostnames only**. They prefer literal hosts from approved URL fi
 
 **Soft-drop sinks:** paste/webhook/tunnel hosts from the shared `network_eval` table never auto-grant (live adapter and managed load).
 
-**Residual (auth trust / DNS):** pi/opencode config dirs remain agent-writable for OAuth refresh. Novel multi-label non-sink hosts from custom `baseUrl` still auto-merge (URL-divergence support). Hostname-class deny does not re-check post-DNS peer address — a discovered name that later resolves to private/IMDS is a known residual; mitigate with catalog-only auto-merge or proxy post-resolve deny (follow-up). Operators can authority write-deny auth paths or pin allows only via `policy.yaml`.
+**Residual (auth trust / DNS):** pi/opencode config dirs remain agent-writable for OAuth refresh. Novel multi-label non-sink hosts from custom `baseUrl` still auto-merge (URL-divergence support). Discovery hostname-class deny matches the hostname string only and does not resolve DNS. A novel custom baseUrl host can still auto-merge onto the allowlist. Proxy-mediated connects re-check every DNS answer and deny private, IMDS, and loopback unless network.allow lists the class token or exact IP. Operators can authority write-deny auth paths or pin allows only via `policy.yaml`.
 
 **Deferred residuals:** interactive post-refresh host summary on `ryk start` (DIS-6 optional P1); pi `models.json` / models-store URL harvest (follow-up unit).
 

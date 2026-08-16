@@ -1,129 +1,97 @@
-# Quickstart (Safe Launch)
+# Quickstart
 
-Protected agent in a few minutes. Taught path only — no parallel setup/quickstart doors.
+Use the installed `ryk` command. For install methods, see [install.md](install.md).
 
-## 1. Build Or Install
+## 1. Start protection
 
-From a clean checkout:
+From the workspace you want protected:
 
 ```sh
-./scripts/zig version   # must show 0.16.0
-./scripts/zig build
-./zig-out/bin/ryk version --json
+ryk start
 ```
 
-The repository is pinned to Zig `0.16.0` (use `./scripts/zig` or `direnv allow` if system `zig` differs). After policy or CLI changes, run `./scripts/test-fast.sh`; run `./scripts/zig build test` before opening a PR. Release installs are covered in [install.md](install.md).
+`ryk start` creates `.ryk/policy.yaml` when missing, wires detected hosts, and checks readiness. On an interactive terminal it asks which detected hosts to enable. It then prints next steps.
 
-For a release install, use the checksum-verified curl installer in [install.md](install.md), then continue from step 2 with `ryk` (or `ryk` alias) on your `PATH`.
-
-## 2. Get Protected
+Non-interactive:
 
 ```sh
-./zig-out/bin/ryk start
+ryk start --auto
+ryk start --auto --hosts claude,codex
 ```
 
-`ryk start` onboards a workspace:
-
-- creates `.ryk/policy.yaml` when missing (`generic-agent` / DCG strict)
-- wires host integrations
-- verifies core readiness
-- prints next steps: run an agent, then `doctor` / `scan` / `replay`
-
-Non-interactive / CI-friendly:
+## 2. Launch an agent
 
 ```sh
-./zig-out/bin/ryk start --auto
-./zig-out/bin/ryk start --auto --hosts claude,codex
+ryk claude
+# or: codex | pi | opencode | openclaw | hermes | grok
 ```
 
-Public peers `ryk setup` / `ryk setup` and quickstart are removed — use `ryk start`. Power/CI scaffolding may still use advanced commands via `ryk help --all`.
+Host aliases use the run engine with `--os-sandbox auto`; no `--os-sandbox` flag is required. The OS filesystem sandbox attaches when Seatbelt (macOS majors 14–26) or Landlock (ABI ≥ 3) can complete child apply-before-exec. `auto` degrades if no backend plan exists. Doctor probes are capability only.
 
-## 3. Diagnose readiness
+Leftover unused policy ask is allow on coding hosts, including Claude, Codex, OpenCode, Pi, Hermes, Grok, and OpenClaw. There is no host ask UI. Unattended or CI hardens leftover ask to deny. Once / Session / Never is the `ryk run -- <command>` TTY prompt.
+
+Session artifacts land under `.ryk/sessions/<session-id>/`. On a successful macOS Seatbelt attach the session banner includes `seatbelt_profile=hardened` (or the grade you chose).
+
+Custom commands and CI automation still use the run engine:
 
 ```sh
-./zig-out/bin/ryk doctor
+ryk run -- echo hello
+ryk run --ci -- ./scripts/agent-task.sh
+```
+
+Absolute paths, non-shimmed binaries, non-proxy traffic, and hooks that do not fire can sit outside a given enforcement surface. Grades: [compatibility.md](compatibility.md#protection-grades-canonical).
+
+## 3. Check readiness
+
+```sh
+ryk doctor
 ```
 
 `ryk doctor` reports policy, host integrations, capabilities, packs, and a recommended next step. Use `ryk doctor --check` in automation (non-zero when core readiness fails).
 
-## 4. Run A Protected Agent
-
-Host aliases are the taught launch path (OS filesystem sandbox attaches automatically when the host supports it — no `--os-sandbox` flag required):
+## 4. Replay the last session
 
 ```sh
-./zig-out/bin/ryk claude
-# or: codex | pi | opencode | openclaw | hermes
+ryk replay
 ```
 
-When a risky action needs approval, interactive sessions offer **Once** / **Session** / **Never** (no rule ids required). Session is in-memory for this ryk process; it is not a permanent allowlist write. Host-UI allow is not a ryk sticky write. Session artifacts land under `.ryk/sessions/<session-id>/`. On a successful macOS Seatbelt attach the session banner includes `seatbelt_profile=hardened` (or the grade you chose). Verify host capability with `ryk doctor` (capability ≠ live session).
-
-Custom commands and CI automation still use the advanced run engine (not the day-1 agent launch path):
+Bare `ryk replay` loads the last session and highlights denied actions.
 
 ```sh
-./zig-out/bin/ryk run -- echo hello
-./zig-out/bin/ryk run --ci -- ./scripts/agent-task.sh
-```
-
-ryk is graded mediation, not a universal sandbox. Absolute paths, non-shimmed binaries, non-proxy traffic, and non-firing host hooks can still bypass. Canonical grades: [compatibility.md](compatibility.md#protection-grades-canonical).
-
-## 5. Replay The Last Session
-
-```sh
-./zig-out/bin/ryk replay
-```
-
-Bare `ryk replay` loads the **last** session and highlights denied actions. Useful flags:
-
-```sh
-./zig-out/bin/ryk replay --only denied
-./zig-out/bin/ryk replay --verify
-./zig-out/bin/ryk replay --list
+ryk replay --only denied
+ryk replay --verify
+ryk replay --list
 ```
 
 `--verify` checks the tamper-evident hash chain. If there are no sessions yet, replay points you back to `ryk start` then `ryk <agent>`.
 
-## 6. Stop Protection
+## 5. Stop protection
 
 ```sh
-./zig-out/bin/ryk stop
+ryk stop
 ```
 
-Removes host plugin registrations; binary and policy stay. Restart later with `ryk start`.
+Removes host plugin registrations. Binary and policy stay. Restart later with `ryk start`.
 
-## 7. Optional: Explain, Dashboard, CI, Red-team
+## 6. Optional: explain and dashboard
 
-Explain a destructive command without executing it (same shell engine hooks use):
+Explain a destructive command without executing it:
 
 ```sh
-./zig-out/bin/ryk explain "rm -rf /"
+ryk explain "rm -rf /"
 ```
 
 Local dashboard:
 
 ```sh
-./zig-out/bin/ryk dashboard
-./zig-out/bin/ryk cloud
+ryk dashboard
 ```
 
-Open `http://127.0.0.1:7742` for health, policy, sessions, and denials. `ryk cloud` is a thin alias for `ryk dashboard --view terminal` on that same localhost bind. Optional; uses existing CLI/Core paths. Install does not start this UI. An empty Terminal feed stays empty unless you pass `--demo`.
+Open `http://127.0.0.1:7742` for health, policy, sessions, and denials. Install does not start this UI.
 
-CI readiness and packs (advanced):
+See `ryk help --all` for CI, packs, and red-team.
 
-```sh
-./zig-out/bin/ryk policy packs
-./zig-out/bin/ryk policy apply-pack team-ci --force
-./zig-out/bin/ryk ci check --format markdown
-```
-
-Engine self-test fixtures (not your workspace policy):
-
-```sh
-./zig-out/bin/ryk redteam --ci
-```
-
-Safety reports are free (`ryk report`; export with `--format markdown|json`). See `ryk help --all` for the full command surface.
-
-## Next Steps
+## Next steps
 
 - Full CLI surface: `ryk help --all`
 - Policies: [policy.md](policy.md)

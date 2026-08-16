@@ -14,19 +14,19 @@ Commands accept `--policy <path>`. Without it, ryk discovers policy in this orde
 If a discovered policy file exists but is invalid or unreadable, ryk fails closed instead of silently falling through to the next location.
 
 ```sh
-./zig-out/bin/ryk init --preset generic-agent
-./zig-out/bin/ryk policy check .ryk/policy.yaml
-
-> **Quick-install note**: Coding defaults (`generic-agent` and coding host presets) use **DCG-style** gating: `mode: strict`, empty `commands.allow` (matrix-only), `commands.default: allow`, network `default: deny`, broad secret read denys, dual-path .git/.ryk protection. Normal work is not ask-gated; packs/hard fence block danger. Designed to be edited after init. See the "What to expect" guidance in quickstart.md.
+ryk init --preset generic-agent
+ryk policy check .ryk/policy.yaml
 ```
+
+After `ryk init --preset generic-agent` (and the coding host presets), policy is `mode: strict` with an empty `commands.allow`, `commands.default: allow`, network `default: deny`, broad secret-read denys, and write denies on `.git` / `.ryk`. Everyday shell work continues. Packs and the hard fence still block danger. Edit the file after init. See [quickstart.md](quickstart.md).
 
 ## Modes
 
 - `observe`: log decisions without blocking supported actions.
-- `ask`: prompt for risky actions when interactive.
-- `yolo`: **YOLO + seatbelt** — first-class mode for autonomous agent work. Uses the same severity matrix as `ask` (low continues; medium/high may prompt; not refuse-all). The agent continues under sandbox (Seatbelt/Landlock when session-attached) plus the hard fence. Prefer `yolo` over treating “ask on everything” as the hero path. Built-in preset: `ryk policy check --preset yolo` / `mode: yolo` in YAML.
-- `strict`: deny unknown or risky actions unless allowed. When a shell **permit-list is configured** for Strict evaluation (`commands.allow` / host permit), commands **off** that list are **refused** (deny, never ask-spam); reason includes `strict: not on allowlist`. On-list does **not** auto-allow high/medium pack hits — the severity matrix still applies after the refuse gate. With an **empty / unconfigured** permit list, Strict keeps the severity matrix only (not refuse-all-off-list).
-  - **Coding create-path (DCG):** `generic-agent` and coding host presets ship **empty** `commands.allow` + `commands.default: allow` under `mode: strict`. Unmatched shell is not approval-gated; high/medium pack hits **block** (never ask); critical stays hard-fenced. Catastrophe `commands.deny` patterns remain. This is intentional — not the sample permit list used by `strict-local` / `yolo` / `ask` built-ins.
+- `ask`: leftover unused policy ask is allow on coding hosts, including Grok and OpenClaw. There is no host ask UI. Unattended/CI hardens leftover ask to deny. Once / Session / Never is the `ryk run` TTY prompt only.
+- `yolo`: same severity matrix as `ask`: low continues, medium warns and continues, and high/unknown is leftover policy ask (coding hosts permit that leftover; unattended hardens it to deny). Plus sandbox (Seatbelt/Landlock when session-attached) and the hard fence. Inspect the built-in body with `ryk policy check --preset yolo`, or set `mode: yolo` in YAML.
+- `strict`: Block medium and high pack hits plus the hard fence. Off-list refuse applies only when `commands.allow` is configured. When a shell permit list is configured (`commands.allow` / host permit), commands off that list are refused (reason: `strict: not on allowlist`). A listed command still goes through the severity matrix after that refuse gate. With an empty or unconfigured permit list, Strict uses the severity matrix only.
+  - **Coding presets:** `generic-agent` and coding host presets ship empty `commands.allow` plus `commands.default: allow` under `mode: strict`. Unmatched shell runs without an approval prompt. High and medium pack hits **block**. Critical stays hard-fenced. Catastrophe `commands.deny` patterns remain. Built-in `strict-local`, `yolo`, and `ask` still ship a sample `commands.allow` list.
   - **Sample permit lists:** built-in `strict` / `yolo` / `ask` / `strict-local` still carry a curated `commands.allow` sample. Unquoted `&&` chains are on-list only when **every** segment matches; pipelines, sequencing, redirects, newlines, background, and `$()` / backticks stay off-list.
 - `ci`: non-interactive strict behavior; ask becomes deny.
 - `redteam`: strict fixture mode for deterministic tests (strict-like permit refuse when a list is configured).
@@ -48,7 +48,7 @@ After an interactive **ask** that the user allows, ryk can record sticky trust s
 
 Sticky state is **in-memory for the session** only. Critical and hard-fence denies are **never** recorded as sticky allows.
 
-**Host-owned sticky limitation (A5):** FM sticky scope hints (`ask_sticky_candidate` → suggested once/session/effect-class) apply only when ryk itself observes the ask→allow transition in-process — notably `ryk run` / shim paths that call `recordStickyFromAskWithHints` after the user approves. Claude, Codex, Pi, and similar host UIs that approve **outside** ryk do **not** automatically feed that allow back into the ryk sticky store unless the host integration explicitly records it (e.g. by calling the same sticky record path). Sticky session trust remains **in-memory for the process session only** — a new ryk process starts with an empty sticky store.
+**Host-owned sticky limitation:** FM sticky scope hints (`ask_sticky_candidate` suggesting once, session, or effect-class) apply only when ryk itself sees the ask-to-allow transition in-process, mainly `ryk run` and shim paths after the user approves. Claude, Codex, Pi, and similar host UIs that approve outside ryk do not write that allow into the ryk sticky store unless the host integration records it. Sticky session trust stays **in-memory for the process session only**. A new ryk process starts with an empty sticky store.
 
 ### Shell evaluation order
 
@@ -118,7 +118,7 @@ swift run fm-steward classify --card Fixtures/timeout_forced.json --human
 
 #### YOLO few-ask (`mode: yolo`)
 
-YOLO uses the **same severity matrix as `ask`** (low continues; medium/high may prompt) plus sandbox when session-attached — it is **not** refuse-all and **not** allow-all. Hard fence still denies catastrophe. On Mac, FM soft seatbelt may still upgrade soft continue → **ask** for hard-danger residuals (assist only).
+YOLO uses the same severity matrix as `ask`: low continues, medium warns and continues, and high/unknown is leftover policy ask (coding hosts permit that leftover; unattended hardens it to deny). Plus sandbox when session-attached. Hard fence still denies catastrophe. On Mac, FM soft seatbelt may still upgrade soft continue → **ask** for hard-danger residuals (assist only).
 
 `ryk evaluate` takes no `--mode` flag: mode comes from the **discovered** policy (`.ryk/policy.yaml` → user config → built-ins), and `RYK_MODE` may only **raise** strictness (never ambient-soften). Put `mode: yolo` in the workspace policy first (or use a policy that already has it), then run shell v1 evaluate shapes. Hosts must read the JSON `decision` field (`ask` is exit 0).
 
@@ -141,7 +141,7 @@ printf '%s' "{\"schema_version\":1,\"kind\":\"shell_command\",\"command\":\"rm -
 # does not soft-mode a strict discovered policy.
 ```
 
-Same matrix via host hook (Claude-shaped shell PreToolUse) when the host/session resolves `yolo` (prefer `ryk run` session mode, or operator-softened bare hook — bare hooks floor to strict unless intentionally softened):
+Same matrix via host hook (Claude-shaped shell PreToolUse) when the discovered policy has `mode: yolo`. `ryk run` inherits that policy mode when you omit `--mode`. `ryk run --mode` accepts only observe, ask, strict, and ci. Bare agent-hooks floor to strict unless the operator sets `RYK_ALLOW_MODE_SOFTEN`:
 
 ```sh
 printf '%s' '{"tool_name":"Bash","tool_input":{"command":"echo hello"}}' \
@@ -165,7 +165,7 @@ printf '%s' '{"schema_version":1,"hook_event_name":"PreToolUse","tool_name":"Bas
 
 Strict off-list refuse (WP4, independent of FM): with `mode: strict` and a configured `commands.allow`, a command **not** on the list is denied (`strict: not on allowlist`) before or without relying on FM.
 
-**Host PreToolUse authority (Grok, Pi, Claude, Codex):** shell gate decisions come from product **`ryk hook`** (hard fence → sticky → strict refuse → matrix; no FM). **`ryk evaluate`** is the same stack plus Mac FM assist. **`ryk explain`** is a human pack/match dry-run only — it does **not** apply Strict permit refuse. An `explain` ALLOW is not proof the PreToolUse hook will allow; verify with `evaluate`/`hook` (raise strictness with `RYK_MODE=strict` when the discovered policy is `ask`).
+**Host PreToolUse authority (Grok, Claude, Codex):** shell gate decisions come from product **`ryk hook`**. Pi is extension-only (`ryk evaluate` / bundled extension); it is not a hook host. **`ryk evaluate`** is the same stack plus Mac FM assist. **`ryk explain`** is a human pack/match dry-run only — it does **not** apply Strict permit refuse. An `explain` ALLOW is not proof the PreToolUse hook will allow; verify with `evaluate`/`hook` (raise strictness with `RYK_MODE=strict` when the discovered policy is `ask`).
 
 ## Priority
 
@@ -470,7 +470,7 @@ CI never prompts. `ask` decisions become `deny`.
 
 ## Common Workflows
 
-- Start coding: `ryk init --preset generic-agent` (DCG-style: matrix-only strict + allow default; packs/hard fence block danger; not ask-on-risk).
+- Start coding: `ryk init --preset generic-agent` (`mode: strict`, empty permit list, `commands.default: allow`; packs and the hard fence block danger).
 - YOLO + seatbelt local autonomy: set `mode: yolo` (or `ryk policy check --preset yolo`) so the agent continues under sandbox + hard fence with the ask severity matrix + sample permit body.
 - Strict local work with off-list refuse: `--preset strict-local` (`mode: strict` with a sample `commands.allow` permit list — off-list refuse when the host wires that list into shell evaluation).
 - MCP development: `--preset mcp-dev` (same coding DCG body as generic-agent).

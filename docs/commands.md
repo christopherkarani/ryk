@@ -56,7 +56,7 @@ git push --force
 
 ## Approvals
 
-Interactive Ask mode prompts in plain language: **Once** (this invocation), **Always** (this session), **Never** (deny). No rule ids required for day-1 recovery. Advanced CLI fallbacks (`ryk allow-once`, allowlist) remain when the prompt is gone — see `ryk help --all`. CI mode never prompts; ask becomes deny.
+`ryk run` on a TTY prompts Once (this invocation), Session (this ryk process), Never (deny). Coding hosts have no ask UI. Leftover unused policy ask is permit unless unattended or CI. When that prompt is gone, use `ryk allow-once` or the allowlist (`ryk help --all`). CI never prompts; ask becomes deny.
 
 ## Shims And Wrappers
 

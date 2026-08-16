@@ -108,7 +108,7 @@ The useful decision statuses are not uniform across commands:
 | test | 0 | 2 for a denied command |
 | run | The child exit code when the child exits normally | 3 for a ryk denial; signal and supervision failures use the CLI failure paths |
 | decide | 0 for allow | 3 block, 7 ask, 8 warn |
-| evaluate | 0 allow | 2 deny, 3 evaluator failure, 64 invalid input, 1 unexpected internal error |
+| evaluate | 0 for allow, observe, or ask. Hosts must read the JSON decision field. | 2 deny, 3 evaluator failure, 64 invalid input, 1 unexpected internal error |
 | doctor --check | 0 when the readiness check passes | 1 when core readiness fails |
 
 Usage errors normally return 2. Do not write an integration that treats every nonzero result as a policy deny. Read the JSON decision or the command-specific contract.
@@ -297,7 +297,7 @@ printf '%s\n' "{\"schema_version\":1,\"kind\":\"shell_command\",\"command\":\"gi
   ryk evaluate --json --stdin
 ~~~
 
-It writes its response to stdout for valid decisions and typed input errors. The tested exit contract is 0 allow, 2 deny, 3 evaluator failure (including invalid, empty, or unreadable discovered policy), 64 invalid input, and 1 unexpected internal error. Missing policy files still fall back to builtin strict. Non-shell evaluation is not supported by this API.
+It writes its response to stdout for valid decisions and typed input errors. evaluate exit 0 is for allow, observe, or ask. Hosts must read the JSON decision field. Exit 2 is deny, 3 evaluator failure (including invalid, empty, or unreadable discovered policy), 64 invalid input, 1 unexpected internal error. Missing policy files still fall back to builtin strict. Non-shell evaluation is not supported by this API.
 
 ### decide
 

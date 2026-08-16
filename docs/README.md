@@ -4,7 +4,7 @@ The docs describe the current CLI and its limits. When a platform detail matters
 
 ## Start here
 
-- [Install](install.md): source builds, checksum-verified curl installs, release archives, and platform notes.
+- [Install](install.md): checksum-verified curl installer, source builds, release archives, and platform notes.
 - [Quickstart](quickstart.md): create a policy, launch an agent, inspect a session, and stop protection.
 - [CLI reference](cli-reference.md): verified commands, output contracts, exit statuses, and integration boundaries.
 - [Commands](commands.md): command guard, shims, session grades, and known bypasses.
