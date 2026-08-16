@@ -1,6 +1,7 @@
 const std = @import("std");
 const exit_codes = @import("exit_codes.zig");
 const hook_client = @import("hook_client.zig");
+const host_ask_resume = @import("host_ask_resume.zig");
 
 /// Exact host names that rewrite to `ryk run -- <host> …`.
 /// Canonical allowlist for dispatch, help, and completions.
@@ -106,6 +107,10 @@ pub fn tryDispatch(
         return exit_codes.success;
     }
     hook_client.prewarmBestEffort(io, allocator);
+    if (try host_ask_resume.formatWarn(allocator, &.{command})) |ask_warn| {
+        defer allocator.free(ask_warn);
+        try stderr.print("ryk: {s}\n", .{ask_warn});
+    }
     const run_argv = try buildRunArgv(allocator, command, rest);
     defer allocator.free(run_argv);
     return try runFn(io, environ_map, run_argv, stdout, stderr);
@@ -257,7 +262,7 @@ test "tryDispatch returns null for non-aliases and rewrites aliases" {
     // tryDispatch type-checks stdout.print on the help branch, so void `{}`
     // no longer instantiates (bare --help landed in #163).
     var stdout_buf: [64]u8 = undefined;
-    var stderr_buf: [64]u8 = undefined;
+    var stderr_buf: [512]u8 = undefined;
     var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
     var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
 
@@ -316,6 +321,44 @@ test "tryDispatch returns null for non-aliases and rewrites aliases" {
     try std.testing.expectEqualStrings("--", Capture.seen0);
     try std.testing.expectEqualStrings("pi", Capture.seen1);
     try std.testing.expectEqualStrings("exec", Capture.seen2);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "host-dependent") != null);
+}
+
+test "host_ask_resume tryDispatch warns when host hard-blocks ask with no resume" {
+    const allocator = std.testing.allocator;
+    var environ_map = std.process.Environ.Map.init(allocator);
+    defer environ_map.deinit();
+
+    var stdout_buf: [64]u8 = undefined;
+    var stderr_buf: [512]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+
+    const code = try tryDispatch(
+        allocator,
+        "opencode",
+        &.{},
+        struct {
+            fn run(
+                _: std.Io,
+                _: *const std.process.Environ.Map,
+                _: []const []const u8,
+                _: anytype,
+                _: anytype,
+            ) !u8 {
+                return 0;
+            }
+        }.run,
+        std.testing.io,
+        &environ_map,
+        &stdout_writer,
+        &stderr_writer,
+    );
+    try std.testing.expectEqual(@as(u8, 0), code.?);
+    const err = stderr_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, err, "opencode") != null);
+    try std.testing.expect(std.mem.indexOf(u8, err, "hard-blocks ask with no resume") != null);
+    try std.testing.expect(std.mem.indexOf(u8, err, "host-decision-mapping.md") != null);
 }
 
 test "tryDispatch intercepts bare --help before rewriting to run" {

@@ -120,7 +120,7 @@ pub const EvaluateOptions = struct {
 /// Empty command is a no-op allow (matches oracle). Registry init failure → deny.
 /// When `options.trace` is non-null, records real timed pipeline steps for explain.
 ///
-/// Order (plan §4.1): allow-once exact → permanent kind=command FULL ALLOW →
+/// Order: allow-once exact → permanent kind=command FULL ALLOW →
 /// packs with permanent kind=rule as skip-this-rule only (E8).
 /// Legacy `options.allowlists` Layered remains a separate pre-pack short-circuit
 /// for engine unit tests — not the product permanent API.
@@ -207,7 +207,7 @@ pub fn evaluateCommand(allocator: std.mem.Allocator, command: []const u8, option
     if (has_heredoc and !is_herestring_only and !isExecutingContext(trimmed)) {
         masked_storage = try maskNonExecutingHeredoc(allocator, trimmed);
         const working = masked_storage.?;
-        try candidates.append(allocator, working);
+        try appendUniqueCandidate(allocator, &candidates, working);
         try appendSegments(allocator, &candidates, working);
     } else {
         // Prefer per-segment evaluation so assignment values and safe prefixes
@@ -216,21 +216,19 @@ pub fn evaluateCommand(allocator: std.mem.Allocator, command: []const u8, option
         try appendSegments(allocator, &candidates, trimmed);
         if (candidates.items.len == 0) {
             // No separators — evaluate the whole line.
-            try candidates.append(allocator, trimmed);
+            try appendUniqueCandidate(allocator, &candidates, trimmed);
         } else if (candidates.items.len == 1) {
             // A lone segment can be a truncated view of the line (e.g. comment
             // handling dropped the tail). Evaluate the full original string as
             // well so a truncated candidate is never the only thing checked.
-            if (!std.mem.eql(u8, candidates.items[0], trimmed)) {
-                try candidates.append(allocator, trimmed);
-            }
+            try appendUniqueCandidate(allocator, &candidates, trimmed);
         } else {
             // Multi-segment: still include a sanitized full-string candidate for
             // spanning patterns, with assignment RHS masked.
             const masked_assign = try maskAssignmentValues(allocator, trimmed);
             if (masked_storage == null) {
                 masked_storage = masked_assign;
-                try candidates.append(allocator, masked_storage.?);
+                try appendUniqueCandidate(allocator, &candidates, masked_storage.?);
             } else {
                 allocator.free(masked_assign);
             }
@@ -239,7 +237,7 @@ pub fn evaluateCommand(allocator: std.mem.Allocator, command: []const u8, option
         if (isExecutingContext(trimmed)) {
             embeds_owned = try normalize.extractEmbeds(allocator, trimmed);
             for (embeds_owned) |e| {
-                try candidates.append(allocator, e);
+                try appendUniqueCandidate(allocator, &candidates, e);
                 try appendSegments(allocator, &candidates, e);
             }
         }
@@ -389,7 +387,7 @@ fn collectPermanentRuleSkipIds(
     }
 }
 
-/// Plan §4.1 step 1: exact allow-once hit before permanent/packs.
+/// Step 1: exact allow-once hit before permanent/packs.
 ///
 /// Product law (operator break-glass): allow-once MAY FULL ALLOW a critical pack
 /// hit after the operator redeems a deny-panel short code. Permanent kind=command
@@ -511,7 +509,7 @@ fn isSandboxHomeStoreAccessError(err: anyerror) bool {
     return err == error.AccessDenied or err == error.PermissionDenied;
 }
 
-/// Plan §4.1 step 2: permanent kind=command exact → FULL ALLOW pre-pack.
+/// Step 2: permanent kind=command exact → FULL ALLOW pre-pack.
 /// Critical hard fence: permanent kind=command cannot unlock a critical pack hit.
 fn tryPermanentCommand(
     allocator: std.mem.Allocator,
@@ -1168,11 +1166,19 @@ fn unwrapPipeWrappers(stage: []const u8) []const u8 {
     return rest;
 }
 
+fn appendUniqueCandidate(allocator: std.mem.Allocator, candidates: *std.ArrayList([]const u8), cand: []const u8) !void {
+    if (cand.len == 0) return;
+    for (candidates.items) |existing| {
+        if (std.mem.eql(u8, existing, cand)) return;
+    }
+    try candidates.append(allocator, cand);
+}
+
 fn appendSegments(allocator: std.mem.Allocator, candidates: *std.ArrayList([]const u8), cmd: []const u8) !void {
     const segs = try segments.splitCommandSegments(cmd, allocator);
     defer segments.freeSegments(allocator, segs);
     for (segs) |s| {
-        try candidates.append(allocator, s);
+        try appendUniqueCandidate(allocator, candidates, s);
     }
 }
 
@@ -1891,6 +1897,24 @@ test "evaluateCommand denies compound safe then destructive" {
     try std.testing.expect(eval.decision == .deny);
 }
 
+test "appendUniqueCandidate skips exact duplicates and empty" {
+    var list: std.ArrayList([]const u8) = .empty;
+    defer list.deinit(std.testing.allocator);
+    try appendUniqueCandidate(std.testing.allocator, &list, "rm -rf /");
+    try appendUniqueCandidate(std.testing.allocator, &list, "rm -rf /");
+    try appendUniqueCandidate(std.testing.allocator, &list, "");
+    try appendUniqueCandidate(std.testing.allocator, &list, "git status");
+    try std.testing.expectEqual(@as(usize, 2), list.items.len);
+    try std.testing.expectEqualStrings("rm -rf /", list.items[0]);
+    try std.testing.expectEqualStrings("git status", list.items[1]);
+}
+
+test "evaluateCommand still denies duplicate destructive segments" {
+    var eval = try evaluateCommand(std.testing.allocator, "rm -rf /; rm -rf /", .{});
+    defer eval.deinit(std.testing.allocator);
+    try std.testing.expect(eval.decision == .deny);
+}
+
 test "evaluateCommand denies sudo wrapper" {
     var eval = try evaluateCommand(std.testing.allocator, "sudo git reset --hard", .{});
     defer eval.deinit(std.testing.allocator);
@@ -2413,9 +2437,7 @@ test "phase2 credentials cat-env Mode A" {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// s-engine — plan §4.1 evaluate order (RED until implementer wires pipeline)
-//
-// Contract pinned for implementer (mod.zig + registry.zig exclusive):
+// s-engine evaluate order
 //
 // EvaluateOptions (distinct permanent API — NOT `allowlists` / Layered):
 //   .permanent_allowlist: ?allowlist_store.Store = null
@@ -2794,7 +2816,7 @@ test "s-engine: kind=rule is not pre-pack FULL ALLOW for unrelated destructive p
 
 test "s-engine: allow-once may FULL ALLOW critical (operator break-glass); permanent cannot" {
     // Product law: permanent is hard-fenced for critical; allow-once after operator
-    // redeem is the intentional single-use recovery path (help.zig / plan §4.1).
+    // redeem is the intentional single-use recovery path (help.zig evaluate order).
     const cmd = "git reset --hard HEAD";
 
     const store = sEnginePermanentStore(&.{

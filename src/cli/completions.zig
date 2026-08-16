@@ -389,7 +389,7 @@ test "completions scope flags to their owning command" {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 1 TDD: completions must stay in sync with help.commands (written FIRST)
+// Completions must stay in sync with help.commands.
 // ---------------------------------------------------------------------------
 
 test "completions include every public help command" {

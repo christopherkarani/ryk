@@ -425,7 +425,7 @@ fn fakeStats(_: std.Io, argv: []const []const u8, stdout: anytype, _: anytype) !
 }
 
 // ---------------------------------------------------------------------------
-// Phase 7 Task D: --live alt-screen view (rejection contracts + the pure
+// --live alt-screen view (rejection contracts + the pure
 // argv builder; the raw TTY loop is manual-verify per the prompt.zig:19 note).
 // ---------------------------------------------------------------------------
 

@@ -33,6 +33,17 @@ pub const pending_rotation_grace_secs: i64 = 300;
 pub const pending_file_name = "pending_exceptions.jsonl";
 pub const allow_once_file_name = "allow_once.jsonl";
 
+/// Test-only: number of durable allow-once rewrites in this process.
+var test_allow_once_writes: usize = 0;
+
+pub fn resetTestAllowOnceWriteCount() void {
+    test_allow_once_writes = 0;
+}
+
+pub fn testAllowOnceWriteCount() usize {
+    return test_allow_once_writes;
+}
+
 pub const ScopeKind = enum {
     cwd,
     project,
@@ -1217,6 +1228,7 @@ fn writeAllowOnceFile(
     path: []const u8,
     entries: []const AllowOnceEntry,
 ) !void {
+    if (builtin.is_test) test_allow_once_writes += 1;
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(gpa);
     for (entries) |e| {
@@ -2264,6 +2276,69 @@ test "s3-once-store: match with consume=false leaves single-use entry intact" {
 
     const d = try matchAllowOnce(io, allocator, paths.allow_once, "git reset --hard HEAD", "/repo", fixed_now, true);
     try testing.expect(d == null);
+}
+
+test "P001: consume is a single allow-once rewrite" {
+    // tryAllowOnce must not load+rewrite twice. matchAllowOnce(consume=true)
+    // is the single durable pass; rewrite+fsync stays (do not drop).
+    var tmp = try tmpRoot();
+    defer {
+        allocator.free(tmp.path);
+        tmp.dir.cleanup();
+    }
+    const paths = try storePaths(tmp.path);
+    defer {
+        allocator.free(paths.pending);
+        allocator.free(paths.allow_once);
+    }
+
+    var issued = try issuePending(
+        io,
+        allocator,
+        paths.pending,
+        "git reset --hard HEAD",
+        "/repo",
+        "p001 single rewrite",
+        fixed_now,
+        true,
+    );
+    defer issued.deinit(allocator);
+    const entry = try redeem(
+        io,
+        allocator,
+        paths.pending,
+        paths.allow_once,
+        issued.redeem_code,
+        fixed_now,
+        .cwd,
+        "/repo",
+    );
+    freeAllowOnceEntry(allocator, entry);
+
+    resetTestAllowOnceWriteCount();
+    const first = try matchAllowOnce(
+        io,
+        allocator,
+        paths.allow_once,
+        "git reset --hard HEAD",
+        "/repo",
+        fixed_now,
+        true,
+    );
+    try testing.expect(first != null);
+    if (first) |h| freeAllowOnceEntry(allocator, h);
+    try testing.expectEqual(@as(usize, 1), testAllowOnceWriteCount());
+
+    const second = try matchAllowOnce(
+        io,
+        allocator,
+        paths.allow_once,
+        "git reset --hard HEAD",
+        "/repo",
+        fixed_now,
+        true,
+    );
+    try testing.expect(second == null);
 }
 
 test "s3-once-store: list revoke clear on allow-once store" {
