@@ -589,8 +589,10 @@ is_ryk_product_binary() {
   _ryk_id_out=""
   if command -v timeout >/dev/null 2>&1; then
     _ryk_id_out="$(timeout 2 "$_ryk_id_path" version --json 2>/dev/null || true)"
+  elif command -v perl >/dev/null 2>&1; then
+    _ryk_id_out="$(perl -e 'alarm 2; exec @ARGV' "$_ryk_id_path" version --json 2>/dev/null || true)"
   else
-    _ryk_id_out="$("$_ryk_id_path" version --json 2>/dev/null || true)"
+    return 1
   fi
   printf '%s' "$_ryk_id_out" | grep -E -q '"product"[[:space:]]*:[[:space:]]*"ryk"'
 }
