@@ -505,42 +505,64 @@ fn loadRecentFromPath(
     };
 }
 
-fn parseFeedRecord(allocator: std.mem.Allocator, line: []const u8, fallback_workspace_root: ?[]const u8) !rust_visibility.RustShellFeedRecord {
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
-    defer parsed.deinit();
-    if (parsed.value != .object) return error.InvalidFeedRecord;
+const FeedRecordJson = struct {
+    timestamp: []const u8,
+    workspace_root: ?[]const u8 = null,
+    event_type: []const u8,
+    decision: []const u8,
+    decision_source: []const u8,
+    event_source: []const u8,
+    host: ?[]const u8 = null,
+    daemon_status: []const u8,
+    pack_id: ?[]const u8 = null,
+    rule: ?[]const u8 = null,
+    severity: ?[]const u8 = null,
+    reason: []const u8,
+    remediation: ?[]const u8 = null,
+    target_summary: []const u8,
+    session_id: ?[]const u8 = null,
+    verified: bool = false,
+};
 
-    const object = parsed.value.object;
-    const timestamp = try dupRequiredString(allocator, object, "timestamp");
+fn parseFeedRecord(allocator: std.mem.Allocator, line: []const u8, fallback_workspace_root: ?[]const u8) !rust_visibility.RustShellFeedRecord {
+    // Typed parse avoids a json.Value object map + per-field lookups (#402).
+    const parsed = std.json.parseFromSlice(FeedRecordJson, allocator, line, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    }) catch return error.InvalidFeedRecord;
+    defer parsed.deinit();
+    const v = parsed.value;
+
+    const timestamp = try allocator.dupe(u8, v.timestamp);
     errdefer allocator.free(timestamp);
-    const workspace_root = try dupWorkspaceRoot(allocator, object, fallback_workspace_root);
+    const workspace_root = try dupWorkspaceRoot(allocator, v.workspace_root, fallback_workspace_root);
     errdefer allocator.free(workspace_root);
     validateFeedWorkspaceRoot(workspace_root) catch return error.InvalidFeedRecord;
-    const event_type = try dupRequiredString(allocator, object, "event_type");
+    const event_type = try allocator.dupe(u8, v.event_type);
     errdefer allocator.free(event_type);
-    const decision = try dupRequiredString(allocator, object, "decision");
+    const decision = try allocator.dupe(u8, v.decision);
     errdefer allocator.free(decision);
-    const decision_source = try dupRequiredString(allocator, object, "decision_source");
+    const decision_source = try allocator.dupe(u8, v.decision_source);
     errdefer allocator.free(decision_source);
-    const event_source = try dupRequiredString(allocator, object, "event_source");
+    const event_source = try allocator.dupe(u8, v.event_source);
     errdefer allocator.free(event_source);
-    const host = try dupOptionalString(allocator, object, "host");
+    const host = try dupeOptional(allocator, v.host);
     errdefer if (host) |value| allocator.free(value);
-    const daemon_status = try dupRequiredString(allocator, object, "daemon_status");
+    const daemon_status = try allocator.dupe(u8, v.daemon_status);
     errdefer allocator.free(daemon_status);
-    const pack_id = try dupOptionalString(allocator, object, "pack_id");
+    const pack_id = try dupeOptional(allocator, v.pack_id);
     errdefer if (pack_id) |value| allocator.free(value);
-    const rule = try dupOptionalString(allocator, object, "rule");
+    const rule = try dupeOptional(allocator, v.rule);
     errdefer if (rule) |value| allocator.free(value);
-    const severity = try dupOptionalString(allocator, object, "severity");
+    const severity = try dupeOptional(allocator, v.severity);
     errdefer if (severity) |value| allocator.free(value);
-    const reason = try dupRequiredString(allocator, object, "reason");
+    const reason = try allocator.dupe(u8, v.reason);
     errdefer allocator.free(reason);
-    const remediation = try dupOptionalString(allocator, object, "remediation");
+    const remediation = try dupeOptional(allocator, v.remediation);
     errdefer if (remediation) |value| allocator.free(value);
-    const target_summary = try dupRequiredString(allocator, object, "target_summary");
+    const target_summary = try allocator.dupe(u8, v.target_summary);
     errdefer allocator.free(target_summary);
-    const session_id = try dupOptionalString(allocator, object, "session_id");
+    const session_id = try dupeOptional(allocator, v.session_id);
     errdefer if (session_id) |value| allocator.free(value);
     if (session_id) |value| {
         // Reject path segments before aggregate joins session_id into a filesystem
@@ -563,12 +585,17 @@ fn parseFeedRecord(allocator: std.mem.Allocator, line: []const u8, fallback_work
         .remediation = remediation,
         .target_summary = target_summary,
         .session_id = session_id,
-        .verified = readBoolField(object, "verified"),
+        .verified = v.verified,
     };
 }
 
-fn dupWorkspaceRoot(allocator: std.mem.Allocator, object: std.json.ObjectMap, fallback: ?[]const u8) ![]u8 {
-    if (try dupOptionalString(allocator, object, "workspace_root")) |root| return root;
+fn dupeOptional(allocator: std.mem.Allocator, value: ?[]const u8) !?[]u8 {
+    const text = value orelse return null;
+    return try allocator.dupe(u8, text);
+}
+
+fn dupWorkspaceRoot(allocator: std.mem.Allocator, from_record: ?[]const u8, fallback: ?[]const u8) ![]u8 {
+    if (from_record) |root| return allocator.dupe(u8, root);
     if (fallback) |root| return allocator.dupe(u8, root);
     return error.InvalidFeedRecord;
 }
@@ -588,24 +615,6 @@ fn validateFeedWorkspaceRoot(value: []const u8) !void {
         }
         if (std.mem.eql(u8, part, "..") or std.mem.eql(u8, part, ".")) return error.InvalidFeedRecord;
     }
-}
-
-fn dupRequiredString(allocator: std.mem.Allocator, object: std.json.ObjectMap, field: []const u8) ![]u8 {
-    const value = object.get(field) orelse return error.InvalidFeedRecord;
-    if (value != .string) return error.InvalidFeedRecord;
-    return try allocator.dupe(u8, value.string);
-}
-
-fn dupOptionalString(allocator: std.mem.Allocator, object: std.json.ObjectMap, field: []const u8) !?[]u8 {
-    const value = object.get(field) orelse return null;
-    if (value == .null) return null;
-    if (value != .string) return error.InvalidFeedRecord;
-    return try allocator.dupe(u8, value.string);
-}
-
-fn readBoolField(object: std.json.ObjectMap, field: []const u8) bool {
-    const value = object.get(field) orelse return false;
-    return value == .bool and value.bool;
 }
 
 test "feed writer round-trips rust shell decision without raw command" {
@@ -697,6 +706,16 @@ test "feed record ring retains newest entries with O(1) eviction" {
     try std.testing.expectEqual(@as(usize, 2), owned.len);
     try std.testing.expectEqualStrings("b", owned[0].record.reason);
     try std.testing.expectEqualStrings("c", owned[1].record.reason);
+}
+
+test "feed typed parse ignores unknown fields" {
+    const line =
+        \\{"timestamp":"2026-07-13T00:00:00Z","workspace_root":"/tmp/legacy","event_type":"command_denied","decision":"deny","decision_source":"rust-daemon","event_source":"hook","host":"codex","daemon_status":"healthy","pack_id":"core.shell","severity":"high","reason":"blocked","remediation":null,"target_summary":"shell command (redacted)","session_id":null,"verified":false,"extra_future_field":{"n":1}}
+    ;
+    var record = try parseFeedRecord(std.testing.allocator, line, null);
+    defer record.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("deny", record.decision);
+    try std.testing.expect(record.rule == null);
 }
 
 test "feed loader accepts legacy records without rule" {
