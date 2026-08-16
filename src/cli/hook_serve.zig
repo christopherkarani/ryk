@@ -16,7 +16,6 @@ const help = @import("help.zig");
 const hook_ipc = @import("hook_ipc.zig");
 
 const poll_in: i16 = 0x0001;
-const poll_out: i16 = 0x0004;
 
 pub fn command(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: anytype) !u8 {
     if (comptime builtin.os.tag == .windows) {
@@ -85,6 +84,7 @@ const WorkspaceCacheEntry = struct {
     policy_stamp: FileStamp,
     pack_stamp: FileStamp,
     user_stamp: FileStamp,
+    legacy_user_stamp: FileStamp,
     last_used: u64,
     loaded: core_api.LoadedPolicy,
 };
@@ -130,13 +130,14 @@ pub const WorkspacePolicyCache = struct {
         defer self.allocator.free(pack_path);
         const policy_stamp = fileStamp(io, policy_path);
         const pack_stamp = fileStamp(io, pack_path);
-        const user_stamp = userPolicyStamp(io, self.allocator);
+        const user_stamps = userPolicyStamps(io, self.allocator);
 
         if (self.indexOf(root)) |idx| {
             if (self.entries[idx]) |*entry| {
                 if (FileStamp.eql(entry.policy_stamp, policy_stamp) and
                     FileStamp.eql(entry.pack_stamp, pack_stamp) and
-                    FileStamp.eql(entry.user_stamp, user_stamp))
+                    FileStamp.eql(entry.user_stamp, user_stamps.xdg) and
+                    FileStamp.eql(entry.legacy_user_stamp, user_stamps.legacy))
                 {
                     self.clock += 1;
                     entry.last_used = self.clock;
@@ -158,7 +159,8 @@ pub const WorkspacePolicyCache = struct {
             .realpath = owned,
             .policy_stamp = policy_stamp,
             .pack_stamp = pack_stamp,
-            .user_stamp = user_stamp,
+            .user_stamp = user_stamps.xdg,
+            .legacy_user_stamp = user_stamps.legacy,
             .last_used = self.clock,
             .loaded = loaded,
         };
@@ -207,10 +209,27 @@ fn fileStamp(io: std.Io, path: []const u8) FileStamp {
     };
 }
 
-fn userPolicyStamp(io: std.Io, allocator: std.mem.Allocator) FileStamp {
+const UserPolicyStamps = struct {
+    xdg: FileStamp = .{},
+    legacy: FileStamp = .{},
+};
+
+fn userPolicyStamps(io: std.Io, allocator: std.mem.Allocator) UserPolicyStamps {
     const home_c = std.c.getenv("HOME") orelse return .{};
     const home = std.mem.span(home_c);
-    const path = std.fs.path.join(allocator, &.{ home, ".config", "ryk", "policy.yaml" }) catch return .{};
+    if (home.len == 0) return .{};
+    return .{
+        .xdg = stampHomePolicy(io, allocator, home, &.{ ".config", "ryk", "policy.yaml" }),
+        .legacy = stampHomePolicy(io, allocator, home, &.{ ".ryk", "policy.yaml" }),
+    };
+}
+
+fn stampHomePolicy(io: std.Io, allocator: std.mem.Allocator, home: []const u8, rel: []const []const u8) FileStamp {
+    var parts: [5][]const u8 = undefined;
+    if (rel.len + 1 > parts.len) return .{};
+    parts[0] = home;
+    for (rel, 0..) |seg, i| parts[i + 1] = seg;
+    const path = std.fs.path.join(allocator, parts[0 .. rel.len + 1]) catch return .{};
     defer allocator.free(path);
     return fileStamp(io, path);
 }
@@ -232,12 +251,12 @@ pub fn serveLoop(
         error.SocketAlreadyBound => return exit_codes.success,
         else => return err,
     };
+    const bound_id = daemon_uds.lstatIdentity(socket_path) catch null;
     defer {
+        if (bound_id) |id| daemon_uds.unlinkUnixSocketIfIdentity(socket_path, id);
         _ = std.c.close(listen_fd);
-        daemon_uds.unlinkUnixSocketPath(socket_path);
     }
     hook_ipc.setNoSigpipe(listen_fd);
-    chmodPath(socket_path, 0o600);
 
     var cache = WorkspacePolicyCache.init(allocator);
     defer cache.deinit();
@@ -260,6 +279,7 @@ pub fn serveLoop(
         if (client_fd < 0) continue;
         defer _ = std.c.close(client_fd);
         hook_ipc.setNoSigpipe(client_fd);
+        daemon_uds.requirePeerEuid(client_fd) catch continue;
 
         last_ms = nowMs(io);
         const shutdown = handleClient(io, allocator, client_fd, self_bin, &cache) catch false;
@@ -288,66 +308,91 @@ fn handleClient(
 
     const parsed = hook_ipc.parseRequest(arena, line) catch |err| {
         const mismatch = err == error.ProtocolMismatch;
-        const resp = try hook_ipc.stringifyResponse(arena, .{
+        writeClientResponse(io, arena, fd, .{
             .id = 0,
             .exit = 2,
             .stdout = "",
             .stderr = if (mismatch) "ryk hook-serve: protocol mismatch" else "ryk hook-serve: invalid request",
             .mismatch = mismatch,
         });
-        hook_ipc.writeAllFd(io, fd, resp, hook_ipc.request_timeout_ms) catch {};
         return false;
     };
 
     const req = parsed.request;
     if (std.mem.eql(u8, req.method, "shutdown")) {
-        const resp = try hook_ipc.stringifyResponse(arena, .{
+        writeClientResponse(io, arena, fd, .{
             .id = req.id,
             .exit = 0,
             .stdout = "",
             .stderr = "",
         });
-        hook_ipc.writeAllFd(io, fd, resp, hook_ipc.request_timeout_ms) catch {};
         return true;
     }
 
     if (requestMismatches(self_bin, req)) {
-        const resp = try hook_ipc.stringifyResponse(arena, .{
+        writeClientResponse(io, arena, fd, .{
             .id = req.id,
             .exit = 2,
             .stdout = "",
             .stderr = "ryk hook-serve: version or binary mismatch",
             .mismatch = true,
         });
-        hook_ipc.writeAllFd(io, fd, resp, hook_ipc.request_timeout_ms) catch {};
         return false;
     }
 
     if (std.mem.eql(u8, req.method, "ping")) {
-        const resp = try hook_ipc.stringifyResponse(arena, .{
+        writeClientResponse(io, arena, fd, .{
             .id = req.id,
             .exit = 0,
             .stdout = hook_ipc.protocol_label,
             .stderr = "",
         });
-        try hook_ipc.writeAllFd(io, fd, resp, hook_ipc.request_timeout_ms);
         return false;
     }
 
-    const emit = dispatchEvaluate(io, arena, req, cache) catch hook_ipc.HostEmit{
-        .exit = 2,
-        .stdout = try arena.dupe(u8, ""),
-        .stderr = try arena.dupe(u8, "ryk hook-serve: evaluation failed"),
+    const emit = dispatchEvaluate(io, arena, req, cache) catch |err| blk: {
+        if (err == error.OutOfMemory) {
+            writeStaticFailClosed(io, fd);
+            return false;
+        }
+        break :blk hook_ipc.HostEmit{
+            .exit = 2,
+            .stdout = arena.dupe(u8, "") catch {
+                writeStaticFailClosed(io, fd);
+                return false;
+            },
+            .stderr = arena.dupe(u8, "ryk hook-serve: evaluation failed") catch {
+                writeStaticFailClosed(io, fd);
+                return false;
+            },
+        };
     };
 
-    const resp = try hook_ipc.stringifyResponse(arena, .{
+    writeClientResponse(io, arena, fd, .{
         .id = req.id,
         .exit = emit.exit,
         .stdout = emit.stdout,
         .stderr = emit.stderr,
     });
-    try hook_ipc.writeAllFd(io, fd, resp, hook_ipc.request_timeout_ms);
     return false;
+}
+
+const fail_closed_response_line =
+    "{\"v\":1,\"id\":0,\"exit\":2,\"stdout\":\"\",\"stderr\":\"ryk hook-serve: response failed\",\"mismatch\":false}\n";
+
+fn writeClientResponse(io: std.Io, allocator: std.mem.Allocator, fd: std.posix.fd_t, resp: hook_ipc.Response) void {
+    const line = hook_ipc.stringifyResponse(allocator, resp) catch {
+        writeStaticFailClosed(io, fd);
+        return;
+    };
+    hook_ipc.writeAllFd(io, fd, line, hook_ipc.request_timeout_ms) catch {
+        writeStaticFailClosed(io, fd);
+    };
+}
+
+fn writeStaticFailClosed(io: std.Io, fd: std.posix.fd_t) void {
+    var buf: [fail_closed_response_line.len]u8 = fail_closed_response_line.*;
+    hook_ipc.writeAllFd(io, fd, &buf, hook_ipc.request_timeout_ms) catch {};
 }
 
 fn dispatchEvaluate(
@@ -360,14 +405,14 @@ fn dispatchEvaluate(
     const evaluate = @import("evaluate.zig");
     const agent_hook = @import("agent_hook.zig");
 
-    const cached = if (req.workspace.len > 0) cache.getOrLoad(io, req.workspace) else null;
+    const cached = cachedPolicyForRequest(io, allocator, req, cache);
 
     if (std.mem.eql(u8, req.method, "evaluate")) {
-        return evaluate.evaluateForServer(io, allocator, req.payload_json, cached);
+        return evaluate.evaluateForServer(io, allocator, req.payload_json, cached, req.ci);
     }
     if (std.mem.eql(u8, req.method, "hook")) {
         if (std.mem.eql(u8, req.host, "cursor")) {
-            return agent_hook.evaluateForServer(allocator, req.payload_json);
+            return agent_hook.evaluateForServer(allocator, req.payload_json, req.ci);
         }
         return hook.evaluateForServer(
             io,
@@ -384,21 +429,62 @@ fn dispatchEvaluate(
     return error.UnknownMethod;
 }
 
-fn ensureSocketParentDir(io: std.Io, socket_path: []const u8) !void {
-    const dir = std.fs.path.dirname(socket_path) orelse return;
-    std.Io.Dir.cwd().createDirPath(io, dir) catch |err| switch (err) {
-        error.PathAlreadyExists => {},
-        else => return err,
-    };
-    chmodPath(dir, 0o700);
+fn cachedPolicyForRequest(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    req: hook_ipc.Request,
+    cache: *WorkspacePolicyCache,
+) ?*const core_api.LoadedPolicy {
+    if (std.mem.eql(u8, req.method, "evaluate")) {
+        const cwd = evaluatePayloadCwd(io, allocator, req.payload_json) orelse return null;
+        defer allocator.free(cwd);
+        const loaded = cache.getOrLoad(io, cwd) orelse return null;
+        const root = supervisor.resolveWorkspaceRoot(io, allocator, null, cwd) catch return null;
+        defer allocator.free(root);
+        if (cache.indexOf(root) == null) return null;
+        return loaded;
+    }
+    if (req.workspace.len == 0) return null;
+    return cache.getOrLoad(io, req.workspace);
 }
 
-fn chmodPath(path: []const u8, mode: c_uint) void {
-    if (path.len >= std.fs.max_path_bytes) return;
+/// Payload `cwd` is the evaluate workspace, not the hook-serve process cwd.
+fn evaluatePayloadCwd(io: std.Io, allocator: std.mem.Allocator, payload_json: []const u8) ?[]u8 {
+    if (payload_json.len == 0) return null;
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, payload_json, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const cwd_value = parsed.value.object.get("cwd") orelse return null;
+    const cwd_text = switch (cwd_value) {
+        .string => |s| s,
+        else => return null,
+    };
+    if (!std.fs.path.isAbsolute(cwd_text)) return null;
+    const resolved_z = std.Io.Dir.cwd().realPathFileAlloc(io, cwd_text, allocator) catch return null;
+    defer allocator.free(resolved_z);
+    return allocator.dupe(u8, resolved_z) catch return null;
+}
+
+fn ensureSocketParentDir(io: std.Io, socket_path: []const u8) !void {
+    const dir = std.fs.path.dirname(socket_path) orelse return;
+    if (daemon_uds.lstatIdentity(dir)) |st| {
+        if (st.is_lnk or !st.is_dir) return error.UntrustedSocketParent;
+    } else |_| {
+        std.Io.Dir.cwd().createDirPath(io, dir) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+    }
+    try chmodPath(dir, 0o700);
+    try daemon_uds.requireTrustedSocketParent(dir);
+}
+
+fn chmodPath(path: []const u8, mode: std.c.mode_t) !void {
+    if (path.len >= std.fs.max_path_bytes) return error.PathTooLong;
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     @memcpy(buf[0..path.len], path);
     buf[path.len] = 0;
-    _ = std.c.chmod(@ptrCast(&buf), mode);
+    if (std.c.chmod(@ptrCast(&buf), mode) != 0) return error.ChmodFailed;
 }
 
 fn nowMs(io: std.Io) u64 {
@@ -428,14 +514,38 @@ fn exchange(allocator: std.mem.Allocator, socket_path: []const u8, request_json:
     return hook_ipc.readLineFd(std.testing.io, allocator, fd, hook_ipc.request_timeout_ms);
 }
 
+const ShortSock = struct {
+    dir: []u8,
+    sock: []u8,
+
+    fn deinit(self: ShortSock) void {
+        daemon_uds.unlinkUnixSocketPath(self.sock);
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        if (self.dir.len < buf.len) {
+            @memcpy(buf[0..self.dir.len], self.dir);
+            buf[self.dir.len] = 0;
+            _ = std.c.rmdir(@ptrCast(&buf));
+        }
+        std.testing.allocator.free(self.sock);
+        std.testing.allocator.free(self.dir);
+    }
+};
+
+fn makeShortSock(name: []const u8) !ShortSock {
+    const dir = try std.fmt.allocPrint(std.testing.allocator, "/tmp/ryk-ht-{d}", .{std.c.getpid()});
+    errdefer std.testing.allocator.free(dir);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, dir);
+    try chmodPath(dir, 0o700);
+    const sock = try std.fmt.allocPrint(std.testing.allocator, "{s}/{s}.sock", .{ dir, name });
+    errdefer std.testing.allocator.free(sock);
+    return .{ .dir = dir, .sock = sock };
+}
+
 test "hook-serve ping returns exit 0" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
-    defer std.testing.allocator.free(dir);
-    const sock = try std.fs.path.join(std.testing.allocator, &.{ dir, "hook-ping.sock" });
-    defer std.testing.allocator.free(sock);
+    const tmp_sock = try makeShortSock("ping");
+    defer tmp_sock.deinit();
+    const sock = tmp_sock.sock;
 
     var stop = std.atomic.Value(bool).init(false);
     const thread = try std.Thread.spawn(.{}, testServe, .{ sock, &stop });
@@ -465,12 +575,9 @@ test "hook-serve ping returns exit 0" {
 
 test "hook-serve binds after a stale sock file" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
-    defer std.testing.allocator.free(dir);
-    const sock = try std.fs.path.join(std.testing.allocator, &.{ dir, "hook-stale.sock" });
-    defer std.testing.allocator.free(sock);
+    const tmp_sock = try makeShortSock("stale");
+    defer tmp_sock.deinit();
+    const sock = tmp_sock.sock;
 
     {
         const file = try std.Io.Dir.cwd().createFile(std.testing.io, sock, .{});
@@ -499,12 +606,9 @@ test "hook-serve binds after a stale sock file" {
 
 test "hook-serve shutdown exits 0 and unlinks the socket" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
-    defer std.testing.allocator.free(dir);
-    const sock = try std.fs.path.join(std.testing.allocator, &.{ dir, "hook-stop.sock" });
-    defer std.testing.allocator.free(sock);
+    const tmp_sock = try makeShortSock("stop");
+    defer tmp_sock.deinit();
+    const sock = tmp_sock.sock;
 
     const thread = try std.Thread.spawn(.{}, testServeNoStop, .{sock});
     try waitForSocket(sock, 50);
@@ -535,12 +639,9 @@ fn testServeNoStop(socket_path: []const u8) void {
 
 test "hook-serve reports mismatch for protocol v != 1" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
-    defer std.testing.allocator.free(dir);
-    const sock = try std.fs.path.join(std.testing.allocator, &.{ dir, "hook-proto.sock" });
-    defer std.testing.allocator.free(sock);
+    const tmp_sock = try makeShortSock("proto");
+    defer tmp_sock.deinit();
+    const sock = tmp_sock.sock;
 
     var stop = std.atomic.Value(bool).init(false);
     const thread = try std.Thread.spawn(.{}, testServe, .{ sock, &stop });
@@ -562,12 +663,9 @@ test "hook-serve reports mismatch for protocol v != 1" {
 
 test "hook-serve reports mismatch for a different version" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
-    defer std.testing.allocator.free(dir);
-    const sock = try std.fs.path.join(std.testing.allocator, &.{ dir, "hook-mismatch.sock" });
-    defer std.testing.allocator.free(sock);
+    const tmp_sock = try makeShortSock("mismatch");
+    defer tmp_sock.deinit();
+    const sock = tmp_sock.sock;
 
     var stop = std.atomic.Value(bool).init(false);
     const thread = try std.Thread.spawn(.{}, testServe, .{ sock, &stop });
@@ -609,6 +707,9 @@ test "workspace policy cache caps at 16 LRU entries" {
         const path = try std.fs.path.join(std.testing.allocator, &.{ root, name });
         defer std.testing.allocator.free(path);
         try std.Io.Dir.cwd().createDirPath(std.testing.io, path);
+        const git = try std.fs.path.join(std.testing.allocator, &.{ path, ".git" });
+        defer std.testing.allocator.free(git);
+        try std.Io.Dir.cwd().createDirPath(std.testing.io, git);
         _ = cache.getOrLoad(std.testing.io, path);
     }
     try std.testing.expectEqual(@as(usize, hook_ipc.workspace_cache_cap), cache.count());
@@ -616,12 +717,9 @@ test "workspace policy cache caps at 16 LRU entries" {
 
 test "hook-serve exits 0 when the socket is already live" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
-    defer std.testing.allocator.free(dir);
-    const sock = try std.fs.path.join(std.testing.allocator, &.{ dir, "hook-already.sock" });
-    defer std.testing.allocator.free(sock);
+    const tmp_sock = try makeShortSock("already");
+    defer tmp_sock.deinit();
+    const sock = tmp_sock.sock;
 
     var stop = std.atomic.Value(bool).init(false);
     const thread = try std.Thread.spawn(.{}, testServe, .{ sock, &stop });
@@ -682,4 +780,106 @@ fn waitForSocket(path: []const u8, attempts: u32) !void {
         }
     }
     return error.ServerNotReady;
+}
+
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+
+test "evaluate cache uses payload cwd not request workspace" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "repo-a/.ryk");
+    try tmp.dir.createDirPath(std.testing.io, "repo-b/.ryk");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "repo-a/.ryk/policy.yaml",
+        .data = "version: 1\nmode: observe\n",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "repo-b/.ryk/policy.yaml",
+        .data = "version: 1\nmode: strict\n",
+    });
+    const repo_a = try tmp.dir.realPathFileAlloc(std.testing.io, "repo-a", std.testing.allocator);
+    defer std.testing.allocator.free(repo_a);
+    const repo_b = try tmp.dir.realPathFileAlloc(std.testing.io, "repo-b", std.testing.allocator);
+    defer std.testing.allocator.free(repo_b);
+
+    var cache = WorkspacePolicyCache.init(std.testing.allocator);
+    defer cache.deinit();
+    const loaded_a = cache.getOrLoad(std.testing.io, repo_a);
+    try std.testing.expect(loaded_a != null);
+    try std.testing.expectEqual(core_api.Mode.observe, loaded_a.?.mode());
+
+    const payload = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"schema_version\":1,\"kind\":\"shell_command\",\"command\":\"true\",\"cwd\":\"{s}\"}}",
+        .{repo_b},
+    );
+    defer std.testing.allocator.free(payload);
+
+    const cached = cachedPolicyForRequest(std.testing.io, std.testing.allocator, .{
+        .id = 1,
+        .method = "evaluate",
+        .workspace = repo_a,
+        .payload_json = payload,
+    }, &cache);
+    try std.testing.expect(cached != null);
+    try std.testing.expectEqual(core_api.Mode.strict, cached.?.mode());
+    try std.testing.expect(std.mem.indexOf(u8, cached.?.path, "repo-b") != null);
+}
+
+test "userPolicyStamps treats missing-to-present legacy ~/.ryk/policy.yaml as a miss" {
+    var home_tmp = std.testing.tmpDir(.{});
+    defer home_tmp.cleanup();
+    const home = try home_tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(home);
+
+    const prev: ?[:0]u8 = if (std.c.getenv("HOME")) |v| try std.testing.allocator.dupeZ(u8, std.mem.span(v)) else null;
+    defer {
+        if (prev) |p| {
+            _ = setenv("HOME", p.ptr, 1);
+            std.testing.allocator.free(p);
+        } else {
+            _ = unsetenv("HOME");
+        }
+    }
+    const home_z = try std.testing.allocator.dupeZ(u8, home);
+    defer std.testing.allocator.free(home_z);
+    try std.testing.expectEqual(@as(c_int, 0), setenv("HOME", home_z.ptr, 1));
+
+    const before = userPolicyStamps(std.testing.io, std.testing.allocator);
+    try std.testing.expect(!before.legacy.exists);
+
+    try home_tmp.dir.createDirPath(std.testing.io, ".ryk");
+    try home_tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = ".ryk/policy.yaml",
+        .data = "mode: ask\n",
+    });
+    const after = userPolicyStamps(std.testing.io, std.testing.allocator);
+    try std.testing.expect(after.legacy.exists);
+    try std.testing.expect(!FileStamp.eql(before.legacy, after.legacy));
+}
+
+test "static fail-closed response is valid deny NDJSON" {
+    var parsed = try hook_ipc.parseResponse(std.testing.allocator, fail_closed_response_line);
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u8, 2), parsed.response.exit);
+    try std.testing.expectEqualStrings("", parsed.response.stdout);
+    try std.testing.expect(parsed.response.stderr.len > 0);
+}
+
+test "ensureSocketParentDir refuses a symlink parent" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "real");
+    const real = try tmp.dir.realPathFileAlloc(std.testing.io, "real", std.testing.allocator);
+    defer std.testing.allocator.free(real);
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const link = try std.fs.path.join(std.testing.allocator, &.{ root, "link" });
+    defer std.testing.allocator.free(link);
+    try std.Io.Dir.cwd().symLink(std.testing.io, real, link, .{});
+    const sock = try std.fs.path.join(std.testing.allocator, &.{ link, "hook.sock" });
+    defer std.testing.allocator.free(sock);
+    try std.testing.expectError(error.UntrustedSocketParent, ensureSocketParentDir(std.testing.io, sock));
 }

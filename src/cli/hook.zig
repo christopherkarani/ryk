@@ -406,8 +406,8 @@ fn tryHookServer(
     if (!hook_client.shouldTry()) return null;
     const bin = std.process.executablePathAlloc(io, allocator) catch "";
     defer if (bin.len > 0) allocator.free(bin);
-    const cwd_z = std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator) catch "";
-    defer if (cwd_z.len > 0) allocator.free(cwd_z);
+    const cwd_z = hook_client.resolveClientWorkspace(io, allocator) orelse return null;
+    defer allocator.free(cwd_z);
 
     var owned = hook_client.tryServe(io, allocator, .{
         .id = 1,
@@ -423,16 +423,18 @@ fn tryHookServer(
         .payload_json = payload_text,
     }) catch |err| switch (err) {
         error.Unavailable => return null,
-        error.OutOfMemory => return error.OutOfMemory,
-        error.BrokenSession => return try emitPreEvalFailClosed(
+        error.BrokenSession, error.OutOfMemory => return try emitPreEvalFailClosed(
             allocator,
             host,
             event,
             stdout,
             stderr,
             "hook",
-            "hook server session broken",
-            "ryk hook: hook server session ended before a decision; ryk blocked it.",
+            if (err == error.OutOfMemory) "hook server allocation failed" else "hook server session broken",
+            if (err == error.OutOfMemory)
+                "ryk hook: hook server ran out of memory; ryk blocked it."
+            else
+                "ryk hook: hook server session ended before a decision; ryk blocked it.",
         ),
     };
     defer owned.deinit(allocator);

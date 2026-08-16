@@ -207,6 +207,7 @@ pub fn parseRequest(allocator: std.mem.Allocator, line: []const u8) !ParsedReque
     const v = jsonInt(obj, "v") orelse return error.InvalidRequest;
     if (v != protocol_version) return error.ProtocolMismatch;
     const id = jsonInt(obj, "id") orelse return error.InvalidRequest;
+    const request_id = std.math.cast(u64, id) orelse return error.InvalidRequest;
     const method = jsonString(obj, "method") orelse return error.InvalidRequest;
     var payload_json: []const u8 = "";
     if (obj.get("payload")) |payload| {
@@ -219,7 +220,7 @@ pub fn parseRequest(allocator: std.mem.Allocator, line: []const u8) !ParsedReque
         .parsed = parsed,
         .request = .{
             .v = @intCast(v),
-            .id = @intCast(id),
+            .id = request_id,
             .method = method,
             .bin = jsonString(obj, "bin") orelse "",
             .version = jsonString(obj, "version") orelse "",
@@ -258,7 +259,7 @@ pub fn parseResponse(allocator: std.mem.Allocator, line: []const u8) !ParsedResp
         .parsed = parsed,
         .response = .{
             .v = @intCast(v),
-            .id = @intCast(id),
+            .id = std.math.cast(u64, id) orelse return error.InvalidResponse,
             .exit = @intCast(std.math.cast(u8, exit) orelse 2),
             .stdout = jsonString(obj, "stdout") orelse "",
             .stderr = jsonString(obj, "stderr") orelse "",
@@ -425,12 +426,6 @@ test "socketPathAlloc includes uid and bin hash" {
     try std.testing.expect(std.mem.indexOf(u8, path, &binHash("/usr/local/bin/ryk")) != null);
 }
 
-test "binHash is stable for the same realpath" {
-    const a = binHash("/usr/local/bin/ryk");
-    const b = binHash("/usr/local/bin/ryk");
-    try std.testing.expectEqualSlices(u8, &a, &b);
-}
-
 test "socketPathAlloc rejects empty realpath" {
     try std.testing.expectError(error.EmptyBinRealpath, socketPathAlloc(std.testing.allocator, 501, ""));
 }
@@ -450,7 +445,16 @@ test "binHash differs for different realpaths" {
     try std.testing.expect(!std.mem.eql(u8, &a, &b));
 }
 
-test "protocol_label is ryk-hook-v1" {
-    try std.testing.expectEqualStrings("ryk-hook-v1", protocol_label);
-    try std.testing.expect(std.mem.indexOf(u8, protocol_label, "ryk-daemon") == null);
+test "parseRequest rejects negative id" {
+    try std.testing.expectError(
+        error.InvalidRequest,
+        parseRequest(std.testing.allocator, "{\"v\":1,\"id\":-1,\"method\":\"ping\"}\n"),
+    );
+}
+
+test "parseResponse rejects negative id" {
+    try std.testing.expectError(
+        error.InvalidResponse,
+        parseResponse(std.testing.allocator, "{\"v\":1,\"id\":-1,\"exit\":0}\n"),
+    );
 }

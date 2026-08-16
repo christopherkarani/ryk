@@ -98,8 +98,8 @@ fn tryHookServer(
     if (!hook_client.shouldTry()) return null;
     const bin = std.process.executablePathAlloc(io, allocator) catch "";
     defer if (bin.len > 0) allocator.free(bin);
-    const cwd_z = std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator) catch "";
-    defer if (cwd_z.len > 0) allocator.free(cwd_z);
+    const cwd_z = hook_client.resolveClientWorkspace(io, allocator) orelse return null;
+    defer allocator.free(cwd_z);
 
     var owned = hook_client.tryServe(io, allocator, .{
         .id = 1,
@@ -108,14 +108,17 @@ fn tryHookServer(
         .version = build_options.version,
         .host = "cursor",
         .event = "beforeShellExecution",
+        .ci = resolveModeFromEnv() == .ci,
         .workspace = cwd_z,
         .cwd = cwd_z,
         .payload_json = payload,
     }) catch |err| switch (err) {
         error.Unavailable => return null,
-        error.OutOfMemory => return error.OutOfMemory,
-        error.BrokenSession => {
-            try writeFailClosedDeny(stdout, "ryk: hook server session ended before a decision; denied fail-closed");
+        error.BrokenSession, error.OutOfMemory => {
+            try writeFailClosedDeny(stdout, if (err == error.OutOfMemory)
+                "ryk: hook server ran out of memory; denied fail-closed"
+            else
+                "ryk: hook server session ended before a decision; denied fail-closed");
             return fail_closed_deny_exit_code;
         },
     };
@@ -124,15 +127,22 @@ fn tryHookServer(
     return owned.response().exit;
 }
 
-pub fn evaluateForServer(allocator: std.mem.Allocator, payload: []const u8) !hook_ipc.HostEmit {
+pub fn evaluateForServer(allocator: std.mem.Allocator, payload: []const u8, raise_ci: bool) !hook_ipc.HostEmit {
     var stdout_buf: std.Io.Writer.Allocating = .init(allocator);
     errdefer stdout_buf.deinit();
-    const code = try evaluatePayload(allocator, payload, &stdout_buf.writer, null);
+    // Floor stays strict so a prewarm cannot freeze soft RYK_MODE. `raise_ci`
+    // is the client's raise-only bit (in-process RYK_MODE=ci).
+    const code = try evaluatePayloadWithMode(allocator, payload, &stdout_buf.writer, null, servedCursorMode(raise_ci));
     return .{
         .exit = code,
         .stdout = try stdout_buf.toOwnedSlice(),
         .stderr = try allocator.dupe(u8, ""),
     };
+}
+
+/// Served Cursor ignores process RYK_MODE / RYK_ALLOW_MODE_SOFTEN.
+fn servedCursorMode(raise_ci: bool) policy.schema.Mode {
+    return if (raise_ci) moreRestrictiveMode(.strict, .ci) else .strict;
 }
 
 /// Soft modes (observe / ask / yolo / trusted) that can weaken pack hits.
@@ -816,6 +826,14 @@ test "critical deny stays deny even in observe mode" {
 
 test "agent hook mode version is wired into build metadata" {
     try std.testing.expect(build_options.version.len > 0);
+}
+
+test "agent hook served Cursor pins strict and ignores process-env soften" {
+    try std.testing.expectEqual(policy.schema.Mode.strict, servedCursorMode(false));
+    try std.testing.expectEqual(policy.schema.Mode.ci, servedCursorMode(true));
+    try std.testing.expect(isSoftMode(.observe));
+    try std.testing.expect(isSoftMode(.ask));
+    try std.testing.expect(hook_client.serveErrorIsFailClosed(error.OutOfMemory));
 }
 
 test "resolveModeFromEnv floors soft modes without RYK_ALLOW_MODE_SOFTEN" {

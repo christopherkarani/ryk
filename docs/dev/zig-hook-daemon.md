@@ -200,64 +200,15 @@ Invisible on the default `ryk` help. Named, honest, machine-friendly:
 
 ---
 
-Task-level implementation steps live in [`zig-hook-daemon-plan.md`](zig-hook-daemon-plan.md).
+## Measuring (Mac, not CI)
 
-## Implementation order
+There is no `RYK_HOOK_PROFILE` flag. Time a real hook:
 
-Do not land a 5ms SLA. Land a server that is correct, then fast.
+```sh
+time ryk hook grok PreToolUse < tests/plugin-fixtures/grok/pre_tool_use_command_safe.json
+```
 
-### Phase A — I/O off the in-process return path
-
-Still needed as the fallback, and it makes the first cold spawn less ugly.
-
-- Hook feed: write + flush, no `file.sync`. Keep fsync on `ryk run` audit.
-- Do not rewrite `workspaces.json` on every allow.
-- Named `ryk hook`: do not `spawnBatch` a second ryk.
-- `RYK_HOOK_PROFILE=1` prints stage timings on stderr.
-
-Files: `src/cli/feed_writer.zig`, `src/cli/hook.zig`, `src/telemetry.zig`, `src/main.zig`.
-
-### Phase B — Server + thin client (the speed win)
-
-- New `src/cli/hook_serve.zig`: accept loop, ping, hook, evaluate, shutdown, idle exit.
-- Reuse `src/cli/daemon_uds.zig` (raise listen backlog; today’s `listen(1)` cannot fan in).
-- Do not reuse Rust `ryk-uds-v1` methods (`Ping` / `Evaluate` / `ExecuteCli`). New protocol label: `ryk-hook-v1`.
-- `hook.command` / `evaluate` / `agent_hook.command`: try client, else current code.
-- Workspace cache + session sticky map with caps.
-- Respond, then feed.
-
-Files: `src/cli/hook_serve.zig`, `src/cli/hook_client.zig`, `src/cli/hook.zig`, `src/cli/evaluate.zig`, `src/cli/agent_hook.zig`, `src/cli/mod.zig`, `src/cli/host_launch.zig`, `src/cli/doctor.zig`.
-
-### Phase C — Hosts + doctor + docs
-
-- Claude / Codex / Grok / plugin argv stay the same (already `ryk hook …`).
-- Pi `evaluate` and Cursor bare stdin use the same client.
-- Doctor line for server state.
-- Docs: this file + a short note on `docs/cli-reference.md` and `docs/compatibility.md`.
-
-### Phase D — Optional later
-
-- Per-workspace evaluate locks.
-- Precompiled default-pack blob (skip gzip scan on server start).
-- Honor Grok `workspaceRoot` instead of walking from `"."`.
-- Windows named pipe if v1 shipped in-process there.
-- Drop the daemon JSON round-trip inside `shell_eval` (`synthesizeDaemonResponseFromZig`).
-
----
-
-## Tests (must exist before calling it done)
-
-- In-process fallback: socket missing → same Claude / Codex / Grok / Cursor / Pi fixtures as `tests/hook_host_matrix.zig`.
-- Server path: private socket, two hosts (e.g. grok allow + claude deny) against one server process; decisions match in-process.
-- Two workspaces: strict vs ask, no cross-talk.
-- Version / bin mismatch → in-process, not the other binary’s decision.
-- Server kill mid-request → deny / exit 2, not allow.
-- `--probe` does not write allow-once.
-- `RYK_HOOK_SERVER=0` never connects.
-- Release / install contracts still reject a `ryk-daemon` artifact.
-- No `elapsed <= 5ms` assertion.
-
-Manual Mac check: `RYK_HOOK_PROFILE=1 ryk hook grok PreToolUse` before and after the server is up. Warm server p50 under 5ms is the product bar; CI does not encode that number.
+Warm p50 under 5ms on Mac is the product bar. CI does not encode that number.
 
 ---
 

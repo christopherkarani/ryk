@@ -10,6 +10,7 @@ const build_options = @import("build_options");
 const daemon_uds = @import("daemon_uds.zig");
 const env_util = @import("../env_util.zig");
 const hook_ipc = @import("hook_ipc.zig");
+const fd_scrub = @import("../sandbox/fd_scrub.zig");
 
 pub const ClientError = error{
     Unavailable,
@@ -56,6 +57,28 @@ pub fn shouldTry() bool {
     return true;
 }
 
+/// True when `tryServe` failed in a way that must emit host deny JSON.
+/// `Unavailable` falls through in-process; OOM / broken session must not
+/// return empty stdout on the named-hook path.
+pub fn serveErrorIsFailClosed(err: ClientError) bool {
+    return switch (err) {
+        error.Unavailable => false,
+        error.BrokenSession, error.OutOfMemory => true,
+    };
+}
+
+/// Absolute client cwd for a hook-serve request. Null means skip the server
+/// so callers never stamp workspace/cwd as "".
+///
+/// `realPathFileAlloc` returns `[:0]u8` (`dupeZ`). Re-dupe as `[]u8` so
+/// callers can `allocator.free` without a sentinel size mismatch.
+pub fn resolveClientWorkspace(io: std.Io, allocator: std.mem.Allocator) ?[]u8 {
+    const z = std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator) catch return null;
+    defer allocator.free(z);
+    if (z.len == 0) return null;
+    return allocator.dupe(u8, z) catch return null;
+}
+
 pub fn tryServe(io: std.Io, allocator: std.mem.Allocator, request: hook_ipc.Request) ClientError!OwnedResponse {
     if (!shouldTry()) return error.Unavailable;
 
@@ -71,13 +94,9 @@ pub fn tryServe(io: std.Io, allocator: std.mem.Allocator, request: hook_ipc.Requ
     const raw = hook_ipc.readLineFd(io, allocator, fd, hook_ipc.request_timeout_ms) catch return error.BrokenSession;
     errdefer allocator.free(raw);
 
-    var parsed = hook_ipc.parseResponse(allocator, raw) catch {
-        allocator.free(raw);
-        return error.BrokenSession;
-    };
+    var parsed = hook_ipc.parseResponse(allocator, raw) catch return error.BrokenSession;
     if (parsed.response.mismatch) {
         parsed.deinit();
-        allocator.free(raw);
         _ = requestShutdown(io, allocator, socket_path, request);
         return error.Unavailable;
     }
@@ -214,6 +233,13 @@ fn spawnDetachedHookServe(exe: []const u8, socket_path: []const u8) !void {
         if (devnull > 2) _ = std.c.close(devnull);
     }
 
+    fd_scrub.closeInheritedFdsDefault();
+
+    var env_store: [hook_serve_env_cap][hook_serve_env_entry_max]u8 = undefined;
+    var envp: [hook_serve_env_cap + 1]?[*:0]const u8 = undefined;
+    const envp_len = fillHookServeEnvp(&env_store, &envp);
+    envp[envp_len] = null;
+
     const argv = [_:null]?[*:0]const u8{
         exe_z[0..exe.len :0],
         "hook-serve",
@@ -221,8 +247,44 @@ fn spawnDetachedHookServe(exe: []const u8, socket_path: []const u8) !void {
         sock_z[0..socket_path.len :0],
         null,
     };
-    _ = std.c.execve(exe_z[0..exe.len :0], @ptrCast(&argv), std.c.environ);
+    _ = std.c.execve(exe_z[0..exe.len :0], @ptrCast(&argv), @ptrCast(&envp));
     std.c._exit(127);
+}
+
+const hook_serve_env_cap = 32;
+const hook_serve_env_entry_max = 512;
+
+/// Allowlist for the detached hook-serve envp. Mode / unattended bits must
+/// not freeze on the first prewarm (`RYK_MODE`, CI, soften, …).
+fn keepHookServeEnvKey(name: []const u8) bool {
+    if (std.mem.eql(u8, name, "PATH")) return true;
+    if (std.mem.eql(u8, name, "HOME")) return true;
+    if (std.mem.eql(u8, name, "TMPDIR") or std.mem.eql(u8, name, "TMP") or std.mem.eql(u8, name, "TEMP")) return true;
+    if (std.mem.eql(u8, name, "XDG_RUNTIME_DIR")) return true;
+    if (std.mem.eql(u8, name, "USER")) return true;
+    if (std.mem.eql(u8, name, "LANG")) return true;
+    if (std.mem.startsWith(u8, name, "LC_")) return true;
+    return false;
+}
+
+fn fillHookServeEnvp(
+    store: *[hook_serve_env_cap][hook_serve_env_entry_max]u8,
+    envp: *[hook_serve_env_cap + 1]?[*:0]const u8,
+) usize {
+    var n: usize = 0;
+    var i: usize = 0;
+    while (std.c.environ[i]) |entry| : (i += 1) {
+        if (n >= hook_serve_env_cap) break;
+        const span = std.mem.span(entry);
+        const eq = std.mem.indexOfScalar(u8, span, '=') orelse continue;
+        if (!keepHookServeEnvKey(span[0..eq])) continue;
+        if (span.len + 1 > hook_serve_env_entry_max) continue;
+        @memcpy(store[n][0..span.len], span);
+        store[n][span.len] = 0;
+        envp[n] = store[n][0..span.len :0];
+        n += 1;
+    }
+    return n;
 }
 
 fn requestShutdown(io: std.Io, allocator: std.mem.Allocator, socket_path: []const u8, request: hook_ipc.Request) bool {
@@ -293,4 +355,51 @@ fn flagMeansDisabled(raw: []const u8) bool {
         std.ascii.eqlIgnoreCase(raw, "false") or
         std.ascii.eqlIgnoreCase(raw, "no") or
         std.ascii.eqlIgnoreCase(raw, "off");
+}
+
+test "hook serve OOM and broken session are fail-closed; Unavailable is not" {
+    try std.testing.expect(serveErrorIsFailClosed(error.OutOfMemory));
+    try std.testing.expect(serveErrorIsFailClosed(error.BrokenSession));
+    try std.testing.expect(!serveErrorIsFailClosed(error.Unavailable));
+}
+
+test "hook-serve env allowlist drops mode bits and keeps runtime keys" {
+    try std.testing.expect(keepHookServeEnvKey("PATH"));
+    try std.testing.expect(keepHookServeEnvKey("HOME"));
+    try std.testing.expect(keepHookServeEnvKey("TMPDIR"));
+    try std.testing.expect(keepHookServeEnvKey("XDG_RUNTIME_DIR"));
+    try std.testing.expect(keepHookServeEnvKey("USER"));
+    try std.testing.expect(keepHookServeEnvKey("LANG"));
+    try std.testing.expect(keepHookServeEnvKey("LC_ALL"));
+    try std.testing.expect(keepHookServeEnvKey("LC_CTYPE"));
+    try std.testing.expect(!keepHookServeEnvKey("RYK_MODE"));
+    try std.testing.expect(!keepHookServeEnvKey("RYK_ALLOW_MODE_SOFTEN"));
+    try std.testing.expect(!keepHookServeEnvKey("RYK_CI"));
+    try std.testing.expect(!keepHookServeEnvKey("RYK_UNATTENDED"));
+    try std.testing.expect(!keepHookServeEnvKey("RYK_NONINTERACTIVE"));
+    try std.testing.expect(!keepHookServeEnvKey("CI"));
+    try std.testing.expect(!keepHookServeEnvKey("RYK_HOOK_SOCKET"));
+    try std.testing.expect(!keepHookServeEnvKey("SSH_AUTH_SOCK"));
+    try std.testing.expect(!keepHookServeEnvKey("OPENAI_API_KEY"));
+}
+
+test "hook resolveClientWorkspace is a non-empty absolute path" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const cwd = resolveClientWorkspace(std.testing.io, std.testing.allocator) orelse
+        return error.TestUnexpectedResult;
+    defer std.testing.allocator.free(cwd);
+    try std.testing.expect(cwd.len > 0);
+    try std.testing.expect(std.fs.path.isAbsolute(cwd));
+}
+
+test "hook mismatch parse deinits JSON without taking raw ownership" {
+    // tryServe errdefer owns `raw`; ParsedResponse.deinit must not free it.
+    const raw = try std.testing.allocator.dupe(
+        u8,
+        "{\"v\":1,\"id\":1,\"exit\":0,\"stdout\":\"\",\"stderr\":\"\",\"mismatch\":true}\n",
+    );
+    defer std.testing.allocator.free(raw);
+    var parsed = try hook_ipc.parseResponse(std.testing.allocator, raw);
+    try std.testing.expect(parsed.response.mismatch);
+    parsed.deinit();
 }

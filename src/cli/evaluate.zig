@@ -47,6 +47,8 @@ const EvaluateWireOpts = struct {
     disable_fm: bool = false,
     /// Server workspace cache hit. Caller owns the policy; do not deinit.
     cached_policy: ?*const core_api.LoadedPolicy = null,
+    /// Client asked to raise leftover ask → deny (`RYK_MODE=ci` / `--ci`).
+    raise_ci: bool = false,
 };
 
 pub const EvaluateRequest = struct {
@@ -191,6 +193,11 @@ fn commandWithEvaluator(io: std.Io, argv: []const []const u8, stdout: anytype, s
     return evaluatePayload(io, allocator, payload, stdout, evaluator, .process_home, .{});
 }
 
+/// Served evaluate must match in-process `evaluatePayload` (FM on).
+fn serverEvaluateWire(cached_policy: ?*const core_api.LoadedPolicy) EvaluateWireOpts {
+    return .{ .cached_policy = cached_policy };
+}
+
 fn tryHookServer(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -201,25 +208,28 @@ fn tryHookServer(
     if (!hook_client.shouldTry()) return null;
     const bin = std.process.executablePathAlloc(io, allocator) catch "";
     defer if (bin.len > 0) allocator.free(bin);
-    const cwd_z = std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator) catch "";
-    defer if (cwd_z.len > 0) allocator.free(cwd_z);
+    const cwd_z = hook_client.resolveClientWorkspace(io, allocator) orelse return null;
+    defer allocator.free(cwd_z);
 
     var owned = hook_client.tryServe(io, allocator, .{
         .id = 1,
         .method = "evaluate",
         .bin = bin,
         .version = build_options.version,
+        .ci = resolveEvaluateMode(.strict) == .ci,
         .workspace = cwd_z,
         .cwd = cwd_z,
         .payload_json = payload,
     }) catch |err| switch (err) {
         error.Unavailable => return null,
-        error.OutOfMemory => return error.OutOfMemory,
-        error.BrokenSession => {
+        error.BrokenSession, error.OutOfMemory => {
             try writeResponseJson(stdout, .{
                 .request_id = null,
                 .decision = "deny",
-                .reason = "hook server session ended before a decision",
+                .reason = if (err == error.OutOfMemory)
+                    "hook server ran out of memory"
+                else
+                    "hook server session ended before a decision",
                 .daemon_status = .unknown,
                 .daemon_compatible = false,
             });
@@ -237,13 +247,13 @@ pub fn evaluateForServer(
     allocator: std.mem.Allocator,
     payload: []const u8,
     cached_policy: ?*const core_api.LoadedPolicy,
+    raise_ci: bool,
 ) !hook_ipc.HostEmit {
     var stdout_buf: std.Io.Writer.Allocating = .init(allocator);
     errdefer stdout_buf.deinit();
-    const code = try evaluatePayload(io, allocator, payload, &stdout_buf.writer, shellEvalBridge, .process_home, .{
-        .disable_fm = true,
-        .cached_policy = cached_policy,
-    });
+    var wire = serverEvaluateWire(cached_policy);
+    wire.raise_ci = raise_ci;
+    const code = try evaluatePayload(io, allocator, payload, &stdout_buf.writer, shellEvalBridge, .process_home, wire);
     return .{
         .exit = code,
         .stdout = try stdout_buf.toOwnedSlice(),
@@ -637,12 +647,16 @@ fn writeEvaluationResponse(
     else
         null;
 
-    const mode: policy.schema.Mode = if (wire.mode_override) |m|
+    const resolved: policy.schema.Mode = if (wire.mode_override) |m|
         m
     else if (discovered) |loaded|
         resolveEvaluateMode(loaded.mode())
     else
         resolveEvaluateMode(.strict);
+    const mode: policy.schema.Mode = if (wire.raise_ci)
+        moreRestrictiveMode(resolved, .ci)
+    else
+        resolved;
 
     const commands_allow: []const []const u8 = if (wire.commands_allow_override) |a|
         a
@@ -1550,6 +1564,18 @@ test "evaluate fail-closes when workspace policy is unreadable" {
     const output = stdout.buffered();
     try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"error\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "policy_load_failed") != null);
+}
+
+test "evaluate hook-serve keeps FM enabled like in-process" {
+    try std.testing.expect(!serverEvaluateWire(null).disable_fm);
+    const in_process = EvaluateWireOpts{};
+    try std.testing.expect(!in_process.disable_fm);
+}
+
+test "evaluate hook-serve OOM is fail-closed like a broken session" {
+    try std.testing.expect(hook_client.serveErrorIsFailClosed(error.OutOfMemory));
+    try std.testing.expect(hook_client.serveErrorIsFailClosed(error.BrokenSession));
+    try std.testing.expect(!hook_client.serveErrorIsFailClosed(error.Unavailable));
 }
 
 test "evaluate missing workspace policy still uses builtin strict" {

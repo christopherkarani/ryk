@@ -58,6 +58,7 @@ fn testServe(socket_path: []const u8, stop: *std.atomic.Value(bool)) void {
 }
 
 fn startServer(sock: []const u8) !struct { stop: *std.atomic.Value(bool), thread: std.Thread } {
+    if (std.fs.path.dirname(sock)) |dir| try chmod0700(dir);
     const stop = try std.testing.allocator.create(std.atomic.Value(bool));
     stop.* = std.atomic.Value(bool).init(false);
     const thread = try std.Thread.spawn(.{}, testServe, .{ sock, stop });
@@ -124,16 +125,121 @@ fn readPipeToAlloc(io: std.Io, allocator: std.mem.Allocator, file: std.Io.File, 
     return try list.toOwnedSlice(allocator);
 }
 
+const EnvPair = struct { name: []const u8, value: []const u8 };
+const HookCliRun = struct { stdout: []u8, stderr: []u8, code: u8 };
+
+fn fileExists(path: []const u8) bool {
+    std.Io.Dir.cwd().access(std.testing.io, path, .{}) catch return false;
+    return true;
+}
+
+fn chmod0700(path: []const u8) !void {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    if (path.len >= buf.len) return error.PathTooLong;
+    @memcpy(buf[0..path.len], path);
+    buf[path.len] = 0;
+    if (std.c.chmod(@ptrCast(&buf), 0o700) != 0) return error.ChmodFailed;
+}
+
+fn rykAbsPath(allocator: std.mem.Allocator) ![]u8 {
+    try std.testing.expect(fileExists(ryk_bin));
+    // realPathFileAlloc is [:0]u8 (dupeZ). Re-dupe so free matches the allocation.
+    const z = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ryk_bin, allocator);
+    defer allocator.free(z);
+    return try allocator.dupe(u8, z);
+}
+
+const ShortSock = struct {
+    dir: []u8,
+    sock: []u8,
+
+    fn deinit(self: ShortSock, allocator: std.mem.Allocator) void {
+        daemon_uds.unlinkUnixSocketPath(self.sock);
+        std.Io.Dir.cwd().deleteTree(std.testing.io, self.dir) catch {};
+        allocator.free(self.sock);
+        allocator.free(self.dir);
+    }
+};
+
+fn makeTestSock(allocator: std.mem.Allocator, label: []const u8) !ShortSock {
+    const dir = try std.fmt.allocPrint(allocator, "/tmp/ryk-htest-{d}-{s}", .{ std.c.getpid(), label });
+    errdefer allocator.free(dir);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, dir);
+    try chmod0700(dir);
+    const sock = try std.fmt.allocPrint(allocator, "{s}/{s}.sock", .{ dir, label });
+    errdefer allocator.free(sock);
+    return .{ .dir = dir, .sock = sock };
+}
+
+fn shutdownServe(allocator: std.mem.Allocator, socket_path: []const u8) void {
+    const req = hook_ipc.stringifyRequest(allocator, .{
+        .id = 99,
+        .method = "shutdown",
+    }) catch return;
+    defer allocator.free(req);
+    if (exchange(allocator, socket_path, req)) |raw| {
+        allocator.free(raw);
+    } else |_| {}
+}
+
+fn startProdHookServe(allocator: std.mem.Allocator, socket_path: []const u8) !std.process.Child {
+    if (std.fs.path.dirname(socket_path)) |dir| {
+        try chmod0700(dir);
+    }
+    const exe = try rykAbsPath(allocator);
+    defer allocator.free(exe);
+    const io = std.testing.io;
+    var argv_buf = [_][]const u8{ exe, "hook-serve", "--socket", socket_path, "--idle-ms", "30000" };
+    var child = try std.process.spawn(io, .{
+        .argv = &argv_buf,
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .pipe,
+    });
+    errdefer child.kill(io);
+    waitForSocket(socket_path, 200) catch |err| {
+        var msg: []u8 = &.{};
+        if (child.stderr) |file| {
+            msg = readPipeToAlloc(io, allocator, file, 64 * 1024) catch &.{};
+        }
+        defer if (msg.len != 0) allocator.free(msg);
+        std.debug.print("hook-serve failed to bind {s}: {s}\n{s}\n", .{ socket_path, @errorName(err), msg });
+        return err;
+    };
+    return child;
+}
+
+fn stopProdHookServe(allocator: std.mem.Allocator, socket_path: []const u8, child: *std.process.Child) void {
+    shutdownServe(allocator, socket_path);
+    const io = std.testing.io;
+    _ = child.wait(io) catch {
+        child.kill(io);
+    };
+}
+
 fn runRykHook(
     allocator: std.mem.Allocator,
     argv: []const []const u8,
     stdin_data: []const u8,
     socket_path: []const u8,
-) !struct { stdout: []u8, stderr: []u8, code: u8 } {
+) !HookCliRun {
+    return runRykHookEnv(allocator, argv, stdin_data, socket_path, &.{});
+}
+
+fn runRykHookEnv(
+    allocator: std.mem.Allocator,
+    argv: []const []const u8,
+    stdin_data: []const u8,
+    socket_path: []const u8,
+    extra_env: []const EnvPair,
+) !HookCliRun {
     var env_map = try std.process.Environ.createMap(processEnviron(), allocator);
     defer env_map.deinit();
     try env_map.put("RYK_HOOK_SOCKET", socket_path);
     try env_map.put("RYK_HOOK_SERVER", "1");
+    for (extra_env) |pair| {
+        try env_map.put(pair.name, pair.value);
+    }
 
     const io = std.testing.io;
     var child = try std.process.spawn(io, .{
@@ -167,12 +273,9 @@ fn runRykHook(
 
 test "one server serves grok allow then claude deny" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
-    defer std.testing.allocator.free(dir);
-    const sock = try std.fs.path.join(std.testing.allocator, &.{ dir, "multi-host.sock" });
-    defer std.testing.allocator.free(sock);
+    const tmp_sock = try makeTestSock(std.testing.allocator, "multi");
+    defer tmp_sock.deinit(std.testing.allocator);
+    const sock = tmp_sock.sock;
 
     const server = try startServer(sock);
     defer stopServer(sock, server);
@@ -222,8 +325,9 @@ test "two workspaces do not share a cached policy" {
     defer tmp.cleanup();
     const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir);
-    const sock = try std.fs.path.join(std.testing.allocator, &.{ dir, "isolate.sock" });
-    defer std.testing.allocator.free(sock);
+    const tmp_sock = try makeTestSock(std.testing.allocator, "iso");
+    defer tmp_sock.deinit(std.testing.allocator);
+    const sock = tmp_sock.sock;
 
     const ok_ws = try std.fs.path.join(std.testing.allocator, &.{ dir, "ok" });
     defer std.testing.allocator.free(ok_ws);
@@ -283,8 +387,9 @@ test "subdir cwd uses walked-up workspace policy not builtin allow" {
     defer tmp.cleanup();
     const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir);
-    const sock = try std.fs.path.join(std.testing.allocator, &.{ dir, "subdir.sock" });
-    defer std.testing.allocator.free(sock);
+    const tmp_sock = try makeTestSock(std.testing.allocator, "sub");
+    defer tmp_sock.deinit(std.testing.allocator);
+    const sock = tmp_sock.sock;
 
     const repo = try std.fs.path.join(std.testing.allocator, &.{ dir, "repo" });
     defer std.testing.allocator.free(repo);
@@ -321,8 +426,9 @@ test "probe does not create allow-once pending files" {
     defer tmp.cleanup();
     const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir);
-    const sock = try std.fs.path.join(std.testing.allocator, &.{ dir, "probe.sock" });
-    defer std.testing.allocator.free(sock);
+    const tmp_sock = try makeTestSock(std.testing.allocator, "probe");
+    defer tmp_sock.deinit(std.testing.allocator);
+    const sock = tmp_sock.sock;
     const data_home = try std.fs.path.join(std.testing.allocator, &.{ dir, "xdg-data" });
     defer std.testing.allocator.free(data_home);
     try std.Io.Dir.cwd().createDirPath(std.testing.io, data_home);
@@ -367,8 +473,9 @@ test "extra-pack workspace fail-closes on bad pack config" {
     defer tmp.cleanup();
     const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir);
-    const sock = try std.fs.path.join(std.testing.allocator, &.{ dir, "pack.sock" });
-    defer std.testing.allocator.free(sock);
+    const tmp_sock = try makeTestSock(std.testing.allocator, "pack");
+    defer tmp_sock.deinit(std.testing.allocator);
+    const sock = tmp_sock.sock;
     const ws = try std.fs.path.join(std.testing.allocator, &.{ dir, "pack-ws" });
     defer std.testing.allocator.free(ws);
     try std.Io.Dir.cwd().createDirPath(std.testing.io, ws);
@@ -404,12 +511,9 @@ test "extra-pack workspace fail-closes on bad pack config" {
 
 test "kill server after accept is fail-closed deny not in-process allow" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
-    defer std.testing.allocator.free(dir);
-    const sock = try std.fs.path.join(std.testing.allocator, &.{ dir, "kill.sock" });
-    defer std.testing.allocator.free(sock);
+    const tmp_sock = try makeTestSock(std.testing.allocator, "kill");
+    defer tmp_sock.deinit(std.testing.allocator);
+    const sock = tmp_sock.sock;
     const sock_z = try std.testing.allocator.dupeZ(u8, sock);
     defer std.testing.allocator.free(sock_z);
 
@@ -452,6 +556,7 @@ test "kill server after accept is fail-closed deny not in-process allow" {
 }
 
 fn startHangServer(sock: []const u8) !struct { stop: *std.atomic.Value(bool), thread: std.Thread } {
+    if (std.fs.path.dirname(sock)) |dir| try chmod0700(dir);
     const stop = try std.testing.allocator.create(std.atomic.Value(bool));
     stop.* = std.atomic.Value(bool).init(false);
     const thread = try std.Thread.spawn(.{}, acceptThenCloseLoop, .{ sock, stop });
@@ -506,12 +611,9 @@ test "host matrix helpers still compile against server types" {
 
 test "version mismatch falls back to in-process allow" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
-    defer std.testing.allocator.free(dir);
-    const sock = try std.fs.path.join(std.testing.allocator, &.{ dir, "mismatch-fallback.sock" });
-    defer std.testing.allocator.free(sock);
+    const tmp_sock = try makeTestSock(std.testing.allocator, "mis");
+    defer tmp_sock.deinit(std.testing.allocator);
+    const sock = tmp_sock.sock;
 
     const hang = try startMismatchServer(sock);
     defer stopHangServer(sock, hang);
@@ -534,13 +636,12 @@ test "version mismatch falls back to in-process allow" {
 
 test "one server serves evaluate allow" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
-    defer std.testing.allocator.free(dir);
-    const sock = try std.fs.path.join(std.testing.allocator, &.{ dir, "evaluate.sock" });
-    defer std.testing.allocator.free(sock);
-    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    const tmp_sock = try makeTestSock(std.testing.allocator, "eval");
+    defer tmp_sock.deinit(std.testing.allocator);
+    const sock = tmp_sock.sock;
+    const cwd_z = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(cwd_z);
+    const cwd = try std.testing.allocator.dupe(u8, cwd_z);
     defer std.testing.allocator.free(cwd);
 
     const server = try startServer(sock);
@@ -660,12 +761,9 @@ test "one server permits leftover unused ask on coding hosts" {
 
 test "one server serves cursor allow" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
-    defer std.testing.allocator.free(dir);
-    const sock = try std.fs.path.join(std.testing.allocator, &.{ dir, "cursor.sock" });
-    defer std.testing.allocator.free(sock);
+    const tmp_sock = try makeTestSock(std.testing.allocator, "cur");
+    defer tmp_sock.deinit(std.testing.allocator);
+    const sock = tmp_sock.sock;
 
     const server = try startServer(sock);
     defer stopServer(sock, server);
@@ -688,6 +786,7 @@ test "one server serves cursor allow" {
 }
 
 fn startMismatchServer(sock: []const u8) !struct { stop: *std.atomic.Value(bool), thread: std.Thread } {
+    if (std.fs.path.dirname(sock)) |dir| try chmod0700(dir);
     const stop = try std.testing.allocator.create(std.atomic.Value(bool));
     stop.* = std.atomic.Value(bool).init(false);
     const thread = try std.Thread.spawn(.{}, acceptMismatchLoop, .{ sock, stop });
@@ -736,4 +835,155 @@ fn acceptMismatchLoop(socket_path: []const u8, stop: *std.atomic.Value(bool)) vo
         defer std.heap.page_allocator.free(resp);
         hook_ipc.writeAllFd(std.testing.io, client_fd, resp, 200) catch {};
     }
+}
+
+fn evaluateAllowPayload(allocator: std.mem.Allocator) ![]u8 {
+    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(cwd);
+    return try std.fmt.allocPrint(
+        allocator,
+        "{{\"schema_version\":1,\"request_id\":\"req-cli\",\"kind\":\"shell_command\",\"command\":\"git status\",\"cwd\":\"{s}\",\"source\":{{\"host\":\"pi\",\"tool_name\":\"bash\",\"mode\":\"tui\",\"session_id\":\"pi-session-cli\"}}}}",
+        .{cwd},
+    );
+}
+
+/// Server NDJSON vs `ryk hook` / `ryk evaluate` must match (exit + host JSON).
+fn expectCliMatchesLiveServer(
+    allocator: std.mem.Allocator,
+    socket_path: []const u8,
+    argv: []const []const u8,
+    stdin_data: []const u8,
+    method: []const u8,
+    host: []const u8,
+    event: []const u8,
+) !struct { exit: u8, decision: []const u8 } {
+    const req = try hook_ipc.stringifyRequest(allocator, .{
+        .id = 1,
+        .method = method,
+        .host = host,
+        .event = event,
+        .payload_json = stdin_data,
+    });
+    defer allocator.free(req);
+    const raw = try exchange(allocator, socket_path, req);
+    defer allocator.free(raw);
+    var parsed = try hook_ipc.parseResponse(allocator, raw);
+    defer parsed.deinit();
+    try std.testing.expect(!parsed.response.mismatch);
+
+    const run = try runRykHook(allocator, argv, stdin_data, socket_path);
+    defer allocator.free(run.stdout);
+    defer allocator.free(run.stderr);
+    try std.testing.expectEqual(parsed.response.exit, run.code);
+    try std.testing.expectEqualStrings(parsed.response.stdout, run.stdout);
+
+    const decision = try parseDecision(allocator, run.stdout);
+    return .{ .exit = run.code, .decision = decision };
+}
+
+test "thin-client ryk hook allow/deny matches live server" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const tmp_sock = try makeTestSock(std.testing.allocator, "cli");
+    defer tmp_sock.deinit(std.testing.allocator);
+    const sock = tmp_sock.sock;
+    const exe = try rykAbsPath(std.testing.allocator);
+    defer std.testing.allocator.free(exe);
+
+    var server = try startProdHookServe(std.testing.allocator, sock);
+    defer stopProdHookServe(std.testing.allocator, sock, &server);
+
+    const grok_payload = try readFile(std.testing.allocator, grok_safe);
+    defer std.testing.allocator.free(grok_payload);
+    const grok = try expectCliMatchesLiveServer(
+        std.testing.allocator,
+        sock,
+        &.{ exe, "hook", "grok", "PreToolUse" },
+        grok_payload,
+        "hook",
+        "grok",
+        "PreToolUse",
+    );
+    defer std.testing.allocator.free(grok.decision);
+    try std.testing.expectEqual(@as(u8, 0), grok.exit);
+    try std.testing.expectEqualStrings("allow", grok.decision);
+
+    const claude_payload = try readFile(std.testing.allocator, claude_danger);
+    defer std.testing.allocator.free(claude_payload);
+    const claude = try expectCliMatchesLiveServer(
+        std.testing.allocator,
+        sock,
+        &.{ exe, "hook", "claude", "PreToolUse" },
+        claude_payload,
+        "hook",
+        "claude",
+        "PreToolUse",
+    );
+    defer std.testing.allocator.free(claude.decision);
+    try std.testing.expect(std.mem.eql(u8, claude.decision, "deny") or std.mem.eql(u8, claude.decision, "block"));
+
+    const eval_payload = try evaluateAllowPayload(std.testing.allocator);
+    defer std.testing.allocator.free(eval_payload);
+    const eval_run = try expectCliMatchesLiveServer(
+        std.testing.allocator,
+        sock,
+        &.{ exe, "evaluate", "--json", "--stdin" },
+        eval_payload,
+        "evaluate",
+        "",
+        "",
+    );
+    defer std.testing.allocator.free(eval_run.decision);
+    try std.testing.expectEqual(@as(u8, 0), eval_run.exit);
+    try std.testing.expectEqualStrings("allow", eval_run.decision);
+}
+
+test "production ryk hook first connect spawns hook-serve" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const tmp_sock = try makeTestSock(std.testing.allocator, "spawn");
+    defer tmp_sock.deinit(std.testing.allocator);
+    const sock = tmp_sock.sock;
+    const home = try std.fs.path.join(std.testing.allocator, &.{ tmp_sock.dir, "home" });
+    defer std.testing.allocator.free(home);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, home);
+    const exe = try rykAbsPath(std.testing.allocator);
+    defer std.testing.allocator.free(exe);
+
+    try std.testing.expect(!hook_client.socketIsLive(sock));
+
+    const grok_payload = try readFile(std.testing.allocator, grok_safe);
+    defer std.testing.allocator.free(grok_payload);
+    const first = try runRykHookEnv(
+        std.testing.allocator,
+        &.{ exe, "hook", "grok", "PreToolUse" },
+        grok_payload,
+        sock,
+        &.{.{ .name = "HOME", .value = home }},
+    );
+    defer std.testing.allocator.free(first.stdout);
+    defer std.testing.allocator.free(first.stderr);
+    defer shutdownServe(std.testing.allocator, sock);
+
+    waitForSocket(sock, 200) catch |err| {
+        std.debug.print("first-hook spawn did not bind {s}: {s}\nstdout={s}\nstderr={s}\n", .{
+            sock,
+            @errorName(err),
+            first.stdout,
+            first.stderr,
+        });
+        return err;
+    };
+    try std.testing.expect(hook_client.socketIsLive(sock));
+
+    const second = try expectCliMatchesLiveServer(
+        std.testing.allocator,
+        sock,
+        &.{ exe, "hook", "grok", "PreToolUse" },
+        grok_payload,
+        "hook",
+        "grok",
+        "PreToolUse",
+    );
+    defer std.testing.allocator.free(second.decision);
+    try std.testing.expectEqual(@as(u8, 0), second.exit);
+    try std.testing.expectEqualStrings("allow", second.decision);
 }

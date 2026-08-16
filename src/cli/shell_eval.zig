@@ -191,7 +191,7 @@ fn resolveAllowOnceJsonlPath(allocator: std.mem.Allocator) error{OutOfMemory}!?[
         const xdg = std.mem.span(xdg_z);
         if (xdg.len > 0) {
             return try std.fs.path.join(allocator, &.{
-                xdg, "ryk",
+                xdg,                                          "ryk",
                 shell_engine.allow_once.allow_once_file_name,
             });
         }
@@ -202,7 +202,8 @@ fn resolveAllowOnceJsonlPath(allocator: std.mem.Allocator) error{OutOfMemory}!?[
             return try std.fs.path.join(allocator, &.{
                 home,
                 ".local",
-                "share", "ryk",
+                "share",
+                "ryk",
                 shell_engine.allow_once.allow_once_file_name,
             });
         }
@@ -1006,7 +1007,7 @@ const SessionStickyMap = struct {
             std.heap.page_allocator.free(old.session_id);
             self.entries[slot] = null;
         }
-        const owned = std.heap.page_allocator.dupe(u8, key) catch return fallbackSessionStickyStore();
+        const owned = sessionStickyKeyAllocator().dupe(u8, key) catch return denyOnlySessionStickyStore();
         self.entries[slot] = .{
             .session_id = owned,
             .store = policy.sticky.Store.init(std.heap.page_allocator),
@@ -1017,19 +1018,27 @@ const SessionStickyMap = struct {
 };
 
 var g_session_sticky_map: SessionStickyMap = .{};
-var g_fallback_session_sticky: ?policy.sticky.Store = null;
+var g_deny_only_session_sticky: ?policy.sticky.Store = null;
+var g_session_sticky_key_allocator: ?std.mem.Allocator = null;
+
+fn sessionStickyKeyAllocator() std.mem.Allocator {
+    return g_session_sticky_key_allocator orelse std.heap.page_allocator;
+}
+
+/// Empty store that is reset on every OOM fallback so session B cannot inherit
+/// session A's sticky allow. Never a shared writable fallback.
+fn denyOnlySessionStickyStore() *policy.sticky.Store {
+    if (g_deny_only_session_sticky) |*store| {
+        store.deinit();
+    }
+    g_deny_only_session_sticky = policy.sticky.Store.init(std.heap.page_allocator);
+    return &(g_deny_only_session_sticky.?);
+}
 
 fn normalizeSessionStickyId(session_id: []const u8) []const u8 {
     const trimmed = std.mem.trim(u8, session_id, " \t\r\n");
     if (trimmed.len == 0) return brand.default_session_id;
     return trimmed;
-}
-
-fn fallbackSessionStickyStore() *policy.sticky.Store {
-    if (g_fallback_session_sticky == null) {
-        g_fallback_session_sticky = policy.sticky.Store.init(std.heap.page_allocator);
-    }
-    return &(g_fallback_session_sticky.?);
 }
 
 /// Default bucket (`ryk-shell`) for callers that have no host session id.
@@ -1105,10 +1114,11 @@ pub fn recordStickyFromAskWithHints(
 /// across cases that used `getSessionStickyStore`.
 pub fn resetSessionStickyStoreForTests() void {
     g_session_sticky_map.deinit();
-    if (g_fallback_session_sticky) |*store| {
+    if (g_deny_only_session_sticky) |*store| {
         store.deinit();
-        g_fallback_session_sticky = null;
+        g_deny_only_session_sticky = null;
     }
+    g_session_sticky_key_allocator = null;
 }
 
 /// Optional policy context for daemon deny → product decision (WP4 + FM wire).
@@ -2801,6 +2811,27 @@ test "evaluateCommand strict permit refuse on-list and yolo no refuse" {
     }
 }
 
+test "session sticky dupe OOM does not share a writable fallback store" {
+    defer resetSessionStickyStoreForTests();
+    resetSessionStickyStoreForTests();
+    const cmd = "git push --force";
+    const fp = policy.sticky.fingerprintCommand(cmd, null);
+    try recordStickyFromAsk(getSessionStickyStoreFor("sess-a"), cmd, .session, .high);
+    try std.testing.expect(getSessionStickyStoreFor("sess-a").allows(fp));
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    g_session_sticky_key_allocator = failing.allocator();
+    const oom_store = getSessionStickyStoreFor("sess-b");
+    try std.testing.expect(!oom_store.allows(fp));
+    try recordStickyFromAsk(oom_store, cmd, .session, .high);
+    // Next OOM fallback resets the deny-only dummy; session B cannot keep a grant.
+    const oom_store_2 = getSessionStickyStoreFor("sess-c");
+    try std.testing.expect(!oom_store_2.allows(fp));
+    try std.testing.expect(oom_store == oom_store_2);
+    g_session_sticky_key_allocator = null;
+    try std.testing.expect(getSessionStickyStoreFor("sess-a").allows(fp));
+}
+
 test "session sticky stores are isolated by session id" {
     defer resetSessionStickyStoreForTests();
     resetSessionStickyStoreForTests();
@@ -3544,7 +3575,7 @@ fn sProductWireWriteUserCommandAllow(
     cmd_text: []const u8,
     reason: []const u8,
 ) !void {
-    const ryk_dir = try sProductWireJoin(&.{ xdg_config, "ryk"});
+    const ryk_dir = try sProductWireJoin(&.{ xdg_config, "ryk" });
     defer std.testing.allocator.free(ryk_dir);
     try std.Io.Dir.cwd().createDirPath(std.testing.io, ryk_dir);
     const path = try sProductWireJoin(&.{ xdg_config, "ryk", "allowlist.toml" });
@@ -3571,7 +3602,7 @@ fn sProductWireSeedAllowOnce(
     cwd: []const u8,
     reason: []const u8,
 ) !void {
-    const ryk_dir = try sProductWireJoin(&.{ xdg_data, "ryk"});
+    const ryk_dir = try sProductWireJoin(&.{ xdg_data, "ryk" });
     defer std.testing.allocator.free(ryk_dir);
     try std.Io.Dir.cwd().createDirPath(std.testing.io, ryk_dir);
     const pending_path = try sProductWireJoin(&.{ xdg_data, "ryk", shell_engine.allow_once.pending_file_name });
