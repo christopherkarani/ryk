@@ -1478,6 +1478,28 @@ test "env schema --help exits 0 and is not usage-as-error" {
     }
 }
 
+test "env schema without --agent stays usage" {
+    var stdout_buf: [4096]u8 = undefined;
+    var stderr_buf: [256]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+
+    const cases = [_][]const []const u8{
+        &.{ "env", "schema" },
+        &.{ "env", "--agent" },
+    };
+    for (cases) |argv| {
+        stdout_writer = .fixed(&stdout_buf);
+        stderr_writer = .fixed(&stderr_buf);
+        const code = try testRun(argv, &stdout_writer, &stderr_writer);
+        try std.testing.expectEqual(exit_codes.usage, code);
+        try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "Usage: ryk env schema --agent") != null);
+        const out = stdout_writer.buffered();
+        try std.testing.expect(std.mem.indexOf(u8, out, "eval \"$(ryk env)\"") == null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "export PATH=") == null);
+    }
+}
+
 test "banner suppressed for completions raw output" {
     var stdout_buf: [4096]u8 = undefined;
     var stderr_buf: [256]u8 = undefined;
