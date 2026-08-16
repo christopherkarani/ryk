@@ -1098,6 +1098,35 @@ test "grok host-config file grant covers config.toml without bare home or keycha
     try std.testing.expect(std.mem.indexOf(u8, seatbelt_scope, "narrow host-config RW, no bare home") != null);
 }
 
+// Residual after #195: auth.json is the same file-only class as config.toml.
+test "grok host-config file grant covers auth.json without docs lock logs or keychain" {
+    const allocator = std.testing.allocator;
+    const home = "/Users/dev";
+    const ws = "/tmp/ryk-grok-repro";
+    const grok_auth = "/Users/dev/.grok/auth.json";
+    var compiled = try compileProfile(allocator, .{
+        .workspace_root = ws,
+        .system_ro_prefixes = &[_][]const u8{ "/usr", "/bin" },
+        .host_rw_paths = &.{grok_auth},
+        .control_roots = &.{grok_auth},
+    });
+    defer compiled.deinit();
+
+    try std.testing.expect(compiled.hasGrant(grok_auth, .rw));
+    try std.testing.expect(compiled.isGrantedReadable(grok_auth));
+    try std.testing.expect(compiled.isControlPath(grok_auth));
+    try std.testing.expect(!compiled.isAgentWritable(grok_auth));
+    try std.testing.expect(!compiled.hasGrant("/Users/dev/.grok", .rw));
+    try std.testing.expect(!compiled.isGrantedReadable("/Users/dev/.grok/docs"));
+    try std.testing.expect(!compiled.isGrantedReadable("/Users/dev/.grok/active_sessions.lock"));
+    try std.testing.expect(!compiled.isGrantedReadable("/Users/dev/.grok/logs/unified.jsonl"));
+    try std.testing.expect(!compiled.isGrantedReadable("/Users/dev/.grok/worktrees/evil"));
+    try std.testing.expect(!compiled.isGrantedReadable("/Users/dev/.grok/bin/grok"));
+    try std.testing.expect(!compiled.grantsHome(home));
+    try std.testing.expect(!compiled.isGrantedReadable("/Users/dev/Library/Keychains/login.keychain-db"));
+    try std.testing.expect(compiled.has_host_config_rw);
+}
+
 test "host config host_rw_paths compile as RW without HOME or ssh" {
     const allocator = std.testing.allocator;
     const home = "/Users/dev";
