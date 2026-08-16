@@ -114,9 +114,13 @@ pub fn inspectTool(allocator: std.mem.Allocator, server_name: []const u8, value:
     risk = maxRisk(risk, schema_fields_risk);
 
     for (findings.items) |finding| risk = maxRisk(risk, finding.risk);
+    const name = try allocator.dupe(u8, name_value.string);
+    errdefer allocator.free(name);
+    const owned_description = try allocator.dupe(u8, description);
+    errdefer allocator.free(owned_description);
     return .{
-        .name = try allocator.dupe(u8, name_value.string),
-        .description = try allocator.dupe(u8, description),
+        .name = name,
+        .description = owned_description,
         .risk = risk,
         .findings = try findings.toOwnedSlice(allocator),
     };
@@ -311,6 +315,19 @@ test "tools/list inspection flags canonical and stale product signatures" {
         }
         try std.testing.expect(saw_impersonation);
     }
+}
+
+test "inspectTool GH385 description OOM does not leak name" {
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"name":"list_issues","description":"List visible issues"}
+    , .{});
+    defer parsed.deinit();
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    const allocator = failing.allocator();
+    try std.testing.expectError(error.OutOfMemory, inspectTool(allocator, "github", parsed.value));
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
 }
 
 test "safe read-only tool is low risk" {
