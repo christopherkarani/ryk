@@ -294,6 +294,22 @@ const RedactionEntry = struct {
     reason: []const u8,
 };
 
+fn appendOwnedRedaction(
+    allocator: std.mem.Allocator,
+    redactions: *std.ArrayList(RedactionEntry),
+    field: []const u8,
+    reason: []const u8,
+) !void {
+    const owned_field = try allocator.dupe(u8, field);
+    errdefer allocator.free(owned_field);
+    const owned_reason = try allocator.dupe(u8, reason);
+    errdefer allocator.free(owned_reason);
+    try redactions.append(allocator, .{
+        .field = owned_field,
+        .reason = owned_reason,
+    });
+}
+
 fn evaluateDecision(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -400,10 +416,7 @@ fn evaluateDecision(
             const had_secrets = redacted.len != text.len or !std.mem.eql(u8, redacted, text);
 
             if (had_secrets) {
-                try redactions.append(allocator, .{
-                    .field = try allocator.dupe(u8, "text"),
-                    .reason = try allocator.dupe(u8, "potential secret detected"),
-                });
+                try appendOwnedRedaction(allocator, &redactions, "text", "potential secret detected");
             }
 
             // Prompt decisions use policy env evaluation as a proxy for sensitivity
@@ -1451,6 +1464,22 @@ test "decide rejects missing required command and file fields" {
     try std.testing.expect(missing_tool_name != exit_codes.success);
     try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "MissingRequiredField") != null);
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "\"decision\": \"error\"") != null);
+}
+
+fn appendRedactionAllocationFailureProbe(allocator: std.mem.Allocator) !void {
+    var redactions: std.ArrayList(RedactionEntry) = .empty;
+    defer {
+        for (redactions.items) |entry| {
+            allocator.free(entry.field);
+            allocator.free(entry.reason);
+        }
+        redactions.deinit(allocator);
+    }
+    try appendOwnedRedaction(allocator, &redactions, "text", "potential secret detected");
+}
+
+test "decide redaction append cleans up every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, appendRedactionAllocationFailureProbe, .{});
 }
 
 test "decide prompt with fake secret returns warn" {
