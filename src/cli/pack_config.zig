@@ -118,6 +118,120 @@ pub const LoadedPackIds = struct {
 /// User config may still opt out baseline packs; those are merged in when the
 /// active scope is project.
 /// Missing config → empty lists (baseline only).
+const PackIdCacheKey = struct {
+    exists: bool,
+    inode: std.Io.File.INode,
+    size: u64,
+    mtime_ns: i96,
+};
+
+const PackIdCache = struct {
+    path: []u8,
+    path_key: PackIdCacheKey,
+    user_key: ?PackIdCacheKey,
+    enabled: []const []const u8,
+    disabled: []const []const u8,
+};
+
+// Zig 0.16: std.atomic.Mutex (not Thread.Mutex).
+var pack_id_cache_mu: std.atomic.Mutex = .unlocked;
+var pack_id_cache: ?PackIdCache = null;
+
+fn lockPackIdCache() void {
+    while (!pack_id_cache_mu.tryLock()) {
+        std.atomic.spinLoopHint();
+    }
+}
+
+fn missingPackConfigKey() PackIdCacheKey {
+    return .{ .exists = false, .inode = 0, .size = 0, .mtime_ns = 0 };
+}
+
+fn statPackConfigKey(io: std.Io, path: []const u8) PackIdCacheKey {
+    const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return missingPackConfigKey();
+    defer file.close(io);
+    const st = file.stat(io) catch return missingPackConfigKey();
+    return .{
+        .exists = true,
+        .inode = st.inode,
+        .size = st.size,
+        .mtime_ns = st.mtime.nanoseconds,
+    };
+}
+
+fn keysEqual(a: PackIdCacheKey, b: PackIdCacheKey) bool {
+    return a.exists == b.exists and a.inode == b.inode and a.size == b.size and a.mtime_ns == b.mtime_ns;
+}
+
+fn optionalKeysEqual(a: ?PackIdCacheKey, b: ?PackIdCacheKey) bool {
+    if (a == null and b == null) return true;
+    const left = a orelse return false;
+    const right = b orelse return false;
+    return keysEqual(left, right);
+}
+
+fn cloneOwnedIds(allocator: std.mem.Allocator, ids: []const []const u8) ![]const []const u8 {
+    if (ids.len == 0) return &.{};
+    const out = try allocator.alloc([]const u8, ids.len);
+    var n: usize = 0;
+    errdefer {
+        for (out[0..n]) |id| allocator.free(id);
+        allocator.free(out);
+    }
+    for (ids, 0..) |id, i| {
+        out[i] = try allocator.dupe(u8, id);
+        n += 1;
+    }
+    return out;
+}
+
+fn storePackIdCache(path: []const u8, path_key: PackIdCacheKey, user_key: ?PackIdCacheKey, enabled: []const []const u8, disabled: []const []const u8) void {
+    const gpa = std.heap.page_allocator;
+    const path_owned = gpa.dupe(u8, path) catch return;
+    const enabled_owned = cloneOwnedIds(gpa, enabled) catch {
+        gpa.free(path_owned);
+        return;
+    };
+    const disabled_owned = cloneOwnedIds(gpa, disabled) catch {
+        freeOwnedSlice(gpa, enabled_owned);
+        gpa.free(path_owned);
+        return;
+    };
+    lockPackIdCache();
+    defer pack_id_cache_mu.unlock();
+    if (pack_id_cache) |*old| {
+        gpa.free(old.path);
+        freeOwnedSlice(gpa, old.enabled);
+        freeOwnedSlice(gpa, old.disabled);
+    }
+    pack_id_cache = .{
+        .path = path_owned,
+        .path_key = path_key,
+        .user_key = user_key,
+        .enabled = enabled_owned,
+        .disabled = disabled_owned,
+    };
+}
+
+fn cloneFromPackIdCache(allocator: std.mem.Allocator, path: []const u8, path_key: PackIdCacheKey, user_key: ?PackIdCacheKey) ?LoadedPackIds {
+    lockPackIdCache();
+    defer pack_id_cache_mu.unlock();
+    const cached = pack_id_cache orelse return null;
+    if (!std.mem.eql(u8, cached.path, path)) return null;
+    if (!keysEqual(cached.path_key, path_key)) return null;
+    if (!optionalKeysEqual(cached.user_key, user_key)) return null;
+    const enabled = cloneOwnedIds(allocator, cached.enabled) catch return null;
+    const disabled = cloneOwnedIds(allocator, cached.disabled) catch {
+        freeOwnedSlice(allocator, enabled);
+        return null;
+    };
+    return .{
+        .enabled = enabled,
+        .disabled = disabled,
+        .owned = true,
+    };
+}
+
 pub fn loadPackIdsForWorkspace(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -128,6 +242,14 @@ pub fn loadPackIdsForWorkspace(
         else => return err,
     };
     defer allocator.free(resolved.path);
+
+    const path_key = statPackConfigKey(io, resolved.path);
+    const user_key: ?PackIdCacheKey = if (resolved.scope == .project) blk: {
+        const user = resolveUserPackConfigPath(allocator) catch break :blk null;
+        defer allocator.free(user.path);
+        break :blk statPackConfigKey(io, user.path);
+    } else null;
+    if (cloneFromPackIdCache(allocator, resolved.path, path_key, user_key)) |hit| return hit;
 
     var lists = loadPackIdLists(io, allocator, resolved.path) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -157,11 +279,24 @@ pub fn loadPackIdsForWorkspace(
     // Drop raw file buffer / empty lists.
     lists.deinit(allocator);
 
+    storePackIdCache(resolved.path, path_key, user_key, enabled, disabled);
     return .{
         .enabled = enabled,
         .disabled = disabled,
         .owned = true,
     };
+}
+
+fn resetPackIdCacheForTests() void {
+    lockPackIdCache();
+    defer pack_id_cache_mu.unlock();
+    if (pack_id_cache) |*old| {
+        const gpa = std.heap.page_allocator;
+        gpa.free(old.path);
+        freeOwnedSlice(gpa, old.enabled);
+        freeOwnedSlice(gpa, old.disabled);
+        pack_id_cache = null;
+    }
 }
 
 /// Errors that mean "cannot read user config under sandbox residual", not "corrupt
@@ -1287,6 +1422,62 @@ test "loadPackIdsForWorkspace user-scope AccessDenied degrades to baseline only"
     // Soft residual: empty lists (baseline only), not error.
     try std.testing.expectEqual(@as(usize, 0), loaded.enabled.len);
     try std.testing.expectEqual(@as(usize, 0), loaded.disabled.len);
+}
+
+test "loadPackIdsForWorkspace cache invalidates when pack config changes" {
+    resetPackIdCacheForTests();
+    defer resetPackIdCacheForTests();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, ".git");
+    {
+        const f = try tmp.dir.createFile(std.testing.io, ".ryk.toml", .{});
+        defer f.close(std.testing.io);
+        try f.writeStreamingAll(std.testing.io,
+            \\[packs]
+            \\enabled = ["containers.docker"]
+            \\
+        );
+    }
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+
+    var xdg = try testIsolateXdg();
+    defer xdg.deinit();
+
+    {
+        var first = try loadPackIdsForWorkspace(std.testing.io, std.testing.allocator, root);
+        defer first.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 1), first.enabled.len);
+        try std.testing.expectEqualStrings("containers.docker", first.enabled[0]);
+    }
+    {
+        // Same mtime/size: second load must still return the cached enablement.
+        var second = try loadPackIdsForWorkspace(std.testing.io, std.testing.allocator, root);
+        defer second.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 1), second.enabled.len);
+        try std.testing.expectEqualStrings("containers.docker", second.enabled[0]);
+    }
+
+    {
+        const f = try tmp.dir.createFile(std.testing.io, ".ryk.toml", .{ .truncate = true });
+        defer f.close(std.testing.io);
+        try f.writeStreamingAll(std.testing.io,
+            \\[packs]
+            \\enabled = ["containers.docker", "package_managers"]
+            \\
+        );
+    }
+
+    var third = try loadPackIdsForWorkspace(std.testing.io, std.testing.allocator, root);
+    defer third.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), third.enabled.len);
+    var saw_pkg = false;
+    for (third.enabled) |id| {
+        if (std.mem.eql(u8, id, "package_managers")) saw_pkg = true;
+    }
+    try std.testing.expect(saw_pkg);
 }
 
 test "resolvePackConfigPath treats .ryk/policy.yaml as project marker" {
