@@ -338,15 +338,27 @@ pub fn stageDelete(
 
     var index = try loadIndex(io, allocator, workspace_root, session_dir);
     defer index.deinit();
+    // #375: build via initOwned so mid-construct OOM cannot leak partial field dupes.
+    // original_hash is already owned; hand off after successful initOwned of path/time fields.
+    const original_path_owned = try allocator.dupe(u8, normalized.resolved_path);
+    errdefer allocator.free(original_path_owned);
+    const normalized_path_owned = try allocator.dupe(u8, normalized.relative_path);
+    errdefer allocator.free(normalized_path_owned);
+    const staged_path_owned = try stagedPathForEntry(allocator, session_dir, normalized.relative_path);
+    errdefer allocator.free(staged_path_owned);
+    const timestamp_owned = try timestampNowAlloc(io, allocator);
+    errdefer allocator.free(timestamp_owned);
+    const actor_owned = try allocator.dupe(u8, "ryk");
+    errdefer allocator.free(actor_owned);
     const new_entry: StagedEntry = .{
-        .original_path = try allocator.dupe(u8, normalized.resolved_path),
-        .normalized_path = try allocator.dupe(u8, normalized.relative_path),
-        .staged_path = try stagedPathForEntry(allocator, session_dir, normalized.relative_path),
+        .original_path = original_path_owned,
+        .normalized_path = normalized_path_owned,
+        .staged_path = staged_path_owned,
         .original_hash = original_hash,
         .staged_hash = null,
         .operation = .delete,
-        .timestamp = try timestampNowAlloc(io, allocator),
-        .actor = try allocator.dupe(u8, "ryk"),
+        .timestamp = timestamp_owned,
+        .actor = actor_owned,
     };
     original_hash = null;
     try index.upsert(new_entry);
@@ -561,15 +573,24 @@ fn stageBytes(
 
     var index = try loadIndex(io, allocator, workspace_root, session_dir);
     defer index.deinit();
+    // #376: locals + errdefer before transfer; avoid multi-dupe struct-literal partial ownership.
+    const original_path_owned = try allocator.dupe(u8, normalized.resolved_path);
+    errdefer allocator.free(original_path_owned);
+    const normalized_path_owned = try allocator.dupe(u8, normalized.relative_path);
+    errdefer allocator.free(normalized_path_owned);
+    const timestamp_owned = try timestampNowAlloc(io, allocator);
+    errdefer allocator.free(timestamp_owned);
+    const actor_owned = try allocator.dupe(u8, "ryk");
+    errdefer allocator.free(actor_owned);
     const new_entry: StagedEntry = .{
-        .original_path = try allocator.dupe(u8, normalized.resolved_path),
-        .normalized_path = try allocator.dupe(u8, normalized.relative_path),
+        .original_path = original_path_owned,
+        .normalized_path = normalized_path_owned,
         .staged_path = staged_path.?,
         .original_hash = original_hash,
         .staged_hash = staged_hash,
         .operation = if (existed) .update else .create,
-        .timestamp = try timestampNowAlloc(io, allocator),
-        .actor = try allocator.dupe(u8, "ryk"),
+        .timestamp = timestamp_owned,
+        .actor = actor_owned,
     };
     original_hash = null;
     staged_hash = null;
