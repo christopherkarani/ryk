@@ -960,7 +960,13 @@ fn installOneHostInner(
     if (std.mem.eql(u8, host_id, "grok")) {
         // Day-one native Command Guard: PreToolUse Bash hook in ~/.grok/hooks/ryk.json
         // (official Grok Build discovery path; also dual-writes legacy user-settings).
-        const result = grok_install.installAtHome(io, allocator, home, self_exe) catch return .failed;
+        const result = grok_install.installAtHome(io, allocator, home, self_exe) catch |err| {
+            setInstallDetail(switch (err) {
+                error.InvalidRykBinary => "Grok hook ryk_binary is not product ryk",
+                else => "Grok hook install failed",
+            });
+            return .failed;
+        };
         result.deinit(allocator);
         return if (result.changed) .installed else .already_installed;
     }
@@ -3127,6 +3133,52 @@ test "day-one installOneHost maps cursor to deferred and unowned Pi to skipped" 
         DayOneInstallResult.skipped_unowned,
         installOneHost(std.testing.io, std.testing.allocator, "pi", home, "/opt/ryk/bin/ryk", workspace),
     );
+}
+
+test "day-one installOneHost rewrites leftover zig Grok hook and names InvalidRykBinary" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, grok_install.hooks_relative_dir);
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = grok_install.managed_hook_relative_path,
+        .data =
+        \\{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"/Users/me/.local/zig/zig-aarch64-macos/zig hook grok PreToolUse","timeout":30}]}]}}
+        \\
+        ,
+    });
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(home);
+    const workspace = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(workspace);
+
+    try std.testing.expectEqual(
+        DayOneInstallResult.failed,
+        installOneHost(
+            std.testing.io,
+            std.testing.allocator,
+            "grok",
+            home,
+            "/private/tmp/ryk-factory/.zig-cache/o/deadbeef/test",
+            workspace,
+        ),
+    );
+    try std.testing.expect(std.mem.indexOf(u8, lastInstallDetail(), "not product ryk") != null);
+
+    try std.testing.expectEqual(
+        DayOneInstallResult.installed,
+        installOneHost(std.testing.io, std.testing.allocator, "grok", home, "/opt/ryk/bin/ryk", workspace),
+    );
+    const hook_path = try std.fs.path.join(std.testing.allocator, &.{ home, grok_install.managed_hook_relative_path });
+    defer std.testing.allocator.free(hook_path);
+    const rewritten = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        hook_path,
+        std.testing.allocator,
+        .limited(grok_install.max_hook_file_size),
+    );
+    defer std.testing.allocator.free(rewritten);
+    try std.testing.expect(std.mem.indexOf(u8, rewritten, "/opt/ryk/bin/ryk hook grok PreToolUse") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rewritten, "/Users/me/.local/zig/zig-aarch64-macos/zig") == null);
 }
 
 test "day-one wire fix hints are non-circular and keep doctor --fix door" {
