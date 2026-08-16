@@ -296,13 +296,13 @@ pub fn stageDelete(
 
     const original_bytes = try std.Io.Dir.cwd().readFileAlloc(io, normalized.resolved_path, allocator, .limited(max_staged_file_bytes));
     defer allocator.free(original_bytes);
-    const original_hash = try sha256HexAlloc(allocator, original_bytes);
-    errdefer allocator.free(original_hash);
+    var original_hash: ?[]u8 = try sha256HexAlloc(allocator, original_bytes);
+    errdefer if (original_hash) |hash| allocator.free(hash);
     try writeSessionRelFile(session_dir, "original", normalized.relative_path, original_bytes);
 
     var index = try loadIndex(io, allocator, workspace_root, session_dir);
     defer index.deinit();
-    try index.upsert(.{
+    const new_entry: StagedEntry = .{
         .original_path = try allocator.dupe(u8, normalized.resolved_path),
         .normalized_path = try allocator.dupe(u8, normalized.relative_path),
         .staged_path = try stagedPathForEntry(allocator, session_dir, normalized.relative_path),
@@ -311,7 +311,9 @@ pub fn stageDelete(
         .operation = .delete,
         .timestamp = try timestampNowAlloc(io, allocator),
         .actor = try allocator.dupe(u8, "ryk"),
-    });
+    };
+    original_hash = null;
+    try index.upsert(new_entry);
     try writeIndex(io, allocator, session_dir, session_id, index.entries.items);
     try auditFileEvent(audit_context, .file_write_staged, normalized.policy_path, .{
         .result = .stage,
@@ -515,25 +517,28 @@ fn stageBytes(
     }
 
     try writeSessionRelFile(session_dir, "staged", normalized.relative_path, bytes);
-    const staged_hash = try sha256HexAlloc(allocator, bytes);
-    errdefer allocator.free(staged_hash);
+    var staged_hash: ?[]u8 = try sha256HexAlloc(allocator, bytes);
+    errdefer if (staged_hash) |hash| allocator.free(hash);
 
-    const staged_path = try stagedPathForEntry(allocator, session_dir, normalized.relative_path);
-    errdefer allocator.free(staged_path);
+    var staged_path: ?[]u8 = try stagedPathForEntry(allocator, session_dir, normalized.relative_path);
+    errdefer if (staged_path) |path| allocator.free(path);
 
     var index = try loadIndex(io, allocator, workspace_root, session_dir);
     defer index.deinit();
-    try index.upsert(.{
+    const new_entry: StagedEntry = .{
         .original_path = try allocator.dupe(u8, normalized.resolved_path),
         .normalized_path = try allocator.dupe(u8, normalized.relative_path),
-        .staged_path = staged_path,
+        .staged_path = staged_path.?,
         .original_hash = original_hash,
         .staged_hash = staged_hash,
         .operation = if (existed) .update else .create,
         .timestamp = try timestampNowAlloc(io, allocator),
         .actor = try allocator.dupe(u8, "ryk"),
-    });
+    };
     original_hash = null;
+    staged_hash = null;
+    staged_path = null;
+    try index.upsert(new_entry);
     try writeIndex(io, allocator, session_dir, session_id, index.entries.items);
 
     try auditFileEvent(audit_context, .file_write_staged, normalized.policy_path, .{
@@ -746,7 +751,9 @@ const Index = struct {
                 return;
             }
         }
-        try self.entries.append(self.allocator, new_entry);
+        var owned = new_entry;
+        errdefer owned.deinit(self.allocator);
+        try self.entries.append(self.allocator, owned);
     }
 
     fn find(self: *Index, relative_path: []const u8) ?StagedEntry {
@@ -1865,4 +1872,70 @@ test "filesystem audit events are emitted through session writer" {
     try std.testing.expect(std.mem.indexOf(u8, events, "file_write_staged") != null);
     try std.testing.expect(std.mem.indexOf(u8, events, "file_discard") != null);
     try std.testing.expect(std.mem.indexOf(u8, events, "fake_secret_value") == null);
+}
+
+test "stageBytes and stageDelete do not double-free after writeIndex fails" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, ".git");
+    try tmp.dir.writeFile(io, .{ .sub_path = "victim.txt", .data = "doomed\n" });
+    const root = try testAllocRealPath(io, tmp.dir, ".", allocator);
+    defer allocator.free(root);
+    var loaded = try policy.load.loadPreset(allocator, .strict);
+    defer loaded.deinit();
+    const session_id = "upsert-own-test";
+
+    var first = try stageCreate(io, allocator, &loaded, root, session_id, "keep.txt", "keep\n", null);
+    defer first.deinit(allocator);
+
+    const index_rel = ".ryk/sessions/upsert-own-test/staging-index.json";
+    try tmp.dir.setFilePermissions(io, index_rel, std.Io.File.Permissions.fromMode(0o444), .{});
+    defer tmp.dir.setFilePermissions(io, index_rel, std.Io.File.Permissions.fromMode(0o644), .{}) catch {};
+
+    if (stageCreate(io, allocator, &loaded, root, session_id, "second.txt", "second\n", null)) |ok_const| {
+        var ok = ok_const;
+        ok.deinit(allocator);
+        return error.TestExpectedError;
+    } else |err| {
+        try std.testing.expect(err == error.AccessDenied or err == error.PermissionDenied);
+    }
+
+    if (stageUpdate(io, allocator, &loaded, root, session_id, "victim.txt", "updated\n", null)) |ok_const| {
+        var ok = ok_const;
+        ok.deinit(allocator);
+        return error.TestExpectedError;
+    } else |err| {
+        try std.testing.expect(err == error.AccessDenied or err == error.PermissionDenied);
+    }
+
+    if (stageDelete(io, allocator, &loaded, root, session_id, "victim.txt", null)) |ok_const| {
+        var ok = ok_const;
+        ok.deinit(allocator);
+        return error.TestExpectedError;
+    } else |err| {
+        try std.testing.expect(err == error.AccessDenied or err == error.PermissionDenied);
+    }
+}
+
+test "upsert deinits new entry when append fails" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const index_allocator = failing.allocator();
+    var index: Index = .{ .allocator = index_allocator, .entries = .empty };
+    defer index.deinit();
+
+    const new_entry: StagedEntry = .{
+        .original_path = try std.testing.allocator.dupe(u8, "/tmp/a"),
+        .normalized_path = try std.testing.allocator.dupe(u8, "a"),
+        .staged_path = try std.testing.allocator.dupe(u8, "/tmp/s"),
+        .original_hash = try std.testing.allocator.dupe(u8, "aa"),
+        .staged_hash = try std.testing.allocator.dupe(u8, "bb"),
+        .operation = .create,
+        .timestamp = try std.testing.allocator.dupe(u8, "t"),
+        .actor = try std.testing.allocator.dupe(u8, "ryk"),
+    };
+    try std.testing.expectError(error.OutOfMemory, index.upsert(new_entry));
 }
