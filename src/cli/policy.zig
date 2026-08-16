@@ -137,15 +137,19 @@ fn check(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: anytype)
     return exit_codes.success;
 }
 
+fn writeExplainUsage(stdout: anytype) !void {
+    try stdout.writeAll(
+        \\Usage:
+        \\  ryk policy explain [--policy <path>] <file.read|file.write|env|command|network|mcp|tool> <target> [--method <HTTP_METHOD>] [--args '<json-object>']
+        \\
+        \\  --args is only used for `tool` (structural effect classification). Size-bounded JSON object.
+        \\
+    );
+}
+
 fn explain(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: anytype) !u8 {
     if (argv.len == 1 and (std.mem.eql(u8, argv[0], "--help") or std.mem.eql(u8, argv[0], "-h"))) {
-        try stdout.writeAll(
-            \\Usage:
-            \\  ryk policy explain [--policy <path>] <file.read|file.write|env|command|network|mcp|tool> <target> [--method <HTTP_METHOD>] [--args '<json-object>']
-            \\
-            \\  --args is only used for `tool` (structural effect classification). Size-bounded JSON object.
-            \\
-        );
+        try writeExplainUsage(stdout);
         return exit_codes.success;
     }
     var policy_path: ?[]const u8 = null;
@@ -164,8 +168,8 @@ fn explain(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: anytyp
     }
     const positional = argv[start_index..];
     if (positional.len < 2) {
-        try stderr.writeAll("ryk policy explain: expected a type and target.\n");
-        return exit_codes.usage;
+        try writeExplainUsage(stdout);
+        return exit_codes.success;
     }
     const kind = policy_mod.explain.ExplainKind.parse(positional[0]) orelse {
         try suggestions.writeSanitizedValue(stderr, "ryk policy explain: unsupported type '", positional[0], "'.\n");
@@ -617,6 +621,58 @@ test "policy explain accepts explicit policy path" {
     try std.testing.expectEqual(exit_codes.success, code);
     try std.testing.expectEqualStrings(@embedFile("test-fixtures/policy-explain-command-deny.txt"), stdout_writer.buffered());
     try std.testing.expectEqualStrings("", stderr_writer.buffered());
+}
+
+test "policy explain with no args writes usage to stdout" {
+    var stdout_buf: [1024]u8 = undefined;
+    var stderr_buf: [512]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+
+    const code = try command(std.testing.io, &.{"explain"}, &stdout_writer, &stderr_writer);
+    try std.testing.expectEqual(exit_codes.success, code);
+    const out = stdout_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "Usage") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "file.read") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "ryk policy explain") != null);
+    try std.testing.expectEqualStrings("", stderr_writer.buffered());
+}
+
+test "policy explain type without target writes usage to stdout" {
+    var stdout_buf: [1024]u8 = undefined;
+    var stderr_buf: [512]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+
+    const code = try command(std.testing.io, &.{ "explain", "command" }, &stdout_writer, &stderr_writer);
+    try std.testing.expectEqual(exit_codes.success, code);
+    const out = stdout_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "Usage") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "file.read") != null);
+    try std.testing.expectEqualStrings("", stderr_writer.buffered());
+}
+
+test "policy explain --policy without path still fails closed" {
+    var stdout_buf: [1024]u8 = undefined;
+    var stderr_buf: [512]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+
+    const code = try command(std.testing.io, &.{ "explain", "--policy" }, &stdout_writer, &stderr_writer);
+    try std.testing.expectEqual(exit_codes.usage, code);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "--policy requires a path") != null);
+}
+
+test "policy explain unsupported type still fails closed" {
+    var stdout_buf: [1024]u8 = undefined;
+    var stderr_buf: [512]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+
+    const code = try command(std.testing.io, &.{ "explain", "not-a-kind", "/tmp" }, &stdout_writer, &stderr_writer);
+    try std.testing.expectEqual(exit_codes.usage, code);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "unsupported type") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "Usage") == null);
 }
 
 test "policy explanation panel sanitizes dynamic fields" {
