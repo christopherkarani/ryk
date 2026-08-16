@@ -4,6 +4,7 @@ const gpa_mod = @import("gpa.zig");
 const env_util = @import("../env_util.zig");
 const intercept = @import("../intercept/mod.zig");
 const exit_codes = @import("exit_codes.zig");
+const help = @import("help.zig");
 
 pub fn command(
     io: std.Io,
@@ -11,6 +12,12 @@ pub fn command(
     stdout: anytype,
     stderr: anytype,
 ) !u8 {
+    for (argv) |arg| {
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            _ = try help.writeCommand(io, stdout, "env");
+            return exit_codes.success;
+        }
+    }
     if (argv.len != 2 or !std.mem.eql(u8, argv[0], "schema") or !std.mem.eql(u8, argv[1], "--agent")) {
         try stderr.writeAll("Usage: ryk env schema --agent\n");
         return exit_codes.usage;

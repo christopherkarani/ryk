@@ -188,6 +188,7 @@ pub const commands =
             .details = &.{
                 "Prints export statements for PATH and RYK_RESOURCE_ROOT.",
                 "Use with eval: eval \"$(ryk env)\"",
+                "ryk env schema --agent prints the agent schema export.",
             },
         },
         .{
