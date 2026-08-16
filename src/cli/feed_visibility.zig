@@ -563,7 +563,10 @@ pub fn writeFeedRecordJson(writer: anytype, record: RustShellFeedRecord) !void {
     try writer.writeByte(',');
     try writeJsonField(writer, "target_summary", record.target_summary);
     try writer.writeByte(',');
-    try writeJsonFieldNullable(writer, "session_id", record.session_id);
+    // session_id is a path key. High-entropy / JWT classification would collapse
+    // legitimate host ids; structured tokens are replaced with `redacted` at
+    // parse time. Write the already-gated value without `redactStringBounded`.
+    try writeJsonStringFieldNullable(writer, "session_id", record.session_id);
     try writer.writeAll(",\"verified\":");
     try writer.writeAll(if (record.verified) "true" else "false");
     try writer.writeByte('}');
@@ -584,6 +587,17 @@ fn writeJsonFieldNullable(writer: anytype, field: []const u8, value: ?[]const u8
     if (value) |text| {
         var redacted_buf: [512]u8 = undefined;
         try core.util.writeJsonString(writer, core_api.redactStringBounded(text, &redacted_buf));
+    } else {
+        try writer.writeAll("null");
+    }
+}
+
+fn writeJsonStringFieldNullable(writer: anytype, field: []const u8, value: ?[]const u8) !void {
+    try writer.writeAll("\"");
+    try writer.writeAll(field);
+    try writer.writeAll("\":");
+    if (value) |text| {
+        try core.util.writeJsonString(writer, text);
     } else {
         try writer.writeAll("null");
     }
