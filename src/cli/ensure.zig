@@ -26,7 +26,7 @@ const telemetry = @import("../telemetry.zig");
 pub const doctor_fix_hint: []const u8 = "ryk doctor --fix";
 
 // ---------------------------------------------------------------------------
-// Frozen API surface (plan §2 / D20)
+// Frozen API surface (EnsureCore contract)
 // ---------------------------------------------------------------------------
 
 /// Options for `runEnsure`. Existing fields stay stable; additive fields default off.
@@ -1369,7 +1369,7 @@ fn ensureCoreReadPolicy(dir: std.Io.Dir) ![]u8 {
 }
 
 // ---------------------------------------------------------------------------
-// EnsureCore — API freeze (plan §2)
+// EnsureCore — API freeze
 // ---------------------------------------------------------------------------
 
 test "EnsureCore API surface freezes EnsureOptions Outcome HostResult fields" {
@@ -1643,7 +1643,7 @@ test "EnsureCore host fix_hint never teaches ryk start as required repair" {
 
     try std.testing.expect(outcome.core_ok);
     for (outcome.hosts) |host| {
-        // Plan §2: fix_hint teaches doctor --fix — never "ryk start" as required.
+        // fix_hint teaches doctor --fix — never "ryk start" as required.
         if (host.fix_hint.len == 0) continue;
         if (containsIgnoreCase(host.fix_hint, "ryk start")) {
             // Only allowed if doctor --fix is also taught as the repair door.

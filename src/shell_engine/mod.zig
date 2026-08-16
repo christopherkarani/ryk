@@ -120,7 +120,7 @@ pub const EvaluateOptions = struct {
 /// Empty command is a no-op allow (matches oracle). Registry init failure → deny.
 /// When `options.trace` is non-null, records real timed pipeline steps for explain.
 ///
-/// Order (plan §4.1): allow-once exact → permanent kind=command FULL ALLOW →
+/// Order: allow-once exact → permanent kind=command FULL ALLOW →
 /// packs with permanent kind=rule as skip-this-rule only (E8).
 /// Legacy `options.allowlists` Layered remains a separate pre-pack short-circuit
 /// for engine unit tests — not the product permanent API.
@@ -389,7 +389,7 @@ fn collectPermanentRuleSkipIds(
     }
 }
 
-/// Plan §4.1 step 1: exact allow-once hit before permanent/packs.
+/// Step 1: exact allow-once hit before permanent/packs.
 ///
 /// Product law (operator break-glass): allow-once MAY FULL ALLOW a critical pack
 /// hit after the operator redeems a deny-panel short code. Permanent kind=command
@@ -511,7 +511,7 @@ fn isSandboxHomeStoreAccessError(err: anyerror) bool {
     return err == error.AccessDenied or err == error.PermissionDenied;
 }
 
-/// Plan §4.1 step 2: permanent kind=command exact → FULL ALLOW pre-pack.
+/// Step 2: permanent kind=command exact → FULL ALLOW pre-pack.
 /// Critical hard fence: permanent kind=command cannot unlock a critical pack hit.
 fn tryPermanentCommand(
     allocator: std.mem.Allocator,
@@ -2413,9 +2413,7 @@ test "phase2 credentials cat-env Mode A" {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// s-engine — plan §4.1 evaluate order (RED until implementer wires pipeline)
-//
-// Contract pinned for implementer (mod.zig + registry.zig exclusive):
+// s-engine evaluate order
 //
 // EvaluateOptions (distinct permanent API — NOT `allowlists` / Layered):
 //   .permanent_allowlist: ?allowlist_store.Store = null
@@ -2794,7 +2792,7 @@ test "s-engine: kind=rule is not pre-pack FULL ALLOW for unrelated destructive p
 
 test "s-engine: allow-once may FULL ALLOW critical (operator break-glass); permanent cannot" {
     // Product law: permanent is hard-fenced for critical; allow-once after operator
-    // redeem is the intentional single-use recovery path (help.zig / plan §4.1).
+    // redeem is the intentional single-use recovery path (help.zig evaluate order).
     const cmd = "git reset --hard HEAD";
 
     const store = sEnginePermanentStore(&.{

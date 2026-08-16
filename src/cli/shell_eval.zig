@@ -3309,9 +3309,9 @@ test "Fm decisionFromDaemonResultWithPolicy timeout keeps allow" {
 
 // ---------------------------------------------------------------------------
 // s-product-wire — product loaders on zigEvaluator (hook/run/shim)
-// Locked INITIAL tests: RED until permanent + allow-once stores are wired into
-// EvaluateOptions (permanent_allowlist / allow_once_path / io / now_iso /
-// consume_allow_once) — never via options.allowlists / policy Layered.
+// Permanent + allow-once stores load via EvaluateOptions (permanent_allowlist /
+// allow_once_path / io / now_iso / consume_allow_once) — never via
+// options.allowlists / policy Layered.
 // ---------------------------------------------------------------------------
 
 const s_product_wire_now_seed = "2099-01-01T12:00:00Z";
