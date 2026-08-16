@@ -4,6 +4,20 @@ const onboarding = @import("ryk").cli.onboarding;
 
 const ryk_bin = "./zig-out/bin/ryk";
 
+fn processEnviron() std.process.Environ {
+    return .{ .block = std.process.Environ.PosixBlock{
+        .slice = @ptrCast(std.c.environ[0..countCEnviron() :null]),
+    } };
+}
+
+fn countCEnviron() usize {
+    var n: usize = 0;
+    while (std.c.environ[n]) |entry| : (n += 1) {
+        _ = entry;
+    }
+    return n;
+}
+
 const Invoke = enum { hook, evaluate, bare };
 
 const HostCase = struct {
@@ -137,7 +151,7 @@ fn runRyk(allocator: std.mem.Allocator, case: HostCase, stdin_data: ?[]const u8)
     var argv_buf: [4][]const u8 = undefined;
     const args = argvFor(case, &argv_buf);
     const io = std.testing.io;
-    var env_map = try std.process.Environ.createMap(std.process.environ, allocator);
+    var env_map = try std.process.Environ.createMap(processEnviron(), allocator);
     defer env_map.deinit();
     try env_map.put("RYK_HOOK_SERVER", "0");
     var child = try std.process.spawn(io, .{

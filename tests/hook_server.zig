@@ -7,6 +7,20 @@ const daemon_uds = @import("ryk").cli.daemon_uds;
 const exit_codes = @import("ryk").cli.exit_codes;
 
 const ryk_bin = "./zig-out/bin/ryk";
+
+fn processEnviron() std.process.Environ {
+    return .{ .block = std.process.Environ.PosixBlock{
+        .slice = @ptrCast(std.c.environ[0..countCEnviron() :null]),
+    } };
+}
+
+fn countCEnviron() usize {
+    var n: usize = 0;
+    while (std.c.environ[n]) |entry| : (n += 1) {
+        _ = entry;
+    }
+    return n;
+}
 const grok_safe = "tests/plugin-fixtures/grok/pre_tool_use_command_safe.json";
 const claude_danger = "tests/plugin-fixtures/claude/pre_tool_use_command_dangerous.json";
 const default_policy = "policies/default.yaml";
@@ -113,7 +127,7 @@ fn runRykHook(
     stdin_data: []const u8,
     socket_path: []const u8,
 ) !struct { stdout: []u8, stderr: []u8, code: u8 } {
-    var env_map = try std.process.Environ.createMap(std.process.environ, allocator);
+    var env_map = try std.process.Environ.createMap(processEnviron(), allocator);
     defer env_map.deinit();
     try env_map.put("RYK_HOOK_SOCKET", socket_path);
     try env_map.put("RYK_HOOK_SERVER", "1");
