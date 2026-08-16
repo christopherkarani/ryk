@@ -31,7 +31,7 @@ Modes:
   compile       ./scripts/test-fast.sh compile
   units         ./scripts/test-fast.sh units
   full          ./scripts/test-fast.sh full
-  core          ./scripts/zig build test-core + test-core-contract
+  core          ./scripts/zig build test-core test-core-contract
   sandbox       ./scripts/test-slice.sh sandbox
   policy        ./scripts/test-slice.sh policy
   intercept     ./scripts/test-slice.sh intercept
@@ -69,6 +69,9 @@ while [[ $# -gt 0 ]]; do
 done
 
 mode="${mode:-auto}"
+
+# Incremental compile; -j1 keeps test binary runs serial (parallel hangs on some hosts).
+ZIG_BUILD_RUN=(./scripts/zig build -fincremental -j1 -Dincremental=true)
 
 if [[ ${#paths[@]} -eq 0 && "${mode}" == "auto" ]]; then
   # Dirty + staged; fall back to empty (→ check).
@@ -461,7 +464,7 @@ run_gate() {
       compile) echo "[agent-gate] dry-run: ./scripts/test-fast.sh compile" ;;
       units) echo "[agent-gate] dry-run: ./scripts/test-fast.sh units" ;;
       full) echo "[agent-gate] dry-run: ./scripts/test-fast.sh full" ;;
-      core) echo "[agent-gate] dry-run: ./scripts/zig build … test-core && test-core-contract" ;;
+      core) echo "[agent-gate] dry-run: ${ZIG_BUILD_RUN[*]} test-core test-core-contract" ;;
       sandbox) echo "[agent-gate] dry-run: ./scripts/test-slice.sh sandbox" ;;
       policy) echo "[agent-gate] dry-run: ./scripts/test-slice.sh policy" ;;
       intercept) echo "[agent-gate] dry-run: ./scripts/test-slice.sh intercept" ;;
@@ -482,8 +485,7 @@ run_gate() {
     units) ./scripts/test-fast.sh units ;;
     full) ./scripts/test-fast.sh full ;;
     core)
-      ./scripts/zig build -fincremental -j1 -Dincremental=true test-core
-      ./scripts/zig build -fincremental -j1 -Dincremental=true test-core-contract
+      "${ZIG_BUILD_RUN[@]}" test-core test-core-contract
       ;;
     sandbox) ./scripts/test-slice.sh sandbox ;;
     policy) ./scripts/test-slice.sh policy ;;
