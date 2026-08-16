@@ -55,7 +55,7 @@ Host aliases are the taught launch path (OS filesystem sandbox attaches automati
 # or: codex | pi | opencode | openclaw | hermes
 ```
 
-When a risky action needs approval, interactive sessions offer **Once** / **Always** / **Never** (no rule ids required). Session artifacts land under `.ryk/sessions/<session-id>/`. On a successful macOS Seatbelt attach the session banner includes `seatbelt_profile=hardened` (or the grade you chose). Verify host capability with `ryk doctor` (capability ≠ live session).
+When a risky action needs approval, interactive sessions offer **Once** / **Session** / **Never** (no rule ids required). Session is in-memory for this ryk process; it is not a permanent allowlist write. Host-UI allow is not a ryk sticky write. Session artifacts land under `.ryk/sessions/<session-id>/`. On a successful macOS Seatbelt attach the session banner includes `seatbelt_profile=hardened` (or the grade you chose). Verify host capability with `ryk doctor` (capability ≠ live session).
 
 Custom commands and CI automation still use the advanced run engine (not the day-1 agent launch path):
 
