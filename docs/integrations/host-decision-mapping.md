@@ -38,7 +38,19 @@ Where a host already hardens interactive outcomes:
 | **Claude Code** | `PreToolUse` / `PermissionRequest` | `permissionDecision: allow` | `permissionDecision: deny` | `permissionDecision: ask` (CI→deny) | proceed as allow | Partial | Host-shaped stdout JSON via `hookSpecificOutput` (hook grade; exit 0). See `host-output-mapping.md`. |
 | **Codex** | `PreToolUse` / `PermissionRequest` | allow | deny | host permission / ask shape | warn | Partial | Same pattern as Claude adapter. |
 | **Pi** | tool hooks | allow | deny | host-dependent | warn | Host-dependent | See `ryk-pi` extension docs. |
+| **Grok** | `PreToolUse` (Bash / Read) | exit 0 | `{"decision":"deny","reason":…}` + exit 2 | **deny** JSON + exit 2 (no resume) | exit 0 | **No** | **hook** + `ryk grok` **wrapper**. Missing/non-executable `ryk` emits deny JSON + exit 2. See below. |
 | **Cursor** | `beforeShellExecution` (bare `ryk` stdin hook) | `permission: allow` JSON, exit 0 | `permission: deny` JSON, exit 0 | **deny** (no native ask) | log + allow | No | Malformed/oversized/unknown payloads: dual-contract deny JSON + exit 2 (host block code). See below. |
+
+### Grok hook fail-closed contract
+
+Official Grok Build treats hook stdout + exit as:
+
+- allow / warn → exit 0 (generic hook JSON from `ryk hook grok`)
+- block / ask / error → `{"decision":"deny","reason":…}` + exit 2 (no resume)
+
+The managed hook command is `/bin/sh -c '…' -- <absolute ryk>`: if the pinned file is missing or not executable, the wrapper prints that deny JSON and exits 2. `ryk grok` / `doctor --fix` rewrites legacy direct `…/ryk hook grok PreToolUse` entries (those still fail-open on exit 127). Claude/Codex plugins wrap the same way.
+
+Residual (host-side, not ryk-fixable): timeouts, crashes, and non-0/2 exits are **fail-open** unless the host adds its own fail-closed setting. Grade remains **hook**, not OS-enforced. Prefer `ryk grok` / `ryk run -- grok` for the wrapper boundary.
 
 ### Cursor bare-hook fail-closed contract
 
