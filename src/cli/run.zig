@@ -2301,10 +2301,11 @@ fn printSessionStart(
         null;
 
     const card_posture = tui.sandbox_card.PostureKind.parse(@tagName(os_receipt.posture));
-    // One-click host handoff: machine-readable posture only — no SHIELD UP wall.
+    // One-click host handoff: machine-readable posture + session grade; no SHIELD UP wall.
     if (quiet_host_handoff) {
         try stdout.writeAll(posture_line);
         try stdout.writeAll(os_line);
+        try stdout.writeAll(grade_line);
         try stdout.writeAll("\n");
     } else if (card_posture.isDramatic()) {
         const grade_str: ?[]const u8 = if (os_receipt.seatbelt_profile) |g| g.toString() else null;
@@ -6767,19 +6768,16 @@ test "empty backpack claude alias -- --help session tmp passes Claude tmpdir che
         try script.writeStreamingAll(std.testing.io,
             \\#!/bin/sh
             \\base="${CLAUDE_CODE_TMPDIR:-${TMPDIR:-/tmp}}"
-            \\# Claude joins the tmp base with claude-{uid}; after userns that is claude-0
-            \\# (process.getuid?.() ?? 0). Check the exact QA leaf first.
+            \\# Claude joins the tmp base with claude-{uid}; after userns / getuid??0
+            \\# that is claude-0. Empty-backpack PATH is the trusted install only —
+            \\# do not exec `id` (not on PATH; extra process-exec is not granted).
             \\leaf0="$base/claude-0"
-            \\leaf="$base/claude-$(id -u)"
             \\if [ -L "$leaf0" ] || [ ! -d "$leaf0" ]; then
             \\  echo "Temp directory $leaf0 is not a directory (may be an attacker-planted symlink)." >&2
             \\  exit 1
             \\fi
-            \\if [ "$leaf" != "$leaf0" ] && { [ -L "$leaf" ] || [ ! -d "$leaf" ]; }; then
-            \\  echo "Temp directory $leaf is not a directory (may be an attacker-planted symlink)." >&2
-            \\  exit 1
-            \\fi
             \\echo "Usage: claude [options]"
+            \\echo "Usage: claude [options]" > usage-ok.txt
             \\exit 0
             \\
         );
@@ -6807,10 +6805,15 @@ test "empty backpack claude alias -- --help session tmp passes Claude tmpdir che
         shell_eval.mockDaemonAllowEvaluator,
     );
     try std.testing.expectEqual(exit_codes.success, code);
-    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "Usage: claude") != null);
     try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "attacker-planted symlink") == null);
+    {
+        const usage = try tmp.dir.readFileAlloc(std.testing.io, "usage-ok.txt", std.testing.allocator, .limited(256));
+        defer std.testing.allocator.free(usage);
+        try std.testing.expect(std.mem.indexOf(u8, usage, "Usage: claude") != null);
+    }
 
     // Leftover `ryk claude -- --help` separator must strip to the same spawn argv.
+    try tmp.dir.deleteFile(std.testing.io, "usage-ok.txt");
     var leftover_stdout: [8192]u8 = undefined;
     var leftover_stderr: [4096]u8 = undefined;
     var leftover_out: std.Io.Writer = .fixed(&leftover_stdout);
@@ -6824,8 +6827,12 @@ test "empty backpack claude alias -- --help session tmp passes Claude tmpdir che
         shell_eval.mockDaemonAllowEvaluator,
     );
     try std.testing.expectEqual(exit_codes.success, leftover_code);
-    try std.testing.expect(std.mem.indexOf(u8, leftover_out.buffered(), "Usage: claude") != null);
     try std.testing.expect(std.mem.indexOf(u8, leftover_err.buffered(), "attacker-planted symlink") == null);
+    {
+        const leftover_usage = try tmp.dir.readFileAlloc(std.testing.io, "usage-ok.txt", std.testing.allocator, .limited(256));
+        defer std.testing.allocator.free(leftover_usage);
+        try std.testing.expect(std.mem.indexOf(u8, leftover_usage, "Usage: claude") != null);
+    }
 }
 
 test "planted cwd ./claude stays CommandDenied under strict" {
@@ -7143,6 +7150,7 @@ test "session start banner is mechanism-neutral for disabled OS sandbox" {
     try std.testing.expect(std.mem.indexOf(u8, quiet_out, "sandbox=active") != null);
     try std.testing.expect(std.mem.indexOf(u8, quiet_out, "OS sandbox: active") != null);
     try std.testing.expect(std.mem.indexOf(u8, quiet_out, "secret-boundary=on") != null);
+    try std.testing.expect(std.mem.indexOf(u8, quiet_out, "Session grade: strong-mediated") != null);
 }
 
 test "computeSessionSandboxGrade: mediated attach vs open escape" {

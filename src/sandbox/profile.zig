@@ -856,11 +856,17 @@ fn serializeCanonical(
             return err;
         };
     }
-    try lines.append(allocator, try std.fmt.allocPrint(
-        allocator,
-        "protect_workspace_secrets\t{}",
-        .{protect_workspace_secrets},
-    ));
+    {
+        const line = try std.fmt.allocPrint(
+            allocator,
+            "protect_workspace_secrets\t{}",
+            .{protect_workspace_secrets},
+        );
+        lines.append(allocator, line) catch |err| {
+            allocator.free(line);
+            return err;
+        };
+    }
 
     std.mem.sort([]u8, lines.items, {}, pathLessThan);
 
@@ -1302,6 +1308,90 @@ test "P1-U-07 determinism: same inputs yield same canonical bytes and hash" {
     });
     defer c.deinit();
     try std.testing.expect(!std.mem.eql(u8, a.hash(), c.hash()));
+}
+
+const protect_secrets_prior_lines = 1 + @max(1, std.atomic.cache_line / @sizeOf([]u8));
+
+fn serializeCanonicalProtectSecretsOomProbe(allocator: std.mem.Allocator) !void {
+    var grants: [protect_secrets_prior_lines]PathGrant = undefined;
+    var path_bufs: [protect_secrets_prior_lines][24]u8 = undefined;
+    for (&grants, &path_bufs, 0..) |*g, *buf, i| {
+        g.* = .{
+            .path = std.fmt.bufPrint(buf, "/g/{d}", .{i}) catch unreachable,
+            .mode = .rw,
+        };
+    }
+    const bytes = try serializeCanonical(allocator, &grants, &.{}, true);
+    defer allocator.free(bytes);
+    if (std.mem.indexOf(u8, bytes, "protect_workspace_secrets\ttrue") == null)
+        return error.TestUnexpectedResult;
+}
+
+fn compileProfileProtectSecretsOomProbe(allocator: std.mem.Allocator) !void {
+    const extra = protect_secrets_prior_lines - 3;
+    const all_prefixes = [_][]const u8{ "/p0", "/p1", "/p2", "/p3", "/p4", "/p5", "/p6", "/p7", "/p8", "/p9", "/p10", "/p11" };
+    var compiled = try compileProfile(allocator, .{
+        .workspace_root = "/tmp/ryk-profile-protect-oom",
+        .system_ro_prefixes = all_prefixes[0..extra],
+        .include_tmp = false,
+        .protect_workspace_secrets = true,
+    });
+    defer compiled.deinit();
+    if (std.mem.indexOf(u8, compiled.canonical_bytes, "protect_workspace_secrets\ttrue") == null)
+        return error.TestUnexpectedResult;
+}
+
+test "ProtectSecretsLineOom serializeCanonical OOM ownership" {
+    const allocator = std.testing.allocator;
+
+    try std.testing.expectError(error.InvalidWorkspace, compileProfile(allocator, .{
+        .workspace_root = "",
+        .protect_workspace_secrets = true,
+    }));
+    try std.testing.expectError(error.InvalidWorkspace, compileProfile(allocator, .{
+        .workspace_root = "relative/path",
+        .protect_workspace_secrets = true,
+    }));
+    try std.testing.expectError(error.InvalidWorkspace, compileProfile(allocator, .{
+        .workspace_root = "/",
+        .protect_workspace_secrets = true,
+    }));
+
+    try std.testing.checkAllAllocationFailures(
+        allocator,
+        serializeCanonicalProtectSecretsOomProbe,
+        .{},
+    );
+    try std.testing.checkAllAllocationFailures(
+        allocator,
+        compileProfileProtectSecretsOomProbe,
+        .{},
+    );
+}
+
+test "P1-U-07 protect_workspace_secrets tab line is hash material" {
+    const allocator = std.testing.allocator;
+    const base = CompileOptions{
+        .workspace_root = "/workspace/same",
+        .system_ro_prefixes = &[_][]const u8{ "/lib", "/usr", "/bin" },
+        .include_tmp = true,
+        .tmp_path = "/tmp",
+        .control_roots = &[_][]const u8{"/var/ryk-control"},
+    };
+
+    var off = try compileProfile(allocator, base);
+    defer off.deinit();
+    var on_opts = base;
+    on_opts.protect_workspace_secrets = true;
+    var on = try compileProfile(allocator, on_opts);
+    defer on.deinit();
+
+    try std.testing.expect(std.mem.indexOf(u8, off.canonical_bytes, "protect_workspace_secrets\tfalse") != null);
+    try std.testing.expect(std.mem.indexOf(u8, on.canonical_bytes, "protect_workspace_secrets\ttrue") != null);
+    try std.testing.expect(!std.mem.eql(u8, off.canonical_bytes, on.canonical_bytes));
+    try std.testing.expect(!std.mem.eql(u8, off.hash(), on.hash()));
+    try std.testing.expect(off.hash().len == 64);
+    try std.testing.expect(on.hash().len == 64);
 }
 
 test "optional tmp grant is RW only when requested" {
