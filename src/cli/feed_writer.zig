@@ -566,9 +566,13 @@ fn parseFeedRecord(allocator: std.mem.Allocator, line: []const u8, fallback_work
         // Reject path segments before aggregate joins session_id into a filesystem
         // path (directory-existence oracle via ../). Same alphabet as audit writers.
         core.session.validateSessionIdText(value) catch return error.InvalidFeedRecord;
-        // `redactAlloc` emits `[REDACTED:…]`, which fails `validateSessionIdText`
-        // and path joins. Use a path-safe alnum placeholder instead.
-        if (redact_bridge.classifySecretValue(value) != null) {
+        // Gate on structured provider tokens only. `classifySecretValue` also
+        // flags high-entropy / JWT blobs, which collapses legitimate host ids
+        // (Codex rollout stems, UUID v4s) onto a shared `redacted` path.
+        // `redactAlloc` / `redactStringBounded` emit `[REDACTED:…]`, which
+        // fails `validateSessionIdText` and path joins. Keep a path-safe
+        // alnum placeholder.
+        if (redact_bridge.containsStructuredSecret(value)) {
             const placeholder = try allocator.dupe(u8, "redacted");
             allocator.free(value);
             session_id = placeholder;
@@ -790,6 +794,154 @@ test "feed loader replaces secret-shaped session_id with path-safe placeholder" 
     try std.testing.expectEqualStrings("redacted", loaded[0].record.session_id.?);
     try std.testing.expect(std.mem.indexOf(u8, loaded[0].raw, fake_session) == null);
     try std.testing.expect(std.mem.indexOf(u8, loaded[0].record.session_id.?, fake_session) == null);
+}
+
+test "feed loader keeps Codex rollout session_id (not high-entropy redacted)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+
+    const path = try feedPath(std.testing.allocator, root);
+    defer std.testing.allocator.free(path);
+    const parent = std.fs.path.dirname(path).?;
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, parent);
+
+    const stem = "rollout-2026-07-30T21-25-08-019fb445-e7a9-7612-bf1a-8fe20ff9e69b";
+    const line = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"timestamp\":\"2026-07-13T00:00:00Z\",\"workspace_root\":\"{s}\",\"event_type\":\"command_denied\",\"decision\":\"deny\",\"decision_source\":\"rust-daemon\",\"event_source\":\"hook\",\"host\":\"codex\",\"daemon_status\":\"healthy\",\"pack_id\":\"core.shell\",\"severity\":\"high\",\"reason\":\"blocked\",\"remediation\":null,\"target_summary\":\"shell command (redacted)\",\"session_id\":\"{s}\",\"verified\":false}}\n",
+        .{ root, stem },
+    );
+    defer std.testing.allocator.free(line);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = line });
+
+    const loaded = try loadRecent(std.testing.io, std.testing.allocator, root, 4);
+    defer {
+        for (loaded) |*item| item.deinit(std.testing.allocator);
+        std.testing.allocator.free(loaded);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), loaded.len);
+    try std.testing.expectEqualStrings(stem, loaded[0].record.session_id.?);
+    try std.testing.expect(std.mem.indexOf(u8, loaded[0].raw, stem) != null);
+    try std.testing.expect(std.mem.indexOf(u8, loaded[0].raw, "\"session_id\":\"redacted\"") == null);
+}
+
+test "feed loader keeps high-unique UUID session_id" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+
+    const path = try feedPath(std.testing.allocator, root);
+    defer std.testing.allocator.free(path);
+    const parent = std.fs.path.dirname(path).?;
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, parent);
+
+    const uuid = "a1b2c3d4-e5f6-7890-abcd-ef1234567890";
+    const line = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"timestamp\":\"2026-07-13T00:00:00Z\",\"workspace_root\":\"{s}\",\"event_type\":\"command_denied\",\"decision\":\"deny\",\"decision_source\":\"rust-daemon\",\"event_source\":\"hook\",\"host\":\"codex\",\"daemon_status\":\"healthy\",\"pack_id\":\"core.shell\",\"severity\":\"high\",\"reason\":\"blocked\",\"remediation\":null,\"target_summary\":\"shell command (redacted)\",\"session_id\":\"{s}\",\"verified\":false}}\n",
+        .{ root, uuid },
+    );
+    defer std.testing.allocator.free(line);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = line });
+
+    const loaded = try loadRecent(std.testing.io, std.testing.allocator, root, 4);
+    defer {
+        for (loaded) |*item| item.deinit(std.testing.allocator);
+        std.testing.allocator.free(loaded);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), loaded.len);
+    try std.testing.expectEqualStrings(uuid, loaded[0].record.session_id.?);
+    try std.testing.expect(std.mem.indexOf(u8, loaded[0].raw, uuid) != null);
+    try std.testing.expect(std.mem.indexOf(u8, loaded[0].raw, "\"session_id\":\"redacted\"") == null);
+}
+
+test "feed loader redacts session_id that embeds a structured token" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+
+    const path = try feedPath(std.testing.allocator, root);
+    defer std.testing.allocator.free(path);
+    const parent = std.fs.path.dirname(path).?;
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, parent);
+
+    const fake_session = "sess.ghp_fakeSyntheticTokenValue1234567890";
+    const line = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"timestamp\":\"2026-07-13T00:00:00Z\",\"workspace_root\":\"{s}\",\"event_type\":\"command_denied\",\"decision\":\"deny\",\"decision_source\":\"rust-daemon\",\"event_source\":\"hook\",\"host\":\"codex\",\"daemon_status\":\"healthy\",\"pack_id\":\"core.shell\",\"severity\":\"high\",\"reason\":\"blocked\",\"remediation\":null,\"target_summary\":\"shell command (redacted)\",\"session_id\":\"{s}\",\"verified\":false}}\n",
+        .{ root, fake_session },
+    );
+    defer std.testing.allocator.free(line);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = line });
+
+    const loaded = try loadRecent(std.testing.io, std.testing.allocator, root, 4);
+    defer {
+        for (loaded) |*item| item.deinit(std.testing.allocator);
+        std.testing.allocator.free(loaded);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), loaded.len);
+    try std.testing.expectEqualStrings("redacted", loaded[0].record.session_id.?);
+    try std.testing.expect(std.mem.indexOf(u8, loaded[0].record.session_id.?, fake_session) == null);
+    try std.testing.expect(std.mem.indexOf(u8, loaded[0].raw, fake_session) == null);
+    try std.testing.expect(std.mem.indexOf(u8, loaded[0].raw, "ghp_fakeSyntheticTokenValue1234567890") == null);
+}
+
+test "feed loader redacts uppercase structured session_id token" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+
+    const path = try feedPath(std.testing.allocator, root);
+    defer std.testing.allocator.free(path);
+    const parent = std.fs.path.dirname(path).?;
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, parent);
+
+    const fake_session = "GHP_0123456789AB";
+    const line = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"timestamp\":\"2026-07-13T00:00:00Z\",\"workspace_root\":\"{s}\",\"event_type\":\"command_denied\",\"decision\":\"deny\",\"decision_source\":\"rust-daemon\",\"event_source\":\"hook\",\"host\":\"codex\",\"daemon_status\":\"healthy\",\"pack_id\":\"core.shell\",\"severity\":\"high\",\"reason\":\"blocked\",\"remediation\":null,\"target_summary\":\"shell command (redacted)\",\"session_id\":\"{s}\",\"verified\":false}}\n",
+        .{ root, fake_session },
+    );
+    defer std.testing.allocator.free(line);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = line });
+
+    const loaded = try loadRecent(std.testing.io, std.testing.allocator, root, 4);
+    defer {
+        for (loaded) |*item| item.deinit(std.testing.allocator);
+        std.testing.allocator.free(loaded);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), loaded.len);
+    try std.testing.expectEqualStrings("redacted", loaded[0].record.session_id.?);
+    try std.testing.expect(std.mem.indexOf(u8, loaded[0].raw, fake_session) == null);
+    try std.testing.expect(std.mem.indexOf(u8, loaded[0].raw, "GHP_") == null);
+}
+
+test "feed parse session_id with embedded token serializes redacted for dashboard" {
+    const fake_session = "sess.ghp_fakeSyntheticTokenValue1234567890";
+    const line =
+        \\{"timestamp":"2026-07-13T00:00:00Z","workspace_root":"/tmp/legacy","event_type":"command_denied","decision":"deny","decision_source":"rust-daemon","event_source":"hook","host":"codex","daemon_status":"healthy","pack_id":"core.shell","severity":"high","reason":"blocked","remediation":null,"target_summary":"shell command (redacted)","session_id":"sess.ghp_fakeSyntheticTokenValue1234567890","verified":false}
+    ;
+    var record = try parseFeedRecord(std.testing.allocator, line, null);
+    defer record.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("redacted", record.session_id.?);
+
+    var feed_json: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer feed_json.deinit();
+    try rust_visibility.writeFeedRecordJson(&feed_json.writer, record);
+    const encoded = feed_json.written();
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"session_id\":\"redacted\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "ghp_") == null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, fake_session) == null);
 }
 
 test "feed loader reconstructs parseable JSON raw for high-entropy fields" {

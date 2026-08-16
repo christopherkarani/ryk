@@ -38,6 +38,14 @@ pub fn redactAlloc(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
     return out.toOwnedSlice(allocator);
 }
 
+/// True when `value` contains a structured provider-token span (or a whole-value
+/// AWS access key). Does **not** treat high-entropy / JWT blobs as secrets.
+pub fn containsStructuredSecret(value: []const u8) bool {
+    if (findStructuredSecret(value, 0) != null) return true;
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    return looksLikeAwsAccessKey(trimmed);
+}
+
 const SecretSpan = struct { start: usize, end: usize };
 
 fn findStructuredSecret(value: []const u8, from: usize) ?SecretSpan {
