@@ -65,6 +65,7 @@ pub const Assessment = struct {
 pub fn daemonWireLabel(status: onboarding.DaemonHealthStatus) []const u8 {
     return switch (status) {
         .compatible => "compatible",
+        .in_process => "in_process",
         .unavailable => "unavailable",
         .incompatible => "incompatible",
         .degraded => "degraded",
@@ -73,7 +74,7 @@ pub fn daemonWireLabel(status: onboarding.DaemonHealthStatus) []const u8 {
 
 /// Assess core readiness from daemon enum + policy flags.
 pub fn assess(daemon_status: onboarding.DaemonHealthStatus, policy_present: bool, policy_valid: bool) Assessment {
-    const daemon_ok = daemon_status == .compatible;
+    const daemon_ok = daemon_status.evaluationReady();
     const ready = daemon_ok and policy_present and policy_valid;
     return .{
         .ready = ready,
@@ -183,6 +184,14 @@ test "assess ready only when daemon compatible and policy valid" {
     try std.testing.expectEqual(State.ready, ok.state);
     try std.testing.expectEqual(exit_codes.success, ok.exitCode(true));
     try std.testing.expectEqual(exit_codes.success, ok.exitCode(false));
+}
+
+test "assess ready when engine is in-process and policy valid" {
+    const a = assess(.in_process, true, true);
+    try std.testing.expect(a.ready);
+    try std.testing.expect(a.daemon_ok);
+    try std.testing.expectEqual(State.ready, a.state);
+    try std.testing.expectEqual(exit_codes.success, a.exitCode(true));
 }
 
 test "assess fails check when daemon unavailable" {
@@ -321,5 +330,6 @@ test "writeJsonEnvelope redacts secret-bearing daemon details and policy paths" 
 
 test "daemonWireLabel is stable machine vocabulary" {
     try std.testing.expectEqualStrings("compatible", daemonWireLabel(.compatible));
+    try std.testing.expectEqualStrings("in_process", daemonWireLabel(.in_process));
     try std.testing.expectEqualStrings("unavailable", daemonWireLabel(.unavailable));
 }

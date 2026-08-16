@@ -286,7 +286,7 @@ fn writeCheckReceipt(stdout: anytype, assessment: readiness.Assessment, context:
         return;
     }
     try stdout.print("not ready · {s}\n", .{receipt});
-    if (context.daemon_health != .compatible) {
+    if (!context.daemon_health.evaluationReady() and context.daemon_binary_exists) {
         try stdout.writeAll("Next: ryk doctor --fix\n");
     } else if (!context.policy_present) {
         try stdout.writeAll("Next: ryk doctor --fix\n");
@@ -380,7 +380,7 @@ fn runDoctorTui(
     }
 
     const next: doctor_tui.NextStepFacts = .{
-        .daemon_health_compatible = context.daemon_health == .compatible,
+        .daemon_health_compatible = context.daemon_health.evaluationReady(),
         .daemon_detail = redacted_daemon_detail,
         .daemon_binary_untrusted = context.daemon_binary_untrusted,
         .daemon_binary_exists = context.daemon_binary_exists,
@@ -557,6 +557,7 @@ fn countCapabilitySummary(os: core.platform.Os, backend_report: sandbox.backend.
 fn daemonStatusSummary(status: onboarding.DaemonHealthStatus) []const u8 {
     return switch (status) {
         .compatible => "daemon compatible",
+        .in_process => "engine in-process",
         .unavailable => "daemon unavailable",
         .incompatible => "daemon incompatible",
         .degraded => "daemon degraded",
@@ -866,7 +867,10 @@ fn writeDefaultPanels(
     const health_lines = [_][]const u8{
         try std.fmt.bufPrint(&health_storage[0], "Platform       {s}", .{os.toString()}),
         try std.fmt.bufPrint(&health_storage[1], "Policy         {s}", .{policy_status}),
-        try std.fmt.bufPrint(&health_storage[2], "Daemon         {s}", .{daemonStatusSummary(context.daemon_health)}),
+        if (context.daemon_health == .in_process)
+            try std.fmt.bufPrint(&health_storage[2], "Engine         in-process", .{})
+        else
+            try std.fmt.bufPrint(&health_storage[2], "Daemon         {s}", .{daemonStatusSummary(context.daemon_health)}),
         try std.fmt.bufPrint(&health_storage[3], "Capabilities   {d} active · {d} limited", .{ counts.active, counts.limited }),
         try std.fmt.bufPrint(&health_storage[4], "Unavailable    {d}", .{counts.unavailable}),
         try std.fmt.bufPrint(&health_storage[5], "Secret boundary {s}", .{secretBoundaryCapability(backend_report)}),
@@ -1191,17 +1195,19 @@ fn hermesFailOpenFromEnv() bool {
     return host_status.hermesFailOpenFromEnv();
 }
 
+fn companionNeedsRemediation(context: IntegrationContext) bool {
+    // Missing companion is CLI-only / first-run, not a broken install.
+    return !context.daemon_health.evaluationReady() and context.daemon_binary_exists;
+}
+
 fn writeRecommendations(stdout: anytype, context: IntegrationContext) !void {
     try stdout.writeAll("\nRecommended next step:\n");
-    if (context.daemon_health != .compatible) {
+    if (companionNeedsRemediation(context)) {
         try writeDynamicLine(context.allocator, stdout, "  Daemon health issue: ", context.daemon_detail, "\n");
         if (context.daemon_binary_untrusted) {
             try stdout.writeAll("  Remove the untrusted legacy companion override, then re-run `ryk doctor`.\n");
-        } else if (context.daemon_binary_exists and !context.daemon_binary_executable) {
+        } else if (!context.daemon_binary_executable) {
             try stdout.writeAll("  Restore companion-service execute permission or reinstall ryk, then re-run `ryk doctor`.\n");
-        } else if (!context.daemon_binary_exists) {
-            try stdout.writeAll("  Reinstall the complete ryk release, then re-run `ryk doctor`.\n");
-            try stdout.writeAll("  Source checkout: `./scripts/zig build`.\n");
         } else {
             try stdout.writeAll("  Reinstall ryk or rebuild with `./scripts/build-all.sh`, then re-run `ryk doctor`.\n");
         }
@@ -1265,8 +1271,22 @@ fn collectIntegrationContextAt(io: std.Io, allocator: std.mem.Allocator, workspa
     defer if (daemon_paths) |value| cli.daemon.freeRuntimePaths(allocator, value);
     // Shared onboarding health path (same as status/quickstart). Probe paths pass
     // ensure_running=false so --check never mutates daemon runtime.
+    // CLI-only: missing companion is the in-process Zig shell_engine, not a broken install.
+    const binary_missing = if (daemon_inspection) |value| !value.exists else true;
     const daemon_health: DaemonHealth = blk: {
+        if (binary_missing) {
+            break :blk .{
+                .status = .in_process,
+                .detail = try allocator.dupe(u8, onboarding.in_process_engine_detail),
+            };
+        }
         const check = onboarding.checkDaemonHealth(allocator, ensure_running, null) catch |err| {
+            if (err == error.DaemonBinaryNotFound) {
+                break :blk .{
+                    .status = .in_process,
+                    .detail = try allocator.dupe(u8, onboarding.in_process_engine_detail),
+                };
+            }
             break :blk try daemonDetailFromError(allocator, err);
         };
         break :blk .{
@@ -1872,6 +1892,44 @@ test "doctor summary includes daemon availability" {
     const written = stdout_writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "daemon unavailable") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "no running daemon answered on the expected socket") != null);
+}
+
+test "doctor summary names in-process engine when companion is not required" {
+    var stdout_buf: [32768]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    const report = sandbox.backend.detect(.linux);
+    var context = try testContext(std.testing.allocator, .{
+        .daemon_binary_exists = false,
+        .daemon_health = .in_process,
+        .daemon_detail = onboarding.in_process_engine_detail,
+    });
+    defer context.deinit();
+
+    try writeReport(std.testing.io, &stdout_writer, .linux, report, context, false);
+    const written = stdout_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "engine in-process") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "Engine         in-process") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "daemon unavailable") == null);
+}
+
+test "doctor recommendations skip reinstall when companion binary is missing" {
+    var stdout_buf: [32768]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    const report = sandbox.backend.detect(.linux);
+    var context = try testContext(std.testing.allocator, .{
+        .daemon_binary_exists = false,
+        .daemon_health = .unavailable,
+        .daemon_detail = "The ryk companion service was not found.",
+    });
+    defer context.deinit();
+
+    try writeReport(std.testing.io, &stdout_writer, .linux, report, context, false);
+    const written = stdout_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "Reinstall the complete ryk release") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "The ryk companion service was not found.") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "install is incomplete") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "Daemon health issue:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "ryk redteam --ci") != null);
 }
 
 test "doctor integration report includes daemon health details" {

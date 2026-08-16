@@ -75,7 +75,9 @@ pub fn proxyCategoryLabel(err: anyerror) []const u8 {
 }
 
 pub fn doctorHealthStatus(err: anyerror) onboarding.DaemonHealthStatus {
-    return if (err == error.ProtocolMismatch)
+    return if (err == error.DaemonBinaryNotFound)
+        .in_process
+    else if (err == error.ProtocolMismatch)
         .incompatible
     else if (err == error.MissingHandshake or err == error.HandshakeMalformed or err == error.DaemonProtocolError or err == error.ResponseParseFailed)
         .degraded
@@ -91,7 +93,7 @@ fn detail(err: anyerror, audience: Audience, probe: ProbeContext) []const u8 {
             .version => "HOME is not set; daemon runtime path is unavailable.",
         },
         error.DaemonBinaryNotFound => switch (audience) {
-            .doctor => "companion service executable not found; reinstall the complete ryk release.",
+            .doctor => onboarding.in_process_engine_detail,
             .onboarding => "The ryk companion service was not found.",
             .version => "ryk companion service executable not found.",
         },
