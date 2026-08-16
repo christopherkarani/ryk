@@ -115,11 +115,27 @@ type PluginHooks = {
   ) => Promise<void>;
 };
 
-/** Decisions that may pass through on a blocking path (ask kept for permission.ask UX). */
+/** Decisions that may pass through on a blocking path. Residual ask is permit unless unattended. */
 const ALLOW_DECISIONS = new Set(['allow', 'warn', 'context_only', 'ask']);
 
 /** Decisions that do not veto tool.execute.before after parsing. */
 const BLOCKING_PASS_THROUGH = new Set(['allow', 'warn', 'context_only']);
+
+function envFlagTruthy(raw: string | undefined): boolean {
+  if (!raw) return false;
+  const value = raw.trim().toLowerCase();
+  return value === '1' || value === 'true' || value === 'yes' || value === 'on';
+}
+
+/** Residual ask hardens to deny only when the operator set an unattended/CI flag. */
+function isUnattendedEnv(env: NodeJS.ProcessEnv = process.env): boolean {
+  return (
+    envFlagTruthy(env.RYK_UNATTENDED) ||
+    envFlagTruthy(env.RYK_CI) ||
+    envFlagTruthy(env.RYK_NONINTERACTIVE) ||
+    envFlagTruthy(env.CI)
+  );
+}
 
 const SECRET_KEYS = [
   'password', 'token', 'secret', 'api_key', 'apikey', 'api_secret',
@@ -744,7 +760,12 @@ async function applyBlockingDecision(
     return;
   }
 
-  // block, ask, error, unrecognized → veto tool execution
+  // Residual ask is permit so coding agents can work. Unattended hardens to deny.
+  if (response.decision === 'ask' && !isUnattendedEnv()) {
+    return;
+  }
+
+  // block, unattended ask, error, unrecognized → veto tool execution
   await hardBlockWithToast(
     ctx,
     formatShortBlock(response, context),
@@ -756,7 +777,7 @@ async function applyBlockingDecision(
 const PERMISSION_STATUS: Record<string, PermissionAskOutput['status']> = {
   block: 'deny',
   error: 'deny',
-  ask: 'ask',
+  ask: 'allow',
   allow: 'allow',
   context_only: 'allow',
   // Keep host permission UI for advisory outcomes (do not auto-allow).
@@ -764,6 +785,10 @@ const PERMISSION_STATUS: Record<string, PermissionAskOutput['status']> = {
 };
 
 function applyPermissionDecision(response: RykResponse, output: PermissionAskOutput): void {
+  if (response.decision === 'ask' && isUnattendedEnv()) {
+    output.status = 'deny';
+    return;
+  }
   const status = PERMISSION_STATUS[response.decision];
   if (!status) {
     const msg = response.message || response.reason || 'ryk returned an invalid permission decision';
@@ -964,7 +989,6 @@ async function rykPlugin(ctx: PluginContext): Promise<PluginHooks> {
     'permission.ask': async (input, output) => {
       const sessionId = sessionIdFromRecord(input);
       const response = callRyk(rykBin, 'permission.asked', input, sessionId, true);
-      // Host already presents permission UI: map via table (ask stays ask for resume).
       applyPermissionDecision(response, output);
       if (output.status === 'deny') {
         // Best-effort error toast; operator detail only when RYK_OPENCODE_VERBOSE=1.
@@ -975,12 +999,12 @@ async function rykPlugin(ctx: PluginContext): Promise<PluginHooks> {
           'ryk blocked',
           formatShortBlock(response, 'permission')
         );
-      } else if (response.decision === 'warn' || response.decision === 'ask') {
+      } else if (response.decision === 'warn') {
         await maybeToast(
           ctx,
           'warning',
-          'ryk approval',
-          response.message || response.reason || 'needs your approval'
+          'ryk warning',
+          response.message || response.reason || 'advisory policy note'
         );
       }
     },

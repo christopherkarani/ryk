@@ -49,10 +49,25 @@ pub fn getenvBrand(suffix: []const u8) ?[*:0]const u8 {
 pub fn getenvBrandFlagTruthy(suffix: []const u8) bool {
     const raw_c = getenvBrand(suffix) orelse return false;
     const raw = std.mem.span(raw_c);
+    return envTokenTruthy(raw);
+}
+
+fn envTokenTruthy(raw: []const u8) bool {
     return std.mem.eql(u8, raw, "1") or
         std.ascii.eqlIgnoreCase(raw, "true") or
         std.ascii.eqlIgnoreCase(raw, "yes") or
         std.ascii.eqlIgnoreCase(raw, "on");
+}
+
+/// Residual `ask` hardens to deny when the operator asked for unattended/CI.
+/// Coding hosts otherwise permit residual ask so agents can work; explicit deny
+/// is unchanged. Signals: `RYK_UNATTENDED`, `RYK_CI`, `RYK_NONINTERACTIVE`, `CI`.
+pub fn getenvUnattended() bool {
+    if (getenvBrandFlagTruthy("UNATTENDED")) return true;
+    if (getenvBrandFlagTruthy("CI")) return true;
+    if (getenvBrandFlagTruthy("NONINTERACTIVE")) return true;
+    const ci = std.c.getenv("CI") orelse return false;
+    return envTokenTruthy(std.mem.span(ci));
 }
 
 /// Process home directory across Unix and Windows. Windows PowerShell commonly
@@ -61,6 +76,16 @@ pub fn getenvHome() ?[*:0]const u8 {
     if (std.c.getenv("HOME")) |home| return home;
     if (comptime builtin.os.tag == .windows) return std.c.getenv("USERPROFILE");
     return null;
+}
+
+test "envTokenTruthy accepts 1/true/yes/on and rejects empty or 0" {
+    try std.testing.expect(envTokenTruthy("1"));
+    try std.testing.expect(envTokenTruthy("true"));
+    try std.testing.expect(envTokenTruthy("YES"));
+    try std.testing.expect(envTokenTruthy("On"));
+    try std.testing.expect(!envTokenTruthy(""));
+    try std.testing.expect(!envTokenTruthy("0"));
+    try std.testing.expect(!envTokenTruthy("false"));
 }
 
 test "getOwnedFirst prefers first key" {

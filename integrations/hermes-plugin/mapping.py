@@ -194,7 +194,7 @@ def map_pre_tool_call(
 
     - allow → None (proceed)
     - block → {"action": "block", ...}
-    - ask → {"action": "approve", ...} or block under CI / unattended marker
+    - ask → None (proceed) or block under CI / unattended marker
     - warn → log advisory + None (not collapsed to block)
     - other → fail-closed block
     """
@@ -212,9 +212,9 @@ def map_pre_tool_call(
             "message": format_tool_message(response, default="blocked by ryk"),
         }
     if decision == "ask":
-        message = format_tool_message(response, default="approval required by ryk")
         if ci_mode(environ, unattended_marker=unattended_marker):
             # Keep one host line: reserve room for the CI clause inside the 200 budget.
+            message = format_tool_message(response, default="approval required by ryk")
             ci_suffix = (
                 " (CI/noninteractive: ryk ask hardened to block; "
                 "no approval prompt available)"
@@ -225,11 +225,8 @@ def map_pre_tool_call(
                 "action": "block",
                 "message": f"{base}{ci_suffix}",
             }
-        return {
-            "action": "approve",
-            "message": message,
-            "rule_key": stable_rule_key(response, tool_name, tool_input),
-        }
+        # Residual ask is permit so agents can work. No Hermes approve UI.
+        return None
     return {
         "action": "block",
         "message": "ryk returned an invalid tool decision; blocked fail-closed.",
@@ -241,7 +238,7 @@ def tool_action_mode(decision: str) -> str:
     return {
         "allow": "proceed",
         "block": "hard_block",
-        "ask": "native_approve_and_resume",
+        "ask": "proceed",
         "warn": "advisory_log",
         "error": "fail_closed_block",
     }.get(decision, "fail_closed_block")

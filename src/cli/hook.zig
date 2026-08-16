@@ -16,6 +16,7 @@ const telemetry = @import("../telemetry.zig");
 const file_policy_path = @import("file_policy_path.zig");
 const fm_steward_client = @import("fm_steward_client.zig");
 const grok_deny_reason = @import("grok_deny_reason.zig");
+const env_util = @import("../env_util.zig");
 
 // Maximum JSON payload size to prevent memory exhaustion from hostile hosts.
 const max_payload_len = 256 * 1024; // 256 KiB
@@ -334,7 +335,7 @@ fn hookCommand(io: std.Io, host: Host, event: Event, original_event_name: []cons
                 \\  ryk hook hermes subagent_stop
                 \\
                 \\Options:
-                \\  --ci     CI mode: ask decisions become block.
+                \\  --ci     Unattended: residual ask becomes block. Explicit deny is unchanged.
                 \\
             );
             return exit_codes.success;
@@ -643,6 +644,10 @@ fn hookCommand(io: std.Io, host: Host, event: Event, original_event_name: []cons
     };
     defer result.deinit(allocator);
 
+    // Coding hosts: residual ask is permit so the agent can work. ryk only
+    // hard-stops block/deny. Unattended / --ci still hardens ask → block.
+    result.decision = wireCodingHostAsk(host, result.decision, ci_mode or env_util.getenvUnattended());
+
     telemetry.recordEnforcement(
         "hook",
         @tagName(host),
@@ -799,6 +804,24 @@ fn isCodexDenyOutput(host: Host, decision: PluginDecision) bool {
     return host == .codex and decision == .block;
 }
 
+/// Residual ask is permit so agents work. OpenClaw / Grok keep their
+/// documented veto (no resume contract / exit-2 deny).
+fn codingHostPermitsResidualAsk(host: Host) bool {
+    return switch (host) {
+        .claude, .codex, .opencode, .hermes => true,
+        .grok, .openclaw => false,
+    };
+}
+
+/// Wire residual `ask`. Explicit block/deny is unchanged.
+/// Unattended / CI: ask → block. Attended coding hosts: ask → allow.
+fn wireCodingHostAsk(host: Host, decision: PluginDecision, unattended: bool) PluginDecision {
+    if (decision != .ask) return decision;
+    if (unattended) return .block;
+    if (codingHostPermitsResidualAsk(host)) return .allow;
+    return .ask;
+}
+
 fn usesExitTwoDenyOutput(host: Host, decision: PluginDecision) bool {
     if (host == .codex) return decision == .block;
     // Grok has no native approval UI for an `ask`/`stage` result. Its only
@@ -893,14 +916,12 @@ fn usesClaudeHostShapedPermission(host: Host, event: Event) bool {
 
 /// Map ryk plugin decisions to Claude `permissionDecision` values.
 /// - block/err → deny
-/// - ask → ask (CI already hardens ask→block before emit)
+/// - ask → allow (coding-host permit; unattended/`--ci` already rewrote ask→block)
 /// - allow/context_only/warn → allow (warn is not a hard veto; documented proceed)
-/// ask never maps to allow.
 fn claudePermissionDecisionString(decision: PluginDecision) []const u8 {
     return switch (decision) {
         .block, .err => "deny",
-        .ask => "ask",
-        .allow, .context_only, .warn => "allow",
+        .ask, .allow, .context_only, .warn => "allow",
     };
 }
 
@@ -1677,7 +1698,7 @@ fn hermesFeedDecisionTag(decision: PluginDecision) []const u8 {
 fn hermesFeedEventType(event_name: []const u8, decision: PluginDecision) []const u8 {
     if (std.mem.eql(u8, event_name, "on_session_start")) return "hermes_session_started";
     if (std.mem.eql(u8, event_name, "pre_tool_call")) return switch (decision) {
-        // Match Hermes plugin mapping: only hard deny is "blocked"; ask escalates to host approve UI.
+        // Residual ask is rewritten to allow before feed; leftover ask is still labeled.
         .block, .err => "hermes_tool_call_blocked",
         .ask => "hermes_tool_call_ask",
         .warn => "hermes_tool_call_warn",
@@ -6118,7 +6139,7 @@ test "hook Claude maps block to permissionDecision deny with short reason" {
     try std.testing.expectEqual(exit_codes.success, hookExitCode(.claude, .block, false));
 }
 
-test "hook Claude maps ask to permissionDecision ask never allow" {
+test "hook Claude maps residual ask to permissionDecision allow never deny" {
     const allocator = std.testing.allocator;
     var result = try testClaudeHookResponse(
         allocator,
@@ -6128,16 +6149,55 @@ test "hook Claude maps ask to permissionDecision ask never allow" {
     );
     defer result.deinit(allocator);
 
-    try std.testing.expectEqualStrings("ask", claudePermissionDecisionString(.ask));
-    try std.testing.expect(!std.mem.eql(u8, claudePermissionDecisionString(.ask), "allow"));
+    try std.testing.expectEqualStrings("allow", claudePermissionDecisionString(.ask));
+    try std.testing.expect(!std.mem.eql(u8, claudePermissionDecisionString(.ask), "deny"));
 
     var stdout_buf: [1024]u8 = undefined;
     var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
     try writeClaudePermissionDecision(allocator, &stdout_writer, .PreToolUse, result);
     const out = stdout_writer.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"permissionDecision\":\"ask\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"permissionDecision\":\"allow\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"permissionDecision\":\"allow\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"permissionDecision\":\"deny\"") == null);
+}
+
+test "coding hosts permit residual ask unless unattended" {
+    try std.testing.expect(codingHostPermitsResidualAsk(.claude));
+    try std.testing.expect(codingHostPermitsResidualAsk(.codex));
+    try std.testing.expect(codingHostPermitsResidualAsk(.opencode));
+    try std.testing.expect(codingHostPermitsResidualAsk(.hermes));
+    try std.testing.expect(!codingHostPermitsResidualAsk(.openclaw));
+    try std.testing.expect(!codingHostPermitsResidualAsk(.grok));
+
+    try std.testing.expectEqual(PluginDecision.allow, wireCodingHostAsk(.claude, .ask, false));
+    try std.testing.expectEqual(PluginDecision.allow, wireCodingHostAsk(.codex, .ask, false));
+    try std.testing.expectEqual(PluginDecision.allow, wireCodingHostAsk(.opencode, .ask, false));
+    try std.testing.expectEqual(PluginDecision.allow, wireCodingHostAsk(.hermes, .ask, false));
+    try std.testing.expectEqual(PluginDecision.block, wireCodingHostAsk(.claude, .ask, true));
+    try std.testing.expectEqual(PluginDecision.block, wireCodingHostAsk(.hermes, .ask, true));
+    try std.testing.expectEqual(PluginDecision.ask, wireCodingHostAsk(.openclaw, .ask, false));
+    try std.testing.expectEqual(PluginDecision.block, wireCodingHostAsk(.claude, .block, false));
+    try std.testing.expectEqual(PluginDecision.allow, wireCodingHostAsk(.claude, .allow, true));
+}
+
+test "hook emit after wire rewrite is allow for attended Hermes" {
+    const wired = wireCodingHostAsk(.hermes, .ask, false);
+    try std.testing.expectEqual(PluginDecision.allow, wired);
+    const result = HookResponse{
+        .decision = wired,
+        .risk = .low,
+        .category = "test",
+        .reason = "residual ask",
+        .rule = null,
+        .message = "residual ask",
+        .redactions = &.{},
+        .host_limitations = &.{},
+    };
+    var stdout_buf: [2048]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    try writeHookResponse(&stdout_writer, result);
+    const out = stdout_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"decision\": \"allow\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"decision\": \"ask\"") == null);
 }
 
 test "hook Claude CI-hardened ask is block which maps to deny" {

@@ -32,7 +32,6 @@ import {
 	parentAskDir,
 	piCoverageLabel,
 	PRODUCT_NAME,
-	protocolBlockOptionLabel,
 	repairMessage,
 	resolveRykBin,
 	resolvePiAskRoot,
@@ -636,7 +635,7 @@ test("custom/MCP-shaped tools are name-gated via ryk decide tool", async () => {
 	assert.equal(isProtectedPiTool("read"), true);
 	assert.equal(isProtectedPiTool("write"), true);
 	assert.match(piCoverageLabel(), /bash \+ write \+ edit \+ read policy-protected/);
-	assert.match(piCoverageLabel(), /grep \+ find \+ ls approval-gated/);
+	assert.match(piCoverageLabel(), /grep \+ find \+ ls root-preflight/);
 	assert.match(piCoverageLabel(), /decide tool/);
 	assert.match(piCoverageLabel(), /passthrough/);
 	assert.equal(shouldNameGateTool("mcp_custom_tool"), true);
@@ -709,15 +708,12 @@ test("custom tool unavailable fails closed", async () => {
 });
 
 test("session bypass skips decide tool for custom tools", async () => {
-	const { pi, handlers } = makePi();
-	// Typed decision:error is non-transient → single attempt (no retry).
-	const err = { code: 1 as number, stdout: errorJson() };
-	const { spawn, calls } = makeSpawn([err]);
+	const { pi, handlers, commands } = makePi();
+	const { spawn, calls } = makeSpawn();
 	installRykExtension(pi, { spawn, rykBin: "ryk" });
-	const { ctx, selections } = makeCtx();
-	selections.push("Disable Rykan V for this session");
+	const { ctx } = makeCtx();
+	await commands.get("ryk-stop")!.handler("", ctx);
 
-	// First call triggers unavailable → user disables session.
 	const first = await fireToolCall(
 		handlers.get("tool_call")![0],
 		ctx,
@@ -734,8 +730,7 @@ test("session bypass skips decide tool for custom tools", async () => {
 	);
 	assert.equal(first, undefined);
 	assert.equal(second, undefined);
-	// Non-transient error: one spawn, then bypass skips further spawns.
-	assert.equal(calls.length, 1);
+	assert.equal(calls.length, 0);
 });
 
 test("empty custom tool name fails closed without spawning decide", async () => {
@@ -967,7 +962,7 @@ test("read tool is evaluated via ryk decide file with operation read", async () 
 	assert.match(messages[0].message.content, /Meta\s+files\.read\.deny\[0\]/);
 });
 
-test("grep tool requires approval even when its broad root is allowed", async () => {
+test("grep tool still evaluates .env path via decide file", async () => {
 	const { pi, handlers } = makePi();
 	const { spawn, calls } = makeSpawn([
 		{ code: 0, stdout: decideAllowJson("file.read") },
@@ -982,8 +977,7 @@ test("grep tool requires approval even when its broad root is allowed", async ()
 		"grep",
 		{ pattern: "secret", path: ".env" },
 	);
-	assert.equal(result?.block, true);
-	assert.match(result?.reason ?? "", /broad discovery|approval/i);
+	assert.equal(result, undefined);
 	const payload = JSON.parse(calls[0].args[3] as string) as {
 		path: string;
 		operation: string;
@@ -1008,7 +1002,7 @@ test("find tool defaults missing path to cwd for decide file", async () => {
 		"find",
 		{ pattern: "**/*.pem" },
 	);
-	assert.equal(result?.block, true);
+	assert.equal(result, undefined);
 	const payload = JSON.parse(calls[0].args[3] as string) as {
 		path: string;
 		operation: string;
@@ -1044,7 +1038,7 @@ test("ls tool denies sensitive directory via decide file read", async () => {
 	assert.equal(payload.operation, "read");
 });
 
-test("file-policy ask uses truthful policy choices", async () => {
+test("file-policy residual ask is permit without a prompt", async () => {
 	const { pi, handlers } = makePi();
 	const { spawn } = makeSpawn([
 		{ code: 7, stdout: decideJson("ask", "file.write") },
@@ -1064,10 +1058,8 @@ test("file-policy ask uses truthful policy choices", async () => {
 		"write",
 		{ path: "src/main.ts", content: "x" },
 	);
-	assert.equal(result?.block, true);
-	assert.ok(offered.includes("Show why"));
-	assert.ok(offered.includes("Allow once"));
-	assert.ok(!offered.some((choice) => /repair|doctor/i.test(choice)));
+	assert.equal(result, undefined);
+	assert.equal(offered.length, 0);
 });
 
 test("allowOnceBypassEnabled honors env and strict mode", () => {
@@ -1110,7 +1102,7 @@ test("allowOnceBypassEnabled honors env and strict mode", () => {
 	);
 });
 
-test("strict mode policy ask omits once-bypass", async () => {
+test("strict mode residual ask is permit without a prompt", async () => {
 	const { pi, handlers, commands } = makePi();
 	const { spawn } = makeSpawn([
 		{ code: 7, stdout: decideJson("ask", "file.write") },
@@ -1131,12 +1123,11 @@ test("strict mode policy ask omits once-bypass", async () => {
 		"write",
 		{ path: "src/main.ts", content: "x" },
 	);
-	assert.equal(result?.block, true);
-	assert.ok(!offered.includes("Allow once"));
-	assert.ok(offered.includes("Show why"));
+	assert.equal(result, undefined);
+	assert.equal(offered.length, 0);
 });
 
-test("once-bypass records an audit event", async () => {
+test("residual ask does not open once-bypass UI", async () => {
 	const { pi, handlers, messages } = makePi();
 	const { spawn } = makeSpawn([
 		{ code: 7, stdout: decideJson("ask", "file.write") },
@@ -1158,31 +1149,13 @@ test("once-bypass records an audit event", async () => {
 		{ path: "src/main.ts", content: "x" },
 	);
 	assert.equal(result, undefined);
-	assert.ok(
-		notifications.some((n) => /ryk audit: once-bypass/i.test(n.message)),
-	);
-	const audit = messages.find((m) => m.message.customType === "ryk.audit");
-	assert.ok(audit);
 	assert.equal(
-		(audit?.message.details as { event?: string } | undefined)?.event,
-		"ryk_once_bypass",
+		messages.find((m) => m.message.customType === "ryk.audit"),
+		undefined,
 	);
-	assert.equal(
-		(audit?.message.details as { tool?: string } | undefined)?.tool,
-		"write",
-	);
-	assert.equal(
-		(audit?.message.details as { source?: string } | undefined)?.source,
-		"policy",
-	);
-	const serializedDetails = JSON.stringify(audit?.message.details);
-	assert.ok(!serializedDetails.includes(syntheticSecret));
-	assert.ok(!serializedDetails.includes(encodedSecret));
-	assert.ok(!Object.hasOwn(audit?.message.details as object, "cwd"));
-	assert.ok(!Object.hasOwn(audit?.message.details as object, "session_id"));
 });
 
-test("once-bypass stays blocked when transcript auditing is unavailable", async () => {
+test("residual ask still permits when transcript auditing is unavailable", async () => {
 	const { pi, handlers, messages } = makePi();
 	delete (pi as { sendMessage?: unknown }).sendMessage;
 	const { spawn } = makeSpawn([
@@ -1199,13 +1172,8 @@ test("once-bypass stays blocked when transcript auditing is unavailable", async 
 		"write",
 		{ path: "src/main.ts", content: "x" },
 	);
-	assert.equal(result?.block, true);
+	assert.equal(result, undefined);
 	assert.equal(messages.length, 0);
-	assert.ok(
-		notifications.some((notification) =>
-			/transcript auditing is unavailable/i.test(notification.message),
-		),
-	);
 });
 
 test("isSubagentSession and shouldAutoDenyPolicyAsk helpers", () => {
@@ -1221,25 +1189,45 @@ test("isSubagentSession and shouldAutoDenyPolicyAsk helpers", () => {
 		shouldAutoDenyPolicyAsk({ hasUI: true, mode: "tui" }, {}),
 		false,
 	);
-	assert.equal(shouldAutoDenyPolicyAsk({ hasUI: false }, {}), true);
+	assert.equal(shouldAutoDenyPolicyAsk({ hasUI: false }, {}), false);
 	assert.equal(
 		shouldAutoDenyPolicyAsk({ hasUI: true, mode: "print" }, {}),
-		true,
+		false,
 	);
 	assert.equal(
 		shouldAutoDenyPolicyAsk({ hasUI: true, mode: "json" }, {}),
-		true,
+		false,
 	);
 	assert.equal(
 		shouldAutoDenyPolicyAsk({ hasUI: true, mode: "noninteractive" }, {}),
+		false,
+	);
+	assert.equal(
+		shouldAutoDenyPolicyAsk({ hasUI: false }, { RYK_UNATTENDED: "1" }),
 		true,
+	);
+	assert.equal(
+		shouldAutoDenyPolicyAsk({ hasUI: true, mode: "tui" }, { CI: "1" }),
+		true,
+	);
+	assert.equal(
+		shouldAutoDenyPolicyAsk({ hasUI: true, mode: "tui" }, { RYK_CI: "1" }),
+		true,
+	);
+	assert.equal(
+		shouldAutoDenyPolicyAsk({ hasUI: true, mode: "tui" }, { RYK_NONINTERACTIVE: "1" }),
+		true,
+	);
+	assert.equal(
+		shouldAutoDenyPolicyAsk({ hasUI: true, mode: "tui" }, { CI: "0" }),
+		false,
 	);
 	assert.equal(
 		shouldAutoDenyPolicyAsk(
 			{ hasUI: true, mode: "tui" },
 			{ PI_SUBAGENT_PARENT_SESSION: "parent-1" },
 		),
-		true,
+		false,
 	);
 	assert.equal(
 		shouldLocalSelectPolicyAsk({ hasUI: true, mode: "tui" }, {}),
@@ -1284,7 +1272,7 @@ test("askOptionsFor policy includes session grant option", () => {
 	assert.ok(noOnce.includes(SESSION_GRANT_OPTION));
 });
 
-test("policy ask auto-denies noninteractive sessions without calling select", async () => {
+test("policy ask permits noninteractive sessions so agents can work", async () => {
 	const { pi, handlers, messages } = makePi();
 	const { spawn } = makeSpawn([
 		{ code: 7, stdout: decideJson("ask", "file.write") },
@@ -1304,37 +1292,45 @@ test("policy ask auto-denies noninteractive sessions without calling select", as
 		"write",
 		{ path: "src/main.ts", content: "x" },
 	);
-	assert.equal(result?.block, true);
-	assert.equal(selectCalled, false, "select must not be called for auto-deny");
-	assert.match(result?.reason ?? "", /auto-denied/i);
-	assert.match(result?.reason ?? "", /non-interactive/i);
-	assert.match(result?.reason ?? "", new RegExp(PRODUCT_NAME));
-	// Agent reason must carry recovery Next (not only "auto-denied").
-	assert.match(result?.reason ?? "", /Next:/i);
-	assert.match(result?.reason ?? "", /interactive Pi|pre-allow/i);
-	assert.ok(
-		!(result?.reason ?? "").includes("\n"),
-		"auto-deny agent reason must be one line",
-	);
-	assert.notEqual(result, undefined, "auto-deny must never proceed");
-	const audit = messages.find((m) => m.message.customType === "ryk.audit");
-	assert.ok(audit, "expected ryk.audit transcript event");
+	assert.equal(result, undefined);
+	assert.equal(selectCalled, false, "select must not be called for residual ask");
 	assert.equal(
-		(audit?.message.details as { event?: string } | undefined)?.event,
-		"ryk_ask_auto_deny",
+		messages.find((m) => m.message.customType === "ryk.audit"),
+		undefined,
 	);
-	// Decision card should carry Next guidance for noninteractive.
-	const decision = messages.find(
-		(m) => m.message.customType === "rykanv-decision",
-	);
-	const details = decision?.message.details as
-		| { nextStep?: string; summary?: string }
-		| undefined;
-	assert.match(details?.nextStep ?? "", /interactive Pi|pre-allow/i);
-	assert.match(details?.summary ?? "", /can't prompt \(non-interactive\)/);
 });
 
-test("policy ask auto-denies print mode even when hasUI is true", async () => {
+test("policy ask auto-denies when RYK_UNATTENDED is set", async () => {
+	const previous = process.env.RYK_UNATTENDED;
+	process.env.RYK_UNATTENDED = "1";
+	try {
+		const { pi, handlers, messages } = makePi();
+		const { spawn } = makeSpawn([
+			{ code: 7, stdout: decideJson("ask", "file.write") },
+		]);
+		installRykExtension(pi, { spawn, rykBin: "ryk" });
+		const { ctx } = makeCtx({ hasUI: false, mode: "print" });
+		const result = await fireToolCall(
+			handlers.get("tool_call")![0],
+			ctx,
+			"",
+			"write",
+			{ path: "src/main.ts", content: "x" },
+		);
+		assert.equal(result?.block, true);
+		assert.match(result?.reason ?? "", /auto-denied/i);
+		const audit = messages.find((m) => m.message.customType === "ryk.audit");
+		assert.equal(
+			(audit?.message.details as { event?: string } | undefined)?.event,
+			"ryk_ask_auto_deny",
+		);
+	} finally {
+		if (previous === undefined) delete process.env.RYK_UNATTENDED;
+		else process.env.RYK_UNATTENDED = previous;
+	}
+});
+
+test("policy ask permits print mode even when hasUI is true", async () => {
 	const { pi, handlers } = makePi();
 	const { spawn } = makeSpawn([
 		{ code: 7, stdout: decideJson("ask", "file.write") },
@@ -1354,12 +1350,11 @@ test("policy ask auto-denies print mode even when hasUI is true", async () => {
 		"write",
 		{ path: "src/main.ts", content: "x" },
 	);
-	assert.equal(result?.block, true);
+	assert.equal(result, undefined);
 	assert.equal(selectCalled, false);
-	assert.match(result?.reason ?? "", /auto-denied/i);
 });
 
-test("policy ask subagent fails closed on parent timeout (no local select)", async () => {
+test("policy ask subagent permits residual ask without parent wait", async () => {
 	const previous = process.env.PI_SUBAGENT_PARENT_SESSION;
 	const previousTimeout = process.env.RYK_PI_PARENT_ASK_TIMEOUT_MS;
 	const previousRoot = process.env.RYK_PI_ASK_ROOT;
@@ -1398,42 +1393,11 @@ test("policy ask subagent fails closed on parent timeout (no local select)", asy
 			"write",
 			{ path: "src/main.ts", content: "x" },
 		);
-		assert.equal(result?.block, true);
+		assert.equal(result, undefined);
 		assert.equal(
 			selectCalled,
 			false,
 			"subagent must not local-select even with hasUI",
-		);
-		assert.match(result?.reason ?? "", /auto-denied/i);
-		assert.match(result?.reason ?? "", /subagent/i);
-		assert.match(result?.reason ?? "", /Next:/i);
-		assert.match(result?.reason ?? "", /parent Pi session|mcp\.allow/i);
-		assert.ok(
-			!(result?.reason ?? "").includes("\n"),
-			"subagent auto-deny agent reason must be one line",
-		);
-		assert.notEqual(result, undefined);
-		const audit = messages.find((m) => m.message.customType === "ryk.audit");
-		assert.equal(
-			(audit?.message.details as { event?: string } | undefined)?.event,
-			"ryk_ask_auto_deny",
-		);
-		assert.equal(
-			(audit?.message.details as { session_class?: string } | undefined)
-				?.session_class,
-			"subagent",
-		);
-		const decision = messages.find(
-			(m) => m.message.customType === "rykanv-decision",
-		);
-		const details = decision?.message.details as
-			| { nextStep?: string; rule?: string; summary?: string }
-			| undefined;
-		assert.match(details?.nextStep ?? "", /parent Pi session/i);
-		assert.match(details?.summary ?? "", /can't prompt \(subagent\)/);
-		assert.ok(
-			details?.rule === "rykanv:parent-ask-timeout" ||
-				details?.rule === "rykanv:ask-no-ui",
 		);
 	} finally {
 		if (previous === undefined) delete process.env.PI_SUBAGENT_PARENT_SESSION;
@@ -1447,7 +1411,7 @@ test("policy ask subagent fails closed on parent timeout (no local select)", asy
 	}
 });
 
-test("policy ask subagent allows when parent responds run_once", async () => {
+test("policy ask subagent permits residual ask without parent IPC", async () => {
 	const previous = process.env.PI_SUBAGENT_PARENT_SESSION;
 	const previousTimeout = process.env.RYK_PI_PARENT_ASK_TIMEOUT_MS;
 	const previousRoot = process.env.RYK_PI_ASK_ROOT;
@@ -1495,13 +1459,7 @@ test("policy ask subagent allows when parent responds run_once", async () => {
 			"write",
 			{ path: "src/main.ts", content: "x" },
 		);
-		assert.equal(result, undefined, "parent run_once should allow");
-		const onceAudit = messages.find(
-			(m) =>
-				(m.message.details as { event?: string } | undefined)?.event ===
-				"ryk_once_bypass",
-		);
-		assert.ok(onceAudit, "expected once-bypass audit after parent allow");
+		assert.equal(result, undefined, "residual ask is permit");
 	} finally {
 		if (previous === undefined) delete process.env.PI_SUBAGENT_PARENT_SESSION;
 		else process.env.PI_SUBAGENT_PARENT_SESSION = previous;
@@ -1514,7 +1472,7 @@ test("policy ask subagent allows when parent responds run_once", async () => {
 	}
 });
 
-test("policy ask subagent denies when parent responds block", async () => {
+test("policy ask subagent does not wait for a parent block", async () => {
 	const previous = process.env.PI_SUBAGENT_PARENT_SESSION;
 	const previousTimeout = process.env.RYK_PI_PARENT_ASK_TIMEOUT_MS;
 	const previousRoot = process.env.RYK_PI_ASK_ROOT;
@@ -1557,8 +1515,7 @@ test("policy ask subagent denies when parent responds block", async () => {
 			"write",
 			{ path: "src/main.ts", content: "x" },
 		);
-		assert.equal(result?.block, true);
-		assert.ok(!/auto-denied/i.test(result?.reason ?? ""));
+		assert.equal(result, undefined);
 	} finally {
 		if (previous === undefined) delete process.env.PI_SUBAGENT_PARENT_SESSION;
 		else process.env.PI_SUBAGENT_PARENT_SESSION = previous;
@@ -1688,7 +1645,7 @@ test("parent main session answers pending child ask via select", async () => {
 	}
 });
 
-test("policy ask still invokes select in interactive parent TUI", async () => {
+test("policy ask permits residual ask in interactive parent TUI", async () => {
 	const previous = process.env.PI_SUBAGENT_PARENT_SESSION;
 	delete process.env.PI_SUBAGENT_PARENT_SESSION;
 	try {
@@ -1711,12 +1668,8 @@ test("policy ask still invokes select in interactive parent TUI", async () => {
 			"write",
 			{ path: "src/main.ts", content: "x" },
 		);
-		assert.equal(result?.block, true);
-		assert.equal(selectCalled, true, "interactive TUI must call select");
-		assert.ok(
-			!/auto-denied/i.test(result?.reason ?? ""),
-			"interactive block should not use auto-deny wording",
-		);
+		assert.equal(result, undefined);
+		assert.equal(selectCalled, false, "residual ask must not prompt");
 	} finally {
 		if (previous === undefined) delete process.env.PI_SUBAGENT_PARENT_SESSION;
 		else process.env.PI_SUBAGENT_PARENT_SESSION = previous;
@@ -1724,33 +1677,40 @@ test("policy ask still invokes select in interactive parent TUI", async () => {
 });
 
 test("policy ask auto-deny still blocks when audit is unavailable", async () => {
-	const { pi, handlers, messages } = makePi();
-	delete (pi as { sendMessage?: unknown }).sendMessage;
-	const { spawn } = makeSpawn([
-		{ code: 7, stdout: decideJson("ask", "file.write") },
-	]);
-	installRykExtension(pi, { spawn, rykBin: "ryk" });
-	const { ctx } = makeCtx({ hasUI: false, mode: "print" });
-	let selectCalled = false;
-	(ctx.ui as any).select = async () => {
-		selectCalled = true;
-		return "Allow once";
-	};
+	const previous = process.env.RYK_UNATTENDED;
+	process.env.RYK_UNATTENDED = "1";
+	try {
+		const { pi, handlers, messages } = makePi();
+		delete (pi as { sendMessage?: unknown }).sendMessage;
+		const { spawn } = makeSpawn([
+			{ code: 7, stdout: decideJson("ask", "file.write") },
+		]);
+		installRykExtension(pi, { spawn, rykBin: "ryk" });
+		const { ctx } = makeCtx({ hasUI: false, mode: "print" });
+		let selectCalled = false;
+		(ctx.ui as any).select = async () => {
+			selectCalled = true;
+			return "Allow once";
+		};
 
-	const result = await fireToolCall(
-		handlers.get("tool_call")![0],
-		ctx,
-		"",
-		"write",
-		{ path: "src/main.ts", content: "x" },
-	);
-	assert.equal(result?.block, true);
-	assert.equal(selectCalled, false);
-	assert.match(result?.reason ?? "", /auto-denied/i);
-	assert.equal(messages.length, 0);
+		const result = await fireToolCall(
+			handlers.get("tool_call")![0],
+			ctx,
+			"",
+			"write",
+			{ path: "src/main.ts", content: "x" },
+		);
+		assert.equal(result?.block, true);
+		assert.equal(selectCalled, false);
+		assert.match(result?.reason ?? "", /auto-denied/i);
+		assert.equal(messages.length, 0);
+	} finally {
+		if (previous === undefined) delete process.env.RYK_UNATTENDED;
+		else process.env.RYK_UNATTENDED = previous;
+	}
 });
 
-test("bash policy ask auto-denies noninteractive sessions", async () => {
+test("bash policy ask permits noninteractive sessions", async () => {
 	const { pi, handlers } = makePi();
 	const { spawn } = makeSpawn([{ code: 0, stdout: askJson() }]);
 	installRykExtension(pi, { spawn, rykBin: "ryk" });
@@ -1766,12 +1726,11 @@ test("bash policy ask auto-denies noninteractive sessions", async () => {
 		ctx,
 		"git push --force",
 	);
-	assert.equal(result?.block, true);
+	assert.equal(result, undefined);
 	assert.equal(selectCalled, false);
-	assert.match(result?.reason ?? "", /auto-denied/i);
 });
 
-test("interactive policy ask blocks when select returns undefined (timeout)", async () => {
+test("interactive policy ask permits residual ask without select", async () => {
 	const previous = process.env.PI_SUBAGENT_PARENT_SESSION;
 	delete process.env.PI_SUBAGENT_PARENT_SESSION;
 	try {
@@ -1790,9 +1749,7 @@ test("interactive policy ask blocks when select returns undefined (timeout)", as
 			"write",
 			{ path: "src/main.ts", content: "x" },
 		);
-		assert.equal(result?.block, true);
-		assert.notEqual(result, undefined);
-		assert.ok(!/auto-denied/i.test(result?.reason ?? ""));
+		assert.equal(result, undefined);
 	} finally {
 		if (previous === undefined) delete process.env.PI_SUBAGENT_PARENT_SESSION;
 		else process.env.PI_SUBAGENT_PARENT_SESSION = previous;
@@ -2328,51 +2285,19 @@ test("ryk error in non-interactive mode blocks", async () => {
 	assert.match(result.reason, /\/ryk-doctor|Fail-closed|malformed|unavailable|error/i);
 });
 
-test("ryk error in interactive mode waits for the user's decision", async () => {
+test("ryk error in interactive mode fail-closes without a prompt", async () => {
 	const { pi, handlers } = makePi();
 	const err = { code: 3 as number, stdout: errorJson() };
 	const { spawn } = makeSpawn([err, err]);
 	installRykExtension(pi, { spawn, rykBin: "ryk" });
-	const { ctx, widgets } = makeCtx();
-	let resolveSelection: (choice: string) => void = () => {};
-	ctx.ui.select = () =>
-		new Promise<string>((resolvePromise) => {
-			resolveSelection = resolvePromise;
-		});
+	const { ctx } = makeCtx();
+	(ctx.ui as { select?: unknown }).select = async () => {
+		throw new Error("protocol failure must not open a select()");
+	};
 
-	let settled = false;
-	const pendingResult = fireToolCall(handlers.get("tool_call")![0], ctx).then(
-		(result) => {
-			settled = true;
-			return result;
-		},
-	);
-	await flushAsyncWork();
-	assert.equal(settled, false, "expected bash tool call to wait for select()");
-	const askWidget = widgets.find((entry) => entry.key === "rykanv-block");
-	assert.ok(askWidget, "expected Rykan V ask widget");
-	assert.deepEqual(askWidget.opts, { placement: "aboveEditor" });
-	const cardText = askWidget.value?.join("\n") ?? "";
-	assert.match(cardText, /RYKAN V · Needs approval/);
-	assert.match(cardText, /Tip\s+|Why\s+/);
-	assert.ok(
-		!/YOUR CALL|COMMAND STOPPED|Choose: Run once/.test(cardText),
-		"legacy chrome must be gone",
-	);
-	assert.ok(
-		!/[┏┓┗┛┃━┌┐└┘│─]/.test(cardText),
-		"ask widget must not use ASCII/Unicode box frames",
-	);
-	assert.ok(
-		askWidget.value?.every((line) => line.length <= 80),
-		"expected a compact card",
-	);
-
-	resolveSelection("Allow once");
-	const result = await pendingResult;
-	assert.equal(result, undefined);
-	assert.equal(settled, true);
-	assert.equal(widgets.at(-1)?.value, undefined);
+	const result = await fireToolCall(handlers.get("tool_call")![0], ctx);
+	assert.equal(result.block, true);
+	assert.match(result.reason, /\/ryk-doctor|Fail-closed|malformed|unavailable|error/i);
 });
 
 test("auto mode blocks print sessions even when hasUI is true", async () => {
@@ -2474,79 +2399,49 @@ test("protocol block choice sticks for the rest of the session", async () => {
 	const { spawn, calls } = makeSpawn([bad, bad, bad, bad, bad, bad]);
 	installRykExtension(pi, { spawn, rykBin: "ryk" });
 	const { ctx, selections } = makeCtx();
-	selections.push(protocolBlockOptionLabel());
 
 	const first = await fireToolCall(handlers.get("tool_call")![0], ctx);
 	assert.equal(first?.block, true);
 	const selectsBefore = selections.length;
 
-	// Second protocol failure must not open another select (sticky block).
 	const second = await fireToolCall(
 		handlers.get("tool_call")![0],
 		ctx,
 		"echo again",
 	);
 	assert.equal(second?.block, true);
-	assert.equal(selections.length, selectsBefore, "no second select");
+	assert.equal(selections.length, selectsBefore, "no select on protocol failure");
 	assert.ok(calls.length >= 2);
 });
 
-test("subagent protocol failure parent-forwards instead of silent local brick", async () => {
+test("subagent protocol failure fail-closes without parent-forward ask", async () => {
 	const previous = process.env.PI_SUBAGENT_PARENT_SESSION;
-	const previousTimeout = process.env.RYK_PI_PARENT_ASK_TIMEOUT_MS;
 	const previousRoot = process.env.RYK_PI_ASK_ROOT;
 	const askRoot = mkdtempSync(resolve(tmpdir(), "ryk-pi-proto-"));
 	const parentId = "parent-proto-session";
 	process.env.PI_SUBAGENT_PARENT_SESSION = parentId;
-	process.env.RYK_PI_PARENT_ASK_TIMEOUT_MS = "2000";
 	process.env.RYK_PI_ASK_ROOT = askRoot;
-	let clock = 0;
-	let sawProtocolAsk = false;
 	try {
-		const { pi, handlers, messages } = makePi();
+		const { pi, handlers } = makePi();
 		const bad = { code: 0 as number, stdout: "{not-json" };
 		const { spawn } = makeSpawn([bad, bad]);
 		installRykExtension(pi, {
 			spawn,
 			rykBin: "ryk",
 			piAskRoot: askRoot,
-			parentAskPollMs: 0,
-			now: () => clock,
-			sleep: async (ms) => {
-				const dir = parentAskDir(askRoot, parentId);
-				const pending = listPendingRequests(dir);
-				for (const req of pending) {
-					if (/\[protocol\]|malformed/i.test(req.reason)) sawProtocolAsk = true;
-					writeAskResponse(dir, {
-						v: 1,
-						id: req.id,
-						choice: "run_once",
-						decided_at_ms: clock,
-					});
-				}
-				clock += ms;
-			},
 		});
 		const { ctx } = makeCtx({ hasUI: true, mode: "tui" });
-		(ctx.ui as any).select = async () => {
-			throw new Error("child must not local-select on protocol recovery");
+		(ctx.ui as { select?: unknown }).select = async () => {
+			throw new Error("child must not local-select on protocol failure");
 		};
 
 		const result = await fireToolCall(handlers.get("tool_call")![0], ctx);
-		assert.equal(result, undefined, "parent run_once should allow through");
-		assert.equal(sawProtocolAsk, true, "expected [protocol] parent-forward ask");
-		const onceAudit = messages.find(
-			(m) =>
-				(m.message.details as { event?: string } | undefined)?.event ===
-				"ryk_once_bypass",
-		);
-		assert.ok(onceAudit, "expected once-bypass audit after parent allow");
+		assert.equal(result?.block, true);
+		assert.match(result?.reason ?? "", /malformed|Fail-closed|unavailable/i);
+		assert.equal(listPendingRequests(parentAskDir(askRoot, parentId)).length, 0);
 	} finally {
 		if (previous === undefined) delete process.env.PI_SUBAGENT_PARENT_SESSION;
 		else process.env.PI_SUBAGENT_PARENT_SESSION = previous;
-		if (previousTimeout === undefined)
-			delete process.env.RYK_PI_PARENT_ASK_TIMEOUT_MS;
-		else process.env.RYK_PI_PARENT_ASK_TIMEOUT_MS = previousTimeout;
 		if (previousRoot === undefined) delete process.env.RYK_PI_ASK_ROOT;
 		else process.env.RYK_PI_ASK_ROOT = previousRoot;
 		rmSync(askRoot, { recursive: true, force: true });
@@ -2591,22 +2486,20 @@ test("repeated protocol failures notify degraded once without allowing", async (
 });
 
 test("session bypass allows subsequent bash calls during same session", async () => {
-	const { pi, handlers } = makePi();
-	const err = { code: 3 as number, stdout: errorJson() };
-	// Non-transient decision:error → single spawn, then session bypass.
-	const { spawn, calls } = makeSpawn([err]);
+	const { pi, handlers, commands } = makePi();
+	const { spawn, calls } = makeSpawn();
 	installRykExtension(pi, { spawn, rykBin: "ryk" });
-	const { ctx, selections } = makeCtx();
-	selections.push("Disable Rykan V for this session");
+	const { ctx } = makeCtx();
+	await commands.get("ryk-stop")!.handler("", ctx);
 
 	const first = await fireToolCall(handlers.get("tool_call")![0], ctx);
 	const second = await fireToolCall(handlers.get("tool_call")![0], ctx);
 	assert.equal(first, undefined);
 	assert.equal(second, undefined);
-	assert.equal(calls.length, 1);
+	assert.equal(calls.length, 0);
 });
 
-test("session bypass does not leak across Pi session ids", async () => {
+test("protocol failure on one session does not disable another", async () => {
 	const { pi, handlers } = makePi();
 	const err = { code: 3 as number, stdout: errorJson() };
 	const { spawn, calls } = makeSpawn([
@@ -2618,15 +2511,14 @@ test("session bypass does not leak across Pi session ids", async () => {
 	const secondSession = makeCtx({
 		sessionManager: { getSessionId: () => "session-b" },
 	});
-	firstSession.selections.push("Disable Rykan V for this session");
 
-	await fireToolCall(handlers.get("tool_call")![0], firstSession.ctx);
+	const first = await fireToolCall(handlers.get("tool_call")![0], firstSession.ctx);
 	const result = await fireToolCall(
 		handlers.get("tool_call")![0],
 		secondSession.ctx,
 	);
+	assert.equal(first?.block, true);
 	assert.equal(result, undefined);
-	// 1 non-transient error on first session + 1 allow on second session.
 	assert.equal(calls.length, 2);
 });
 
@@ -3209,7 +3101,7 @@ test("tool_call survives parent-ask mkdir EPERM", async () => {
 	);
 });
 
-test("subagent policy ask fails closed when parent-ask FS is EPERM", async () => {
+test("subagent residual ask permits when parent-ask FS is EPERM", async () => {
 	const previous = process.env.PI_SUBAGENT_PARENT_SESSION;
 	process.env.PI_SUBAGENT_PARENT_SESSION = "parent-eperm";
 	try {
@@ -3241,7 +3133,7 @@ test("subagent policy ask fails closed when parent-ask FS is EPERM", async () =>
 			"write",
 			{ path: "src/main.ts", content: "x" },
 		);
-		assert.equal(result?.block, true);
+		assert.equal(result, undefined);
 	} finally {
 		if (previous === undefined) delete process.env.PI_SUBAGENT_PARENT_SESSION;
 		else process.env.PI_SUBAGENT_PARENT_SESSION = previous;
