@@ -200,7 +200,7 @@ SIGNATURE_STATE="unverified"
 # ── Version resolution ───────────────────────────────────────────────────────
 # cut-release rewrites INSTALL_FALLBACK_VERSION when shipping; do not hand-edit
 # without also updating VERSION / the release cutter.
-INSTALL_FALLBACK_VERSION="0.2.18"
+INSTALL_FALLBACK_VERSION="0.2.19"
 
 is_semver() {
   # Strict X.Y.Z only (installer artifact names depend on this shape).

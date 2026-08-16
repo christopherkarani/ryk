@@ -1,5 +1,48 @@
 # Changelog
 
+## [0.2.19] - 2026-08-16
+
+## What's Changed
+* Put core_engine on the real test gates by @christopherkarani in https://github.com/christopherkarani/ryk/pull/140
+* fix(opencode): show ryk host in vanilla OpenCode TUI by @christopherkarani in https://github.com/christopherkarani/ryk/pull/141
+* Peel shell_eval into cwd, synth, and fm siblings by @christopherkarani in https://github.com/christopherkarani/ryk/pull/143
+* fix(cli): expand env-node shebang so ryk pi survives OS sandbox attach by @christopherkarani in https://github.com/christopherkarani/ryk/pull/142
+* fix(pi): stop TUI crashes on decision cards and sandbox mkdir EPERM by @christopherkarani in https://github.com/christopherkarani/ryk/pull/156
+* fix(start): Claude smoke, probe smokes, leftover hosts by @christopherkarani in https://github.com/christopherkarani/ryk/pull/158
+* fix(opencode): show TUI toast when ryk blocks a command by @christopherkarani in https://github.com/christopherkarani/ryk/pull/157
+* fix(mcp): close notifications/ prefix fail-open in the policy proxy by @christopherkarani in https://github.com/christopherkarani/ryk/pull/160
+* fix(agent-hook): fail closed on empty stdin for bare ryk by @christopherkarani in https://github.com/christopherkarani/ryk/pull/159
+* fix: Windows doctor panic and ryk run AccessDenied (#147) by @christopherkarani in https://github.com/christopherkarani/ryk/pull/148
+* fix(security): ignore allow-once store unless OS sandbox is active by @christopherkarani in https://github.com/christopherkarani/ryk/pull/161
+* fix(security): realpath-reject workspace-planted user allowlist.toml by @christopherkarani in https://github.com/christopherkarani/ryk/pull/151
+* fix: deny force-equivalent git push on classify and shell_engine by @christopherkarani in https://github.com/christopherkarani/ryk/pull/152
+* Expand hook host matrix to all 8 supported envelopes by @christopherkarani in https://github.com/christopherkarani/ryk/pull/162
+* fix(cli): rebase #150 glanceable surface onto current main by @christopherkarani in https://github.com/christopherkarani/ryk/pull/163
+* perf(hook): cheaper hot path without a 5ms SLA by @christopherkarani in https://github.com/christopherkarani/ryk/pull/164
+* docs: real OpenCode deny GIF on the README hero by @christopherkarani in https://github.com/christopherkarani/ryk/pull/165
+* fix(ryk-pi): borderless blocked-command cards (no untested Box) by @christopherkarani in https://github.com/christopherkarani/ryk/pull/167
+* fix: force-push Why points at fast-forward git push, not lease by @christopherkarani in https://github.com/christopherkarani/ryk/pull/178
+* fix: launch Hermes under ryk; honor RYK_BIN/PATH source-build discovery by @christopherkarani in https://github.com/christopherkarani/ryk/pull/173
+* fix(cli): override only top-level policy mode on ryk init by @christopherkarani in https://github.com/christopherkarani/ryk/pull/179
+* perf: strip ReleaseSafe ryk and DCE product DebugAllocator by @christopherkarani in https://github.com/christopherkarani/ryk/pull/184
+* chore: move Mac FM steward Swift source to ryk-fm-steward by @christopherkarani in https://github.com/christopherkarani/ryk/pull/183
+* perf: gzip-embed oracle packs and inflate fail-closed by @christopherkarani in https://github.com/christopherkarani/ryk/pull/185
+* fix(windows): open audit log for resync by @onatozmenn in https://github.com/christopherkarani/ryk/pull/186
+* perf: slim PCRE2 without UCD and add -Dhttp TLS omit by @christopherkarani in https://github.com/christopherkarani/ryk/pull/188
+* perf: split TUI barrel so -Dtui=false drops vaxis by @christopherkarani in https://github.com/christopherkarani/ryk/pull/187
+* fix: unblock Linux CI gates and drop billed macOS runners by @christopherkarani in https://github.com/christopherkarani/ryk/pull/190
+* fix(ux): say Session, not Always, for TTY ask (#146) by @christopherkarani in https://github.com/christopherkarani/ryk/pull/191
+* fix(hook): list grok in `ryk hook --help` by @christopherkarani in https://github.com/christopherkarani/ryk/pull/192
+* fix: ryk start banner names written policy posture (#144) by @christopherkarani in https://github.com/christopherkarani/ryk/pull/193
+* refactor(cli): rename rust_visibility to feed_visibility by @christopherkarani in https://github.com/christopherkarani/ryk/pull/182
+* docs: P4 binary-size measurement — flags-only, no ryk-dev split by @christopherkarani in https://github.com/christopherkarani/ryk/pull/189
+* Add honest localhost Terminal view (supersedes #154) by @christopherkarani in https://github.com/christopherkarani/ryk/pull/168
+
+## New Contributors
+* @onatozmenn made their first contribution in https://github.com/christopherkarani/ryk/pull/186
+
+**Full Changelog**: https://github.com/christopherkarani/ryk/compare/v0.2.18...v0.2.19
+
 ## [0.2.18] - 2026-08-14
 
 ## What's Changed

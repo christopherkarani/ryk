@@ -1,6 +1,6 @@
 {
   "name": "@rykan/pi-ryk",
-  "version": "0.2.18",
+  "version": "0.2.19",
   "description": "Official ryk Pi integration for fail-closed bash and file protection.",
   "type": "module",
   "license": "Apache-2.0",
@@ -37,7 +37,7 @@
     "smoke": "bash scripts/smoke.sh"
   },
   "dependencies": {
-    "@rykan/ryk": "0.2.18"
+    "@rykan/ryk": "0.2.19"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": ">=0.79.0"
