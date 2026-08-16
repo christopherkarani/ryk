@@ -617,6 +617,40 @@ fn buildFromInventory(
         },
     }
 
+    const transferred = try transferOwnedInventorySlices(
+        allocator,
+        &argv,
+        &exec_paths,
+        &ro_paths,
+        &disabled,
+        &env_puts,
+    );
+    return .{
+        .allocator = allocator,
+        .argv = transferred.argv,
+        .exec_paths = transferred.exec_paths,
+        .ro_paths = transferred.ro_paths,
+        .disabled_server_names = transferred.disabled_server_names,
+        .env_puts = transferred.env_puts,
+        .wrapper_root = wrapper_root,
+        .audit_root = audit_root,
+    };
+}
+
+fn transferOwnedInventorySlices(
+    allocator: std.mem.Allocator,
+    argv: *std.ArrayList([]const u8),
+    exec_paths: *std.ArrayList([]const u8),
+    ro_paths: *std.ArrayList([]const u8),
+    disabled: *std.ArrayList([]const u8),
+    env_puts: *std.ArrayList(EnvPut),
+) error{OutOfMemory}!struct {
+    argv: []const []const u8,
+    exec_paths: []const []const u8,
+    ro_paths: []const []const u8,
+    disabled_server_names: []const []const u8,
+    env_puts: []const EnvPut,
+} {
     const owned_argv = try argv.toOwnedSlice(allocator);
     errdefer freeOwnedStrings(allocator, owned_argv);
     const owned_exec_paths = try exec_paths.toOwnedSlice(allocator);
@@ -634,14 +668,11 @@ fn buildFromInventory(
         allocator.free(owned_env_puts);
     }
     return .{
-        .allocator = allocator,
         .argv = owned_argv,
         .exec_paths = owned_exec_paths,
         .ro_paths = owned_ro_paths,
         .disabled_server_names = owned_disabled,
         .env_puts = owned_env_puts,
-        .wrapper_root = wrapper_root,
-        .audit_root = audit_root,
     };
 }
 
@@ -1085,6 +1116,11 @@ fn pathPresent(paths: []const []const u8, needle: []const u8) bool {
     return false;
 }
 
+test {
+    // File-local test module. Zig 0.16 -Dtest-filter= drops cli/mod.zig's unnamed
+    // `_ = host_mcp_sandbox` pull, so this file must be a test module itself.
+}
+
 test "opencode plan wraps approved local MCP and disables remote" {
     if (builtin.os.tag != .macos) return error.SkipZigTest;
     const allocator = std.testing.allocator;
@@ -1277,4 +1313,143 @@ test "openCode config collector extracts local command arrays" {
     try std.testing.expect(std.mem.indexOf(u8, json, "open-computer-use") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"stdio\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "open-computer-use") != null);
+}
+
+fn hostMcpTransferOomFreePending(
+    allocator: std.mem.Allocator,
+    argv: *std.ArrayList([]const u8),
+    exec_paths: *std.ArrayList([]const u8),
+    ro_paths: *std.ArrayList([]const u8),
+    disabled: *std.ArrayList([]const u8),
+    env_puts: *std.ArrayList(EnvPut),
+) void {
+    freeOwnedList(allocator, argv);
+    freeOwnedList(allocator, exec_paths);
+    freeOwnedList(allocator, ro_paths);
+    freeOwnedList(allocator, disabled);
+    for (env_puts.items) |put| {
+        allocator.free(put.name);
+        allocator.free(put.value);
+    }
+    env_puts.deinit(allocator);
+}
+
+fn hostMcpTransferOomFreeTransferred(
+    allocator: std.mem.Allocator,
+    argv: []const []const u8,
+    exec_paths: []const []const u8,
+    ro_paths: []const []const u8,
+    disabled_server_names: []const []const u8,
+    env_puts: []const EnvPut,
+) void {
+    // Same ownership as Plan.deinit for the five transferred lists (no wrapper/audit trees).
+    freeOwnedStrings(allocator, argv);
+    freeOwnedStrings(allocator, exec_paths);
+    freeOwnedStrings(allocator, ro_paths);
+    freeOwnedStrings(allocator, disabled_server_names);
+    for (env_puts) |put| {
+        allocator.free(put.name);
+        allocator.free(put.value);
+    }
+    allocator.free(env_puts);
+}
+
+fn hostMcpTransferOomSeedLists(
+    allocator: std.mem.Allocator,
+    argv: *std.ArrayList([]const u8),
+    exec_paths: *std.ArrayList([]const u8),
+    ro_paths: *std.ArrayList([]const u8),
+    disabled: *std.ArrayList([]const u8),
+    env_puts: *std.ArrayList(EnvPut),
+) error{OutOfMemory}!void {
+    // Non-empty so each toOwnedSlice reallocates; empty lists can skip the hole.
+    try appendCopy(allocator, argv, "opencode");
+    try appendCopy(allocator, exec_paths, "/usr/bin/false");
+    try appendCopy(allocator, ro_paths, "/usr/bin");
+    try appendCopy(allocator, disabled, "remote-tool");
+    // Block drops errdefer after a successful append so a later OOM is not a double-free.
+    {
+        const env_name = try allocator.dupe(u8, "OPENCODE_CONFIG_CONTENT");
+        errdefer allocator.free(env_name);
+        const env_value = try allocator.dupe(u8, "{\"mcp\":{}}");
+        errdefer allocator.free(env_value);
+        try env_puts.append(allocator, .{ .name = env_name, .value = env_value });
+    }
+}
+
+fn hostMcpTransferOomSeedListsProbe(allocator: std.mem.Allocator) !void {
+    var argv: std.ArrayList([]const u8) = .empty;
+    var exec_paths: std.ArrayList([]const u8) = .empty;
+    var ro_paths: std.ArrayList([]const u8) = .empty;
+    var disabled: std.ArrayList([]const u8) = .empty;
+    var env_puts: std.ArrayList(EnvPut) = .empty;
+    errdefer hostMcpTransferOomFreePending(allocator, &argv, &exec_paths, &ro_paths, &disabled, &env_puts);
+    try hostMcpTransferOomSeedLists(allocator, &argv, &exec_paths, &ro_paths, &disabled, &env_puts);
+    try std.testing.expectEqual(@as(usize, 1), argv.items.len);
+    try std.testing.expectEqual(@as(usize, 1), exec_paths.items.len);
+    try std.testing.expectEqual(@as(usize, 1), ro_paths.items.len);
+    try std.testing.expectEqual(@as(usize, 1), disabled.items.len);
+    try std.testing.expectEqual(@as(usize, 1), env_puts.items.len);
+    hostMcpTransferOomFreePending(allocator, &argv, &exec_paths, &ro_paths, &disabled, &env_puts);
+}
+
+fn hostMcpTransferOwnedInventorySlicesOomProbe(allocator: std.mem.Allocator) !void {
+    var argv: std.ArrayList([]const u8) = .empty;
+    var exec_paths: std.ArrayList([]const u8) = .empty;
+    var ro_paths: std.ArrayList([]const u8) = .empty;
+    var disabled: std.ArrayList([]const u8) = .empty;
+    var env_puts: std.ArrayList(EnvPut) = .empty;
+    errdefer hostMcpTransferOomFreePending(allocator, &argv, &exec_paths, &ro_paths, &disabled, &env_puts);
+    try hostMcpTransferOomSeedLists(allocator, &argv, &exec_paths, &ro_paths, &disabled, &env_puts);
+
+    const transferred = try transferOwnedInventorySlices(
+        allocator,
+        &argv,
+        &exec_paths,
+        &ro_paths,
+        &disabled,
+        &env_puts,
+    );
+    defer hostMcpTransferOomFreeTransferred(
+        allocator,
+        transferred.argv,
+        transferred.exec_paths,
+        transferred.ro_paths,
+        transferred.disabled_server_names,
+        transferred.env_puts,
+    );
+    argv.deinit(allocator);
+    exec_paths.deinit(allocator);
+    ro_paths.deinit(allocator);
+    disabled.deinit(allocator);
+    env_puts.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), transferred.argv.len);
+    try std.testing.expectEqualStrings("opencode", transferred.argv[0]);
+    try std.testing.expectEqual(@as(usize, 1), transferred.exec_paths.len);
+    try std.testing.expectEqualStrings("/usr/bin/false", transferred.exec_paths[0]);
+    try std.testing.expectEqual(@as(usize, 1), transferred.ro_paths.len);
+    try std.testing.expectEqualStrings("/usr/bin", transferred.ro_paths[0]);
+    try std.testing.expectEqual(@as(usize, 1), transferred.disabled_server_names.len);
+    try std.testing.expectEqualStrings("remote-tool", transferred.disabled_server_names[0]);
+    try std.testing.expectEqual(@as(usize, 1), transferred.env_puts.len);
+    try std.testing.expectEqualStrings("OPENCODE_CONFIG_CONTENT", transferred.env_puts[0].name);
+    try std.testing.expectEqualStrings("{\"mcp\":{}}", transferred.env_puts[0].value);
+}
+
+fn hostMcpTransferOomFailAtZeroIsOutOfMemory() !void {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        hostMcpTransferOwnedInventorySlicesOomProbe(failing.allocator()),
+    );
+    const as_plan: PlanError = error.OutOfMemory;
+    try std.testing.expect(as_plan != error.InvalidInventory);
+    try std.testing.expect(failing.has_induced_failure);
+}
+
+test "HostMcpTransferOom host MCP inventory transfer OOM" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, hostMcpTransferOomSeedListsProbe, .{});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, hostMcpTransferOwnedInventorySlicesOomProbe, .{});
+    try hostMcpTransferOomFailAtZeroIsOutOfMemory();
 }

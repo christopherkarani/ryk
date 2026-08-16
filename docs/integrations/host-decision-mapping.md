@@ -22,10 +22,10 @@ Adapters **must not** claim stronger enforcement than the host provides. Passive
 
 ## CI / unattended rule
 
-Coding hosts (Claude, Codex, OpenCode, Cursor, Pi, Hermes) permit leftover
-unused policy `ask` so agents can work. There is no host ask UI for that
-leftover. Stage, FM steward soft→ask, SoftBlock, and explicit deny never
-become allow. ryk still hard-stops explicit deny/block.
+Coding hosts (Claude, Codex, OpenCode, Cursor, Pi, Hermes, Grok, OpenClaw)
+permit leftover unused policy `ask` so agents can work. There is no host
+ask UI for that leftover. Stage, FM steward soft→ask, SoftBlock, and
+explicit deny never become allow. ryk still hard-stops explicit deny/block.
 
 When unattended (`CI`, `RYK_CI`, `RYK_NONINTERACTIVE`, `RYK_UNATTENDED`, or
 host `--ci`):
@@ -38,22 +38,22 @@ host `--ci`):
 | Host | Event | `allow` | `block` | `ask` | `warn` | Resume? | Notes |
 |---|---|---|---|---|---|---|---|
 | **Hermes** | `pre_tool_call` | proceed | `action: block` | **allow** (unattended → block) | log + proceed | No | Residual ask is permit. No Hermes approve UI. CI / unattended hardens `ask`→`block`. |
-| **OpenClaw** | `tool.before` | proceed | block | **block** until a live, versioned resumable-approval contract is validated | log + allow | **No** | Unknown/legacy/metadata registration is unprotected; use the wrapper for the hard boundary. |
+| **OpenClaw** | `tool.before` | proceed | block | **allow** (unattended → block) | log + allow | **No** | Residual unused ask is permit. Unknown/legacy/metadata registration is unprotected; use the wrapper for the hard boundary. |
 | **OpenCode** | `tool.execute.before` | proceed | throw/block | **allow** (unattended → block) | log + allow | No | Residual ask is permit so agents can work. |
 | **OpenCode** | `command.execute.before` | proceed | throw/block | **allow** (unattended → block) | log + allow | No | Slash/custom commands; payload uses command name as tool. |
 | **OpenCode** | `permission.ask` | allow | deny | **allow** (unattended → deny) | log | No | Residual ask is permit; only hard-deny on `block`. |
 | **Claude Code** | `PreToolUse` / `PermissionRequest` | `permissionDecision: allow` | `permissionDecision: deny` | **allow** (unattended/`--ci` → deny) | proceed as allow | No | Host-shaped stdout JSON via `hookSpecificOutput` (hook grade; exit 0). Residual ask is permit so agents can work. |
 | **Codex** | `PreToolUse` / `PermissionRequest` | allow | deny | **allow** (unattended/`--ci` → deny) | warn | No | Residual ask is permit; unattended wires ask to block. |
 | **Pi** | tool hooks | allow | deny | **allow** (unattended → auto-deny) | warn | No | Residual ask is permit. `RYK_UNATTENDED` / `CI` auto-denies. |
-| **Grok** | `PreToolUse` (Bash / Read) | exit 0 | `{"decision":"deny","reason":…}` + exit 2 | **deny** JSON + exit 2 (no resume) | exit 0 | **No** | **hook** + `ryk grok` **wrapper**. Missing/non-executable `ryk` emits deny JSON + exit 2. See below. |
+| **Grok** | `PreToolUse` (Bash / Read) | exit 0 | `{"decision":"deny","reason":…}` + exit 2 | **allow** (unattended → deny JSON + exit 2) | exit 0 | **No** | Residual unused ask is permit. Stage / SoftBlock / FM / explicit deny stay deny JSON + exit 2. **hook** + `ryk grok` **wrapper**. Missing/non-executable `ryk` emits deny JSON + exit 2. See below. |
 | **Cursor** | `beforeShellExecution` (bare `ryk` stdin hook) | `permission: allow` JSON, exit 0 | `permission: deny` JSON, exit 0 | **allow** (unattended → deny) | log + allow | No | Residual ask is permit. Malformed/oversized/unknown payloads: dual-contract deny JSON + exit 2. |
 
 ### Grok hook fail-closed contract
 
 Official Grok Build treats hook stdout + exit as:
 
-- allow / warn → exit 0 (generic hook JSON from `ryk hook grok`)
-- block / ask / error → `{"decision":"deny","reason":…}` + exit 2 (no resume)
+- allow / warn / leftover unused ask → exit 0 (generic hook JSON from `ryk hook grok`)
+- block / stage / SoftBlock / FM ask / error → `{"decision":"deny","reason":…}` + exit 2 (no resume)
 
 The managed hook command is `/bin/sh -c '…' -- <absolute ryk>`: if the pinned file is missing or not executable, the wrapper prints that deny JSON and exits 2. `ryk doctor --fix` and `ryk start` rewrite legacy direct `…/ryk hook grok PreToolUse` entries (those still fail-open on exit 127).
 

@@ -608,13 +608,24 @@ function normalizeBlockingDecision(
     };
   }
   if (decision === 'ask') {
-    return failClosedBlock(
-      options.unattended ? 'ryk_unattended_ask' : 'ryk_ask_unsupported',
-      options.unattended
-        ? 'ryk requested approval, but this OpenClaw process is unattended; blocking without waiting.'
-        : 'ryk requested interactive approval (ask), but this OpenClaw integration has no verified resumable approval contract; blocking.',
-      base
-    );
+    if (options.unattended) {
+      return failClosedBlock(
+        'ryk_unattended_ask',
+        'ryk requested approval, but this OpenClaw process is unattended; blocking without waiting.',
+        base
+      );
+    }
+    // Leftover unused policy ask is permit (same coding-host wire as Grok).
+    // Stage / SoftBlock / FM ask are remapped to block by ryk hook before emit.
+    return {
+      ...base,
+      decision: 'allow',
+      risk: base.risk ?? 'low',
+      category: base.category ?? 'unknown',
+      reason: base.reason ?? 'ryk_leftover_ask_permit',
+      message: sanitizeDiagnostic(base.message) || sanitizeDiagnostic(base.reason) ||
+        'ryk leftover unused policy ask is permitted.',
+    };
   }
   if (!ALLOW_DECISIONS.has(decision)) {
     return failClosedBlock(
@@ -639,10 +650,10 @@ function normalizeBlockingDecision(
 /**
  * Parse ryk hook stdout into a decision.
  * Non-blocking: soft-allow on empty/malformed.
- * Blocking: fail closed on empty/whitespace, parse errors, missing/non-string decision,
- * `ask`, and unrecognized decisions. Approval is deliberately not translated
- * into a host-native request until a live, versioned OpenClaw approval contract
- * is available; an unknown host must never receive an unenforced ask.
+ * Blocking: fail closed on empty/whitespace, parse errors, missing/non-string
+ * decision, unattended leftover `ask`, and unrecognized decisions. Attended
+ * leftover unused policy `ask` is permit (allow). Approval is not translated
+ * into a host-native request.
  */
 export function parseHookResponse(
   stdout: string,

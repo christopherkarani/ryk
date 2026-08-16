@@ -74,7 +74,7 @@ Claude only. Informational allow.
 |---|---|---|
 | `allow` | `allow` | Policy allows |
 | `deny` | `block` | Policy denies |
-| `ask` | `allow` on Claude/Codex/OpenCode/Cursor/Pi; `block` when unattended | Leftover unused policy ask is permit so agents can work. Stage, FM steward ask, and SoftBlock never ride this wire. Explicit deny is unchanged. |
+| `ask` | `allow` on coding hosts (Claude, Codex, OpenCode, Cursor, Pi, Hermes, Grok, OpenClaw); `block` when unattended | Leftover unused policy ask is permit so agents can work. Stage, FM steward ask, and SoftBlock never ride this wire. Explicit deny is unchanged. |
 | `observe` | `context_only` | Log only |
 | `redact` | `warn` | Secrets detected |
 | `stage` | hold (`ask` on Claude `permissionDecision`) or `stage`/`block` on generic hook JSON; never `allow` | Staged write pending review. Unattended/`--ci` hardens to `block`. |
@@ -287,7 +287,7 @@ For headless runs, ryk should report the CI limitation directly instead of prete
 
 ## Cross-host decision mapping
 
-The living multi-host matrix (residual ask is permit on coding hosts, OpenClaw ask→block until a resume contract exists, prompt-path honesty) lives in:
+The living multi-host matrix (residual unused ask is permit on coding hosts including Grok and OpenClaw; unattended leftover ask still denies; prompt-path honesty) lives in:
 
 - `docs/integrations/host-decision-mapping.md`
 - `integrations/common/schemas/host-decision-mapping-v1.json`

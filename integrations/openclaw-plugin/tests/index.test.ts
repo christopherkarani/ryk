@@ -377,24 +377,24 @@ describe('parseHookResponse (fail-closed blocking path)', () => {
     assert.strictEqual(r.reason, 'ryk_missing_decision');
   });
 
-  it('ask decision on blocking path → block', () => {
+  it('ask decision on blocking path is leftover-ask permit', () => {
     const r = parseHookResponse(
       JSON.stringify({ decision: 'ask', reason: 'needs_approval' }),
       true
     );
-    assert.strictEqual(r.decision, 'block');
-    assert.strictEqual(r.reason, 'ryk_ask_unsupported');
+    assert.strictEqual(r.decision, 'allow');
+    assert.strictEqual(r.reason, 'needs_approval');
   });
 
-  it('ask decision blocks until a live resumable approval contract is verified', () => {
+  it('ask decision is leftover-ask permit and keeps rule provenance', () => {
     const r = parseHookResponse(
       JSON.stringify({ decision: 'ask', reason: 'needs_approval', rule: 'policy.rule' }),
       true,
       {}
     );
-    assert.strictEqual(r.decision, 'block');
+    assert.strictEqual(r.decision, 'allow');
     assert.strictEqual(r.rule, 'policy.rule');
-    assert.strictEqual(r.reason, 'ryk_ask_unsupported');
+    assert.strictEqual(r.reason, 'needs_approval');
   });
 
   it('ask decision blocks immediately in unattended mode', () => {

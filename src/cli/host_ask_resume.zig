@@ -80,6 +80,7 @@ test "host_ask_resume matrix: hermes resumes; openclaw/opencode/cursor hard-bloc
     try std.testing.expectEqual(ToolAskEnforcement.native_approve_and_resume, toolAskEnforcement("hermes"));
     try std.testing.expect(!hardBlocksAskWithNoResume("hermes"));
     try std.testing.expectEqual(ToolAskEnforcement.hard_block_no_resume, toolAskEnforcement("openclaw"));
+    try std.testing.expect(hardBlocksAskWithNoResume("openclaw"));
     try std.testing.expectEqual(ToolAskEnforcement.hard_block_no_resume, toolAskEnforcement("opencode"));
     try std.testing.expectEqual(ToolAskEnforcement.hard_block_no_resume, toolAskEnforcement("cursor"));
     try std.testing.expect(hardBlocksAskWithNoResume("cursor"));
