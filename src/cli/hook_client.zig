@@ -162,8 +162,10 @@ fn connectOrSpawn(io: std.Io, allocator: std.mem.Allocator, socket_path: []const
     const deadline = std.Io.Timestamp.now(io, .awake).toMilliseconds() + @as(i64, @intCast(hook_ipc.spawn_wait_ms));
     while (std.Io.Timestamp.now(io, .awake).toMilliseconds() < deadline) {
         if (daemon_uds.connectUnixSocketTimeout(socket_path, hook_ipc.connect_timeout_ms)) |fd| return fd else |_| {}
-        const delay = std.c.timespec{ .sec = 0, .nsec = 5 * std.time.ns_per_ms };
-        _ = std.c.nanosleep(&delay, null);
+        if (comptime builtin.os.tag != .windows) {
+            const delay = std.c.timespec{ .sec = 0, .nsec = 5 * std.time.ns_per_ms };
+            _ = std.c.nanosleep(&delay, null);
+        }
     }
     return error.Unavailable;
 }

@@ -230,7 +230,7 @@ fn observeLayer(runtime_io: std.Io, path: ?[]const u8) LayerObs {
         .inode = st.inode,
         .size = st.size,
         .mtime_ns = st.mtime.toNanoseconds(),
-        .mode = st.permissions.toMode(),
+        .mode = if (comptime builtin.os.tag == .windows) 0 else st.permissions.toMode(),
     };
 }
 
