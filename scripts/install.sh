@@ -606,9 +606,6 @@ validate_binary_destination() {
     if [ "${RYK_INSTALL_FORCE:-0}" = "1" ]; then
       return 0
     fi
-    if managed_runtime_version >/dev/null; then
-      return 0
-    fi
     if is_ryk_product_binary "$validate_destination"; then
       return 0
     fi

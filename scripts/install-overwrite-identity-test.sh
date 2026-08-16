@@ -168,17 +168,21 @@ assert_not_executed "random script dest"
 if [[ -x "${ELF_DIR}/ryk" ]]; then
   is_ryk_product_binary "${ELF_DIR}/ryk" &&
     fail "non-ryk ELF named ryk must not be a product binary"
+  assert_not_executed "non-ryk ELF dest"
 fi
 
 is_ryk_product_binary "${OTHER_NAME}/not-ryk" &&
   fail "product marker in a file not named ryk must not pass"
 
 # Identity must never exec dest (timeout/perl/version --json are the old hole).
-if grep -E -q 'timeout[[:space:]]+[0-9]|perl -e .alarm' "${INSTALL_SH}"; then
+if grep -E -q 'timeout[[:space:]]+[0-9]|perl -e' "${INSTALL_SH}"; then
   fail "install.sh must not exec dest via timeout/perl"
 fi
 if grep -n 'version --json' "${INSTALL_SH}" | grep -v '^[^:]*:[[:space:]]*#'; then
   fail "install.sh must not probe dest with version --json"
+fi
+if grep -E -q '"\$_ryk_id_path"[[:space:]]+(version|--)|[[:space:]]"\$_ryk_id_path"[[:space:]]+version' "${INSTALL_SH}"; then
+  fail "install.sh must not exec dest via \$_ryk_id_path"
 fi
 if grep -q 'RYK_INSTALL_SOURCE_ONLY' "${INSTALL_SH}"; then
   fail "install.sh must not implement RYK_INSTALL_SOURCE_ONLY (production kill-switch)"
@@ -189,11 +193,14 @@ grep -F -q 'RYK_INSTALL_FORCE=1' "${INSTALL_PS1}" ||
   fail "install.ps1 refuse path must name RYK_INSTALL_FORCE=1"
 
 # Windows: markers only, skip reparse, never exec, do not Copy-Item through a link.
-if grep -q 'function Get-ExistingProductInfo' "${INSTALL_PS1}"; then
+if grep -q 'Get-ExistingProductInfo' "${INSTALL_PS1}"; then
   fail "install.ps1 must not exec dest via Get-ExistingProductInfo"
 fi
-if grep -E -q '& \$Path version|ReadToEnd' "${INSTALL_PS1}"; then
-  fail "install.ps1 must not exec dest or ReadToEnd a dest stream"
+if grep -q 'Start-Process' "${INSTALL_PS1}"; then
+  fail "install.ps1 must not exec dest via Start-Process"
+fi
+if grep -E -q '& \$Path|ReadToEnd' "${INSTALL_PS1}"; then
+  fail "install.ps1 must not exec dest via & \$Path or ReadToEnd"
 fi
 grep -q 'ReparsePoint' "${INSTALL_PS1}" ||
   fail "install.ps1 must skip reparse/symlink dest (allow, never exec)"
@@ -211,15 +218,30 @@ fail() {
   exit 1
 }
 reject_symlink_parents() { :; }
-managed_runtime_version() { return 1; }
-eval "$(awk '
+# Do not stub managed_runtime_version to hide a dest-identity short-circuit.
+# After the #209 fix, validate_binary_destination must not call it at all.
+validate_fn_body="$(awk '
   $0 == "validate_binary_destination() {" { printing = 1 }
   printing { print }
   printing && $0 == "}" { exit }
 ' "${INSTALL_SH}")"
+if printf '%s\n' "${validate_fn_body}" | grep -q 'managed_runtime_version'; then
+  test_fail "validate_binary_destination must not call managed_runtime_version (dest identity, not managed runtime)"
+fi
+eval "${validate_fn_body}"
 
 type validate_binary_destination >/dev/null 2>&1 ||
   test_fail "validate_binary_destination is missing from install.sh"
+
+# If the short-circuit still exists, a succeeding managed helper must not
+# authorize overwrite of a hostile dest named ryk.
+managed_runtime_version() { return 0; }
+if (validate_binary_destination "${NON_RYK_DIR}/ryk") >"${TMP_ROOT}/managed-shortcircuit.out" 2>&1; then
+  test_fail "managed_runtime_version success must not overwrite a non-ryk dest without FORCE"
+fi
+assert_not_executed "managed-runtime short-circuit python dest"
+grep -F -q "RYK_INSTALL_FORCE=1" "${TMP_ROOT}/managed-shortcircuit.out" ||
+  test_fail "managed-runtime short-circuit refuse must name RYK_INSTALL_FORCE=1"
 
 validate_binary_destination "${STUB_DIR}/ryk" ||
   test_fail "validate_binary_destination must allow a ryk product binary without FORCE"
@@ -244,6 +266,15 @@ grep -F -q "RYK_INSTALL_FORCE=1" "${refuse_out}" ||
   test_fail "curl-door refuse next step must be RYK_INSTALL_FORCE=1"
 if grep -E -q 'choose another| or |ryk update --force' "${refuse_out}"; then
   test_fail "refuse must be one reason + one next (RYK_INSTALL_FORCE=1)"
+fi
+
+if [[ -x "${ELF_DIR}/ryk" ]]; then
+  if (validate_binary_destination "${ELF_DIR}/ryk") >"${TMP_ROOT}/elf-validate.out" 2>&1; then
+    test_fail "validate_binary_destination must refuse a non-ryk ELF without FORCE"
+  fi
+  assert_not_executed "validate non-ryk ELF dest"
+  grep -F -q "RYK_INSTALL_FORCE=1" "${TMP_ROOT}/elf-validate.out" ||
+    test_fail "non-ryk ELF refuse must name RYK_INSTALL_FORCE=1"
 fi
 
 dir_dest="${TMP_ROOT}/dir-dest"
