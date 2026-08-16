@@ -89,10 +89,7 @@ pub fn command(io: std.Io, cwd: std.Io.Dir, argv: []const []const u8, stdout: an
         try stdout.writeAll("\n" ++
             "Your policy is ready.\n" ++
             "\n" ++
-            "Next steps:\n" ++
-            "  ryk policy check .ryk/policy.yaml\n" ++
-            "  ryk doctor\n" ++
-            "  ryk run -- <command>\n" ++
+            "Next: ryk doctor\n" ++
             "\n");
     }
 
@@ -330,10 +327,13 @@ test "init writes requested phase 18 presets as valid policies" {
 
         const code = try command(std.testing.io, tmp.dir, &.{ "--preset", preset_name, "--force" }, &stdout_writer, &stderr_writer);
         try std.testing.expectEqual(exit_codes.success, code);
-        try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "Next steps:") != null);
+        const out = stdout_writer.buffered();
+        try std.testing.expect(std.mem.indexOf(u8, out, "Next: ryk doctor") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "ryk policy check") == null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "ryk run --") == null);
         // Warm success path (checkmark + "Your policy is ready")
-        try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), style.Glyph.check ++ " Created") != null);
-        try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "Your policy is ready") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, style.Glyph.check ++ " Created") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "Your policy is ready") != null);
         try std.testing.expectEqualStrings("", stderr_writer.buffered());
 
         const policy = try tmp.dir.readFileAlloc(std.testing.io, ".ryk/policy.yaml", std.testing.allocator, .limited(16 * 1024));
@@ -342,6 +342,25 @@ test "init writes requested phase 18 presets as valid policies" {
         defer loaded.deinit();
         try policy_mod.validate.policy(&loaded);
     }
+}
+
+test "init un-quiet success lists one next: ryk doctor" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var stdout_buf: [2048]u8 = undefined;
+    var stderr_buf: [512]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+
+    const code = try command(std.testing.io, tmp.dir, &.{}, &stdout_writer, &stderr_writer);
+    try std.testing.expectEqual(exit_codes.success, code);
+    const out = stdout_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "Next: ryk doctor") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "ryk policy check") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "ryk run --") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, style.Glyph.check ++ " Created") != null);
+    try std.testing.expectEqualStrings("", stderr_writer.buffered());
 }
 
 test "init --mode overrides only top-level policy mode and writes parseable YAML" {
