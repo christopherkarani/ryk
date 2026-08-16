@@ -2,6 +2,7 @@ const std = @import("std");
 
 const core = @import("ryk_core").core;
 const core_api = @import("ryk_core").api;
+const redact_bridge = @import("ryk_core").audit.redact_bridge;
 const daemon = @import("daemon.zig");
 pub const decision_source_rust = "rust-daemon";
 pub const decision_source_zig = "zig-native";
@@ -564,9 +565,13 @@ pub fn writeFeedRecordJson(writer: anytype, record: RustShellFeedRecord) !void {
     try writeJsonField(writer, "target_summary", record.target_summary);
     try writer.writeByte(',');
     // session_id is a path key. High-entropy / JWT classification would collapse
-    // legitimate host ids; structured tokens are replaced with `redacted` at
-    // parse time. Write the already-gated value without `redactStringBounded`.
-    try writeJsonStringFieldNullable(writer, "session_id", record.session_id);
+    // legitimate host ids. Gate structured tokens here so append-time JSONL
+    // cannot persist a raw `ghp_` / `sk-` host id.
+    const session_id = if (record.session_id) |sid|
+        if (redact_bridge.containsStructuredSecret(sid)) "redacted" else sid
+    else
+        null;
+    try writeJsonStringFieldNullable(writer, "session_id", session_id);
     try writer.writeAll(",\"verified\":");
     try writer.writeAll(if (record.verified) "true" else "false");
     try writer.writeByte('}');

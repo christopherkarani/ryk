@@ -55,7 +55,15 @@ pub fn containsStructuredSecret(value: []const u8) bool {
         from = span.start + 1;
     }
     const trimmed = std.mem.trim(u8, value, " \t\r\n");
-    return looksLikeAwsAccessKey(trimmed);
+    if (looksLikeAwsAccessKey(trimmed)) return true;
+    var i: usize = 0;
+    while (i + 20 <= value.len) : (i += 1) {
+        if (!isSessionIdTokenBoundary(value, i)) continue;
+        const cand = value[i .. i + 20];
+        if (!looksLikeAwsAccessKey(cand)) continue;
+        if (i + 20 == value.len or !std.ascii.isAlphanumeric(value[i + 20])) return true;
+    }
+    return false;
 }
 
 fn isSessionIdTokenBoundary(value: []const u8, i: usize) bool {

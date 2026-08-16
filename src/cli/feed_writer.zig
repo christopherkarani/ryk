@@ -491,7 +491,11 @@ fn loadRecentFromPath(
             discarded.deinit(allocator);
             continue;
         }
-        try stack.append(allocator, loaded);
+        stack.append(allocator, loaded) catch |err| {
+            var leaked = loaded;
+            leaked.deinit(allocator);
+            return err;
+        };
     }
 
     return .{
@@ -544,15 +548,15 @@ fn parseFeedRecord(allocator: std.mem.Allocator, line: []const u8, fallback_work
     errdefer allocator.free(decision_source);
     const event_source = try dupRequiredString(allocator, object, "event_source");
     errdefer allocator.free(event_source);
-    const host = try dupOptionalString(allocator, object, "host");
+    const host = try redactOwnedAllocOptional(allocator, try dupOptionalString(allocator, object, "host"));
     errdefer if (host) |value| allocator.free(value);
     const daemon_status = try dupRequiredString(allocator, object, "daemon_status");
     errdefer allocator.free(daemon_status);
-    const pack_id = try dupOptionalString(allocator, object, "pack_id");
+    const pack_id = try redactOwnedAllocOptional(allocator, try dupOptionalString(allocator, object, "pack_id"));
     errdefer if (pack_id) |value| allocator.free(value);
     const rule = try redactOwnedAllocOptional(allocator, try dupOptionalString(allocator, object, "rule"));
     errdefer if (rule) |value| allocator.free(value);
-    const severity = try dupOptionalString(allocator, object, "severity");
+    const severity = try redactOwnedAllocOptional(allocator, try dupOptionalString(allocator, object, "severity"));
     errdefer if (severity) |value| allocator.free(value);
     const reason = try redactOwnedAlloc(allocator, try dupRequiredString(allocator, object, "reason"));
     errdefer allocator.free(reason);
@@ -1027,6 +1031,73 @@ test "feed loader redacts uppercase structured session_id token" {
     try std.testing.expectEqualStrings("redacted", loaded[0].record.session_id.?);
     try std.testing.expect(std.mem.indexOf(u8, loaded[0].raw, fake_session) == null);
     try std.testing.expect(std.mem.indexOf(u8, loaded[0].raw, "GHP_") == null);
+}
+
+test "feed loader redacts host pack_id and severity secret-shaped fields" {
+    const line =
+        \\{"timestamp":"2026-07-13T00:00:00Z","workspace_root":"/tmp/legacy","event_type":"command_denied","decision":"deny","decision_source":"rust-daemon","event_source":"hook","host":"ghp_fakeSyntheticTokenValue1234567890","daemon_status":"healthy","pack_id":"sk-fakeSyntheticOpenAIKey1234567890","severity":"ghp_fakeSyntheticTokenValue1234567890","reason":"blocked","remediation":null,"target_summary":"shell command (redacted)","session_id":null,"verified":false}
+    ;
+    var record = try parseFeedRecord(std.testing.allocator, line, null);
+    defer record.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, record.host.?, "ghp_") == null);
+    try std.testing.expect(std.mem.indexOf(u8, record.pack_id.?, "sk-") == null);
+    try std.testing.expect(std.mem.indexOf(u8, record.severity.?, "ghp_") == null);
+}
+
+test "feed writer persists structured session_id as path-safe placeholder" {
+    const record = rust_visibility.RustShellFeedRecord{
+        .timestamp = "2026-07-13T00:00:00Z",
+        .workspace_root = "/tmp/legacy",
+        .event_type = "command_denied",
+        .decision = "deny",
+        .decision_source = "rust-daemon",
+        .event_source = "hook",
+        .host = "codex",
+        .daemon_status = "healthy",
+        .pack_id = "core.shell",
+        .rule = null,
+        .severity = "high",
+        .reason = "blocked",
+        .remediation = null,
+        .target_summary = "shell command (redacted)",
+        .session_id = "ghp_fakeSyntheticTokenValue1234567890",
+        .verified = false,
+    };
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try rust_visibility.writeFeedRecordJson(&out.writer, record);
+    const encoded = out.written();
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"session_id\":\"redacted\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "ghp_") == null);
+}
+
+test "feed loader redacts session_id that embeds an AWS access key" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+
+    const path = try feedPath(std.testing.allocator, root);
+    defer std.testing.allocator.free(path);
+    const parent = std.fs.path.dirname(path).?;
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, parent);
+
+    const fake_session = "sess_AKIAIOSFODNN7EXAMPLE";
+    const line = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"timestamp\":\"2026-07-13T00:00:00Z\",\"workspace_root\":\"{s}\",\"event_type\":\"command_denied\",\"decision\":\"deny\",\"decision_source\":\"rust-daemon\",\"event_source\":\"hook\",\"host\":\"codex\",\"daemon_status\":\"healthy\",\"pack_id\":\"core.shell\",\"severity\":\"high\",\"reason\":\"blocked\",\"remediation\":null,\"target_summary\":\"shell command (redacted)\",\"session_id\":\"{s}\",\"verified\":false}}\n",
+        .{ root, fake_session },
+    );
+    defer std.testing.allocator.free(line);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = line });
+
+    const loaded = try loadRecent(std.testing.io, std.testing.allocator, root, 4);
+    defer {
+        for (loaded) |*item| item.deinit(std.testing.allocator);
+        std.testing.allocator.free(loaded);
+    }
+    try std.testing.expectEqualStrings("redacted", loaded[0].record.session_id.?);
+    try std.testing.expect(std.mem.indexOf(u8, loaded[0].raw, "AKIA") == null);
 }
 
 test "feed parse session_id with embedded token serializes redacted for dashboard" {
