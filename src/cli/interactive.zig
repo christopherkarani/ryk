@@ -135,11 +135,15 @@ pub fn deinitMultiSelectResult(result: *MultiSelectResult, allocator: std.mem.Al
 /// Useful for logging / summaries in guided flows.
 pub fn getSelectedLabels(allocator: std.mem.Allocator, items: []const SelectionItem) ![][]const u8 {
     var list: std.ArrayList([]const u8) = .empty;
-    defer list.deinit(allocator);
+    errdefer {
+        for (list.items) |item| allocator.free(item);
+        list.deinit(allocator);
+    }
 
     for (items) |item| {
         if (item.checked) {
             const owned = try allocator.dupe(u8, item.label);
+            errdefer allocator.free(owned);
             try list.append(allocator, owned);
         }
     }
@@ -258,6 +262,30 @@ test "interactive: getSelectedLabels returns only checked items" {
     try std.testing.expectEqual(@as(usize, 2), labels.len);
     try std.testing.expectEqualStrings("OpenCode", labels[0]);
     try std.testing.expectEqualStrings("OpenClaw", labels[1]);
+}
+
+test "interactive: getSelectedLabels does not leak on OOM" {
+    const items = [_]SelectionItem{
+        .{ .label = "one", .checked = true },
+        .{ .label = "two", .checked = true },
+    };
+    var saw_oom = false;
+    var saw_success = false;
+    var fail_index: usize = 0;
+    while (fail_index < 8) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        const labels = getSelectedLabels(failing.allocator(), &items) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            saw_oom = true;
+            continue;
+        };
+        for (labels) |label| failing.allocator().free(label);
+        failing.allocator().free(labels);
+        saw_success = true;
+        break;
+    }
+    try std.testing.expect(saw_oom);
+    try std.testing.expect(saw_success);
 }
 
 test "interactive: deinitMultiSelectResult frees memory cleanly" {

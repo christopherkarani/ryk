@@ -94,6 +94,7 @@ test {
     _ = pi_install;
     _ = grok_install;
     _ = plugin_install;
+    _ = interactive;
     _ = plugin;
     _ = @import("openclaw_status.zig");
     _ = start;

@@ -864,6 +864,22 @@ const CapturedAction = struct {
     stderr: []u8,
 };
 
+fn takeCapturedAction(
+    allocator: std.mem.Allocator,
+    stdout_aw: *std.Io.Writer.Allocating,
+    stderr_aw: *std.Io.Writer.Allocating,
+    code: u8,
+) !CapturedAction {
+    const stdout = try stdout_aw.toOwnedSlice();
+    errdefer allocator.free(stdout);
+    const stderr = try stderr_aw.toOwnedSlice();
+    return .{
+        .exit_code = code,
+        .stdout = stdout,
+        .stderr = stderr,
+    };
+}
+
 /// Scoped process cwd change for legacy CLI entrypoints. Restore failures are hard errors
 /// so a subsequent dashboard request never inherits a foreign workspace.
 const WorkspaceCwdGuard = struct {
@@ -900,11 +916,7 @@ fn runAllowedAction(io: std.Io, allocator: std.mem.Allocator, action: []const u8
     // Daemon-proxied remediation: trusted cwd rides on ExecuteCli — never touch process cwd.
     if (kind.daemonArgv()) |argv| {
         const code = try runDaemonProxyAction(allocator, argv, workspace_root.?, stdout, stderr);
-        return .{
-            .exit_code = code,
-            .stdout = try stdout_aw.toOwnedSlice(),
-            .stderr = try stderr_aw.toOwnedSlice(),
-        };
+        return takeCapturedAction(allocator, &stdout_aw, &stderr_aw, code);
     }
 
     // Init accepts an open Dir; no process chdir required.
@@ -912,11 +924,7 @@ fn runAllowedAction(io: std.Io, allocator: std.mem.Allocator, action: []const u8
         var workspace_dir = try std.Io.Dir.cwd().openDir(io, workspace_root.?, .{});
         defer workspace_dir.close(io);
         const code = try init.command(io, workspace_dir, &.{ "--preset", "generic-agent" }, stdout, stderr);
-        return .{
-            .exit_code = code,
-            .stdout = try stdout_aw.toOwnedSlice(),
-            .stderr = try stderr_aw.toOwnedSlice(),
-        };
+        return takeCapturedAction(allocator, &stdout_aw, &stderr_aw, code);
     }
 
     // Policy check can use an absolute policy path without changing process cwd.
@@ -924,11 +932,7 @@ fn runAllowedAction(io: std.Io, allocator: std.mem.Allocator, action: []const u8
         const policy_path = try std.fs.path.join(allocator, &.{ workspace_root.?, ".ryk", "policy.yaml" });
         defer allocator.free(policy_path);
         const code = try policy.command(io, &.{ "check", policy_path }, stdout, stderr);
-        return .{
-            .exit_code = code,
-            .stdout = try stdout_aw.toOwnedSlice(),
-            .stderr = try stderr_aw.toOwnedSlice(),
-        };
+        return takeCapturedAction(allocator, &stdout_aw, &stderr_aw, code);
     }
 
     var cwd_guard: ?WorkspaceCwdGuard = null;
@@ -959,11 +963,7 @@ fn runAllowedAction(io: std.Io, allocator: std.mem.Allocator, action: []const u8
         try guard.leave();
     }
 
-    return .{
-        .exit_code = code,
-        .stdout = try stdout_aw.toOwnedSlice(),
-        .stderr = try stderr_aw.toOwnedSlice(),
-    };
+    return takeCapturedAction(allocator, &stdout_aw, &stderr_aw, code);
 }
 
 /// Fixed argv proxy for allowlisted dashboard remediation actions (no browser-supplied args).

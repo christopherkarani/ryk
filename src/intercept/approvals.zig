@@ -153,6 +153,26 @@ test "session approval stores exact command for session scope" {
     try std.testing.expect(approvals.contains("npm install"));
 }
 
+test "allowForSession OOM ownership does not leak command or reason" {
+    var saw_oom = false;
+    var saw_success = false;
+    var fail_index: usize = 0;
+    while (fail_index < 8) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        var approvals = SessionApprovals.init(failing.allocator());
+        defer approvals.deinit();
+        approvals.allowForSession("npm install", "package install") catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            saw_oom = true;
+            continue;
+        };
+        saw_success = true;
+        break;
+    }
+    try std.testing.expect(saw_oom);
+    try std.testing.expect(saw_success);
+}
+
 test "approval prompt supports explain and session allow" {
     var input: std.Io.Reader = .fixed("?\nA\n");
     var output_buf: [1024]u8 = undefined;
