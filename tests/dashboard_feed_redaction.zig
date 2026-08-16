@@ -9,6 +9,39 @@ const shell_eval = ryk.cli.shell_eval;
 
 const fake_secret = "sk-fakeSyntheticOpenAIKey1234567890";
 
+test "phase2510 loadRecent redacts historical JSONL secrets" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+
+    const feed_path = try feed_writer.feedPath(std.testing.allocator, root);
+    defer std.testing.allocator.free(feed_path);
+    const feed_dir = std.fs.path.dirname(feed_path).?;
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, feed_dir);
+
+    const line = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"timestamp\":\"2026-07-13T00:00:00Z\",\"workspace_root\":\"{s}\",\"event_type\":\"command_denied\",\"decision\":\"deny\",\"decision_source\":\"rust-daemon\",\"event_source\":\"hook\",\"host\":\"codex\",\"daemon_status\":\"healthy\",\"pack_id\":\"core.shell\",\"rule\":\"leak-{s}\",\"severity\":\"high\",\"reason\":\"blocked token {s}\",\"remediation\":\"rotate {s}\",\"target_summary\":\"cmd {s}\",\"session_id\":null,\"verified\":false}}\n",
+        .{ root, fake_secret, fake_secret, fake_secret, fake_secret },
+    );
+    defer std.testing.allocator.free(line);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = feed_path, .data = line });
+
+    const loaded = try feed_writer.loadRecent(std.testing.io, std.testing.allocator, root, 4);
+    defer {
+        for (loaded) |*item| item.deinit(std.testing.allocator);
+        std.testing.allocator.free(loaded);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), loaded.len);
+    try std.testing.expect(std.mem.indexOf(u8, loaded[0].raw, fake_secret) == null);
+    try std.testing.expect(std.mem.indexOf(u8, loaded[0].record.reason, fake_secret) == null);
+    try std.testing.expect(std.mem.indexOf(u8, loaded[0].record.target_summary, fake_secret) == null);
+    try std.testing.expect(std.mem.indexOf(u8, loaded[0].record.rule.?, fake_secret) == null);
+    try std.testing.expect(std.mem.indexOf(u8, loaded[0].record.remediation.?, fake_secret) == null);
+}
+
 test "phase2510 hook deny feed record is zig-backed and redacted" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

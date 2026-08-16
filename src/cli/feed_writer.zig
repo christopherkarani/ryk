@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const core = @import("ryk_core").core;
+const core_api = @import("ryk_core").api;
 const env_util = @import("../env_util.zig");
 const rust_visibility = @import("feed_visibility.zig");
 
@@ -453,20 +454,17 @@ fn loadRecentFromPath(
         errdefer ring.deinit(allocator);
         while (lines.next()) |line| {
             if (line.len == 0) continue;
-            const owned_line = try allocator.dupe(u8, line);
-            const record = parseFeedRecord(allocator, owned_line, fallback_workspace_root) catch |err| {
-                allocator.free(owned_line);
+            const loaded = loadOwnedFeedLine(allocator, line, fallback_workspace_root) catch |err| {
                 if (err == error.OutOfMemory) return err;
                 skipped_lines += 1;
                 continue;
             };
-            if (!filter.matches(record)) {
-                allocator.free(owned_line);
-                var discarded = record;
+            if (!filter.matches(loaded.record)) {
+                var discarded = loaded;
                 discarded.deinit(allocator);
                 continue;
             }
-            ring.push(allocator, .{ .raw = owned_line, .record = record });
+            ring.push(allocator, loaded);
         }
         return .{
             .records = try ring.toOwnedSlice(allocator),
@@ -482,20 +480,17 @@ fn loadRecentFromPath(
     }
     while (lines.next()) |line| {
         if (line.len == 0) continue;
-        const owned_line = try allocator.dupe(u8, line);
-        const record = parseFeedRecord(allocator, owned_line, fallback_workspace_root) catch |err| {
-            allocator.free(owned_line);
+        const loaded = loadOwnedFeedLine(allocator, line, fallback_workspace_root) catch |err| {
             if (err == error.OutOfMemory) return err;
             skipped_lines += 1;
             continue;
         };
-        if (!filter.matches(record)) {
-            allocator.free(owned_line);
-            var discarded = record;
+        if (!filter.matches(loaded.record)) {
+            var discarded = loaded;
             discarded.deinit(allocator);
             continue;
         }
-        try stack.append(allocator, .{ .raw = owned_line, .record = record });
+        try stack.append(allocator, loaded);
     }
 
     return .{
@@ -503,6 +498,30 @@ fn loadRecentFromPath(
         .health = if (skipped_lines == 0) .healthy else .degraded,
         .skipped_lines = skipped_lines,
     };
+}
+
+fn redactOwnedAlloc(allocator: std.mem.Allocator, owned: []u8) ![]u8 {
+    defer allocator.free(owned);
+    return core_api.redactAlloc(allocator, owned);
+}
+
+fn redactOwnedAllocOptional(allocator: std.mem.Allocator, owned: ?[]u8) !?[]u8 {
+    return if (owned) |value| try redactOwnedAlloc(allocator, value) else null;
+}
+
+fn loadOwnedFeedLine(
+    allocator: std.mem.Allocator,
+    line: []const u8,
+    fallback_workspace_root: ?[]const u8,
+) !LoadedFeedRecord {
+    const owned_line = try allocator.dupe(u8, line);
+    var record = parseFeedRecord(allocator, owned_line, fallback_workspace_root) catch |err| {
+        allocator.free(owned_line);
+        return err;
+    };
+    errdefer record.deinit(allocator);
+    const raw = try redactOwnedAlloc(allocator, owned_line);
+    return .{ .raw = raw, .record = record };
 }
 
 fn parseFeedRecord(allocator: std.mem.Allocator, line: []const u8, fallback_workspace_root: ?[]const u8) !rust_visibility.RustShellFeedRecord {
@@ -530,15 +549,15 @@ fn parseFeedRecord(allocator: std.mem.Allocator, line: []const u8, fallback_work
     errdefer allocator.free(daemon_status);
     const pack_id = try dupOptionalString(allocator, object, "pack_id");
     errdefer if (pack_id) |value| allocator.free(value);
-    const rule = try dupOptionalString(allocator, object, "rule");
+    const rule = try redactOwnedAllocOptional(allocator, try dupOptionalString(allocator, object, "rule"));
     errdefer if (rule) |value| allocator.free(value);
     const severity = try dupOptionalString(allocator, object, "severity");
     errdefer if (severity) |value| allocator.free(value);
-    const reason = try dupRequiredString(allocator, object, "reason");
+    const reason = try redactOwnedAlloc(allocator, try dupRequiredString(allocator, object, "reason"));
     errdefer allocator.free(reason);
-    const remediation = try dupOptionalString(allocator, object, "remediation");
+    const remediation = try redactOwnedAllocOptional(allocator, try dupOptionalString(allocator, object, "remediation"));
     errdefer if (remediation) |value| allocator.free(value);
-    const target_summary = try dupRequiredString(allocator, object, "target_summary");
+    const target_summary = try redactOwnedAlloc(allocator, try dupRequiredString(allocator, object, "target_summary"));
     errdefer allocator.free(target_summary);
     const session_id = try dupOptionalString(allocator, object, "session_id");
     errdefer if (session_id) |value| allocator.free(value);
@@ -697,6 +716,40 @@ test "feed record ring retains newest entries with O(1) eviction" {
     try std.testing.expectEqual(@as(usize, 2), owned.len);
     try std.testing.expectEqualStrings("b", owned[0].record.reason);
     try std.testing.expectEqualStrings("c", owned[1].record.reason);
+}
+
+test "feed loader redacts historical JSONL user-controlled fields" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+
+    const path = try feedPath(std.testing.allocator, root);
+    defer std.testing.allocator.free(path);
+    const parent = std.fs.path.dirname(path).?;
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, parent);
+
+    const fake_secret = "sk-fakeSyntheticOpenAIKey1234567890";
+    const line = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"timestamp\":\"2026-07-13T00:00:00Z\",\"workspace_root\":\"{s}\",\"event_type\":\"command_denied\",\"decision\":\"deny\",\"decision_source\":\"rust-daemon\",\"event_source\":\"hook\",\"host\":\"codex\",\"daemon_status\":\"healthy\",\"pack_id\":\"core.shell\",\"rule\":\"leak-{s}\",\"severity\":\"high\",\"reason\":\"blocked token {s}\",\"remediation\":\"rotate {s}\",\"target_summary\":\"cmd {s}\",\"session_id\":null,\"verified\":false}}\n",
+        .{ root, fake_secret, fake_secret, fake_secret, fake_secret },
+    );
+    defer std.testing.allocator.free(line);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = line });
+
+    const loaded = try loadRecent(std.testing.io, std.testing.allocator, root, 4);
+    defer {
+        for (loaded) |*item| item.deinit(std.testing.allocator);
+        std.testing.allocator.free(loaded);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), loaded.len);
+    try std.testing.expect(std.mem.indexOf(u8, loaded[0].raw, fake_secret) == null);
+    try std.testing.expect(std.mem.indexOf(u8, loaded[0].record.reason, fake_secret) == null);
+    try std.testing.expect(std.mem.indexOf(u8, loaded[0].record.target_summary, fake_secret) == null);
+    try std.testing.expect(std.mem.indexOf(u8, loaded[0].record.rule.?, fake_secret) == null);
+    try std.testing.expect(std.mem.indexOf(u8, loaded[0].record.remediation.?, fake_secret) == null);
 }
 
 test "feed loader accepts legacy records without rule" {
