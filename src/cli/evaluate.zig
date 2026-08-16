@@ -14,6 +14,8 @@ const feed_writer = @import("feed_writer.zig");
 const help = @import("help.zig");
 const rust_visibility = @import("feed_visibility.zig");
 const telemetry = @import("../telemetry.zig");
+const hook_client = @import("hook_client.zig");
+const hook_ipc = @import("hook_ipc.zig");
 
 const max_payload_len = 256 * 1024;
 const api_schema_version: i64 = 1;
@@ -175,7 +177,63 @@ fn commandWithEvaluator(io: std.Io, argv: []const []const u8, stdout: anytype, s
     };
     defer allocator.free(payload);
 
+    if (try tryHookServer(io, allocator, payload, stdout, stderr)) |code| {
+        return code;
+    }
+
     return evaluatePayload(io, allocator, payload, stdout, evaluator, .process_home, .{});
+}
+
+fn tryHookServer(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    payload: []const u8,
+    stdout: anytype,
+    stderr: anytype,
+) !?u8 {
+    if (!hook_client.shouldTry()) return null;
+    const bin = std.process.executablePathAlloc(io, allocator) catch "";
+    defer if (bin.len > 0) allocator.free(bin);
+    const cwd_z = std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator) catch "";
+    defer if (cwd_z.len > 0) allocator.free(cwd_z);
+
+    var owned = hook_client.tryServe(io, allocator, .{
+        .id = 1,
+        .method = "evaluate",
+        .bin = bin,
+        .version = build_options.version,
+        .workspace = cwd_z,
+        .cwd = cwd_z,
+        .payload_json = payload,
+    }) catch |err| switch (err) {
+        error.Unavailable => return null,
+        error.OutOfMemory => return error.OutOfMemory,
+        error.BrokenSession => {
+            try writeResponseJson(stdout, .{
+                .request_id = null,
+                .decision = "deny",
+                .reason = "hook server session ended before a decision",
+                .daemon_status = .unknown,
+                .daemon_compatible = false,
+            });
+            return exit_denied;
+        },
+    };
+    defer owned.deinit(allocator);
+    try stdout.writeAll(owned.response().stdout);
+    try stderr.writeAll(owned.response().stderr);
+    return owned.response().exit;
+}
+
+pub fn evaluateForServer(io: std.Io, allocator: std.mem.Allocator, payload: []const u8) !hook_ipc.HostEmit {
+    var stdout_buf: std.Io.Writer.Allocating = .init(allocator);
+    errdefer stdout_buf.deinit();
+    const code = try evaluatePayload(io, allocator, payload, &stdout_buf.writer, shellEvalBridge, .process_home, .{});
+    return .{
+        .exit = code,
+        .stdout = try stdout_buf.toOwnedSlice(),
+        .stderr = try allocator.dupe(u8, ""),
+    };
 }
 
 fn evaluatePayload(
@@ -373,14 +431,19 @@ fn persistEvaluationRecordBestEffort(
     record: rust_visibility.RustShellFeedRecord,
     destination: FeedDestination,
 ) void {
-    feed_writer.appendRecord(io, allocator, record.workspace_root, record) catch {};
+    const opts = feed_writer.AppendOptions{
+        .sync = false,
+        .update_registry = !std.mem.eql(u8, record.decision, "allow") and
+            !std.mem.eql(u8, record.decision, "context_only"),
+    };
+    feed_writer.appendRecordWithOptions(io, allocator, record.workspace_root, record, opts) catch {};
     const dashboard_root = switch (destination) {
         .disabled => return,
         .process_home => if (feed_writer.processGlobalWritesDisabled()) return else feed_writer.resolveGlobalDashboardRoot(allocator) catch return,
         .explicit => |root| allocator.dupe(u8, root) catch return,
     };
     defer allocator.free(dashboard_root);
-    feed_writer.appendGlobalRecord(io, allocator, dashboard_root, record) catch {};
+    feed_writer.appendGlobalRecordWithOptions(io, allocator, dashboard_root, record, opts) catch {};
 }
 
 const RequestParseError = error{

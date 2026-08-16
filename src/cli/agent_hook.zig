@@ -22,6 +22,8 @@ const fm_steward_client = @import("fm_steward_client.zig");
 const telemetry = @import("../telemetry.zig");
 const core_api = @import("ryk_core").api;
 const policy = @import("ryk_core").policy;
+const hook_client = @import("hook_client.zig");
+const hook_ipc = @import("hook_ipc.zig");
 
 const max_payload_len = 256 * 1024;
 
@@ -79,7 +81,57 @@ pub fn commandWithEvaluator(
     };
     defer allocator.free(payload);
 
+    if (try tryHookServer(io, allocator, payload, stdout)) |code| {
+        return code;
+    }
+
     return evaluatePayload(allocator, payload, stdout, evaluator);
+}
+
+fn tryHookServer(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    payload: []const u8,
+    stdout: anytype,
+) !?u8 {
+    if (!hook_client.shouldTry()) return null;
+    const bin = std.process.executablePathAlloc(io, allocator) catch "";
+    defer if (bin.len > 0) allocator.free(bin);
+    const cwd_z = std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator) catch "";
+    defer if (cwd_z.len > 0) allocator.free(cwd_z);
+
+    var owned = hook_client.tryServe(io, allocator, .{
+        .id = 1,
+        .method = "hook",
+        .bin = bin,
+        .version = build_options.version,
+        .host = "cursor",
+        .event = "beforeShellExecution",
+        .workspace = cwd_z,
+        .cwd = cwd_z,
+        .payload_json = payload,
+    }) catch |err| switch (err) {
+        error.Unavailable => return null,
+        error.OutOfMemory => return error.OutOfMemory,
+        error.BrokenSession => {
+            try writeFailClosedDeny(stdout, "ryk: hook server session ended before a decision; denied fail-closed");
+            return fail_closed_deny_exit_code;
+        },
+    };
+    defer owned.deinit(allocator);
+    try stdout.writeAll(owned.response().stdout);
+    return owned.response().exit;
+}
+
+pub fn evaluateForServer(allocator: std.mem.Allocator, payload: []const u8) !hook_ipc.HostEmit {
+    var stdout_buf: std.Io.Writer.Allocating = .init(allocator);
+    errdefer stdout_buf.deinit();
+    const code = try evaluatePayload(allocator, payload, &stdout_buf.writer, null);
+    return .{
+        .exit = code,
+        .stdout = try stdout_buf.toOwnedSlice(),
+        .stderr = try allocator.dupe(u8, ""),
+    };
 }
 
 /// Soft modes (observe / ask / yolo / trusted) that can weaken pack hits.

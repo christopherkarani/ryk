@@ -1,4 +1,5 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const core = @import("ryk_core").core;
 const supervisor = core.supervisor;
 const core_api = @import("ryk_core").api;
@@ -16,6 +17,8 @@ const telemetry = @import("../telemetry.zig");
 const file_policy_path = @import("file_policy_path.zig");
 const fm_steward_client = @import("fm_steward_client.zig");
 const grok_deny_reason = @import("grok_deny_reason.zig");
+const hook_client = @import("hook_client.zig");
+const hook_ipc = @import("hook_ipc.zig");
 
 // Maximum JSON payload size to prevent memory exhaustion from hostile hosts.
 const max_payload_len = 256 * 1024; // 256 KiB
@@ -380,6 +383,143 @@ fn hookCommand(io: std.Io, host: Host, event: Event, original_event_name: []cons
     };
     defer allocator.free(payload_text);
 
+    if (try tryHookServer(io, allocator, host, event, original_event_name, payload_text, ci_mode, hook_probe_mode, stdout, stderr)) |code| {
+        return code;
+    }
+
+    return evaluateFromPayload(io, allocator, host, event, original_event_name, payload_text, ci_mode, null, stdout, stderr);
+}
+
+fn tryHookServer(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    host: Host,
+    event: Event,
+    event_name: []const u8,
+    payload_text: []const u8,
+    ci: bool,
+    probe: bool,
+    stdout: anytype,
+    stderr: anytype,
+) !?u8 {
+    if (!hook_client.shouldTry()) return null;
+    const bin = std.process.executablePathAlloc(io, allocator) catch "";
+    defer if (bin.len > 0) allocator.free(bin);
+    const cwd_z = std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator) catch "";
+    defer if (cwd_z.len > 0) allocator.free(cwd_z);
+
+    var owned = hook_client.tryServe(io, allocator, .{
+        .id = 1,
+        .method = "hook",
+        .bin = bin,
+        .version = build_options.version,
+        .host = @tagName(host),
+        .event = event_name,
+        .ci = ci,
+        .probe = probe,
+        .workspace = cwd_z,
+        .cwd = cwd_z,
+        .payload_json = payload_text,
+    }) catch |err| switch (err) {
+        error.Unavailable => return null,
+        error.OutOfMemory => return error.OutOfMemory,
+        error.BrokenSession => return try emitPreEvalFailClosed(
+            allocator,
+            host,
+            event,
+            stdout,
+            stderr,
+            "hook",
+            "hook server session broken",
+            "ryk hook: hook server session ended before a decision; ryk blocked it.",
+        ),
+    };
+    defer owned.deinit(allocator);
+    try stdout.writeAll(owned.response().stdout);
+    try stderr.writeAll(owned.response().stderr);
+    return owned.response().exit;
+}
+
+pub fn evaluateForServer(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    host_name: []const u8,
+    event_name: []const u8,
+    payload_text: []const u8,
+    ci: bool,
+    probe: bool,
+    workspace_override: ?[]const u8,
+) !hook_ipc.HostEmit {
+    const host = Host.parse(host_name) orelse return failClosedEmit(allocator, "unknown host");
+    const event = resolveEvent(host, event_name) orelse return failClosedEmit(allocator, "unknown event");
+
+    const saved_probe = hook_probe_mode;
+    hook_probe_mode = probe;
+    defer hook_probe_mode = saved_probe;
+
+    var stdout_buf: std.Io.Writer.Allocating = .init(allocator);
+    errdefer stdout_buf.deinit();
+    var stderr_buf: std.Io.Writer.Allocating = .init(allocator);
+    errdefer stderr_buf.deinit();
+
+    const code = try evaluateFromPayload(
+        io,
+        allocator,
+        host,
+        event,
+        event_name,
+        payload_text,
+        ci,
+        workspace_override,
+        &stdout_buf.writer,
+        &stderr_buf.writer,
+    );
+    return .{
+        .exit = code,
+        .stdout = try stdout_buf.toOwnedSlice(),
+        .stderr = try stderr_buf.toOwnedSlice(),
+    };
+}
+
+fn failClosedEmit(allocator: std.mem.Allocator, reason: []const u8) !hook_ipc.HostEmit {
+    _ = reason;
+    const stdout = try allocator.dupe(u8, "{\"decision\":\"deny\",\"reason\":\"ryk hook-serve: invalid host or event\"}\n");
+    errdefer allocator.free(stdout);
+    const stderr = try allocator.dupe(u8, "ryk hook-serve: invalid host or event\n");
+    return .{ .exit = 2, .stdout = stdout, .stderr = stderr };
+}
+
+fn resolveEvent(host: Host, event_name: []const u8) ?Event {
+    if (host == .opencode) {
+        if (mapOpenCodeEvent(event_name)) |event| return event;
+        if (isOpenCodeInformationalEvent(event_name)) return .SessionStart;
+        return null;
+    }
+    if (host == .openclaw) {
+        if (mapOpenClawEvent(event_name)) |event| return event;
+        if (isOpenClawInformationalEvent(event_name)) return .SessionStart;
+        return null;
+    }
+    if (host == .hermes) {
+        if (mapHermesEvent(event_name)) |event| return event;
+        if (isHermesInformationalEvent(event_name)) return .SessionStart;
+        return null;
+    }
+    return Event.parse(event_name);
+}
+
+fn evaluateFromPayload(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    host: Host,
+    event: Event,
+    original_event_name: []const u8,
+    payload_text: []const u8,
+    ci_mode: bool,
+    workspace_override: ?[]const u8,
+    stdout: anytype,
+    stderr: anytype,
+) !u8 {
     if (payload_text.len == 0) {
         if (shouldFailClosedOnPreEval(host, event)) {
             return try emitPreEvalFailClosed(
@@ -544,10 +684,11 @@ fn hookCommand(io: std.Io, host: Host, event: Event, original_event_name: []cons
     const needs_policy = eventNeedsPolicy(event);
     const fail_closed_pre_eval = shouldFailClosedOnPreEval(host, event);
     const needs_workspace = needs_policy or fail_closed_pre_eval or host == .hermes;
+    const start_dir = workspace_override orelse ".";
     const root = if (needs_workspace)
-        supervisor.resolveWorkspaceRoot(io, allocator, null, ".") catch try allocator.dupe(u8, ".")
+        supervisor.resolveWorkspaceRoot(io, allocator, null, start_dir) catch try allocator.dupe(u8, start_dir)
     else
-        try allocator.dupe(u8, ".");
+        try allocator.dupe(u8, start_dir);
     defer allocator.free(root);
 
     if (host == .hermes and isHermesInformationalEvent(request_event)) {

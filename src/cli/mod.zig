@@ -42,6 +42,8 @@ pub const decide = @import("decide.zig");
 pub const evaluate = @import("evaluate.zig");
 pub const hook = @import("hook.zig");
 pub const hook_ipc = @import("hook_ipc.zig");
+pub const hook_serve = @import("hook_serve.zig");
+pub const hook_client = @import("hook_client.zig");
 pub const dashboard_command = @import("dashboard.zig");
 pub const report = @import("report.zig");
 pub const ci = @import("ci.zig");
@@ -119,6 +121,8 @@ test {
     // Pull hook.zig tests (daemon evaluate → HookResponse, strict refuse, redaction).
     _ = hook;
     _ = @import("hook_ipc.zig");
+    _ = @import("hook_serve.zig");
+    _ = @import("hook_client.zig");
     // Grok deny reason smart-shrink (pure formatter; also imported by hook.zig).
     _ = @import("grok_deny_reason.zig");
     _ = shell_test;
@@ -183,7 +187,7 @@ const self_banner_commands = [_][]const u8{ "version", "--version", "help", "run
 /// Commands whose output is always machine/raw (JSON, generated scripts, export
 /// lines, long-running servers) — never receive the human brand banner.
 const always_machine_commands = [_][]const u8{
-    "evaluate", "hook", "shim", "completions", "env", "dashboard", "cloud", "telemetry", "--print-install-env",
+    "evaluate", "hook", "hook-serve", "shim", "completions", "env", "dashboard", "cloud", "telemetry", "--print-install-env",
     // Zig-native shell tools (formerly daemon-proxied): keep machine/banner-free.
     // `explain` is human pretty by default (DCG-class colors); machine only via
     // `--format json` (isMachineArgv). Own header is `RYK EXPLAIN` (no brand banner).
@@ -387,6 +391,9 @@ fn runWithCwdUsing(
     if (argv.len > 0 and std.mem.eql(u8, argv[0], "hook")) {
         return hook.command(io, argv[1..], stdout, stderr);
     }
+    if (argv.len > 0 and std.mem.eql(u8, argv[0], "hook-serve")) {
+        return hook_serve.command(io, argv[1..], stdout, stderr);
+    }
     const no_rich_env = tui.output_policy.envDisablesRich(
         environ_map.get("RYK_NO_RICH"),
     );
@@ -575,6 +582,7 @@ fn runWithCwdUsing(
     if (std.mem.eql(u8, command, "decide")) return decide.command(io, argv[1..], stdout, stderr);
     if (std.mem.eql(u8, command, "evaluate")) return evaluate.command(io, argv[1..], stdout, stderr);
     if (std.mem.eql(u8, command, "hook")) return hook.command(io, argv[1..], stdout, stderr);
+    if (std.mem.eql(u8, command, "hook-serve")) return hook_serve.command(io, argv[1..], stdout, stderr);
     if (std.mem.eql(u8, command, "dashboard")) return dashboard_command.command(io, argv[1..], stdout, stderr);
     if (std.mem.eql(u8, command, "cloud")) return dashboard_command.commandCloud(io, argv[1..], stdout, stderr);
     if (std.mem.eql(u8, command, "report")) return report.command(io, argv[1..], stdout, stderr);

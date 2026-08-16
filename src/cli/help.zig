@@ -771,6 +771,19 @@ pub const commands =
             "Exit codes: 0 allow, 2 deny, 3 evaluator failure, 64 invalid input, 1 unexpected internal error.",
             "Designed for external integrations such as Pi bash tool-call evaluation; non-shell evaluation is intentionally unsupported.",
         } },
+        .{
+            .name = "hook-serve",
+            .summary = "Long-lived hook server for warm host decisions",
+            .usage = "ryk hook-serve --socket <path>",
+            .category = .internal,
+            .hidden = true,
+            .details = &.{
+                "Accepts NDJSON ryk-hook-v1 requests from ryk hook / evaluate / bare ryk.",
+                "One server per UNIX user and ryk binary. Hosts keep spawning ryk hook; this process stays warm.",
+                "Not a second binary and not the removed Rust daemon. Idle exit after 30 minutes.",
+                "Hidden from default help; use ryk hook-serve --help.",
+            },
+        },
         .{ .name = "hook", .summary = "Receive events from AI agent hosts", .usage = "ryk hook <codex|claude|grok|opencode|openclaw|hermes> <event> [--ci]", .category = .advanced, .details = &.{
             "Reads a JSON payload from stdin, normalizes host-specific events to ryk decisions,",
             "and emits a host-valid JSON response to stdout. Debug logs go to stderr only.",
