@@ -2616,7 +2616,7 @@ test "doctorFix --fix command path invokes ensure mutation door" {
     // Acceptance (2): --fix early-branches to ensure. Contrast with probe-only:
     // under empty tmpDir, doctor --fix must create-if-missing .ryk/policy.yaml
     // (ensure core). Host wire may soft-fail under zig-test binary; policy create is
-    // the greppable ensure side effect. RED until production wires the fix door.
+    // the greppable ensure side effect.
     const io = std.testing.io;
     const allocator = std.testing.allocator;
 

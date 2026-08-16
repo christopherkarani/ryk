@@ -7,6 +7,3 @@ The examples are deterministic and local. They do not require real secrets, real
 - `effect-packs/`: classification-only effect-pack YAML.
 - `mcp/`: stdio MCP proxy examples.
 - `ci/`: CI integration snippets.
-- `staged-writes/`: staged write review.
-- `network/`: network policy examples.
-- `commands/`: command guard examples.
