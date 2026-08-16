@@ -322,7 +322,6 @@ test "tools/list inspection flags canonical and stale product signatures" {
     }
 }
 
-<<<<<<< HEAD
 test "addFinding GH363 reason OOM does not leak tool_name" {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
     const allocator = failing.allocator();
@@ -344,6 +343,19 @@ test "addFinding GH363 reason OOM does not leak tool_name" {
     try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
 }
 
+test "inspectTool GH385 description OOM does not leak name" {
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"name":"list_issues","description":"List visible issues"}
+    , .{});
+    defer parsed.deinit();
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    const allocator = failing.allocator();
+    try std.testing.expectError(error.OutOfMemory, inspectTool(allocator, "github", parsed.value));
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+}
+
 test "addFinding GH363 append OOM does not leak name or reason" {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 2 });
     const allocator = failing.allocator();
@@ -362,18 +374,6 @@ test "addFinding GH363 append OOM does not leak name or reason" {
     );
     try std.testing.expect(failing.has_induced_failure);
     try std.testing.expectEqual(@as(usize, 0), findings.items.len);
-=======
-test "inspectTool GH385 description OOM does not leak name" {
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
-        \\{"name":"list_issues","description":"List visible issues"}
-    , .{});
-    defer parsed.deinit();
-
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
-    const allocator = failing.allocator();
-    try std.testing.expectError(error.OutOfMemory, inspectTool(allocator, "github", parsed.value));
-    try std.testing.expect(failing.has_induced_failure);
->>>>>>> origin/cursor/fix-385-mcp-tool-descriptor-af09
     try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
 }
 
