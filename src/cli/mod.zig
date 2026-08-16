@@ -41,6 +41,7 @@ pub const quickstart = @import("quickstart.zig");
 pub const decide = @import("decide.zig");
 pub const evaluate = @import("evaluate.zig");
 pub const hook = @import("hook.zig");
+pub const hook_ipc = @import("hook_ipc.zig");
 pub const dashboard_command = @import("dashboard.zig");
 pub const report = @import("report.zig");
 pub const ci = @import("ci.zig");
@@ -117,6 +118,7 @@ test {
     _ = scan_command;
     // Pull hook.zig tests (daemon evaluate → HookResponse, strict refuse, redaction).
     _ = hook;
+    _ = @import("hook_ipc.zig");
     // Grok deny reason smart-shrink (pure formatter; also imported by hook.zig).
     _ = @import("grok_deny_reason.zig");
     _ = shell_test;
