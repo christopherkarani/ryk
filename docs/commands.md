@@ -26,9 +26,12 @@ Alt-screen views require an interactive rich terminal and are rejected under mac
 
 ```sh
 ryk dashboard
+ryk cloud
 ```
 
-Starts the local dashboard at `http://127.0.0.1:7742` by default. The dashboard exposes health, policy, integration, session, and denied-action views over existing ryk CLI/Core behavior.
+Starts the local dashboard at `http://127.0.0.1:7742` by default. The dashboard exposes health, policy, integration, session, denied-action, and Terminal views over existing ryk CLI/Core behavior.
+
+`ryk cloud` opens the Terminal view of real blocked commands on that same localhost bind. It is not a hosted control plane. `--demo` loads a labeled fixture stream only when requested. The alias is on `ryk help --all` and `ryk cloud --help`, not default `ryk` / `ryk help`.
 
 The dashboard accepts only localhost bindings by default, uses a per-run browser token for mutation routes, and does not accept arbitrary shell commands from the browser.
 

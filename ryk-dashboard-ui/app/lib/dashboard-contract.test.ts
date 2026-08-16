@@ -41,7 +41,7 @@ test("session identity includes its workspace", () => {
 test("machine navigation renders only global-safe destinations", () => {
   const machineLabels = visibleNavigation("machine").map((tab) => tab.label);
   const workspaceLabels = visibleNavigation("workspace").map((tab) => tab.label);
-  assert.deepEqual(machineLabels, ["Overview", "Activity", "Integrations"]);
+  assert.deepEqual(machineLabels, ["Overview", "Activity", "Terminal", "Integrations"]);
   assert.ok(workspaceLabels.includes("Policy"));
   assert.ok(workspaceLabels.includes("Secretless"));
 });

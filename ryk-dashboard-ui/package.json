@@ -7,7 +7,7 @@
     "node": ">=22.6.0"
   },
   "scripts": {
-    "test": "node --test --experimental-strip-types app/lib/dashboard-contract.test.ts",
+    "test": "node --test --experimental-strip-types app/lib/*.test.ts",
     "dev": "next dev -p 3000",
     "build": "next build",
     "lint": "next lint"

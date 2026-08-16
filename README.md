@@ -59,7 +59,7 @@ If ryk saves you a bad day, [star the repo](https://github.com/christopherkarani
 | MCP protection | MCP tool calls are classified locally, and supported stdio servers run through ryk's protected proxy. |
 | 86 safety packs | Built-in command patterns for destructive and sensitive operations, with project-level opt-in packs. |
 | Policy decisions | `allow`, `ask`, `deny`, and `observe` decisions for local actions. |
-| Local evidence | A dashboard and replay commands for sessions, decisions, and audit records. |
+| Local evidence | A localhost dashboard (including a Terminal view of blocked commands) and replay commands for sessions, decisions, and audit records. |
 | One local binary | The Zig CLI owns launch, evaluation, policy checks, host adapters, and diagnostics. |
 
 

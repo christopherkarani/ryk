@@ -102,9 +102,10 @@ Local dashboard:
 
 ```sh
 ./zig-out/bin/ryk dashboard
+./zig-out/bin/ryk cloud
 ```
 
-Open `http://127.0.0.1:7742` for health, policy, sessions, and denials. Optional; uses existing CLI/Core paths.
+Open `http://127.0.0.1:7742` for health, policy, sessions, and denials. `ryk cloud` is a thin alias for `ryk dashboard --view terminal` on that same localhost bind. Optional; uses existing CLI/Core paths. Install does not start this UI. An empty Terminal feed stays empty unless you pass `--demo`.
 
 CI readiness and packs (advanced):
 

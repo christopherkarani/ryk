@@ -173,6 +173,9 @@ const DashboardOptions = struct {
     port: u16 = default_port,
     once: bool = false,
     workspace: ?[]const u8 = null,
+    view: []const u8 = "overview",
+    demo: bool = false,
+    cloud: bool = false,
 };
 
 const DashboardContext = struct {
@@ -201,6 +204,48 @@ pub fn command(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: an
 
 pub fn commandForTest(argv: []const []const u8, stdout: anytype, stderr: anytype) !u8 {
     return command(std.testing.io, argv, stdout, stderr);
+}
+
+pub fn commandCloud(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: anytype) !u8 {
+    if (comptime builtin.os.tag == .windows) return exit_codes.unsupported;
+    for (argv) |arg| {
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            _ = try help.writeCommand(io, stdout, "cloud");
+            return exit_codes.success;
+        }
+    }
+    var options = parseOptions(io, argv, stdout, stderr) catch |err| switch (err) {
+        error.HelpShown => return exit_codes.success,
+        error.Usage => return exit_codes.usage,
+        else => return err,
+    };
+    applyCloudAlias(&options);
+    return serve(io, options, stdout, stderr);
+}
+
+fn applyCloudAlias(options: *DashboardOptions) void {
+    options.cloud = true;
+    options.view = "terminal";
+}
+
+fn effectiveView(options: DashboardOptions) []const u8 {
+    if (options.cloud and std.mem.eql(u8, options.view, "overview")) return "terminal";
+    if (options.demo and std.mem.eql(u8, options.view, "overview")) return "terminal";
+    return options.view;
+}
+
+fn formatListenUrl(buf: []u8, options: DashboardOptions) ![]u8 {
+    const view = effectiveView(options);
+    if (std.mem.eql(u8, view, "terminal")) {
+        if (options.demo) {
+            return std.fmt.bufPrint(buf, "http://{s}:{d}/terminal/?demo=1", .{ options.host, options.port });
+        }
+        return std.fmt.bufPrint(buf, "http://{s}:{d}/terminal/", .{ options.host, options.port });
+    }
+    if (std.mem.eql(u8, view, "activity")) {
+        return std.fmt.bufPrint(buf, "http://{s}:{d}/activity/", .{ options.host, options.port });
+    }
+    return std.fmt.bufPrint(buf, "http://{s}:{d}/", .{ options.host, options.port });
 }
 
 fn parseOptions(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: anytype) !DashboardOptions {
@@ -245,13 +290,26 @@ fn parseOptions(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: a
             explicit_workspace = argv[index];
         } else if (std.mem.eql(u8, arg, "--machine")) {
             explicit_machine = true;
+        } else if (std.mem.eql(u8, arg, "--view")) {
+            index += 1;
+            if (index >= argv.len or argv[index].len == 0) {
+                try stderr.writeAll("ryk dashboard: --view requires overview, activity, or terminal.\n");
+                return error.Usage;
+            }
+            if (!std.mem.eql(u8, argv[index], "overview") and !std.mem.eql(u8, argv[index], "activity") and !std.mem.eql(u8, argv[index], "terminal")) {
+                try stderr.writeAll("ryk dashboard: --view must be overview, activity, or terminal.\n");
+                return error.Usage;
+            }
+            options.view = argv[index];
+        } else if (std.mem.eql(u8, arg, "--demo")) {
+            options.demo = true;
         } else {
             const suggestions = @import("suggestions.zig");
             suggestions.writeUnknownOption(
                 stderr,
                 "ryk dashboard",
                 arg,
-                &.{ "--host", "--port", "--once", "--workspace", "--machine", "--help" },
+                &.{ "--host", "--port", "--once", "--workspace", "--machine", "--view", "--demo", "--help" },
                 "dashboard",
             ) catch {};
             return error.Usage;
@@ -285,7 +343,20 @@ fn serve(io: std.Io, options: DashboardOptions, stdout: anytype, stderr: anytype
     };
     defer server.deinit(io);
     const mode_label: []const u8 = if (options.workspace != null) "workspace" else "machine";
-    try stdout.print("ryk dashboard listening at http://{s}:{d} ({s} mode)\n", .{ options.host, options.port, mode_label });
+    var url_buf: [128]u8 = undefined;
+    const listen_url = formatListenUrl(&url_buf, options) catch {
+        try stderr.writeAll("ryk dashboard: failed to format listen URL.\n");
+        return exit_codes.general;
+    };
+    if (options.cloud) {
+        try stdout.print("ryk cloud listening at {s} ({s} mode)\n", .{ listen_url, mode_label });
+        try stdout.writeAll("localhost only — blocked-command evidence from this machine. Not a hosted control plane.\n");
+        if (options.demo) {
+            try stdout.writeAll("DEMO fixture stream requested. An empty live feed stays empty unless you pass --demo.\n");
+        }
+    } else {
+        try stdout.print("ryk dashboard listening at {s} ({s} mode)\n", .{ listen_url, mode_label });
+    }
     if (options.once) {
         try stdout.print("Waiting for one request. Press Ctrl-C to cancel. Idle timeout: {d}s.\n", .{once_idle_timeout_ms / 1000});
     }
@@ -475,8 +546,20 @@ fn handleConnection(
     try sendText(io, stream, 404, "Not Found", "application/json; charset=utf-8", "{\"error\":\"not_found\"}\n");
 }
 
+/// Map a request path onto a static relative path.
+/// `/` → `index.html`. A single trailing slash is a directory index
+/// (`/terminal/` → `terminal`) so `isSafeStaticPath` does not see an empty
+/// segment. `//`, `/terminal//`, and `..` still fail the safe-path check.
+fn staticRelPath(path: []const u8) []const u8 {
+    if (path.len == 0 or std.mem.eql(u8, path, "/")) return "index.html";
+    const start: usize = if (path[0] == '/') 1 else 0;
+    var end = path.len;
+    if (end > start and path[end - 1] == '/') end -= 1;
+    return path[start..end];
+}
+
 fn serveStaticFile(io: std.Io, allocator: std.mem.Allocator, stream: std.Io.net.Stream, path: []const u8, csrf_token: []const u8, dist_dir: []const u8) !void {
-    const rel_path = if (std.mem.eql(u8, path, "/")) "index.html" else path[1..];
+    const rel_path = staticRelPath(path);
     if (!isSafeStaticPath(rel_path)) return sendJsonError(io, stream, 404, "Not Found", "not_found");
 
     const file_path = try std.fs.path.join(allocator, &.{ dist_dir, rel_path });
@@ -1323,10 +1406,143 @@ test "request parser handles post body and query stripping" {
 test "dashboard static paths reject traversal and platform escapes" {
     try std.testing.expect(isSafeStaticPath("index.html"));
     try std.testing.expect(isSafeStaticPath("_next/static/app.js"));
+    try std.testing.expect(isSafeStaticPath("terminal"));
+    try std.testing.expect(isSafeStaticPath("terminal/index.html"));
+    try std.testing.expect(!isSafeStaticPath("terminal/"));
+    try std.testing.expectEqualStrings("terminal", staticRelPath("/terminal/"));
+    try std.testing.expectEqualStrings("activity", staticRelPath("/activity/"));
+    try std.testing.expectEqualStrings("terminal", staticRelPath("/terminal"));
+    try std.testing.expectEqualStrings("index.html", staticRelPath("/"));
+    try std.testing.expect(isSafeStaticPath(staticRelPath("/terminal/")));
+    try std.testing.expect(isSafeStaticPath(staticRelPath("/activity/")));
+    try std.testing.expect(!isSafeStaticPath(staticRelPath("/../")));
+    try std.testing.expect(!isSafeStaticPath(staticRelPath("/terminal/../")));
+    try std.testing.expect(!isSafeStaticPath(staticRelPath("/terminal//")));
+    try std.testing.expect(!isSafeStaticPath(staticRelPath("//")));
     try std.testing.expect(!isSafeStaticPath("../../README.md"));
     try std.testing.expect(!isSafeStaticPath("%2e%2e/README.md"));
     try std.testing.expect(!isSafeStaticPath("C:/Windows/win.ini"));
     try std.testing.expect(!isSafeStaticPath("..\\..\\.ssh\\id_rsa"));
+}
+
+const StaticGetState = struct {
+    server: *std.Io.net.Server,
+    io: std.Io,
+    dist_dir: []const u8,
+};
+
+fn serveOneStaticGet(state: *StaticGetState) void {
+    var listen_fd = [_]std.posix.pollfd{.{
+        .fd = state.server.socket.handle,
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
+    _ = std.posix.poll(&listen_fd, 5_000) catch return;
+    var stream = state.server.accept(state.io) catch return;
+    defer stream.close(state.io);
+    var req_buf: [1024]u8 = undefined;
+    const n = readAvailableHttpRequest(state.io, stream, &req_buf) catch return;
+    const request = parseRequest(req_buf[0..n]) catch return;
+    serveStaticFile(state.io, std.heap.page_allocator, stream, request.path, "test-token", state.dist_dir) catch {};
+}
+
+fn readHttpExchange(io: std.Io, stream: std.Io.net.Stream, buffer: []u8) !usize {
+    var total: usize = 0;
+    const started = std.Io.Clock.Timestamp.now(io, .awake);
+    const deadline_ns: i96 = 2 * std.time.ns_per_s;
+    var header_end: ?usize = null;
+    var content_length: usize = 0;
+    while (total < buffer.len and started.durationFromNow(io).raw.nanoseconds < deadline_ns) {
+        var fds = [_]std.posix.pollfd{.{
+            .fd = stream.socket.handle,
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        }};
+        const ready = std.posix.poll(&fds, 100) catch break;
+        if (ready == 0) continue;
+        const n = std.posix.read(stream.socket.handle, buffer[total..]) catch |err| switch (err) {
+            error.WouldBlock => continue,
+            else => return err,
+        };
+        if (n == 0) break;
+        total += n;
+        if (header_end == null) {
+            if (std.mem.indexOf(u8, buffer[0..total], "\r\n\r\n")) |idx| {
+                header_end = idx;
+                content_length = parseContentLength(buffer[0..idx]) orelse 0;
+            }
+        }
+        if (header_end) |idx| {
+            if (total >= idx + 4 + content_length) break;
+        }
+    }
+    return total;
+}
+
+fn getDashboardStatic(io: std.Io, allocator: std.mem.Allocator, dist_dir: []const u8, path: []const u8) ![]u8 {
+    const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try address.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    var state: StaticGetState = .{ .server = &server, .io = io, .dist_dir = dist_dir };
+    const thread = try std.Thread.spawn(.{}, serveOneStaticGet, .{&state});
+    defer thread.join();
+    std.Io.sleep(io, std.Io.Duration.fromNanoseconds(50 * std.time.ns_per_ms), .awake) catch {};
+
+    const port = server.socket.address.getPort();
+    const client_addr = try std.Io.net.IpAddress.parse("127.0.0.1", port);
+    var client = try std.Io.net.IpAddress.connect(&client_addr, io, .{ .mode = .stream });
+    defer client.close(io);
+
+    var request_buf: [256]u8 = undefined;
+    const request = try std.fmt.bufPrint(
+        &request_buf,
+        "GET {s} HTTP/1.1\r\nHost: 127.0.0.1:{d}\r\nConnection: close\r\n\r\n",
+        .{ path, port },
+    );
+    var write_buf: [512]u8 = undefined;
+    var writer = client.writer(io, &write_buf);
+    try writer.interface.writeAll(request);
+    try writer.interface.flush();
+
+    var response_buf: [4096]u8 = undefined;
+    const n = try readHttpExchange(io, client, &response_buf);
+    return try allocator.dupe(u8, response_buf[0..n]);
+}
+
+test "GET /terminal/ and sibling trailing-slash paths serve a directory index" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "terminal");
+    try tmp.dir.createDirPath(std.testing.io, "activity");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "index.html", .data = "ROOT-INDEX" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "terminal/index.html", .data = "TERMINAL-INDEX" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "activity/index.html", .data = "ACTIVITY-INDEX" });
+    const dist_dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(dist_dir);
+
+    const terminal = try getDashboardStatic(std.testing.io, std.testing.allocator, dist_dir, "/terminal/");
+    defer std.testing.allocator.free(terminal);
+    try std.testing.expect(std.mem.indexOf(u8, terminal, "HTTP/1.1 200") != null);
+    try std.testing.expect(std.mem.indexOf(u8, terminal, "TERMINAL-INDEX") != null);
+    try std.testing.expect(std.mem.indexOf(u8, terminal, "\"error\":\"not_found\"") == null);
+
+    const activity = try getDashboardStatic(std.testing.io, std.testing.allocator, dist_dir, "/activity/");
+    defer std.testing.allocator.free(activity);
+    try std.testing.expect(std.mem.indexOf(u8, activity, "HTTP/1.1 200") != null);
+    try std.testing.expect(std.mem.indexOf(u8, activity, "ACTIVITY-INDEX") != null);
+    try std.testing.expect(std.mem.indexOf(u8, activity, "\"error\":\"not_found\"") == null);
+
+    const traversal = try getDashboardStatic(std.testing.io, std.testing.allocator, dist_dir, "/../");
+    defer std.testing.allocator.free(traversal);
+    try std.testing.expect(std.mem.indexOf(u8, traversal, "HTTP/1.1 404") != null);
+    try std.testing.expect(std.mem.indexOf(u8, traversal, "\"error\":\"not_found\"") != null);
+
+    const empty_seg = try getDashboardStatic(std.testing.io, std.testing.allocator, dist_dir, "/terminal//");
+    defer std.testing.allocator.free(empty_seg);
+    try std.testing.expect(std.mem.indexOf(u8, empty_seg, "HTTP/1.1 404") != null);
+    try std.testing.expect(std.mem.indexOf(u8, empty_seg, "\"error\":\"not_found\"") != null);
 }
 
 test "dashboard request source accepts loopback and rejects rebinding origins" {
@@ -1341,4 +1557,60 @@ test "dashboard request source accepts loopback and rejects rebinding origins" {
 test "dashboard --once has a bounded idle timeout" {
     try std.testing.expect(once_idle_timeout_ms <= 30_000);
     try std.testing.expect(once_idle_timeout_ms >= 1_000);
+}
+
+test "dashboard parses --view terminal and --demo without inventing a remote plane" {
+    var stdout_buf: [256]u8 = undefined;
+    var stderr_buf: [256]u8 = undefined;
+    var stdout: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr: std.Io.Writer = .fixed(&stderr_buf);
+    const terminal = try parseOptions(std.testing.io, &.{ "--view", "terminal", "--demo" }, &stdout, &stderr);
+    try std.testing.expectEqualStrings("terminal", terminal.view);
+    try std.testing.expect(terminal.demo);
+    try std.testing.expect(!terminal.cloud);
+    try std.testing.expectError(error.Usage, parseOptions(std.testing.io, &.{ "--view", "remote" }, &stdout, &stderr));
+}
+
+test "ryk cloud is a localhost dashboard alias for the terminal view" {
+    var stdout_buf: [256]u8 = undefined;
+    var stderr_buf: [256]u8 = undefined;
+    var stdout: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr: std.Io.Writer = .fixed(&stderr_buf);
+    var options = try parseOptions(std.testing.io, &.{}, &stdout, &stderr);
+    applyCloudAlias(&options);
+    try std.testing.expect(options.cloud);
+    try std.testing.expectEqualStrings("terminal", effectiveView(options));
+    try std.testing.expect(!options.demo);
+
+    var demo = try parseOptions(std.testing.io, &.{"--demo"}, &stdout, &stderr);
+    applyCloudAlias(&demo);
+    try std.testing.expect(demo.demo);
+    try std.testing.expectEqualStrings("terminal", effectiveView(demo));
+
+    var activity = try parseOptions(std.testing.io, &.{ "--view", "activity" }, &stdout, &stderr);
+    applyCloudAlias(&activity);
+    try std.testing.expectEqualStrings("terminal", activity.view);
+    try std.testing.expectEqualStrings("terminal", effectiveView(activity));
+
+    var href_buf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "http://127.0.0.1:7742/terminal/",
+        try formatListenUrl(&href_buf, options),
+    );
+    try std.testing.expectEqualStrings(
+        "http://127.0.0.1:7742/terminal/?demo=1",
+        try formatListenUrl(&href_buf, demo),
+    );
+    const overview = try parseOptions(std.testing.io, &.{}, &stdout, &stderr);
+    try std.testing.expectEqualStrings("http://127.0.0.1:7742/", try formatListenUrl(&href_buf, overview));
+    try std.testing.expect(std.mem.indexOf(u8, try formatListenUrl(&href_buf, options), "demo") == null);
+
+    var help_out: [4096]u8 = undefined;
+    var help_err: [256]u8 = undefined;
+    var help_stdout: std.Io.Writer = .fixed(&help_out);
+    var help_stderr: std.Io.Writer = .fixed(&help_err);
+    const help_code = try commandCloud(std.testing.io, &.{ "--workspace", ".", "--help" }, &help_stdout, &help_stderr);
+    try std.testing.expectEqual(exit_codes.success, help_code);
+    try std.testing.expect(std.mem.indexOf(u8, help_stdout.buffered(), "ryk dashboard --view terminal") != null);
+    try std.testing.expectEqualStrings("", help_stderr.buffered());
 }

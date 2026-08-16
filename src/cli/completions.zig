@@ -313,7 +313,7 @@ test "completions include command-specific dashboard flags" {
     // packs is P0-hidden until Slice 4 lands; only assert live command flags here.
     const shells = [_][]const u8{ "bash", "zsh", "fish", "powershell" };
     const required_flags = [_][]const u8{
-        "--machine", "--workspace", "--host", "--port", "--once",
+        "--machine", "--workspace", "--host", "--port", "--once", "--view", "--demo",
     };
     for (shells) |shell| {
         var stdout_buf: [32 * 1024]u8 = undefined;
