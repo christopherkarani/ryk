@@ -277,7 +277,7 @@ pub const commands =
             .details = &.{
                 "Human stats are rendered by ryk from structured history data.",
                 "Use 'ryk history --help' for actions and examples.",
-                "--live opens a scrollable alt-screen view of the current stats snapshot on an interactive TTY; non-TTY / --plain / --no-rich falls back to linear (not with --json).",
+                "--live opens a scrollable alt-screen view of the current stats snapshot (TTY only; not with --json).",
                 "Use --json, --robot, or --format for machine-readable daemon output.",
             },
         },
@@ -610,7 +610,7 @@ pub const commands =
             "run 'find . -type d -name .ryk' to locate them manually.",
             "Package-manager binaries (Homebrew/Scoop/WinGet) are left in place; uninstall there separately.",
         } },
-        .{ .name = "replay", .summary = "Replay an audit session", .usage = "ryk replay [--list] [--session <id|last>] [--json] [--only denied] [--verify] [--tui]", .category = .core_workflow, .public = true, .examples = &.{
+        .{ .name = "replay", .summary = "Replay an audit session", .usage = "ryk replay [--list] [--session <id|last>] [--json] [--only denied] [--verify] [--tui] [--plain]", .category = .core_workflow, .public = true, .examples = &.{
             "ryk replay",
             "ryk replay --list",
             "ryk replay --session last",

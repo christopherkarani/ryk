@@ -47,13 +47,28 @@ pub fn command(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: an
         return listSessions(io, allocator, workspace_root, stdout);
     }
 
-    return replaySession(io, allocator, workspace_root, options, stdout, stderr);
+    return replaySession(io, allocator, workspace_root, argv, options, stdout, stderr);
+}
+
+/// Pure TUI entry for replay: same shared gate as doctor (`shouldEnterTui`)
+/// plus colour capability so `NO_COLOR` / `TERM=dumb` stay linear on a TTY.
+/// Callers pass **real argv** (not a synthetic `&.{"--tui"}`).
+fn wouldEnterReplayTui(
+    stdin_is_tty: bool,
+    stdout_is_tty: bool,
+    argv: []const []const u8,
+    has_color: bool,
+) bool {
+    if (comptime !enable_tui) return false;
+    if (!has_color) return false;
+    return tui.output_policy.shouldEnterTui(stdin_is_tty, stdout_is_tty, argv);
 }
 
 fn replaySession(
     io: std.Io,
     allocator: std.mem.Allocator,
     workspace_root: []const u8,
+    argv: []const []const u8,
     options: ReplayCliOptions,
     stdout: anytype,
     stderr: anytype,
@@ -67,7 +82,12 @@ fn replaySession(
             try stderr.writeAll("ryk replay: --tui cannot be combined with --json (machine output is frozen).\n");
             return exit_codes.usage;
         }
-        enter_tui = (comptime enable_tui) and tui.output_policy.shouldEnterTuiIo(io, &.{"--tui"});
+        enter_tui = wouldEnterReplayTui(
+            std.Io.File.stdin().isTty(io) catch false,
+            std.Io.File.stdout().isTty(io) catch false,
+            argv,
+            tui.theme.active(io, stdout).capability.hasColor(),
+        );
         if (!enter_tui) {
             if (comptime enable_tui) {
                 try stderr.writeAll("ryk replay: --tui requires an interactive TTY (and no --json/--plain/--no-rich); using linear report.\n");
@@ -500,8 +520,13 @@ fn parseOptions(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: a
             // frozen and cannot combine with --tui. No-TTY falls back to linear.
             // Do not clear fallback_to_list: `--tui` alone is args-minus-TUI empty.
             options.tui_view = true;
+        } else if (std.mem.eql(u8, arg, "--plain") or std.mem.eql(u8, arg, "--no-rich")) {
+            // Linear escape (matches doctor / help: non-TTY / --plain / --no-rich).
+            // Disables opt-in --tui via wouldEnterReplayTui when still on argv.
         } else {
-            try suggestions.writeUnknownOption(stderr, "ryk replay", arg, &.{ "--list", "--session", "--json", "--verify", "--only", "--tui", "--help", "-h" }, "replay");
+            try suggestions.writeUnknownOption(stderr, "ryk replay", arg, &.{
+                "--list", "--session", "--json", "--verify", "--only", "--tui", "--plain", "--no-rich", "--help", "-h",
+            }, "replay");
             return error.Usage;
         }
     }
@@ -510,7 +535,10 @@ fn parseOptions(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: a
 
 fn argvHasOnlyTuiFlags(argv: []const []const u8) bool {
     for (argv) |arg| {
-        if (!std.mem.eql(u8, arg, "--tui")) return false;
+        if (std.mem.eql(u8, arg, "--tui")) continue;
+        if (std.mem.eql(u8, arg, "--plain")) continue;
+        if (std.mem.eql(u8, arg, "--no-rich")) continue;
+        return false;
     }
     return true;
 }
@@ -1032,9 +1060,25 @@ test "replay human timeline collapses repeated redactions and json remains exact
 // contracts must be unchanged when --tui is absent.
 // ---------------------------------------------------------------------------
 
+test "replay --tui gate uses real argv and colour capability" {
+    // Deterministic gate: TTY pair + colour + real argv (doctor's shouldEnterTui).
+    // --plain / --no-rich / no colour / pipe stay linear even when stdin/stdout
+    // look like a colour TTY. Does not probe File.stdin / File.stdout.
+    try std.testing.expectEqual(enable_tui, wouldEnterReplayTui(true, true, &.{"--tui"}, true));
+    try std.testing.expect(!wouldEnterReplayTui(true, true, &.{ "--tui", "--plain" }, true));
+    try std.testing.expect(!wouldEnterReplayTui(true, true, &.{ "--tui", "--no-rich" }, true));
+    try std.testing.expect(!wouldEnterReplayTui(true, true, &.{"--tui"}, false));
+    try std.testing.expect(!wouldEnterReplayTui(false, true, &.{"--tui"}, true));
+    try std.testing.expect(!wouldEnterReplayTui(true, false, &.{"--tui"}, true));
+    try std.testing.expect(!wouldEnterReplayTui(true, true, &.{ "--tui", "--json" }, true));
+}
+
 test "replay --tui falls back to linear on non-interactive output" {
-    // Pipe / fixed-buffer / no colour TTY: --tui must not EXIT 2. Fall back to
-    // the same linear timeline the fixture would render without --tui.
+    // Force the no-colour path the way history does under builtin.is_test so
+    // this does not depend on whether the test process stdin/stdout is a TTY.
+    tui.theme.setTestActive(.{ .capability = .none, .background = .unknown });
+    defer tui.theme.setTestActive(null);
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
@@ -1071,6 +1115,9 @@ test "replay --tui falls back to linear on non-interactive output" {
 
 test "replay --tui with no sessions falls back to linear empty list" {
     // args-minus-TUI of bare `--tui` is `ryk replay`: friendly empty list, EXIT 0.
+    tui.theme.setTestActive(.{ .capability = .none, .background = .unknown });
+    defer tui.theme.setTestActive(null);
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(std.testing.io, ".ryk");
@@ -1096,6 +1143,48 @@ test "replay --tui with no sessions falls back to linear empty list" {
     try std.testing.expect(std.mem.indexOf(u8, out, "No sessions") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "FileNotFound") == null);
     try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "using linear") != null);
+}
+
+test "replay --tui --plain falls back to linear" {
+    // --plain is a no-op escape (doctor): accept it, stay linear, EXIT 0.
+    // Fixture session so this is not the empty-list path. Forced no-colour so
+    // the assert does not depend on process TTY.
+    tui.theme.setTestActive(.{ .capability = .none, .background = .unknown });
+    defer tui.theme.setTestActive(null);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    try tmp.dir.createDirPath(std.testing.io, ".ryk");
+    {
+        const policy_file = try tmp.dir.createFile(std.testing.io, ".ryk/policy.yaml", .{});
+        defer policy_file.close(std.testing.io);
+        try policy_file.writeStreamingAll(std.testing.io, "version: 1\nmode: strict\n");
+    }
+    const session_id = try writeReplayTimelineFixture(std.testing.io, std.testing.allocator, root);
+    defer std.testing.allocator.free(session_id);
+
+    const previous_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(previous_cwd);
+    try std.process.setCurrentDir(std.testing.io, tmp.dir);
+    defer std.process.setCurrentPath(std.testing.io, previous_cwd) catch {};
+
+    var stdout_buf: [4096]u8 = undefined;
+    var stderr_buf: [512]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+
+    const code = try command(std.testing.io, &.{ "--session", session_id, "--tui", "--plain" }, &stdout_writer, &stderr_writer);
+    try std.testing.expectEqual(exit_codes.success, code);
+    const err = stderr_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, err, "using linear") != null);
+    try std.testing.expect(std.mem.indexOf(u8, err, "unknown") == null);
+    try std.testing.expect(std.mem.indexOf(u8, err, "Drop --tui") == null);
+    const out = stdout_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "3 secret redactions") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "secret_redacted"));
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[?1049") == null);
 }
 
 test "replay --tui cannot combine with --json" {
