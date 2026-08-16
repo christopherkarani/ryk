@@ -226,6 +226,8 @@ pub fn channelAllowsInstaller(channel: InstallChannel, force: bool) bool {
 /// destination can be overwritten (same contract as RYK_INSTALL_FORCE=1).
 pub const install_force_env_key = "RYK_INSTALL_FORCE";
 pub const install_force_env_value = "1";
+/// Leftover test hook must never reach the official installer child.
+pub const install_source_only_env_key = "RYK_INSTALL_SOURCE_ONLY";
 
 pub fn forceImpliesInstallForce(force: bool) bool {
     return force;
@@ -866,12 +868,20 @@ const scrub_env_keys = [_][]const u8{
     "RYK_ARTIFACT_DIR",
     "RYK_INSTALL_ROOT",
     "RYK_INSTALL_ROOT",
+    install_source_only_env_key,
 };
 
 fn scrubInstallerEnv(env_map: *std.process.Environ.Map) void {
     for (scrub_env_keys) |key| {
         _ = env_map.swapRemove(key);
     }
+}
+
+pub fn installerScrubsSourceOnly() bool {
+    for (scrub_env_keys) |key| {
+        if (std.mem.eql(u8, key, install_source_only_env_key)) return true;
+    }
+    return false;
 }
 
 fn execInstaller(
@@ -1072,4 +1082,9 @@ test "forceImpliesInstallForce wires RYK_INSTALL_FORCE" {
     try std.testing.expect(!forceImpliesInstallForce(false));
     try std.testing.expectEqualStrings("RYK_INSTALL_FORCE", install_force_env_key);
     try std.testing.expectEqualStrings("1", install_force_env_value);
+}
+
+test "execInstaller scrubs RYK_INSTALL_SOURCE_ONLY" {
+    try std.testing.expect(installerScrubsSourceOnly());
+    try std.testing.expectEqualStrings("RYK_INSTALL_SOURCE_ONLY", install_source_only_env_key);
 }

@@ -303,11 +303,7 @@ SHARE_DIR="${RYK_SHARE_DIR:-${HOME}/.local/share/ryk}"
 RESOURCE_ROOT="${SHARE_DIR}/${VERSION}"
 CURRENT_LINK="${SHARE_DIR}/current"
 ARTIFACT_DIR="${RYK_ARTIFACT_DIR:-}"
-if [ "${RYK_INSTALL_SOURCE_ONLY:-0}" = "1" ]; then
-  TMP_DIR=""
-else
-  TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ryk-install.XXXXXX")"
-fi
+TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ryk-install.XXXXXX")"
 RUNTIME_DIRS="integrations fixtures schemas policies ryk-pi"
 INSTALL_MARKER=".ryk-installation"
 install_stage=""
@@ -369,9 +365,7 @@ cleanup() {
     rm -rf "$TMP_DIR"
   fi
 }
-if [ "${RYK_INSTALL_SOURCE_ONLY:-0}" != "1" ]; then
-  trap cleanup EXIT INT TERM
-fi
+trap cleanup EXIT INT TERM
 
 detect_os() {
   case "${RYK_OS_OVERRIDE:-$(uname -s)}" in
@@ -567,10 +561,12 @@ managed_runtime_version() {
   printf '%s\n' "$managed_version"
 }
 
-# Conservative product identity. Never follows or executes a symlink destination
-# (those are replaced without probing). Regular files named ryk/ryk.exe pass when
-# a cheap version-json marker is present or a short `version --json` probe
-# prints product ryk. Do not treat every ELF as ryk.
+# Conservative product identity. Never executes dest (it may be attacker-controlled
+# and inherit the installer environment). Never follows a symlink. Regular files
+# named ryk/ryk.exe pass only when they are a native image (ELF/PE/Mach-O) and
+# contain the in-binary marker `safety_boundary_version` (real 0.2.18+). Unsure
+# dest → not a product binary (caller refuses + RYK_INSTALL_FORCE=1). Do not
+# treat every ELF as ryk, and do not treat a wrapper comment as identity.
 is_ryk_product_binary() {
   _ryk_id_path="$1"
   [ -n "$_ryk_id_path" ] || return 1
@@ -580,21 +576,14 @@ is_ryk_product_binary() {
     ryk|ryk.exe) ;;
     *) return 1 ;;
   esac
-  if grep -a -E -q '"product"[[:space:]]*:[[:space:]]*"ryk"' "$_ryk_id_path" 2>/dev/null; then
-    return 0
-  fi
-  if grep -a -F -q 'safety_boundary_version' "$_ryk_id_path" 2>/dev/null; then
-    return 0
-  fi
-  _ryk_id_out=""
-  if command -v timeout >/dev/null 2>&1; then
-    _ryk_id_out="$(timeout 2 "$_ryk_id_path" version --json 2>/dev/null || true)"
-  elif command -v perl >/dev/null 2>&1; then
-    _ryk_id_out="$(perl -e 'alarm 2; exec @ARGV' "$_ryk_id_path" version --json 2>/dev/null || true)"
-  else
-    return 1
-  fi
-  printf '%s' "$_ryk_id_out" | grep -E -q '"product"[[:space:]]*:[[:space:]]*"ryk"'
+  command -v dd >/dev/null 2>&1 || return 1
+  command -v od >/dev/null 2>&1 || return 1
+  _ryk_hdr=$(dd if="$_ryk_id_path" bs=4 count=1 2>/dev/null | od -An -tx1 | tr -d ' \n' | tr 'A-F' 'a-f')
+  case "$_ryk_hdr" in
+    7f454c46*|4d5a*|cffaedfe*|cefaedfe*|feedface*|feedfacf*|cafebabe*|bebafeca*) ;;
+    *) return 1 ;;
+  esac
+  grep -a -F -q 'safety_boundary_version' "$_ryk_id_path" 2>/dev/null
 }
 
 validate_binary_destination() {
@@ -624,13 +613,9 @@ validate_binary_destination() {
       return 0
     fi
     fail "refusing to overwrite non-ryk file at $validate_destination" \
-      "ryk update --force"
+      "RYK_INSTALL_FORCE=1"
   fi
 }
-
-if [ "${RYK_INSTALL_SOURCE_ONLY:-0}" = "1" ]; then
-  return 0 2>/dev/null || exit 0
-fi
 
 safe_install() {
   source_bin="$1"
