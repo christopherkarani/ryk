@@ -247,8 +247,15 @@ const MergedCache = struct {
     corrupt: bool,
 };
 
-var merged_cache_mutex: std.Thread.Mutex = .{};
+// Zig 0.16: std.atomic.Mutex (not Thread.Mutex).
+var merged_cache_mu: std.atomic.Mutex = .unlocked;
 var merged_cache: ?MergedCache = null;
+
+fn lockMergedCache() void {
+    while (!merged_cache_mu.tryLock()) {
+        std.atomic.spinLoopHint();
+    }
+}
 
 fn missingStamp() FileStamp {
     return .{ .exists = false, .inode = 0, .size = 0, .mtime_ns = 0 };
@@ -287,8 +294,8 @@ fn freeMergedCacheLocked() void {
 }
 
 pub fn resetMergedCacheForTests() void {
-    merged_cache_mutex.lock();
-    defer merged_cache_mutex.unlock();
+    lockMergedCache();
+    defer merged_cache_mu.unlock();
     freeMergedCacheLocked();
 }
 
@@ -325,8 +332,8 @@ fn storeMergedCache(
         gpa.free(project_owned);
         return;
     };
-    merged_cache_mutex.lock();
-    defer merged_cache_mutex.unlock();
+    lockMergedCache();
+    defer merged_cache_mu.unlock();
     freeMergedCacheLocked();
     merged_cache = .{
         .user_path = user_owned,
@@ -345,8 +352,8 @@ fn cloneFromMergedCache(
     project_path: ?[]const u8,
     project_stamp: FileStamp,
 ) ?LoadOutcome {
-    merged_cache_mutex.lock();
-    defer merged_cache_mutex.unlock();
+    lockMergedCache();
+    defer merged_cache_mu.unlock();
     const cached = merged_cache orelse return null;
     if (!std.mem.eql(u8, cached.user_path, pathOrEmpty(user_path))) return null;
     if (!std.mem.eql(u8, cached.project_path, pathOrEmpty(project_path))) return null;
