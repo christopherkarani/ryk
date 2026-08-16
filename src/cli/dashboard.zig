@@ -546,8 +546,20 @@ fn handleConnection(
     try sendText(io, stream, 404, "Not Found", "application/json; charset=utf-8", "{\"error\":\"not_found\"}\n");
 }
 
+/// Map a request path onto a static relative path.
+/// `/` → `index.html`. A single trailing slash is a directory index
+/// (`/terminal/` → `terminal`) so `isSafeStaticPath` does not see an empty
+/// segment. `//`, `/terminal//`, and `..` still fail the safe-path check.
+fn staticRelPath(path: []const u8) []const u8 {
+    if (path.len == 0 or std.mem.eql(u8, path, "/")) return "index.html";
+    const start: usize = if (path[0] == '/') 1 else 0;
+    var end = path.len;
+    if (end > start and path[end - 1] == '/') end -= 1;
+    return path[start..end];
+}
+
 fn serveStaticFile(io: std.Io, allocator: std.mem.Allocator, stream: std.Io.net.Stream, path: []const u8, csrf_token: []const u8, dist_dir: []const u8) !void {
-    const rel_path = if (std.mem.eql(u8, path, "/")) "index.html" else path[1..];
+    const rel_path = staticRelPath(path);
     if (!isSafeStaticPath(rel_path)) return sendJsonError(io, stream, 404, "Not Found", "not_found");
 
     const file_path = try std.fs.path.join(allocator, &.{ dist_dir, rel_path });
@@ -1394,10 +1406,143 @@ test "request parser handles post body and query stripping" {
 test "dashboard static paths reject traversal and platform escapes" {
     try std.testing.expect(isSafeStaticPath("index.html"));
     try std.testing.expect(isSafeStaticPath("_next/static/app.js"));
+    try std.testing.expect(isSafeStaticPath("terminal"));
+    try std.testing.expect(isSafeStaticPath("terminal/index.html"));
+    try std.testing.expect(!isSafeStaticPath("terminal/"));
+    try std.testing.expectEqualStrings("terminal", staticRelPath("/terminal/"));
+    try std.testing.expectEqualStrings("activity", staticRelPath("/activity/"));
+    try std.testing.expectEqualStrings("terminal", staticRelPath("/terminal"));
+    try std.testing.expectEqualStrings("index.html", staticRelPath("/"));
+    try std.testing.expect(isSafeStaticPath(staticRelPath("/terminal/")));
+    try std.testing.expect(isSafeStaticPath(staticRelPath("/activity/")));
+    try std.testing.expect(!isSafeStaticPath(staticRelPath("/../")));
+    try std.testing.expect(!isSafeStaticPath(staticRelPath("/terminal/../")));
+    try std.testing.expect(!isSafeStaticPath(staticRelPath("/terminal//")));
+    try std.testing.expect(!isSafeStaticPath(staticRelPath("//")));
     try std.testing.expect(!isSafeStaticPath("../../README.md"));
     try std.testing.expect(!isSafeStaticPath("%2e%2e/README.md"));
     try std.testing.expect(!isSafeStaticPath("C:/Windows/win.ini"));
     try std.testing.expect(!isSafeStaticPath("..\\..\\.ssh\\id_rsa"));
+}
+
+const StaticGetState = struct {
+    server: *std.Io.net.Server,
+    io: std.Io,
+    dist_dir: []const u8,
+};
+
+fn serveOneStaticGet(state: *StaticGetState) void {
+    var listen_fd = [_]std.posix.pollfd{.{
+        .fd = state.server.socket.handle,
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
+    _ = std.posix.poll(&listen_fd, 5_000) catch return;
+    var stream = state.server.accept(state.io) catch return;
+    defer stream.close(state.io);
+    var req_buf: [1024]u8 = undefined;
+    const n = readAvailableHttpRequest(state.io, stream, &req_buf) catch return;
+    const request = parseRequest(req_buf[0..n]) catch return;
+    serveStaticFile(state.io, std.heap.page_allocator, stream, request.path, "test-token", state.dist_dir) catch {};
+}
+
+fn readHttpExchange(io: std.Io, stream: std.Io.net.Stream, buffer: []u8) !usize {
+    var total: usize = 0;
+    const started = std.Io.Clock.Timestamp.now(io, .awake);
+    const deadline_ns: i96 = 2 * std.time.ns_per_s;
+    var header_end: ?usize = null;
+    var content_length: usize = 0;
+    while (total < buffer.len and started.durationFromNow(io).raw.nanoseconds < deadline_ns) {
+        var fds = [_]std.posix.pollfd{.{
+            .fd = stream.socket.handle,
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        }};
+        const ready = std.posix.poll(&fds, 100) catch break;
+        if (ready == 0) continue;
+        const n = std.posix.read(stream.socket.handle, buffer[total..]) catch |err| switch (err) {
+            error.WouldBlock => continue,
+            else => return err,
+        };
+        if (n == 0) break;
+        total += n;
+        if (header_end == null) {
+            if (std.mem.indexOf(u8, buffer[0..total], "\r\n\r\n")) |idx| {
+                header_end = idx;
+                content_length = parseContentLength(buffer[0..idx]) orelse 0;
+            }
+        }
+        if (header_end) |idx| {
+            if (total >= idx + 4 + content_length) break;
+        }
+    }
+    return total;
+}
+
+fn getDashboardStatic(io: std.Io, allocator: std.mem.Allocator, dist_dir: []const u8, path: []const u8) ![]u8 {
+    const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try address.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    var state: StaticGetState = .{ .server = &server, .io = io, .dist_dir = dist_dir };
+    const thread = try std.Thread.spawn(.{}, serveOneStaticGet, .{&state});
+    defer thread.join();
+    std.Io.sleep(io, std.Io.Duration.fromNanoseconds(50 * std.time.ns_per_ms), .awake) catch {};
+
+    const port = server.socket.address.getPort();
+    const client_addr = try std.Io.net.IpAddress.parse("127.0.0.1", port);
+    var client = try std.Io.net.IpAddress.connect(&client_addr, io, .{ .mode = .stream });
+    defer client.close(io);
+
+    var request_buf: [256]u8 = undefined;
+    const request = try std.fmt.bufPrint(
+        &request_buf,
+        "GET {s} HTTP/1.1\r\nHost: 127.0.0.1:{d}\r\nConnection: close\r\n\r\n",
+        .{ path, port },
+    );
+    var write_buf: [512]u8 = undefined;
+    var writer = client.writer(io, &write_buf);
+    try writer.interface.writeAll(request);
+    try writer.interface.flush();
+
+    var response_buf: [4096]u8 = undefined;
+    const n = try readHttpExchange(io, client, &response_buf);
+    return try allocator.dupe(u8, response_buf[0..n]);
+}
+
+test "GET /terminal/ and sibling trailing-slash paths serve a directory index" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "terminal");
+    try tmp.dir.createDirPath(std.testing.io, "activity");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "index.html", .data = "ROOT-INDEX" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "terminal/index.html", .data = "TERMINAL-INDEX" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "activity/index.html", .data = "ACTIVITY-INDEX" });
+    const dist_dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(dist_dir);
+
+    const terminal = try getDashboardStatic(std.testing.io, std.testing.allocator, dist_dir, "/terminal/");
+    defer std.testing.allocator.free(terminal);
+    try std.testing.expect(std.mem.indexOf(u8, terminal, "HTTP/1.1 200") != null);
+    try std.testing.expect(std.mem.indexOf(u8, terminal, "TERMINAL-INDEX") != null);
+    try std.testing.expect(std.mem.indexOf(u8, terminal, "\"error\":\"not_found\"") == null);
+
+    const activity = try getDashboardStatic(std.testing.io, std.testing.allocator, dist_dir, "/activity/");
+    defer std.testing.allocator.free(activity);
+    try std.testing.expect(std.mem.indexOf(u8, activity, "HTTP/1.1 200") != null);
+    try std.testing.expect(std.mem.indexOf(u8, activity, "ACTIVITY-INDEX") != null);
+    try std.testing.expect(std.mem.indexOf(u8, activity, "\"error\":\"not_found\"") == null);
+
+    const traversal = try getDashboardStatic(std.testing.io, std.testing.allocator, dist_dir, "/../");
+    defer std.testing.allocator.free(traversal);
+    try std.testing.expect(std.mem.indexOf(u8, traversal, "HTTP/1.1 404") != null);
+    try std.testing.expect(std.mem.indexOf(u8, traversal, "\"error\":\"not_found\"") != null);
+
+    const empty_seg = try getDashboardStatic(std.testing.io, std.testing.allocator, dist_dir, "/terminal//");
+    defer std.testing.allocator.free(empty_seg);
+    try std.testing.expect(std.mem.indexOf(u8, empty_seg, "HTTP/1.1 404") != null);
+    try std.testing.expect(std.mem.indexOf(u8, empty_seg, "\"error\":\"not_found\"") != null);
 }
 
 test "dashboard request source accepts loopback and rejects rebinding origins" {
