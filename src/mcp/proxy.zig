@@ -411,9 +411,9 @@ fn upsertMetadataGate(
     const existing = metadata_gates.getEntry(tool_name);
     if (existing) |entry| {
         if (riskRank(risk) <= riskRank(entry.value_ptr.risk)) return;
-        // Own the replacement before releasing the stored reason. A free-then-dupe
-        // leaves a dangling pointer in the map when the dupe OOMs; runWithServer
-        // teardown then double-frees it.
+        // Own the replacement before releasing the stored reason (#347). A
+        // free-then-dupe leaves a dangling pointer in the map when the dupe
+        // OOMs; runWithServer teardown then double-frees it.
         const new_reason = try allocator.dupe(u8, reason);
         allocator.free(entry.value_ptr.reason);
         entry.value_ptr.* = .{
