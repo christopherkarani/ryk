@@ -355,26 +355,32 @@ fn resolveSelectedHosts(
     }
 
     var options = try allocator.alloc(tui.prompt.SelectionOption, detected_count);
-    defer allocator.free(options);
+    var filled: usize = 0;
+    defer {
+        for (options[0..filled]) |opt| {
+            allocator.free(opt.label);
+            if (opt.id) |id| allocator.free(id);
+        }
+        allocator.free(options);
+    }
 
     var visible_idx: usize = 0;
     for (host_statuses) |status| {
         if (!status.detected) continue;
         const marker = if (status.installed) " (installed)" else "";
         var label_buf: [64]u8 = undefined;
-        const label = std.fmt.bufPrint(&label_buf, "{s}{s}", .{ status.name, marker }) catch status.name;
+        const label_text = std.fmt.bufPrint(&label_buf, "{s}{s}", .{ status.name, marker }) catch status.name;
+        const label = try allocator.dupe(u8, label_text);
+        errdefer allocator.free(label);
+        const id = try allocator.dupe(u8, status.name);
+        errdefer allocator.free(id);
         options[visible_idx] = .{
-            .label = try allocator.dupe(u8, label),
+            .label = label,
             .checked = !std.mem.eql(u8, status.name, "cursor"),
-            .id = try allocator.dupe(u8, status.name),
+            .id = id,
         };
+        filled += 1;
         visible_idx += 1;
-    }
-    defer {
-        for (options) |opt| {
-            allocator.free(opt.label);
-            if (opt.id) |id| allocator.free(id);
-        }
     }
 
     const confirmed = try tui.prompt.multiSelect(io, allocator, stdout, options, "Select agent hosts to integrate", null);

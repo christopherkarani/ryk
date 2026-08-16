@@ -34,17 +34,27 @@ pub fn marketplaceHostInstallSpec(
     marketplace_json: []const u8,
 ) !MarketplaceHostInstall {
     return switch (target) {
-        .codex => .{
-            .host_label = "Codex",
-            .plugin_dest = try std.fs.path.join(allocator, &.{ workspace_root, ".agents", "plugins", "ryk" }),
-            .marketplace_path = try std.fs.path.join(allocator, &.{ workspace_root, ".agents", "plugins", "marketplace.json" }),
-            .marketplace_json = marketplace_json,
+        .codex => blk: {
+            const plugin_dest = try std.fs.path.join(allocator, &.{ workspace_root, ".agents", "plugins", "ryk" });
+            errdefer allocator.free(plugin_dest);
+            const marketplace_path = try std.fs.path.join(allocator, &.{ workspace_root, ".agents", "plugins", "marketplace.json" });
+            break :blk .{
+                .host_label = "Codex",
+                .plugin_dest = plugin_dest,
+                .marketplace_path = marketplace_path,
+                .marketplace_json = marketplace_json,
+            };
         },
-        .claude => .{
-            .host_label = "Claude Code",
-            .plugin_dest = try std.fs.path.join(allocator, &.{ workspace_root, ".claude", "plugins", "ryk" }),
-            .marketplace_path = try std.fs.path.join(allocator, &.{ workspace_root, ".claude-plugin", "marketplace.json" }),
-            .marketplace_json = marketplace_json,
+        .claude => blk: {
+            const plugin_dest = try std.fs.path.join(allocator, &.{ workspace_root, ".claude", "plugins", "ryk" });
+            errdefer allocator.free(plugin_dest);
+            const marketplace_path = try std.fs.path.join(allocator, &.{ workspace_root, ".claude-plugin", "marketplace.json" });
+            break :blk .{
+                .host_label = "Claude Code",
+                .plugin_dest = plugin_dest,
+                .marketplace_path = marketplace_path,
+                .marketplace_json = marketplace_json,
+            };
         },
     };
 }
@@ -1156,4 +1166,24 @@ test "marketplace registration validation requires the exact host source" {
         path,
         .codex,
     ));
+}
+
+test "marketplaceHostInstallSpec OOM ownership does not leak first path" {
+    var saw_oom = false;
+    var saw_success = false;
+    var fail_index: usize = 0;
+    while (fail_index < 8) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        const spec = marketplaceHostInstallSpec(failing.allocator(), "/tmp/ws", .codex, "{}") catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            saw_oom = true;
+            continue;
+        };
+        failing.allocator().free(spec.plugin_dest);
+        failing.allocator().free(spec.marketplace_path);
+        saw_success = true;
+        break;
+    }
+    try std.testing.expect(saw_oom);
+    try std.testing.expect(saw_success);
 }

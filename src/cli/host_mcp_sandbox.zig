@@ -617,13 +617,29 @@ fn buildFromInventory(
         },
     }
 
+    const owned_argv = try argv.toOwnedSlice(allocator);
+    errdefer freeOwnedStrings(allocator, owned_argv);
+    const owned_exec_paths = try exec_paths.toOwnedSlice(allocator);
+    errdefer freeOwnedStrings(allocator, owned_exec_paths);
+    const owned_ro_paths = try ro_paths.toOwnedSlice(allocator);
+    errdefer freeOwnedStrings(allocator, owned_ro_paths);
+    const owned_disabled = try disabled.toOwnedSlice(allocator);
+    errdefer freeOwnedStrings(allocator, owned_disabled);
+    const owned_env_puts = try env_puts.toOwnedSlice(allocator);
+    errdefer {
+        for (owned_env_puts) |put| {
+            allocator.free(put.name);
+            allocator.free(put.value);
+        }
+        allocator.free(owned_env_puts);
+    }
     return .{
         .allocator = allocator,
-        .argv = try argv.toOwnedSlice(allocator),
-        .exec_paths = try exec_paths.toOwnedSlice(allocator),
-        .ro_paths = try ro_paths.toOwnedSlice(allocator),
-        .disabled_server_names = try disabled.toOwnedSlice(allocator),
-        .env_puts = try env_puts.toOwnedSlice(allocator),
+        .argv = owned_argv,
+        .exec_paths = owned_exec_paths,
+        .ro_paths = owned_ro_paths,
+        .disabled_server_names = owned_disabled,
+        .env_puts = owned_env_puts,
         .wrapper_root = wrapper_root,
         .audit_root = audit_root,
     };
