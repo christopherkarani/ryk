@@ -6726,6 +6726,56 @@ test "empty backpack grok interactive without config.toml still fail-closed" {
         std.mem.indexOf(u8, stderr_writer.buffered(), "cannot read host agent login/config") != null);
 }
 
+test "empty backpack grok --os-sandbox off still exit 2" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+
+    var home_tmp = std.testing.tmpDir(.{});
+    defer home_tmp.cleanup();
+    try home_tmp.dir.createDirPath(std.testing.io, ".grok/bin");
+    try home_tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = ".grok/config.toml",
+        .data = "[cli]\nauto_update = false\n",
+    });
+    try home_tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = ".grok/auth.json",
+        .data = "{\"accessToken\":\"synthetic\"}\n",
+    });
+    try home_tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = ".grok/bin/grok",
+        .data = "#!/bin/sh\nexit 0\n",
+    });
+    try home_tmp.dir.setFilePermissions(std.testing.io, ".grok/bin/grok", @enumFromInt(0o755), .{});
+    const fake_home = try home_tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(fake_home);
+    const grok_bin = try std.fs.path.join(std.testing.allocator, &.{ fake_home, ".grok/bin" });
+    defer std.testing.allocator.free(grok_bin);
+
+    var current = std.process.Environ.Map.init(std.testing.allocator);
+    defer current.deinit();
+    try current.put("PATH", grok_bin);
+    try current.put("HOME", fake_home);
+
+    var stdout_buf: [4096]u8 = undefined;
+    var stderr_buf: [4096]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+    const code = try commandForTestWithEnvAndShellEvaluator(
+        &.{ "--workspace", root, "--mode", "observe", "--os-sandbox", "off", "--", "grok", "--", "--help" },
+        &stdout_writer,
+        &stderr_writer,
+        .ignore,
+        &current,
+        shell_eval.mockDaemonAllowEvaluator,
+    );
+    try std.testing.expectEqual(exit_codes.usage, code);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "empty-backpack secret boundary requires an active OS sandbox") != null);
+}
+
 test "empty backpack allows claude --help with no credentials at all" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     try skipLinuxWorkspaceViewSelfExec();

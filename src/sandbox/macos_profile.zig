@@ -1187,6 +1187,36 @@ test "SBPL grok config.toml grant covers file plus parent-walk metadata" {
     try std.testing.expect(std.mem.indexOf(u8, sbpl, "(deny file-write* (literal \"/Users/dev/.grok/config.toml\"))") != null);
 }
 
+// Residual after #195: auth.json must be content-granted and write-denied as a
+// file. Parent-walk metadata stays on ~/.grok; no docs/lock/logs/Keychain grant.
+test "SBPL grok auth.json grant covers file plus parent-walk metadata" {
+    const allocator = std.testing.allocator;
+    const grok_auth = "/Users/dev/.grok/auth.json";
+    var compiled = try profile.compileProfile(allocator, .{
+        .workspace_root = "/tmp/ryk-grok-repro",
+        .system_ro_prefixes = &[_][]const u8{ "/usr", "/bin" },
+        .host_rw_paths = &.{grok_auth},
+        .control_roots = &.{grok_auth},
+    });
+    defer compiled.deinit();
+
+    const sbpl = try renderSbplWithOptions(allocator, &compiled, .{
+        .write_deny_literals = &.{grok_auth},
+    });
+    defer allocator.free(sbpl);
+
+    try std.testing.expect(std.mem.indexOf(u8, sbpl, "(allow file-read* (subpath \"/Users/dev/.grok/auth.json\"))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sbpl, "(allow file-read-metadata (literal \"/Users/dev/.grok\"))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sbpl, "(allow file-read* (subpath \"/Users/dev/.grok\"))\n") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sbpl, "(allow file-read* (subpath \"/Users/dev\"))") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sbpl, "Library/Keychains") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sbpl, "/dev/tty") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sbpl, ".grok/docs") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sbpl, "active_sessions.lock") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sbpl, "unified.jsonl") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sbpl, "(deny file-write* (literal \"/Users/dev/.grok/auth.json\"))") != null);
+}
+
 test "SBPL host config host_rw_paths emit subpath RW without bare HOME" {
     const allocator = std.testing.allocator;
     const claude_cfg = "/Users/dev/.claude";
