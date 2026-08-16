@@ -44,5 +44,7 @@ The docs describe the current CLI and its limits. When a platform detail matters
 - [Release process](dev/release.md)
 - [Dependency notes](dev/dependencies.md)
 - [Binary size P4 (flags-only vs `ryk-dev`)](dev/binary-size-p4.md)
+- [Zig hook server (fast hooks)](dev/zig-hook-daemon.md)
+- [Zig hook server implementation plan](dev/zig-hook-daemon-plan.md)
 
 For security reports, read [SECURITY.md](../SECURITY.md). For code and documentation changes, read [CONTRIBUTING.md](../CONTRIBUTING.md).
