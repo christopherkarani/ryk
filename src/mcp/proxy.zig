@@ -458,11 +458,12 @@ fn requestServerForClient(
             if (jsonrpc.idOf(parsed.value()) != null and sampling.isSamplingMethod(method_name)) {
                 // On sampling handler error, free both response and parsed.
                 try handleServerOriginatedSampling(allocator, config, client_reader, client_writer, server, parsed.value(), current, session_approvals);
-                parsed.deinit();
                 allocator.free(current);
                 response = null;
+                // errdefer owns parsed until read cannot fail (explicit deinit here would UAF on error return).
                 const read = server.read orelse return error.McpServerOriginatedSamplingRequiresReadableTransport;
                 response = try read(server.context, allocator);
+                parsed.deinit();
                 continue;
             }
         }
@@ -1077,6 +1078,10 @@ const ServerSamplingFirstServer = struct {
         if (std.mem.indexOf(u8, line, "\"result\"") != null and std.mem.indexOf(u8, line, "\"srv-1\"") != null) {
             self.saw_sampling_client_response = true;
         }
+    }
+
+    fn readFails(_: *anyopaque, _: std.mem.Allocator) ![]u8 {
+        return error.ReadFailed;
     }
 };
 
@@ -1713,6 +1718,132 @@ test "server-originated sampling rejects mismatched client response id" {
     try std.testing.expect(std.mem.indexOf(u8, output_writer.buffered(), "sampling/createMessage") != null);
     try std.testing.expect(std.mem.indexOf(u8, output_writer.buffered(), "\"tools\"") != null);
     try std.testing.expect(try @import("stdio.zig").isProtocolCleanOutput(output_writer.buffered(), std.testing.allocator));
+}
+
+test "server-originated sampling default-deny then missing read does not double-deinit" {
+    const load = policy_mod.load;
+    var policy = try load.parseFromSlice(std.testing.allocator,
+        \\version: 1
+        \\mode: strict
+    , "test.yaml");
+    defer policy.deinit();
+
+    var server = ServerSamplingFirstServer{};
+    var input: std.Io.Reader = .fixed("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}\n");
+    var output_buf: [2048]u8 = undefined;
+    var output_writer: std.Io.Writer = .fixed(&output_buf);
+    try std.testing.expectError(
+        error.McpServerOriginatedSamplingRequiresReadableTransport,
+        runWithServer(std.testing.allocator, .{
+            .server_name = "fake",
+            .server_command_display = "fake",
+            .policy = &policy,
+            .mode = .strict,
+        }, &input, &output_writer, .{
+            .context = &server,
+            .request = ServerSamplingFirstServer.request,
+            .notify = ServerSamplingFirstServer.notify,
+        }),
+    );
+    try std.testing.expect(server.saw_sampling_error);
+    try std.testing.expect(std.mem.indexOf(u8, output_writer.buffered(), "sampling/createMessage") == null);
+}
+
+test "server-originated sampling default-deny then read error does not double-deinit" {
+    const load = policy_mod.load;
+    var policy = try load.parseFromSlice(std.testing.allocator,
+        \\version: 1
+        \\mode: strict
+    , "test.yaml");
+    defer policy.deinit();
+
+    var server = ServerSamplingFirstServer{};
+    var input: std.Io.Reader = .fixed("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}\n");
+    var output_buf: [2048]u8 = undefined;
+    var output_writer: std.Io.Writer = .fixed(&output_buf);
+    try std.testing.expectError(
+        error.ReadFailed,
+        runWithServer(std.testing.allocator, .{
+            .server_name = "fake",
+            .server_command_display = "fake",
+            .policy = &policy,
+            .mode = .strict,
+        }, &input, &output_writer, .{
+            .context = &server,
+            .request = ServerSamplingFirstServer.request,
+            .notify = ServerSamplingFirstServer.notify,
+            .read = ServerSamplingFirstServer.readFails,
+        }),
+    );
+    try std.testing.expect(server.saw_sampling_error);
+    try std.testing.expect(std.mem.indexOf(u8, output_writer.buffered(), "sampling/createMessage") == null);
+}
+
+test "server-originated sampling allow then missing read does not double-deinit" {
+    const load = policy_mod.load;
+    var policy = try load.parseFromSlice(std.testing.allocator,
+        \\version: 1
+        \\mode: strict
+        \\mcp:
+        \\  allow:
+        \\    - "fake.local"
+    , "test.yaml");
+    defer policy.deinit();
+
+    var server = ServerSamplingFirstServer{};
+    var input: std.Io.Reader = .fixed("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}\n" ++
+        "{\"jsonrpc\":\"2.0\",\"id\":\"srv-1\",\"result\":{\"role\":\"assistant\",\"content\":{\"type\":\"text\",\"text\":\"ok\"}}}\n");
+    var output_buf: [4096]u8 = undefined;
+    var output_writer: std.Io.Writer = .fixed(&output_buf);
+    try std.testing.expectError(
+        error.McpServerOriginatedSamplingRequiresReadableTransport,
+        runWithServer(std.testing.allocator, .{
+            .server_name = "fake",
+            .server_command_display = "fake",
+            .policy = &policy,
+            .mode = .strict,
+        }, &input, &output_writer, .{
+            .context = &server,
+            .request = ServerSamplingFirstServer.request,
+            .notify = ServerSamplingFirstServer.notify,
+        }),
+    );
+    try std.testing.expect(server.saw_sampling_client_response);
+    try std.testing.expect(std.mem.indexOf(u8, output_writer.buffered(), "sampling/createMessage") != null);
+}
+
+test "server-originated sampling allow then read error does not double-deinit" {
+    const load = policy_mod.load;
+    var policy = try load.parseFromSlice(std.testing.allocator,
+        \\version: 1
+        \\mode: strict
+        \\mcp:
+        \\  allow:
+        \\    - "fake.local"
+    , "test.yaml");
+    defer policy.deinit();
+
+    var server = ServerSamplingFirstServer{};
+    var input: std.Io.Reader = .fixed("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}\n" ++
+        "{\"jsonrpc\":\"2.0\",\"id\":\"srv-1\",\"result\":{\"role\":\"assistant\",\"content\":{\"type\":\"text\",\"text\":\"ok\"}}}\n");
+    var output_buf: [4096]u8 = undefined;
+    var output_writer: std.Io.Writer = .fixed(&output_buf);
+    try std.testing.expectError(
+        error.ReadFailed,
+        runWithServer(std.testing.allocator, .{
+            .server_name = "fake",
+            .server_command_display = "fake",
+            .policy = &policy,
+            .mode = .strict,
+        }, &input, &output_writer, .{
+            .context = &server,
+            .request = ServerSamplingFirstServer.request,
+            .notify = ServerSamplingFirstServer.notify,
+            .read = ServerSamplingFirstServer.readFails,
+        }),
+    );
+    try std.testing.expect(server.saw_sampling_client_response);
+    try std.testing.expect(std.mem.indexOf(u8, output_writer.buffered(), "sampling/createMessage") != null);
 }
 
 test "invalid json-rpc fails safely with protocol error response" {
