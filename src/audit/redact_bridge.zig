@@ -98,9 +98,15 @@ fn findStructuredSecret(value: []const u8, from: usize) ?SecretSpan {
             .{ .prefix = "xoxa-", .min_after = 12 },
             .{ .prefix = "xoxs-", .min_after = 12 },
             .{ .prefix = "xoxe-", .min_after = 12 },
+            .{ .prefix = "xoxc-", .min_after = 12 },
             .{ .prefix = "sk_live_", .min_after = 8 },
             .{ .prefix = "sk_test_", .min_after = 8 },
+            .{ .prefix = "rk_live_", .min_after = 8 },
+            .{ .prefix = "rk_test_", .min_after = 8 },
+            .{ .prefix = "pk_live_", .min_after = 8 },
+            .{ .prefix = "pk_test_", .min_after = 8 },
             .{ .prefix = "glpat-", .min_after = 12 },
+            .{ .prefix = "gldt-", .min_after = 12 },
             // 20 after `hf_` (23 total) sits under real HF tokens (~34) and
             // above common HF_* identifiers (`HF_HUB_OFFLINE`, `hf_home_directory`).
             .{ .prefix = "hf_", .min_after = 20 },
@@ -273,23 +279,34 @@ fn isOpaqueSecretLabel(label: []const u8) bool {
         std.mem.eql(u8, label, "secret:aws_access_key");
 }
 
+// `@` `+` `#` split leftover jwt / AKIA beside a vendor token. `/` stays out:
+// it is standard base64, and splitting it would drop URL-embedded entropy.
+const embedded_token_delims = " \t\r\n?&=|,;:\"'()[]{}<>@+#";
+
+fn tokenHasOpaqueSecret(token: []const u8) bool {
+    const match = classifySecretValue(token) orelse return false;
+    return isOpaqueSecretLabel(match.label);
+}
+
 fn containsOpaqueSecret(value: []const u8) bool {
-    if (classifySecretValue(value)) |match| {
-        if (isOpaqueSecretLabel(match.label)) return true;
-    }
-    var tokens = std.mem.tokenizeAny(u8, value, " \t\r\n?&=|,;:\"'()[]{}<>");
+    if (tokenHasOpaqueSecret(value)) return true;
+    var tokens = std.mem.tokenizeAny(u8, value, embedded_token_delims);
     while (tokens.next()) |raw_token| {
-        const token = std.mem.trim(u8, raw_token, ":");
-        if (classifySecretValue(token)) |match| {
-            if (isOpaqueSecretLabel(match.label)) return true;
+        if (tokenHasOpaqueSecret(std.mem.trim(u8, raw_token, ":"))) return true;
+    }
+    // Second pass: leftover jwt / AKIA glued with `/`. Skip high_entropy so a
+    // slash-split base64 blob is not discarded after the first pass missed it.
+    var slash_tokens = std.mem.tokenizeAny(u8, value, embedded_token_delims ++ "/");
+    while (slash_tokens.next()) |raw_token| {
+        if (classifySecretValue(std.mem.trim(u8, raw_token, ":"))) |match| {
+            if (isOpaqueSecretLabel(match.label) and !std.mem.eql(u8, match.label, "secret:high_entropy"))
+                return true;
         }
     }
     var assignments = std.mem.tokenizeAny(u8, value, " \t\r\n");
     while (assignments.next()) |raw_token| {
         if (parseEnvAssignment(trimCommandToken(raw_token))) |assignment| {
-            if (classifySecretValue(assignment.value)) |match| {
-                if (isOpaqueSecretLabel(match.label)) return true;
-            }
+            if (tokenHasOpaqueSecret(assignment.value)) return true;
         }
     }
     return false;
@@ -601,6 +618,9 @@ pub fn redactTargetValueBounded(kind_name: []const u8, value: []const u8, buffer
         if (classifySecretValue(value)) |match| {
             return formatReplacement(buffer, match.label) catch redacted_value;
         }
+        if (containsOpaqueSecret(value) or findStructuredSecret(value, 0) != null) {
+            return redactStringBounded(value, buffer);
+        }
         return value;
     }
     return redactStringBounded(value, buffer);
@@ -652,11 +672,11 @@ pub fn classifySecretValue(value: []const u8) ?RedactionMatch {
     if (containsIgnoreCase(trimmed, "fake_secret") or containsIgnoreCase(trimmed, "fake-secret") or containsIgnoreCase(trimmed, "secret_value") or containsIgnoreCase(trimmed, "secret-value")) {
         return labeledMatch("secret:synthetic_secret");
     }
-    if (containsIgnoreCase(trimmed, "-----BEGIN ") and containsIgnoreCase(trimmed, "PRIVATE KEY-----")) {
-        return labeledMatch("secret:pem_private_key");
-    }
     if (containsIgnoreCase(trimmed, "-----BEGIN OPENSSH PRIVATE KEY-----")) {
         return labeledMatch("secret:ssh_private_key");
+    }
+    if (containsIgnoreCase(trimmed, "-----BEGIN ") and containsIgnoreCase(trimmed, "PRIVATE KEY-----")) {
+        return labeledMatch("secret:pem_private_key");
     }
     if (containsCloudCredentialJson(trimmed)) {
         return labeledMatch("secret:cloud_credentials_json");
@@ -734,10 +754,17 @@ fn classifyEmbeddedAssignment(value: []const u8) ?RedactionMatch {
 }
 
 fn classifyEmbeddedSecretToken(value: []const u8) ?RedactionMatch {
-    var tokens = std.mem.tokenizeAny(u8, value, " \t\r\n?&=|,;:\"'()[]{}<>");
+    var tokens = std.mem.tokenizeAny(u8, value, embedded_token_delims);
     while (tokens.next()) |raw_token| {
         const token = std.mem.trim(u8, raw_token, ":");
         if (classifySecretValue(token)) |match| return match;
+    }
+    var slash_tokens = std.mem.tokenizeAny(u8, value, embedded_token_delims ++ "/");
+    while (slash_tokens.next()) |raw_token| {
+        const token = std.mem.trim(u8, raw_token, ":");
+        if (classifySecretValue(token)) |match| {
+            if (!std.mem.eql(u8, match.label, "secret:high_entropy")) return match;
+        }
     }
     return null;
 }
@@ -793,7 +820,7 @@ fn looksLikePrefixedTokenChars(value: []const u8, prefix: []const u8, min_after:
 }
 
 fn looksLikeSlackToken(value: []const u8) bool {
-    const prefixes = [_][]const u8{ "xoxb-", "xoxp-", "xoxa-", "xoxs-", "xoxe-" };
+    const prefixes = [_][]const u8{ "xoxb-", "xoxp-", "xoxa-", "xoxs-", "xoxe-", "xoxc-" };
     for (prefixes) |prefix| {
         if (looksLikePrefixedTokenChars(value, prefix, 12)) return true;
     }
@@ -802,7 +829,11 @@ fn looksLikeSlackToken(value: []const u8) bool {
 
 fn looksLikeStripeKey(value: []const u8) bool {
     return looksLikePrefixedTokenChars(value, "sk_live_", 8) or
-        looksLikePrefixedTokenChars(value, "sk_test_", 8);
+        looksLikePrefixedTokenChars(value, "sk_test_", 8) or
+        looksLikePrefixedTokenChars(value, "rk_live_", 8) or
+        looksLikePrefixedTokenChars(value, "rk_test_", 8) or
+        looksLikePrefixedTokenChars(value, "pk_live_", 8) or
+        looksLikePrefixedTokenChars(value, "pk_test_", 8);
 }
 
 fn looksLikeHuggingFaceToken(value: []const u8) bool {
@@ -810,14 +841,15 @@ fn looksLikeHuggingFaceToken(value: []const u8) bool {
 }
 
 fn looksLikeGitlabToken(value: []const u8) bool {
-    return looksLikePrefixedTokenChars(value, "glpat-", 12);
+    return looksLikePrefixedTokenChars(value, "glpat-", 12) or
+        looksLikePrefixedTokenChars(value, "gldt-", 12);
 }
 
 fn isQueryParamBoundary(value: []const u8, i: usize) bool {
     if (i == 0) return true;
     const prev = value[i - 1];
-    return prev == '?' or prev == '&' or prev == ';' or prev == '=' or
-        !(std.ascii.isAlphanumeric(prev) or prev == '_' or prev == '-');
+    return prev == '?' or prev == '&' or prev == ';' or prev == '=' or prev == '-' or
+        !(std.ascii.isAlphanumeric(prev) or prev == '_');
 }
 
 fn looksLikeAzureSas(value: []const u8) bool {
@@ -836,7 +868,9 @@ fn azureSasSigAt(value: []const u8, sig_at: usize) ?SecretSpan {
     const sig_start = sig_at + "sig=".len;
     var sig_end = sig_start;
     while (sig_end < value.len and value[sig_end] != '&' and value[sig_end] != '#' and
-        value[sig_end] != ';' and !std.ascii.isWhitespace(value[sig_end])) : (sig_end += 1)
+        value[sig_end] != ';' and value[sig_end] != '"' and value[sig_end] != '\'' and
+        value[sig_end] != ')' and value[sig_end] != '>' and
+        !std.ascii.isWhitespace(value[sig_end])) : (sig_end += 1)
     {}
     if (!isConservativeAzureSasSig(value[sig_start..sig_end])) return null;
     return .{ .start = sig_start, .end = sig_end };
@@ -1017,10 +1051,14 @@ test "secret value detection covers vendor token shapes" {
     try expectSecretLabel("xoxa-fakeSynthetic", "secret:slack_token");
     try expectSecretLabel("xoxs-fakeSynthetic", "secret:slack_token");
     try expectSecretLabel("xoxe-fakeSynthetic", "secret:slack_token");
+    try expectSecretLabel("xoxc-fakeSynthetic", "secret:slack_token");
     try expectSecretLabel("sk_live_fakeSynth", "secret:stripe_api_key");
     try expectSecretLabel("sk_test_fakeSynth", "secret:stripe_api_key");
+    try expectSecretLabel("rk_live_fakeSynth", "secret:stripe_api_key");
+    try expectSecretLabel("pk_test_fakeSynth", "secret:stripe_api_key");
     try expectSecretLabel("hf_fakeSyntheticHuggingFaceTok", "secret:huggingface_token");
     try expectSecretLabel("glpat-fakeSynthetic", "secret:gitlab_token");
+    try expectSecretLabel("gldt-fakeSynthetic", "secret:gitlab_token");
     try expectSecretLabel("sv=2021-06-08&sig=fakeSyntheticAzureSasSigValue", "secret:azure_sas");
     try expectSecretLabel(
         "https://example.invalid/blob?sv=2021-06-08&sig=fakeSyntheticAzureSasSigValue",
@@ -1098,6 +1136,9 @@ test "vendor tokens are redacted when embedded mid-string" {
         .{ .value = "charge sk_test_fakeSynth now", .expected = "charge [REDACTED] now" },
         .{ .value = "model hf_fakeSyntheticHuggingFaceTok ready", .expected = "model [REDACTED] ready" },
         .{ .value = "clone glpat-fakeSynthetic ok", .expected = "clone [REDACTED] ok" },
+        .{ .value = "note xoxc-fakeSynthetic here", .expected = "note [REDACTED] here" },
+        .{ .value = "charge rk_live_fakeSynth now", .expected = "charge [REDACTED] now" },
+        .{ .value = "clone gldt-fakeSynthetic ok", .expected = "clone [REDACTED] ok" },
         .{
             .value = "get https://example.invalid/blob?sv=2021-06-08&sig=fakeSyntheticAzureSasSigValue&sp=r",
             .expected = "get https://example.invalid/blob?sv=2021-06-08&sig=[REDACTED]&sp=r",
@@ -1109,18 +1150,18 @@ test "vendor tokens are redacted when embedded mid-string" {
         try expectSpanRedaction(case.value, case.expected);
     }
 
-    // `@` is not a classify tokenizer delimiter and is outside the high-entropy
-    // alphabet, so both alloc and bounded must use findStructuredSecret.
-    const glued = [_]struct { value: []const u8, expected: []const u8 }{
-        .{ .value = "note@xoxb-fakeSynthetic@here", .expected = "note@[REDACTED]@here" },
-        .{ .value = "charge@sk_live_fakeSynth@now", .expected = "charge@[REDACTED]@now" },
-        .{ .value = "model@hf_fakeSyntheticHuggingFaceTok@ready", .expected = "model@[REDACTED]@ready" },
-        .{ .value = "clone@glpat-fakeSynthetic@ok", .expected = "clone@[REDACTED]@ok" },
+    // Alloc span-replaces. Bounded classifies `@`/`+`/`#`-split tokens and
+    // whole-redacts the vendor label (more conservative; leftover jwt cannot leak).
+    const glued = [_]struct { value: []const u8, expected_alloc: []const u8, expected_bounded: []const u8 }{
+        .{ .value = "note@xoxb-fakeSynthetic@here", .expected_alloc = "note@[REDACTED]@here", .expected_bounded = "[REDACTED:secret:slack_token]" },
+        .{ .value = "charge@sk_live_fakeSynth@now", .expected_alloc = "charge@[REDACTED]@now", .expected_bounded = "[REDACTED:secret:stripe_api_key]" },
+        .{ .value = "model@hf_fakeSyntheticHuggingFaceTok@ready", .expected_alloc = "model@[REDACTED]@ready", .expected_bounded = "[REDACTED:secret:huggingface_token]" },
+        .{ .value = "clone@glpat-fakeSynthetic@ok", .expected_alloc = "clone@[REDACTED]@ok", .expected_bounded = "[REDACTED:secret:gitlab_token]" },
     };
     for (glued) |case| {
-        try expectSpanRedaction(case.value, case.expected);
+        try expectSpanRedaction(case.value, case.expected_alloc);
         var buffer: [512]u8 = undefined;
-        try std.testing.expectEqualStrings(case.expected, redactStringBounded(case.value, &buffer));
+        try std.testing.expectEqualStrings(case.expected_bounded, redactStringBounded(case.value, &buffer));
     }
 
     const benign = [_][]const u8{
@@ -1219,6 +1260,54 @@ test "opaque secrets beside vendor or sas spans redact the whole alloc value" {
     defer std.testing.allocator.free(akia_owned);
     try std.testing.expectEqualStrings(redacted_value, akia_owned);
     try std.testing.expect(std.mem.indexOf(u8, akia_owned, "AKIA") == null);
+
+    const leftover_glue = [_][]const u8{
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJmYWtlIn0.c2lnbmF0dXJl@xoxb-fakeSynthetic",
+        "xoxb-fakeSynthetic@eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJmYWtlIn0.c2lnbmF0dXJl",
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJmYWtlIn0.c2lnbmF0dXJl+xoxb-fakeSynthetic",
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJmYWtlIn0.c2lnbmF0dXJl#xoxb-fakeSynthetic",
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJmYWtlIn0.c2lnbmF0dXJl/xoxb-fakeSynthetic",
+    };
+    for (leftover_glue) |glued| {
+        const glued_owned = try redactAlloc(std.testing.allocator, glued);
+        defer std.testing.allocator.free(glued_owned);
+        try std.testing.expectEqualStrings(redacted_value, glued_owned);
+        try std.testing.expect(std.mem.indexOf(u8, glued_owned, "eyJ") == null);
+        var buffer: [256]u8 = undefined;
+        const bounded = redactStringBounded(glued, &buffer);
+        try std.testing.expect(std.mem.indexOf(u8, bounded, "eyJ") == null);
+        try std.testing.expect(std.mem.indexOf(u8, bounded, "xoxb-fakeSynthetic") == null);
+    }
+}
+
+test "azure sas accepts hyphen prefix quotes and parens" {
+    try expectSpanRedaction(
+        "-sv=2021-06-08&sig=fakeSyntheticAzureSasSigValue",
+        "-sv=2021-06-08&sig=[REDACTED]",
+    );
+    try expectSpanRedaction(
+        "(sv=2021-06-08&sig=fakeSyntheticAzureSasSigValue)",
+        "(sv=2021-06-08&sig=[REDACTED])",
+    );
+    try expectRedactsSecret(
+        "\"sv=2021-06-08&sig=fakeSyntheticAzureSasSigValue\"",
+        "fakeSyntheticAzureSasSigValue",
+    );
+}
+
+test "env_var bounded redacts mixed opaque leftovers" {
+    const mixed = "xoxb-fakeSynthetic eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJmYWtlIn0.c2lnbmF0dXJl";
+    var buffer: [256]u8 = undefined;
+    const out = redactTargetValueBounded("env_var", mixed, &buffer);
+    try std.testing.expect(std.mem.indexOf(u8, out, "eyJ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "xoxb-fakeSynthetic") == null);
+}
+
+test "openssh private key classifies as ssh not pem" {
+    try expectSecretLabel(
+        "-----BEGIN OPENSSH PRIVATE KEY-----\nFAKE\n-----END OPENSSH PRIVATE KEY-----",
+        "secret:ssh_private_key",
+    );
 }
 
 test "azure sas accepts connection-string semicolon and entity-escaped delimiters" {
