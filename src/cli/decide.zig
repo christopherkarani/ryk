@@ -295,6 +295,22 @@ const RedactionEntry = struct {
     reason: []const u8,
 };
 
+fn appendOwnedRedaction(
+    allocator: std.mem.Allocator,
+    redactions: *std.ArrayList(RedactionEntry),
+    field: []const u8,
+    reason: []const u8,
+) !void {
+    const owned_field = try allocator.dupe(u8, field);
+    errdefer allocator.free(owned_field);
+    const owned_reason = try allocator.dupe(u8, reason);
+    errdefer allocator.free(owned_reason);
+    try redactions.append(allocator, .{
+        .field = owned_field,
+        .reason = owned_reason,
+    });
+}
+
 fn evaluateDecision(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -305,6 +321,13 @@ fn evaluateDecision(
     workspace_root: []const u8,
 ) !DecisionOutput {
     var redactions: std.ArrayList(RedactionEntry) = .empty;
+    errdefer {
+        for (redactions.items) |entry| {
+            allocator.free(entry.field);
+            allocator.free(entry.reason);
+        }
+        redactions.deinit(allocator);
+    }
 
     switch (kind) {
         .command => {
@@ -401,10 +424,7 @@ fn evaluateDecision(
             const had_secrets = redacted.len != text.len or !std.mem.eql(u8, redacted, text);
 
             if (had_secrets) {
-                try redactions.append(allocator, .{
-                    .field = try allocator.dupe(u8, "text"),
-                    .reason = try allocator.dupe(u8, "potential secret detected"),
-                });
+                try appendOwnedRedaction(allocator, &redactions, "text", "potential secret detected");
             }
 
             // Prompt decisions use policy env evaluation as a proxy for sensitivity
@@ -419,21 +439,15 @@ fn evaluateDecision(
 
             const risk: RiskLevel = if (had_secrets) .high else RiskLevel.fromScore(evaluation.decision.risk_score);
 
-            return .{
-                .decision = decision,
-                .risk = risk,
-                .category = try allocator.dupe(u8, "prompt"),
-                .reason = if (had_secrets)
-                    try allocator.dupe(u8, "prompt contains potential secret")
-                else
-                    try allocator.dupe(u8, evaluation.decision.reason),
-                .rule = if (evaluation.matched_rule) |rule| try allocator.dupe(u8, rule.id) else null,
-                .message = if (had_secrets)
-                    try allocator.dupe(u8, "Prompt may contain sensitive data. Review before submitting.")
-                else
-                    try buildMessage(allocator, decision, "prompt"),
-                .redactions = try redactions.toOwnedSlice(allocator),
-            };
+            return try buildPromptDecisionOutput(
+                allocator,
+                decision,
+                risk,
+                had_secrets,
+                evaluation.decision.reason,
+                if (evaluation.matched_rule) |rule| rule.id else null,
+                &redactions,
+            );
         },
         .tool => {
             const tool_name = extractString(payload, "name") orelse
@@ -554,6 +568,41 @@ fn pluginDecisionRestrictiveness(decision: PluginDecision) u8 {
 
 /// Build a command-path DecisionOutput with full errdefer cleanup on partial alloc.
 /// Mirrors `buildFileNormalizationBlock` ownership discipline.
+fn buildPromptDecisionOutput(
+    allocator: std.mem.Allocator,
+    decision: PluginDecision,
+    risk: RiskLevel,
+    had_secrets: bool,
+    evaluation_reason: []const u8,
+    rule_id: ?[]const u8,
+    redactions: *std.ArrayList(RedactionEntry),
+) !DecisionOutput {
+    const category = try allocator.dupe(u8, "prompt");
+    errdefer allocator.free(category);
+    const reason_owned = try allocator.dupe(u8, if (had_secrets)
+        "prompt contains potential secret"
+    else
+        evaluation_reason);
+    errdefer allocator.free(reason_owned);
+    const rule_owned: ?[]const u8 = if (rule_id) |id| try allocator.dupe(u8, id) else null;
+    errdefer if (rule_owned) |id| allocator.free(id);
+    const message = if (had_secrets)
+        try allocator.dupe(u8, "Prompt may contain sensitive data. Review before submitting.")
+    else
+        try buildMessage(allocator, decision, "prompt");
+    errdefer allocator.free(message);
+    const redactions_owned = try redactions.toOwnedSlice(allocator);
+    return .{
+        .decision = decision,
+        .risk = risk,
+        .category = category,
+        .reason = reason_owned,
+        .rule = rule_owned,
+        .message = message,
+        .redactions = redactions_owned,
+    };
+}
+
 fn buildCommandDecisionOutput(
     allocator: std.mem.Allocator,
     decision: PluginDecision,
@@ -1461,6 +1510,49 @@ test "decide rejects missing required command and file fields" {
     try std.testing.expect(missing_tool_name != exit_codes.success);
     try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "MissingRequiredField") != null);
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "\"decision\": \"error\"") != null);
+}
+
+fn appendRedactionAllocationFailureProbe(allocator: std.mem.Allocator) !void {
+    var redactions: std.ArrayList(RedactionEntry) = .empty;
+    defer {
+        for (redactions.items) |entry| {
+            allocator.free(entry.field);
+            allocator.free(entry.reason);
+        }
+        redactions.deinit(allocator);
+    }
+    try appendOwnedRedaction(allocator, &redactions, "text", "potential secret detected");
+}
+
+test "decide redaction append cleans up every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, appendRedactionAllocationFailureProbe, .{});
+}
+
+fn promptDecisionAllocationFailureProbe(allocator: std.mem.Allocator) !void {
+    var redactions: std.ArrayList(RedactionEntry) = .empty;
+    errdefer {
+        for (redactions.items) |entry| {
+            allocator.free(entry.field);
+            allocator.free(entry.reason);
+        }
+        redactions.deinit(allocator);
+    }
+    try appendOwnedRedaction(allocator, &redactions, "text", "potential secret detected");
+    var output = try buildPromptDecisionOutput(
+        allocator,
+        .warn,
+        .high,
+        true,
+        "unused",
+        null,
+        &redactions,
+    );
+    output.deinit(allocator);
+    redactions.deinit(allocator);
+}
+
+test "decide prompt response cleans up every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, promptDecisionAllocationFailureProbe, .{});
 }
 
 test "decide prompt with fake secret returns warn" {
