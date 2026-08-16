@@ -202,9 +202,14 @@ fn looksLikeImpersonation(server_name: []const u8, tool_name: []const u8) bool {
 }
 
 fn addFinding(allocator: std.mem.Allocator, findings: *std.ArrayList(Finding), tool_name: []const u8, reason: []const u8, risk: RiskClass) !void {
+    // Locals + errdefer: dual-dupe in one append orphaned tool_name on reason/append OOM (M004 / #363).
+    const owned_name = try allocator.dupe(u8, tool_name);
+    errdefer allocator.free(owned_name);
+    const owned_reason = try allocator.dupe(u8, reason);
+    errdefer allocator.free(owned_reason);
     try findings.append(allocator, .{
-        .tool_name = try allocator.dupe(u8, tool_name),
-        .reason = try allocator.dupe(u8, reason),
+        .tool_name = owned_name,
+        .reason = owned_reason,
         .risk = risk,
     });
 }
@@ -311,6 +316,48 @@ test "tools/list inspection flags canonical and stale product signatures" {
         }
         try std.testing.expect(saw_impersonation);
     }
+}
+
+test "addFinding GH363 reason OOM does not leak tool_name" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    const allocator = failing.allocator();
+    var findings: std.ArrayList(Finding) = .empty;
+    defer {
+        for (findings.items) |finding| {
+            allocator.free(finding.tool_name);
+            allocator.free(finding.reason);
+        }
+        findings.deinit(allocator);
+    }
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        addFinding(allocator, &findings, "search_issues", "exfiltrate", .critical),
+    );
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(@as(usize, 0), findings.items.len);
+    try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+}
+
+test "addFinding GH363 append OOM does not leak name or reason" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 2 });
+    const allocator = failing.allocator();
+    var findings: std.ArrayList(Finding) = .empty;
+    defer {
+        for (findings.items) |finding| {
+            allocator.free(finding.tool_name);
+            allocator.free(finding.reason);
+        }
+        findings.deinit(allocator);
+    }
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        addFinding(allocator, &findings, "search_issues", "exfiltrate", .critical),
+    );
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(@as(usize, 0), findings.items.len);
+    try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
 }
 
 test "safe read-only tool is low risk" {
