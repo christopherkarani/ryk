@@ -285,7 +285,10 @@ pub fn collectHostStatuses(io: std.Io, allocator: std.mem.Allocator, doctor_repo
         // remaining day-one hosts use PATH + plugin report.
         // Cursor (W3 writer pending): binary detect ok; never claim wired without a writer.
         const detected = if (std.mem.eql(u8, host_name, "pi"))
-            @import("host_status.zig").inspectPi(io, allocator).binary_detected
+            @import("host_status.zig").inspectPi(io, allocator).detected()
+        else if (std.mem.eql(u8, host_name, "grok"))
+            plugin.binaryInPath(io, allocator, host_name) or
+                @import("grok_install.zig").installed(io, allocator)
         else
             plugin.binaryInPath(io, allocator, host_name);
         const installed = if (std.mem.eql(u8, host_name, "pi"))
