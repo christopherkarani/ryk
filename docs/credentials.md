@@ -62,9 +62,9 @@ ryk inspects values and classifies them into specific secret types:
 | **Anthropic API Key** | `sk-ant-` prefix, 16+ chars | `sk-ant-xxxxxxxxxxxxxxxx` |
 | **Slack Token** | `xoxb-`, `xoxp-`, `xoxa-`, `xoxs-`, `xoxe-` prefix + 12 token chars | `xoxb-fakeSynthetic` |
 | **Stripe API Key** | `sk_live_` / `sk_test_` prefix (underscore, not `sk-`) + 8 token chars | `sk_live_fakeSynth` |
-| **Hugging Face Token** | `hf_` prefix, 12+ chars total | `hf_fakeSynth` |
+| **Hugging Face Token** | `hf_` prefix + 20 token chars (23+ total); excludes `HF_HUB_OFFLINE` / `hf_home_directory` | `hf_fakeSyntheticHuggingFaceTok` |
 | **GitLab Token** | `glpat-` prefix + 12 token chars | `glpat-fakeSynthetic` |
-| **Azure SAS** | query contains both `sv=` and `sig=` with a long signature | `https://example.invalid/blob?sv=2021-06-08&sig=fakeSyntheticAzureSasSigValue` |
+| **Azure SAS** | query contains both `sv=` and `sig=`; signature ≥ 16 chars and ≥ 8 distinct (restricted alphabet) | `https://example.invalid/blob?sv=2021-06-08&sig=fakeSyntheticAzureSasSigValue` |
 | **JWT** | Three base64url parts separated by dots (each part 4+ chars); first part starts with `eyJ` so dotted rule ids are not classified | `eyJhbG...eyJzdWI...c2lnbmF0dXJl` |
 | **PEM Private Key** | `-----BEGIN PRIVATE KEY-----` | RSA/EC private keys |
 | **SSH Private Key** | `-----BEGIN OPENSSH PRIVATE KEY-----` | Ed25519/RSA keys |

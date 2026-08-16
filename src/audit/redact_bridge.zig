@@ -86,7 +86,7 @@ fn findStructuredSecret(value: []const u8, from: usize) ?SecretSpan {
 
         // Vendor prefixes use per-shape floors so Stripe `sk_live_`/`sk_test_`
         // (underscore) never collide with OpenAI `sk-`, and short false friends
-        // (`xox`, `hf`, `glpat`) stay unclassified.
+        // (`xox`, `hf`, `HF_HUB_OFFLINE`, `glpat`) stay unclassified.
         const vendor_prefixes = [_]struct { prefix: []const u8, min_after: usize }{
             .{ .prefix = "xoxb-", .min_after = 12 },
             .{ .prefix = "xoxp-", .min_after = 12 },
@@ -96,7 +96,9 @@ fn findStructuredSecret(value: []const u8, from: usize) ?SecretSpan {
             .{ .prefix = "sk_live_", .min_after = 8 },
             .{ .prefix = "sk_test_", .min_after = 8 },
             .{ .prefix = "glpat-", .min_after = 12 },
-            .{ .prefix = "hf_", .min_after = 9 },
+            // 20 after `hf_` (23 total) sits under real HF tokens (~34) and
+            // above common HF_* identifiers (`HF_HUB_OFFLINE`, `hf_home_directory`).
+            .{ .prefix = "hf_", .min_after = 20 },
         };
         for (vendor_prefixes) |vendor| {
             if (startsWithIgnoreCase(value[i..], vendor.prefix)) {
@@ -725,25 +727,34 @@ fn looksLikeAnthropicKey(value: []const u8) bool {
     return std.mem.startsWith(u8, value, "sk-ant-") and value.len >= 16;
 }
 
+fn looksLikePrefixedTokenChars(value: []const u8, prefix: []const u8, min_after: usize) bool {
+    if (!startsWithIgnoreCase(value, prefix)) return false;
+    var n: usize = 0;
+    const rest = value[prefix.len..];
+    while (n < rest.len and isTokenChar(rest[n])) : (n += 1) {}
+    // Whole-value classify: the suffix must be the token-char run (no `!` padding).
+    return n == rest.len and n >= min_after;
+}
+
 fn looksLikeSlackToken(value: []const u8) bool {
     const prefixes = [_][]const u8{ "xoxb-", "xoxp-", "xoxa-", "xoxs-", "xoxe-" };
     for (prefixes) |prefix| {
-        if (std.mem.startsWith(u8, value, prefix) and value.len >= prefix.len + 12) return true;
+        if (looksLikePrefixedTokenChars(value, prefix, 12)) return true;
     }
     return false;
 }
 
 fn looksLikeStripeKey(value: []const u8) bool {
-    return (std.mem.startsWith(u8, value, "sk_live_") or std.mem.startsWith(u8, value, "sk_test_")) and
-        value.len >= 16;
+    return looksLikePrefixedTokenChars(value, "sk_live_", 8) or
+        looksLikePrefixedTokenChars(value, "sk_test_", 8);
 }
 
 fn looksLikeHuggingFaceToken(value: []const u8) bool {
-    return std.mem.startsWith(u8, value, "hf_") and value.len >= 12;
+    return looksLikePrefixedTokenChars(value, "hf_", 20);
 }
 
 fn looksLikeGitlabToken(value: []const u8) bool {
-    return std.mem.startsWith(u8, value, "glpat-") and value.len >= 18;
+    return looksLikePrefixedTokenChars(value, "glpat-", 12);
 }
 
 fn looksLikeAzureSas(value: []const u8) bool {
@@ -934,7 +945,7 @@ test "secret value detection covers synthetic examples" {
     try std.testing.expect(classifySecretValue("sk-learn") == null);
     try std.testing.expect(classifySecretValue("xoxb-fakeSynthetic") != null);
     try std.testing.expect(classifySecretValue("sk_live_fakeSynth") != null);
-    try std.testing.expect(classifySecretValue("hf_fakeSynth") != null);
+    try std.testing.expect(classifySecretValue("hf_fakeSyntheticHuggingFaceTok") != null);
     try std.testing.expect(classifySecretValue("glpat-fakeSynthetic") != null);
     try std.testing.expect(classifySecretValue("sv=2021-06-08&sig=fakeSyntheticAzureSasSigValue") != null);
 }
@@ -947,7 +958,7 @@ test "secret value detection covers vendor token shapes" {
     try expectSecretLabel("xoxe-fakeSynthetic", "secret:slack_token");
     try expectSecretLabel("sk_live_fakeSynth", "secret:stripe_api_key");
     try expectSecretLabel("sk_test_fakeSynth", "secret:stripe_api_key");
-    try expectSecretLabel("hf_fakeSynth", "secret:huggingface_token");
+    try expectSecretLabel("hf_fakeSyntheticHuggingFaceTok", "secret:huggingface_token");
     try expectSecretLabel("glpat-fakeSynthetic", "secret:gitlab_token");
     try expectSecretLabel("sv=2021-06-08&sig=fakeSyntheticAzureSasSigValue", "secret:azure_sas");
     try expectSecretLabel(
@@ -963,17 +974,46 @@ test "secret value detection covers vendor token shapes" {
     try expectSecretLabel("sk-fakeSynthetic", "secret:openai_api_key");
     try expectSecretLabel("sk-fakeSyntheticOpenAIKey1234567890", "secret:openai_api_key");
 
+    // Case-insensitive classify (env_var target path has no structured-scan fallback).
+    try expectSecretLabel("XOXB-fakeSyntheticUpperCase", "secret:slack_token");
+    try expectSecretLabel("XOXA-fakeSyntheticUpperCase", "secret:slack_token");
+    try expectSecretLabel("XOXS-fakeSyntheticUpperCase", "secret:slack_token");
+    try expectSecretLabel("XOXE-fakeSyntheticUpperCase", "secret:slack_token");
+    try expectSecretLabel("SK_LIVE_fakeSynth", "secret:stripe_api_key");
+    try expectSecretLabel("SK_TEST_fakeSynth", "secret:stripe_api_key");
+    try expectSecretLabel("HF_fakeSyntheticHuggingFaceTok", "secret:huggingface_token");
+    try expectSecretLabel("GLPAT-fakeSynthetic", "secret:gitlab_token");
+
+    // Inclusive N / exclusive N-1 token-char floors.
+    try expectSecretLabel("xoxb-abcdefghijkl", "secret:slack_token");
+    try std.testing.expect(classifySecretValue("xoxb-abcdefghijk") == null);
+    try expectSecretLabel("sk_live_abcdefgh", "secret:stripe_api_key");
+    try std.testing.expect(classifySecretValue("sk_live_abcdefg") == null);
+    try expectSecretLabel("sk_test_abcdefgh", "secret:stripe_api_key");
+    try std.testing.expect(classifySecretValue("sk_test_abcdefg") == null);
+    try expectSecretLabel("glpat-abcdefghijkl", "secret:gitlab_token");
+    try std.testing.expect(classifySecretValue("glpat-abcdefghijk") == null);
+    try expectSecretLabel("hf_abcdefghijklmnopqrst", "secret:huggingface_token");
+    try std.testing.expect(classifySecretValue("hf_abcdefghijklmnopqrs") == null);
+
     try std.testing.expect(classifySecretValue("sk-learn") == null);
     try std.testing.expect(classifySecretValue("xox") == null);
     try std.testing.expect(classifySecretValue("xoxb") == null);
     try std.testing.expect(classifySecretValue("xoxb-shorttoken") == null);
     try std.testing.expect(classifySecretValue("hf") == null);
     try std.testing.expect(classifySecretValue("hf_tooshort") == null);
+    try std.testing.expect(classifySecretValue("hf_fakeSynth") == null);
+    try std.testing.expect(classifySecretValue("HF_HUB_OFFLINE") == null);
+    try std.testing.expect(classifySecretValue("hf_home_directory") == null);
+    try std.testing.expect(classifySecretValue("hf_dataset_config") == null);
     try std.testing.expect(classifySecretValue("glpat") == null);
     try std.testing.expect(classifySecretValue("glpat_fakeSynthetic") == null);
     try std.testing.expect(classifySecretValue("sk_live_") == null);
     try std.testing.expect(classifySecretValue("sk_live_short") == null);
     try std.testing.expect(classifySecretValue("sk_test_short") == null);
+    try std.testing.expect(classifySecretValue("xoxb-!!!!!!!!!!!!") == null);
+    try std.testing.expect(classifySecretValue("sk_live_!!!!!!!!") == null);
+    try std.testing.expect(classifySecretValue("glpat-!!!!!!!!!!!!") == null);
     try std.testing.expect(classifySecretValue("sv=2021-06-08") == null);
     // `sig=` without `sv=` is not Azure SAS. A long mixed sig may still trip the
     // independent high-entropy heuristic; only the SAS label is forbidden here.
@@ -984,25 +1024,58 @@ test "secret value detection covers vendor token shapes" {
 }
 
 test "vendor tokens are redacted when embedded mid-string" {
-    const cases = [_]struct { value: []const u8, secret: []const u8 }{
-        .{ .value = "note xoxb-fakeSynthetic here", .secret = "xoxb-fakeSynthetic" },
-        .{ .value = "note xoxp-fakeSynthetic here", .secret = "xoxp-fakeSynthetic" },
-        .{ .value = "charge sk_live_fakeSynth now", .secret = "sk_live_fakeSynth" },
-        .{ .value = "charge sk_test_fakeSynth now", .secret = "sk_test_fakeSynth" },
-        .{ .value = "model hf_fakeSynth ready", .secret = "hf_fakeSynth" },
-        .{ .value = "clone glpat-fakeSynthetic ok", .secret = "glpat-fakeSynthetic" },
+    // Exact alloc results prove findStructuredSecret span replacement. If a
+    // vendor row is removed from the scanner, classifyString can still swallow
+    // the whole value and a "token disappeared" assertion would still pass.
+    const span_cases = [_]struct { value: []const u8, expected: []const u8 }{
+        .{ .value = "note xoxb-fakeSynthetic here", .expected = "note [REDACTED] here" },
+        .{ .value = "note xoxp-fakeSynthetic here", .expected = "note [REDACTED] here" },
+        .{ .value = "note xoxa-fakeSynthetic here", .expected = "note [REDACTED] here" },
+        .{ .value = "note xoxs-fakeSynthetic here", .expected = "note [REDACTED] here" },
+        .{ .value = "note xoxe-fakeSynthetic here", .expected = "note [REDACTED] here" },
+        .{ .value = "charge sk_live_fakeSynth now", .expected = "charge [REDACTED] now" },
+        .{ .value = "charge sk_test_fakeSynth now", .expected = "charge [REDACTED] now" },
+        .{ .value = "model hf_fakeSyntheticHuggingFaceTok ready", .expected = "model [REDACTED] ready" },
+        .{ .value = "clone glpat-fakeSynthetic ok", .expected = "clone [REDACTED] ok" },
         .{
             .value = "get https://example.invalid/blob?sv=2021-06-08&sig=fakeSyntheticAzureSasSigValue&sp=r",
-            .secret = "fakeSyntheticAzureSasSigValue",
+            .expected = "get https://example.invalid/blob?sv=2021-06-08&sig=[REDACTED]&sp=r",
         },
-        .{ .value = "prefix XOXB-fakeSynthetic suffix", .secret = "XOXB-fakeSynthetic" },
-        .{ .value = "https://example.invalid/?q=sk_live_fakeSynth", .secret = "sk_live_fakeSynth" },
+        .{ .value = "prefix XOXB-fakeSynthetic suffix", .expected = "prefix [REDACTED] suffix" },
+        .{ .value = "https://example.invalid/?q=sk_live_fakeSynth", .expected = "https://example.invalid/?q=[REDACTED]" },
     };
-    for (cases) |case| {
-        try expectRedactsSecret(case.value, case.secret);
+    for (span_cases) |case| {
+        try expectSpanRedaction(case.value, case.expected);
     }
 
-    const benign = [_][]const u8{ "sk-learn", "xox", "hf", "glpat", "curl --user-agent ryk /health" };
+    // `+` is not a classify tokenizer delimiter, so both alloc and bounded
+    // must use findStructuredSecret to keep the surrounding text.
+    const glued = [_]struct { value: []const u8, expected: []const u8 }{
+        .{ .value = "note+xoxb-fakeSynthetic+here", .expected = "note+[REDACTED]+here" },
+        .{ .value = "charge+sk_live_fakeSynth+now", .expected = "charge+[REDACTED]+now" },
+        .{ .value = "model+hf_fakeSyntheticHuggingFaceTok+ready", .expected = "model+[REDACTED]+ready" },
+        .{ .value = "clone+glpat-fakeSynthetic+ok", .expected = "clone+[REDACTED]+ok" },
+    };
+    for (glued) |case| {
+        try expectSpanRedaction(case.value, case.expected);
+        var buffer: [512]u8 = undefined;
+        try std.testing.expectEqualStrings(case.expected, redactStringBounded(case.value, &buffer));
+    }
+
+    const benign = [_][]const u8{
+        "sk-learn",
+        "xox",
+        "hf",
+        "glpat",
+        "xoxb-!!!!!!!!!!!!",
+        "sk_live_!!!!!!!!",
+        "glpat-!!!!!!!!!!!!",
+        "HF_HUB_OFFLINE",
+        "hf_home_directory",
+        "hf_dataset_config",
+        "hf_fakeSynth",
+        "curl --user-agent ryk /health",
+    };
     for (benign) |value| {
         const unchanged = try redactAlloc(std.testing.allocator, value);
         defer std.testing.allocator.free(unchanged);
@@ -1010,11 +1083,25 @@ test "vendor tokens are redacted when embedded mid-string" {
     }
 }
 
+test "uppercase vendor tokens redact on env_var target path" {
+    const cases = [_]struct { value: []const u8, label: []const u8 }{
+        .{ .value = "XOXB-fakeSyntheticUpperCase", .label = "[REDACTED:secret:slack_token]" },
+        .{ .value = "SK_LIVE_fakeSynth", .label = "[REDACTED:secret:stripe_api_key]" },
+        .{ .value = "HF_fakeSyntheticHuggingFaceTok", .label = "[REDACTED:secret:huggingface_token]" },
+        .{ .value = "GLPAT-fakeSynthetic", .label = "[REDACTED:secret:gitlab_token]" },
+    };
+    for (cases) |case| {
+        var buffer: [256]u8 = undefined;
+        const out = redactTargetValueBounded("env_var", case.value, &buffer);
+        try std.testing.expectEqualStrings(case.label, out);
+    }
+}
+
 test "forged REDACTED prefix cannot hide later vendor tokens" {
     const cases = [_]struct { value: []const u8, secret: []const u8 }{
         .{ .value = "prefix [REDACTED then xoxb-fakeSynthetic", .secret = "xoxb-fakeSynthetic" },
         .{ .value = "prefix [REDACTED then sk_live_fakeSynth", .secret = "sk_live_fakeSynth" },
-        .{ .value = "prefix [REDACTED then hf_fakeSynth", .secret = "hf_fakeSynth" },
+        .{ .value = "prefix [REDACTED then hf_fakeSyntheticHuggingFaceTok", .secret = "hf_fakeSyntheticHuggingFaceTok" },
         .{ .value = "prefix [REDACTED then glpat-fakeSynthetic", .secret = "glpat-fakeSynthetic" },
         .{
             .value = "prefix [REDACTED then https://example.invalid/?sv=2021-06-08&sig=fakeSyntheticAzureSasSigValue",
@@ -1529,4 +1616,10 @@ fn expectRedactsSecret(value: []const u8, secret: []const u8) !void {
     var buffer: [512]u8 = undefined;
     const bounded = redactStringBounded(value, &buffer);
     try std.testing.expect(std.mem.indexOf(u8, bounded, secret) == null);
+}
+
+fn expectSpanRedaction(value: []const u8, expected: []const u8) !void {
+    const owned = try redactAlloc(std.testing.allocator, value);
+    defer std.testing.allocator.free(owned);
+    try std.testing.expectEqualStrings(expected, owned);
 }
