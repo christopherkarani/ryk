@@ -2996,6 +2996,50 @@ test "hook help usage lists every Host.parse allowlist member including grok" {
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), info.usage) != null);
 }
 
+test "hook help documents pi as extension-only and dispatch rejects it" {
+    const host_launch = @import("host_launch.zig");
+    try std.testing.expect(Host.parse("pi") == null);
+    try std.testing.expect(Host.parse("cursor") == null);
+    try std.testing.expect(host_launch.isHostLaunchAlias("pi"));
+    try std.testing.expect(!host_launch.isHostLaunchAlias("cursor"));
+    try std.testing.expectEqual(@as(usize, 7), host_launch.host_launch_aliases.len);
+
+    const info = help.findCommand("hook") orelse return error.MissingHookHelp;
+    const open = std.mem.indexOfScalar(u8, info.usage, '<') orelse return error.MissingHostUsageGroup;
+    const close = std.mem.indexOfScalar(u8, info.usage[open..], '>') orelse return error.MissingHostUsageGroup;
+    const listed = info.usage[open + 1 .. open + close];
+    var listed_it = std.mem.splitScalar(u8, listed, '|');
+    while (listed_it.next()) |name| {
+        try std.testing.expect(!std.mem.eql(u8, name, "pi"));
+        try std.testing.expect(!std.mem.eql(u8, name, "cursor"));
+    }
+
+    var found_pi_note = false;
+    for (info.details) |line| {
+        const mentions_pi = std.mem.indexOf(u8, line, "Pi") != null or std.mem.indexOf(u8, line, "pi") != null;
+        const mentions_extension = std.mem.indexOf(u8, line, "extension") != null;
+        const mentions_evaluate = std.mem.indexOf(u8, line, "evaluate") != null;
+        if (mentions_pi and mentions_extension and mentions_evaluate) found_pi_note = true;
+    }
+    try std.testing.expect(found_pi_note);
+
+    var stdout_buf: [4096]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_buf: [256]u8 = undefined;
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+    const help_code = try command(std.testing.io, &.{"--help"}, &stdout_writer, &stderr_writer);
+    try std.testing.expectEqual(exit_codes.success, help_code);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "extension") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "evaluate") != null);
+
+    stdout_writer = .fixed(&stdout_buf);
+    stderr_writer = .fixed(&stderr_buf);
+    const pi_code = try command(std.testing.io, &.{"pi"}, &stdout_writer, &stderr_writer);
+    try std.testing.expectEqual(exit_codes.usage, pi_code);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "unknown host") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "'pi'") != null);
+}
+
 test "hook recognizes Grok as a PreToolUse host with exit-two deny semantics" {
     try std.testing.expectEqual(Host.grok, Host.parse("grok").?);
     try std.testing.expect(shouldFailClosedOnPreEval(.grok, .PreToolUse));

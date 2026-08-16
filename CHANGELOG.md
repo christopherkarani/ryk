@@ -77,6 +77,7 @@
 
 ### Fixed
 
+* **`ryk hook --help` documents that Pi is not a hook host.** Usage stays the six `Host.parse` hosts (`codex|claude|grok|opencode|openclaw|hermes`). Pi remains a launch alias and uses `ryk evaluate` / the bundled extension. Cursor is still not a hook host. The lock test now requires that honesty line and rejects `ryk hook pi`.
 * **Dashboard GET `/terminal/` is a directory index.** `formatListenUrl` prints `http://127.0.0.1:7742/terminal/`; a single trailing slash now maps to the `terminal` prefix (then `terminal/index.html` / SPA fallback) instead of failing `isSafeStaticPath` as an empty segment. Sibling trailing-slash views (`/activity/`) share the helper. `//`, `/terminal//`, and `..` still 404.
 * **`ryk start` banner names the written policy posture.** Default create still seeds generic-agent / DCG `mode: strict`. The setup-path line and first-run receipt now say `strict` (or `Ask` when the YAML is ask) instead of a hardcoded “Ask on risk (auto)”. Quiet success, one next action, no box-drawing walls. install ≠ start.
 * **`ryk hook --help` lists grok.** Dispatch already accepted `ryk hook grok`; the usage host list was a stale subset (`codex|claude|opencode|openclaw|hermes`). Help now matches `Host.parse`, and a lock test keeps the Usage group aligned with that allowlist. Pi stays on `evaluate`; cursor is not a hook host.
