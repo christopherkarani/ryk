@@ -4,6 +4,7 @@
 //! (`pack_state.zig`) so each file stays focused and under a healthy size.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const plugin = @import("plugin.zig");
 
 pub const ConfigScope = enum {
@@ -110,67 +111,119 @@ pub const LoadedPackIds = struct {
     }
 };
 
-/// Load `[packs] enabled` / `disabled` for the workspace (project `.ryk.toml` when
-/// the workspace has `.git` or `.ryk/policy.yaml`, otherwise user config).
-///
-/// **Baseline safety:** project-scoped `disabled` entries for `core` / `core.*` /
-/// `system.disk` are stripped (untrusted project files cannot drop baseline packs).
-/// User config may still opt out baseline packs; those are merged in when the
-/// active scope is project.
-/// Missing config → empty lists (baseline only).
-const PackIdCacheKey = struct {
-    exists: bool,
-    inode: std.Io.File.INode,
-    size: u64,
-    mtime_ns: i96,
-};
+const PackConfigIdentity = struct {
+    exists: bool = false,
+    inode: std.Io.File.INode = 0,
+    size: u64 = 0,
+    mtime_ns: i96 = 0,
 
-const PackIdCache = struct {
-    path: []u8,
-    path_key: PackIdCacheKey,
-    user_key: ?PackIdCacheKey,
-    enabled: []const []const u8,
-    disabled: []const []const u8,
-};
+    const missing: PackConfigIdentity = .{};
 
-// Zig 0.16: std.atomic.Mutex (not Thread.Mutex).
-var pack_id_cache_mu: std.atomic.Mutex = .unlocked;
-var pack_id_cache: ?PackIdCache = null;
-
-fn lockPackIdCache() void {
-    while (!pack_id_cache_mu.tryLock()) {
-        std.atomic.spinLoopHint();
+    fn eql(a: PackConfigIdentity, b: PackConfigIdentity) bool {
+        return a.exists == b.exists and a.inode == b.inode and a.size == b.size and a.mtime_ns == b.mtime_ns;
     }
-}
+};
 
-fn missingPackConfigKey() PackIdCacheKey {
-    return .{ .exists = false, .inode = 0, .size = 0, .mtime_ns = 0 };
-}
-
-fn statPackConfigKey(io: std.Io, path: []const u8) PackIdCacheKey {
-    const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return missingPackConfigKey();
-    defer file.close(io);
-    const st = file.stat(io) catch return missingPackConfigKey();
-    return .{
-        .exists = true,
-        .inode = st.inode,
-        .size = st.size,
-        .mtime_ns = st.mtime.nanoseconds,
+/// Process-local raw pack-id lists. Key includes path + project/user scope +
+/// inode/size/mtime. Two slots so a project miss/error never returns user-scope
+/// lists. page_allocator-owned; callers always get a deep copy.
+const PackConfigCache = struct {
+    const Slot = struct {
+        path: []u8,
+        scope: ConfigScope,
+        identity: PackConfigIdentity,
+        enabled: []const []const u8,
+        disabled: []const []const u8,
     };
+
+    var mu: std.Io.Mutex = .init;
+    var slots: [2]?Slot = .{ null, null };
+
+    fn slotIndex(scope: ConfigScope) usize {
+        return switch (scope) {
+            .project => 0,
+            .user => 1,
+        };
+    }
+
+    fn reset(io: std.Io) void {
+        mu.lockUncancelable(io);
+        defer mu.unlock(io);
+        for (&slots) |*slot| {
+            if (slot.*) |old| {
+                freeCachedSlot(old);
+                slot.* = null;
+            }
+        }
+    }
+
+    fn getCopy(
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        path: []const u8,
+        scope: ConfigScope,
+        identity: PackConfigIdentity,
+    ) ?PackIdLists {
+        mu.lockUncancelable(io);
+        defer mu.unlock(io);
+        const slot = slots[slotIndex(scope)] orelse return null;
+        if (slot.scope != scope) return null;
+        if (!std.mem.eql(u8, slot.path, path)) return null;
+        if (!slot.identity.eql(identity)) return null;
+        const enabled = cloneCachedIds(allocator, slot.enabled) catch return null;
+        const disabled = cloneCachedIds(allocator, slot.disabled) catch {
+            freeCachedIds(allocator, enabled);
+            return null;
+        };
+        return .{
+            .existing_raw = null,
+            .enabled = idsToList(enabled),
+            .disabled = idsToList(disabled),
+        };
+    }
+
+    fn put(
+        io: std.Io,
+        path: []const u8,
+        scope: ConfigScope,
+        identity: PackConfigIdentity,
+        enabled: []const []const u8,
+        disabled: []const []const u8,
+    ) void {
+        const gpa = std.heap.page_allocator;
+        const path_owned = gpa.dupe(u8, path) catch return;
+        const enabled_owned = cloneCachedIds(gpa, enabled) catch {
+            gpa.free(path_owned);
+            return;
+        };
+        const disabled_owned = cloneCachedIds(gpa, disabled) catch {
+            freeCachedIds(gpa, enabled_owned);
+            gpa.free(path_owned);
+            return;
+        };
+
+        mu.lockUncancelable(io);
+        defer mu.unlock(io);
+        const idx = slotIndex(scope);
+        if (slots[idx]) |old| freeCachedSlot(old);
+        slots[idx] = .{
+            .path = path_owned,
+            .scope = scope,
+            .identity = identity,
+            .enabled = enabled_owned,
+            .disabled = disabled_owned,
+        };
+    }
+};
+
+fn freeCachedSlot(slot: PackConfigCache.Slot) void {
+    const gpa = std.heap.page_allocator;
+    gpa.free(slot.path);
+    freeCachedIds(gpa, slot.enabled);
+    freeCachedIds(gpa, slot.disabled);
 }
 
-fn keysEqual(a: PackIdCacheKey, b: PackIdCacheKey) bool {
-    return a.exists == b.exists and a.inode == b.inode and a.size == b.size and a.mtime_ns == b.mtime_ns;
-}
-
-fn optionalKeysEqual(a: ?PackIdCacheKey, b: ?PackIdCacheKey) bool {
-    if (a == null and b == null) return true;
-    const left = a orelse return false;
-    const right = b orelse return false;
-    return keysEqual(left, right);
-}
-
-fn cloneOwnedIds(allocator: std.mem.Allocator, ids: []const []const u8) ![]const []const u8 {
+fn cloneCachedIds(allocator: std.mem.Allocator, ids: []const []const u8) ![]const []const u8 {
     if (ids.len == 0) return &.{};
     const out = try allocator.alloc([]const u8, ids.len);
     var n: usize = 0;
@@ -185,53 +238,70 @@ fn cloneOwnedIds(allocator: std.mem.Allocator, ids: []const []const u8) ![]const
     return out;
 }
 
-fn storePackIdCache(path: []const u8, path_key: PackIdCacheKey, user_key: ?PackIdCacheKey, enabled: []const []const u8, disabled: []const []const u8) void {
-    const gpa = std.heap.page_allocator;
-    const path_owned = gpa.dupe(u8, path) catch return;
-    const enabled_owned = cloneOwnedIds(gpa, enabled) catch {
-        gpa.free(path_owned);
-        return;
-    };
-    const disabled_owned = cloneOwnedIds(gpa, disabled) catch {
-        freeOwnedSlice(gpa, enabled_owned);
-        gpa.free(path_owned);
-        return;
-    };
-    lockPackIdCache();
-    defer pack_id_cache_mu.unlock();
-    if (pack_id_cache) |*old| {
-        gpa.free(old.path);
-        freeOwnedSlice(gpa, old.enabled);
-        freeOwnedSlice(gpa, old.disabled);
-    }
-    pack_id_cache = .{
-        .path = path_owned,
-        .path_key = path_key,
-        .user_key = user_key,
-        .enabled = enabled_owned,
-        .disabled = disabled_owned,
+fn freeCachedIds(allocator: std.mem.Allocator, ids: []const []const u8) void {
+    if (ids.len == 0) return;
+    for (ids) |id| allocator.free(id);
+    allocator.free(ids);
+}
+
+fn idsToList(ids: []const []const u8) std.ArrayListUnmanaged([]const u8) {
+    if (ids.len == 0) return .empty;
+    return .{
+        .items = @constCast(ids),
+        .capacity = ids.len,
     };
 }
 
-fn cloneFromPackIdCache(allocator: std.mem.Allocator, path: []const u8, path_key: PackIdCacheKey, user_key: ?PackIdCacheKey) ?LoadedPackIds {
-    lockPackIdCache();
-    defer pack_id_cache_mu.unlock();
-    const cached = pack_id_cache orelse return null;
-    if (!std.mem.eql(u8, cached.path, path)) return null;
-    if (!keysEqual(cached.path_key, path_key)) return null;
-    if (!optionalKeysEqual(cached.user_key, user_key)) return null;
-    const enabled = cloneOwnedIds(allocator, cached.enabled) catch return null;
-    const disabled = cloneOwnedIds(allocator, cached.disabled) catch {
-        freeOwnedSlice(allocator, enabled);
-        return null;
+fn statPackConfigIdentity(io: std.Io, path: []const u8) !PackConfigIdentity {
+    const st = std.Io.Dir.cwd().statFile(io, path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return PackConfigIdentity.missing,
+        else => return err,
     };
     return .{
-        .enabled = enabled,
-        .disabled = disabled,
-        .owned = true,
+        .exists = true,
+        .inode = st.inode,
+        .size = st.size,
+        .mtime_ns = st.mtime.toNanoseconds(),
     };
 }
 
+/// Raw enabled/disabled from the file (or cache). Does **not** strip or merge.
+fn loadRawPackIdListsCached(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    scope: ConfigScope,
+) !PackIdLists {
+    const identity = statPackConfigIdentity(io, path) catch |err| switch (err) {
+        error.FileNotFound => PackConfigIdentity.missing,
+        else => return err,
+    };
+
+    if (PackConfigCache.getCopy(io, allocator, path, scope, identity)) |hit| return hit;
+
+    var lists: PackIdLists = if (!identity.exists)
+        .{ .existing_raw = null }
+    else
+        try loadPackIdLists(io, allocator, path);
+    errdefer lists.deinit(allocator);
+
+    PackConfigCache.put(io, path, scope, identity, lists.enabled.items, lists.disabled.items);
+    return lists;
+}
+
+/// Load `[packs] enabled` / `disabled` for the workspace (project `.ryk.toml` when
+/// the workspace has `.git` or `.ryk/policy.yaml`, otherwise user config).
+///
+/// **Baseline safety:** project-scoped `disabled` entries for `core` / `core.*` /
+/// `system.disk` are stripped (untrusted project files cannot drop baseline packs).
+/// User config may still opt out baseline packs; those are merged in when the
+/// active scope is project.
+/// Missing config → empty lists (baseline only).
+///
+/// In-process cache stores **raw** file lists keyed by path + scope + identity.
+/// Every project fill re-applies M-8 strip + user baseline merge (never a pre-strip
+/// blob). Invalid/unreadable project files fail closed — they never return a
+/// user-scope cache hit.
 pub fn loadPackIdsForWorkspace(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -243,15 +313,7 @@ pub fn loadPackIdsForWorkspace(
     };
     defer allocator.free(resolved.path);
 
-    const path_key = statPackConfigKey(io, resolved.path);
-    const user_key: ?PackIdCacheKey = if (resolved.scope == .project) blk: {
-        const user = resolveUserPackConfigPath(allocator) catch break :blk null;
-        defer allocator.free(user.path);
-        break :blk statPackConfigKey(io, user.path);
-    } else null;
-    if (cloneFromPackIdCache(allocator, resolved.path, path_key, user_key)) |hit| return hit;
-
-    var lists = loadPackIdLists(io, allocator, resolved.path) catch |err| switch (err) {
+    var lists = loadRawPackIdListsCached(io, allocator, resolved.path, resolved.scope) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         // User-scope config under Seatbelt "no bare home" (or missing HOME path) is
         // unreadable by design → baseline packs only, not a shell hard-deny.
@@ -263,7 +325,8 @@ pub fn loadPackIdsForWorkspace(
     errdefer lists.deinit(allocator);
 
     if (resolved.scope == .project) {
-        // Project file must never turn off baseline packs (M-8).
+        // Project file must never turn off baseline packs (M-8). Always re-apply
+        // on fill — cache holds raw lists, never a stripped/merged blob.
         try stripBaselineIdsFromList(allocator, &lists.disabled);
         // Operator baseline opt-outs live in user config; merge them in.
         try mergeUserBaselineDisabled(io, allocator, &lists.disabled);
@@ -279,24 +342,11 @@ pub fn loadPackIdsForWorkspace(
     // Drop raw file buffer / empty lists.
     lists.deinit(allocator);
 
-    storePackIdCache(resolved.path, path_key, user_key, enabled, disabled);
     return .{
         .enabled = enabled,
         .disabled = disabled,
         .owned = true,
     };
-}
-
-fn resetPackIdCacheForTests() void {
-    lockPackIdCache();
-    defer pack_id_cache_mu.unlock();
-    if (pack_id_cache) |*old| {
-        const gpa = std.heap.page_allocator;
-        gpa.free(old.path);
-        freeOwnedSlice(gpa, old.enabled);
-        freeOwnedSlice(gpa, old.disabled);
-        pack_id_cache = null;
-    }
 }
 
 /// Errors that mean "cannot read user config under sandbox residual", not "corrupt
@@ -332,7 +382,7 @@ fn mergeUserBaselineDisabled(
     const user = resolveUserPackConfigPath(allocator) catch return;
     defer allocator.free(user.path);
 
-    var user_lists = loadPackIdLists(io, allocator, user.path) catch |err| switch (err) {
+    var user_lists = loadRawPackIdListsCached(io, allocator, user.path, .user) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
             // Missing / unreadable user config: no baseline opt-outs to merge.
@@ -860,6 +910,7 @@ fn writePacksArrays(
 }
 
 fn readFileIfExists(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    if (builtin.is_test) testing_pack_config_reads += 1;
     return std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024)) catch |err| switch (err) {
         error.FileNotFound => return error.FileNotFound,
         else => return err,
@@ -1150,6 +1201,13 @@ fn collectQuotedIdsForKeyOwned(
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
+var testing_pack_config_reads: usize = 0;
+
+fn resetPackIdCacheForTests(io: std.Io) void {
+    PackConfigCache.reset(io);
+    testing_pack_config_reads = 0;
+}
+
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 
@@ -1390,6 +1448,232 @@ test "loadPackIdsForWorkspace survives unreadable user config when merging basel
     }
 }
 
+test "loadPackIdsForWorkspace does not re-read unchanged project pack config" {
+    resetPackIdCacheForTests(std.testing.io);
+    defer resetPackIdCacheForTests(std.testing.io);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, ".git");
+    {
+        const f = try tmp.dir.createFile(std.testing.io, ".ryk.toml", .{});
+        defer f.close(std.testing.io);
+        try f.writeStreamingAll(std.testing.io,
+            \\[packs]
+            \\enabled = ["containers.docker"]
+            \\
+        );
+    }
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+
+    var xdg = try testIsolateXdg();
+    defer xdg.deinit();
+
+    testing_pack_config_reads = 0;
+    {
+        var first = try loadPackIdsForWorkspace(std.testing.io, std.testing.allocator, root);
+        defer first.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 1), first.enabled.len);
+        try std.testing.expectEqualStrings("containers.docker", first.enabled[0]);
+    }
+    const reads_after_first = testing_pack_config_reads;
+    try std.testing.expect(reads_after_first >= 1);
+
+    {
+        var second = try loadPackIdsForWorkspace(std.testing.io, std.testing.allocator, root);
+        defer second.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 1), second.enabled.len);
+        try std.testing.expectEqualStrings("containers.docker", second.enabled[0]);
+    }
+    try std.testing.expectEqual(reads_after_first, testing_pack_config_reads);
+}
+
+test "loadPackIdsForWorkspace cache invalidates when pack config changes" {
+    resetPackIdCacheForTests(std.testing.io);
+    defer resetPackIdCacheForTests(std.testing.io);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, ".git");
+    {
+        const f = try tmp.dir.createFile(std.testing.io, ".ryk.toml", .{});
+        defer f.close(std.testing.io);
+        try f.writeStreamingAll(std.testing.io,
+            \\[packs]
+            \\enabled = ["containers.docker"]
+            \\
+        );
+    }
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+
+    var xdg = try testIsolateXdg();
+    defer xdg.deinit();
+
+    {
+        var first = try loadPackIdsForWorkspace(std.testing.io, std.testing.allocator, root);
+        defer first.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 1), first.enabled.len);
+        try std.testing.expectEqualStrings("containers.docker", first.enabled[0]);
+    }
+
+    {
+        const f = try tmp.dir.createFile(std.testing.io, ".ryk.toml", .{ .truncate = true });
+        defer f.close(std.testing.io);
+        try f.writeStreamingAll(std.testing.io,
+            \\[packs]
+            \\enabled = ["containers.docker", "package_managers"]
+            \\
+        );
+    }
+
+    var third = try loadPackIdsForWorkspace(std.testing.io, std.testing.allocator, root);
+    defer third.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), third.enabled.len);
+    var saw_pkg = false;
+    for (third.enabled) |id| {
+        if (std.mem.eql(u8, id, "package_managers")) saw_pkg = true;
+    }
+    try std.testing.expect(saw_pkg);
+}
+
+test "loadPackIdsForWorkspace cache hit still strips project baseline disabled" {
+    resetPackIdCacheForTests(std.testing.io);
+    defer resetPackIdCacheForTests(std.testing.io);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, ".git");
+    {
+        const f = try tmp.dir.createFile(std.testing.io, ".ryk.toml", .{});
+        defer f.close(std.testing.io);
+        try f.writeStreamingAll(std.testing.io,
+            \\[packs]
+            \\enabled = ["containers.docker"]
+            \\disabled = ["system.disk", "core.git", "strict_git"]
+            \\
+        );
+    }
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+
+    var xdg = try testIsolateXdg();
+    defer xdg.deinit();
+
+    var i: usize = 0;
+    while (i < 2) : (i += 1) {
+        var loaded = try loadPackIdsForWorkspace(std.testing.io, std.testing.allocator, root);
+        defer loaded.deinit(std.testing.allocator);
+        var saw_strict = false;
+        for (loaded.disabled) |id| {
+            try std.testing.expect(!isBaselineDisabledToken(id));
+            if (std.mem.eql(u8, id, "strict_git")) saw_strict = true;
+        }
+        try std.testing.expect(saw_strict);
+    }
+}
+
+test "loadPackIdsForWorkspace cache hit still merges new user baseline" {
+    resetPackIdCacheForTests(std.testing.io);
+    defer resetPackIdCacheForTests(std.testing.io);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, ".git");
+    {
+        const f = try tmp.dir.createFile(std.testing.io, ".ryk.toml", .{});
+        defer f.close(std.testing.io);
+        try f.writeStreamingAll(std.testing.io,
+            \\[packs]
+            \\enabled = ["containers.docker"]
+            \\disabled = []
+            \\
+        );
+    }
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+
+    var xdg = try testIsolateXdg();
+    defer xdg.deinit();
+
+    {
+        var first = try loadPackIdsForWorkspace(std.testing.io, std.testing.allocator, root);
+        defer first.deinit(std.testing.allocator);
+        for (first.disabled) |id| {
+            try std.testing.expect(!std.mem.eql(u8, id, "system.disk"));
+        }
+    }
+
+    {
+        const user = try resolveUserPackConfigPath(std.testing.allocator);
+        defer std.testing.allocator.free(user.path);
+        try writeConfigFile(std.testing.io, std.testing.allocator, user.path,
+            \\[packs]
+            \\enabled = []
+            \\disabled = ["system.disk"]
+            \\
+        );
+    }
+
+    var second = try loadPackIdsForWorkspace(std.testing.io, std.testing.allocator, root);
+    defer second.deinit(std.testing.allocator);
+    var saw_disk = false;
+    for (second.disabled) |id| {
+        if (std.mem.eql(u8, id, "system.disk")) saw_disk = true;
+    }
+    try std.testing.expect(saw_disk);
+}
+
+test "loadPackIdsForWorkspace invalid project file fail-closes not user-scope cache" {
+    resetPackIdCacheForTests(std.testing.io);
+    defer resetPackIdCacheForTests(std.testing.io);
+
+    var xdg = try testIsolateXdg();
+    defer xdg.deinit();
+
+    {
+        const user = try resolveUserPackConfigPath(std.testing.allocator);
+        defer std.testing.allocator.free(user.path);
+        try writeConfigFile(std.testing.io, std.testing.allocator, user.path,
+            \\[packs]
+            \\enabled = ["containers.docker"]
+            \\disabled = []
+            \\
+        );
+    }
+
+    var user_tmp = std.testing.tmpDir(.{});
+    defer user_tmp.cleanup();
+    const user_root = try user_tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(user_root);
+    {
+        var warmed = try loadPackIdsForWorkspace(std.testing.io, std.testing.allocator, user_root);
+        defer warmed.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 1), warmed.enabled.len);
+        try std.testing.expectEqualStrings("containers.docker", warmed.enabled[0]);
+    }
+
+    var proj = std.testing.tmpDir(.{});
+    defer proj.cleanup();
+    try proj.dir.createDirPath(std.testing.io, ".git");
+    try proj.dir.createDirPath(std.testing.io, ".ryk.toml");
+    const proj_root = try proj.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(proj_root);
+
+    if (loadPackIdsForWorkspace(std.testing.io, std.testing.allocator, proj_root)) |owned| {
+        var loaded = owned;
+        defer loaded.deinit(std.testing.allocator);
+        for (loaded.enabled) |id| {
+            try std.testing.expect(!std.mem.eql(u8, id, "containers.docker"));
+        }
+        return error.TestUnexpectedResult;
+    } else |err| {
+        try std.testing.expect(err != error.HomeDirectoryNotFound);
+        try std.testing.expect(err != error.FileNotFound);
+    }
+}
+
 test "loadPackIdsForWorkspace user-scope AccessDenied degrades to baseline only" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
 
@@ -1422,62 +1706,6 @@ test "loadPackIdsForWorkspace user-scope AccessDenied degrades to baseline only"
     // Soft residual: empty lists (baseline only), not error.
     try std.testing.expectEqual(@as(usize, 0), loaded.enabled.len);
     try std.testing.expectEqual(@as(usize, 0), loaded.disabled.len);
-}
-
-test "loadPackIdsForWorkspace cache invalidates when pack config changes" {
-    resetPackIdCacheForTests();
-    defer resetPackIdCacheForTests();
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, ".git");
-    {
-        const f = try tmp.dir.createFile(std.testing.io, ".ryk.toml", .{});
-        defer f.close(std.testing.io);
-        try f.writeStreamingAll(std.testing.io,
-            \\[packs]
-            \\enabled = ["containers.docker"]
-            \\
-        );
-    }
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
-    defer std.testing.allocator.free(root);
-
-    var xdg = try testIsolateXdg();
-    defer xdg.deinit();
-
-    {
-        var first = try loadPackIdsForWorkspace(std.testing.io, std.testing.allocator, root);
-        defer first.deinit(std.testing.allocator);
-        try std.testing.expectEqual(@as(usize, 1), first.enabled.len);
-        try std.testing.expectEqualStrings("containers.docker", first.enabled[0]);
-    }
-    {
-        // Same mtime/size: second load must still return the cached enablement.
-        var second = try loadPackIdsForWorkspace(std.testing.io, std.testing.allocator, root);
-        defer second.deinit(std.testing.allocator);
-        try std.testing.expectEqual(@as(usize, 1), second.enabled.len);
-        try std.testing.expectEqualStrings("containers.docker", second.enabled[0]);
-    }
-
-    {
-        const f = try tmp.dir.createFile(std.testing.io, ".ryk.toml", .{ .truncate = true });
-        defer f.close(std.testing.io);
-        try f.writeStreamingAll(std.testing.io,
-            \\[packs]
-            \\enabled = ["containers.docker", "package_managers"]
-            \\
-        );
-    }
-
-    var third = try loadPackIdsForWorkspace(std.testing.io, std.testing.allocator, root);
-    defer third.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 2), third.enabled.len);
-    var saw_pkg = false;
-    for (third.enabled) |id| {
-        if (std.mem.eql(u8, id, "package_managers")) saw_pkg = true;
-    }
-    try std.testing.expect(saw_pkg);
 }
 
 test "resolvePackConfigPath treats .ryk/policy.yaml as project marker" {

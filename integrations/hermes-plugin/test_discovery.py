@@ -50,11 +50,50 @@ def _write_identity_ryk(path: Path, mode: int = 0o700) -> Path:
     return path
 
 
+def _non_tmp_parent() -> Path:
+    """Writable directory outside ryk tmp-plant roots (worktrees may live under /var/folders)."""
+    tmp_roots: list[Path] = []
+    for raw in (tempfile.gettempdir(), "/tmp", "/private/tmp"):
+        try:
+            tmp_roots.append(Path(raw).resolve())
+        except OSError:
+            continue
+
+    def under_tmp(path: Path) -> bool:
+        try:
+            resolved = path.resolve()
+        except OSError:
+            return True
+        for root in tmp_roots:
+            try:
+                resolved.relative_to(root)
+                return True
+            except ValueError:
+                continue
+        return False
+
+    for candidate in (
+        Path(__file__).resolve().parent,
+        Path.home() / ".cache" / "ryk-hermes-plugin-tests",
+        Path("/var/tmp") / "ryk-hermes-plugin-tests",
+    ):
+        if under_tmp(candidate):
+            continue
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            probe = candidate / ".write-probe"
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink()
+            return candidate
+        except OSError:
+            continue
+    raise RuntimeError("no writable non-tmp directory for source-build discovery tests")
+
+
 @contextlib.contextmanager
 def _non_tmp_dir():
     """Temp directory that is not under /tmp, so source-build trust can be tested."""
-    root = Path(__file__).resolve().parent
-    with tempfile.TemporaryDirectory(prefix="ryk-disc-", dir=root) as directory:
+    with tempfile.TemporaryDirectory(prefix="ryk-disc-", dir=_non_tmp_parent()) as directory:
         yield Path(directory)
 
 
@@ -62,6 +101,7 @@ class HermesPluginDiscoveryTests(unittest.TestCase):
     def setUp(self) -> None:
         _PLUGIN._ryk_cache_env = None
         _PLUGIN._ryk_cache_path = None
+        _PLUGIN._clear_sticky_attest()
 
     def test_fail_open_requires_explicit_configuration(self) -> None:
         with mock.patch.dict(os.environ, {}, clear=False):

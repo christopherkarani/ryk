@@ -33,17 +33,6 @@ pub const pending_rotation_grace_secs: i64 = 300;
 pub const pending_file_name = "pending_exceptions.jsonl";
 pub const allow_once_file_name = "allow_once.jsonl";
 
-/// Test-only: number of durable allow-once rewrites in this process.
-var test_allow_once_writes: usize = 0;
-
-pub fn resetTestAllowOnceWriteCount() void {
-    test_allow_once_writes = 0;
-}
-
-pub fn testAllowOnceWriteCount() usize {
-    return test_allow_once_writes;
-}
-
 pub const ScopeKind = enum {
     cwd,
     project,
@@ -168,6 +157,19 @@ pub const LoadAllowOnce = struct {
 pub const ClearResult = struct {
     removed: usize = 0,
     maintenance: Maintenance = .{},
+};
+
+/// Test-only peek/consume instrumentation. Product paths ignore these.
+pub const test_support = struct {
+    pub var load_count: u32 = 0;
+    pub var fail_eval_after_peek: bool = false;
+    pub var after_peek: ?*const fn (std.Io, std.mem.Allocator, []const u8) anyerror!void = null;
+
+    pub fn reset() void {
+        load_count = 0;
+        fail_eval_after_peek = false;
+        after_peek = null;
+    }
 };
 
 pub fn freePendingRecord(gpa: std.mem.Allocator, r: PendingRecord) void {
@@ -628,6 +630,38 @@ pub fn loadAllowOnceActive(
     return allowOnceStateToLoad(gpa, &state);
 }
 
+/// On-disk identity captured under the peek lock. Consume writes the held
+/// generation only when this still matches; otherwise one reload + rematch.
+pub const AllowOnceIdentity = struct {
+    inode: std.Io.File.INode,
+    size: u64,
+    mtime_ns: i96,
+
+    fn eql(a: AllowOnceIdentity, b: AllowOnceIdentity) bool {
+        return a.inode == b.inode and a.size == b.size and a.mtime_ns == b.mtime_ns;
+    }
+};
+
+/// Parsed allow-once generation held on the tryAllowOnce stack (not a process cache).
+pub const PeekedAllowOnce = struct {
+    entry: AllowOnceEntry,
+    generation: []AllowOnceEntry,
+    live_len: usize,
+    hit_idx: usize,
+    identity: AllowOnceIdentity,
+
+    pub fn deinit(self: *PeekedAllowOnce, gpa: std.mem.Allocator) void {
+        freeAllowOnceEntry(gpa, self.entry);
+        freeAllowOnceEntries(gpa, self.generation[0..self.live_len]);
+        if (self.generation.len > 0) gpa.free(self.generation);
+        self.* = undefined;
+    }
+
+    fn live(self: *PeekedAllowOnce) []AllowOnceEntry {
+        return self.generation[0..self.live_len];
+    }
+};
+
 /// Match exact command + scope. When `consume` is true and the entry is single_use,
 /// remove it from the store (evaluate path). When `consume` is false, leave store intact
 /// (explain / dry-run / peek before consume).
@@ -654,15 +688,7 @@ pub fn matchAllowOnce(
         state.active.deinit(gpa);
     }
 
-    var hit_idx: ?usize = null;
-    for (state.active.items, 0..) |e, i| {
-        if (!std.mem.eql(u8, e.command_raw, command)) continue;
-        if (!scopeMatches(e, cwd)) continue;
-        hit_idx = i;
-        break;
-    }
-
-    const idx = hit_idx orelse {
+    const idx = findAllowOnceHit(state.active.items, command, cwd) orelse {
         if (state.dirty) {
             try writeAllowOnceFile(runtime_io, gpa, allow_once_path, state.active.items);
         }
@@ -685,18 +711,15 @@ pub fn matchAllowOnce(
     return owned;
 }
 
-
-/// Re-insert a previously consumed single-use entry (M-15 restore path).
-/// Used when Evaluation construction fails after a durable consume so the grant
-/// is not lost. Best-effort: if a concurrent writer already re-added an equivalent
-/// command+scope entry, this is a no-op success. Failures propagate (caller fail-closes).
-pub fn restoreAllowOnceEntry(
+/// Load + match without consuming. Caller holds the generation for a later locked consume.
+pub fn peekAllowOnce(
     runtime_io: std.Io,
     gpa: std.mem.Allocator,
     allow_once_path: []const u8,
-    entry: AllowOnceEntry,
+    command: []const u8,
+    cwd: []const u8,
     now_iso: []const u8,
-) !void {
+) !?PeekedAllowOnce {
     var lock = try StoreLock.acquire(runtime_io, gpa, allow_once_path);
     defer lock.release(runtime_io);
 
@@ -706,29 +729,111 @@ pub fn restoreAllowOnceEntry(
         state.active.deinit(gpa);
     }
 
-    // Dedup: same command + identical scope already present → leave store as-is.
-    for (state.active.items) |e| {
-        const same_cmd = std.mem.eql(u8, e.command_raw, entry.command_raw);
-        const same_scope = e.scope_kind == entry.scope_kind and std.mem.eql(u8, e.scope_path, entry.scope_path);
-        if (same_cmd and same_scope) {
-            if (state.dirty) {
-                try writeAllowOnceFile(runtime_io, gpa, allow_once_path, state.active.items);
-            }
-            return;
+    const idx = findAllowOnceHit(state.active.items, command, cwd) orelse {
+        if (state.dirty) {
+            try writeAllowOnceFile(runtime_io, gpa, allow_once_path, state.active.items);
         }
+        return null;
+    };
+
+    if (state.dirty) {
+        try writeAllowOnceFile(runtime_io, gpa, allow_once_path, state.active.items);
     }
 
-    const owned = try cloneAllowOnceEntry(gpa, entry);
-    errdefer freeAllowOnceEntry(gpa, owned);
-    // Restored grants must remain single-use and unconsumed.
-    var restored = owned;
-    if (restored.consumed_at) |c| {
-        gpa.free(c);
-        restored.consumed_at = null;
+    const identity = try statAllowOnceIdentity(runtime_io, allow_once_path);
+    const entry = try cloneAllowOnceEntry(gpa, state.active.items[idx]);
+    errdefer freeAllowOnceEntry(gpa, entry);
+
+    const generation = try state.active.toOwnedSlice(gpa);
+    return .{
+        .entry = entry,
+        .generation = generation,
+        .live_len = generation.len,
+        .hit_idx = idx,
+        .identity = identity,
+    };
+}
+
+/// Durable consume after Evaluation exists. Re-stats under lock. Unchanged
+/// identity writes the held generation; mismatch reloads once and rematches.
+/// Vanished store is an error (caller fail-closes). Never writes a stale peek snapshot.
+pub fn consumePeekedAllowOnce(
+    runtime_io: std.Io,
+    gpa: std.mem.Allocator,
+    allow_once_path: []const u8,
+    peeked: *PeekedAllowOnce,
+    command: []const u8,
+    cwd: []const u8,
+    now_iso: []const u8,
+) !void {
+    if (!peeked.entry.single_use) return;
+
+    var lock = try StoreLock.acquire(runtime_io, gpa, allow_once_path);
+    defer lock.release(runtime_io);
+
+    const live_id = statAllowOnceIdentity(runtime_io, allow_once_path) catch |err| switch (err) {
+        error.FileNotFound => return error.FileNotFound,
+        else => return err,
+    };
+
+    if (AllowOnceIdentity.eql(live_id, peeked.identity)) {
+        removePeekedHit(gpa, peeked);
+        try writeAllowOnceFile(runtime_io, gpa, allow_once_path, peeked.live());
+        return;
     }
-    restored.single_use = true;
-    try state.active.append(gpa, restored);
+
+    var state = try loadAllowOnceState(runtime_io, gpa, allow_once_path, now_iso);
+    defer {
+        freeAllowOnceEntries(gpa, state.active.items);
+        state.active.deinit(gpa);
+    }
+
+    const idx = findAllowOnceHit(state.active.items, command, cwd) orelse {
+        if (state.dirty) {
+            try writeAllowOnceFile(runtime_io, gpa, allow_once_path, state.active.items);
+        }
+        return error.AlreadyConsumed;
+    };
+
+    if (!state.active.items[idx].single_use) {
+        if (state.dirty) {
+            try writeAllowOnceFile(runtime_io, gpa, allow_once_path, state.active.items);
+        }
+        return;
+    }
+
+    const taken = state.active.orderedRemove(idx);
+    freeAllowOnceEntry(gpa, taken);
     try writeAllowOnceFile(runtime_io, gpa, allow_once_path, state.active.items);
+}
+
+fn findAllowOnceHit(entries: []const AllowOnceEntry, command: []const u8, cwd: []const u8) ?usize {
+    for (entries, 0..) |e, i| {
+        if (!std.mem.eql(u8, e.command_raw, command)) continue;
+        if (!scopeMatches(e, cwd)) continue;
+        return i;
+    }
+    return null;
+}
+
+fn statAllowOnceIdentity(runtime_io: std.Io, path: []const u8) !AllowOnceIdentity {
+    const st = try std.Io.Dir.cwd().statFile(runtime_io, path, .{});
+    return .{
+        .inode = st.inode,
+        .size = st.size,
+        .mtime_ns = st.mtime.toNanoseconds(),
+    };
+}
+
+fn removePeekedHit(gpa: std.mem.Allocator, peeked: *PeekedAllowOnce) void {
+    std.debug.assert(peeked.hit_idx < peeked.live_len);
+    const taken = peeked.generation[peeked.hit_idx];
+    var i = peeked.hit_idx;
+    while (i + 1 < peeked.live_len) : (i += 1) {
+        peeked.generation[i] = peeked.generation[i + 1];
+    }
+    peeked.live_len -= 1;
+    freeAllowOnceEntry(gpa, taken);
 }
 
 pub fn clearAllowOnce(
@@ -1088,6 +1193,7 @@ fn loadAllowOnceState(
     allow_once_path: []const u8,
     now_iso: []const u8,
 ) !AllowOnceState {
+    if (builtin.is_test) test_support.load_count += 1;
     var state: AllowOnceState = .{};
     errdefer {
         freeAllowOnceEntries(gpa, state.active.items);
@@ -1228,7 +1334,6 @@ fn writeAllowOnceFile(
     path: []const u8,
     entries: []const AllowOnceEntry,
 ) !void {
-    if (builtin.is_test) test_allow_once_writes += 1;
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(gpa);
     for (entries) |e| {
@@ -2278,9 +2383,7 @@ test "s3-once-store: match with consume=false leaves single-use entry intact" {
     try testing.expect(d == null);
 }
 
-test "P001: consume is a single allow-once rewrite" {
-    // tryAllowOnce must not load+rewrite twice. matchAllowOnce(consume=true)
-    // is the single durable pass; rewrite+fsync stays (do not drop).
+test "s3-once-store: allow-once peek plus consume is one load when identity holds" {
     var tmp = try tmpRoot();
     defer {
         allocator.free(tmp.path);
@@ -2298,12 +2401,12 @@ test "P001: consume is a single allow-once rewrite" {
         paths.pending,
         "git reset --hard HEAD",
         "/repo",
-        "p001 single rewrite",
+        "one load consume",
         fixed_now,
         true,
     );
     defer issued.deinit(allocator);
-    const entry = try redeem(
+    const minted = try redeem(
         io,
         allocator,
         paths.pending,
@@ -2313,32 +2416,35 @@ test "P001: consume is a single allow-once rewrite" {
         .cwd,
         "/repo",
     );
-    freeAllowOnceEntry(allocator, entry);
+    freeAllowOnceEntry(allocator, minted);
 
-    resetTestAllowOnceWriteCount();
-    const first = try matchAllowOnce(
+    test_support.reset();
+    defer test_support.reset();
+
+    var peeked = (try peekAllowOnce(
         io,
         allocator,
         paths.allow_once,
         "git reset --hard HEAD",
         "/repo",
         fixed_now,
-        true,
-    );
-    try testing.expect(first != null);
-    if (first) |h| freeAllowOnceEntry(allocator, h);
-    try testing.expectEqual(@as(usize, 1), testAllowOnceWriteCount());
+    )).?;
+    defer peeked.deinit(allocator);
+    try testing.expectEqual(@as(u32, 1), test_support.load_count);
 
-    const second = try matchAllowOnce(
+    try consumePeekedAllowOnce(
         io,
         allocator,
         paths.allow_once,
+        &peeked,
         "git reset --hard HEAD",
         "/repo",
         fixed_now,
-        true,
     );
-    try testing.expect(second == null);
+    try testing.expectEqual(@as(u32, 1), test_support.load_count);
+
+    const gone = try matchAllowOnce(io, allocator, paths.allow_once, "git reset --hard HEAD", "/repo", fixed_now, false);
+    try testing.expect(gone == null);
 }
 
 test "s3-once-store: list revoke clear on allow-once store" {

@@ -91,6 +91,13 @@ _HERMES_SMOKE_PAYLOAD = json.dumps(
 
 _ryk_cache_env: str | None = None
 _ryk_cache_path: str | None = None
+# Sticky managed-provenance cache: canonical path -> (dev, ino, size, mtime_ns).
+# Written only after a successful hash + version --json attest. Never stores failures.
+_sticky_managed_attest: dict[str, tuple[int, int, int, int]] = {}
+
+
+def _clear_sticky_attest() -> None:
+    _sticky_managed_attest.clear()
 
 
 _FAIL_STANCE_FILENAMES = (".ryk_fail_stance",)
@@ -629,6 +636,44 @@ def _is_explicit_ryk_bin(canonical: Path) -> bool:
     return pinned is not None and pinned == canonical
 
 
+def _stat_identity(stat: os.stat_result) -> tuple[int, int, int, int]:
+    mtime_ns = getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000))
+    return (stat.st_dev, stat.st_ino, stat.st_size, int(mtime_ns))
+
+
+def _managed_install_roots() -> set[Path]:
+    return {
+        (Path.home() / ".local" / "bin").resolve(),
+        (Path.home() / ".ryk" / "bin").resolve(),
+    }
+
+
+def _path_is_managed_install(canonical: Path) -> bool:
+    try:
+        return any(_path_is_within(canonical, root) for root in _managed_install_roots())
+    except OSError:
+        return False
+
+
+def _managed_sticky_hit(canonical: Path, stat: os.stat_result) -> bool:
+    """True only for a prior successful managed-provenance attest of this identity."""
+    if _is_explicit_ryk_bin(canonical) or not _path_is_managed_install(canonical):
+        return False
+    return _sticky_managed_attest.get(str(canonical)) == _stat_identity(stat)
+
+
+def _record_sticky_managed_attest(canonical: Path, stat: os.stat_result | None = None) -> None:
+    """Remember a successful managed hash+identity attest. Pins are never recorded."""
+    if _is_explicit_ryk_bin(canonical) or not _path_is_managed_install(canonical):
+        return
+    if stat is None:
+        try:
+            stat = canonical.stat()
+        except OSError:
+            return
+    _sticky_managed_attest[str(canonical)] = _stat_identity(stat)
+
+
 def _passes_owner_and_mode(stat: os.stat_result) -> bool:
     if os.name == "nt":
         return True
@@ -691,6 +736,8 @@ def _candidate_is_trusted(path: Path) -> bool:
     # Roots win over temp/workspace-plant rejects so cwd=$HOME (or a test
     # HOME under /tmp) does not discard ~/.local/bin/ryk.
     if in_managed:
+        if _managed_sticky_hit(canonical, stat):
+            return True
         return _installer_provenance_valid(canonical)
     if workspace_override:
         return True
@@ -748,6 +795,12 @@ def _is_workspace_candidate(candidate: str) -> bool:
 
 def _has_ryk_identity(ryk: str) -> bool:
     try:
+        canonical = Path(ryk).resolve(strict=True)
+        if _managed_sticky_hit(canonical, canonical.stat()):
+            return True
+    except OSError:
+        pass
+    try:
         completed = _run_process_bounded(
             [ryk, "version", "--json"],
             input_text="",
@@ -768,6 +821,28 @@ def _has_ryk_identity(ryk: str) -> bool:
         and isinstance(version, str)
         and bool(_RYK_VERSION_RE.fullmatch(version))
     )
+
+
+def _attest_ryk_candidate(candidate: str | Path) -> bool:
+    """Re-check path/mode/uid; skip hash + version only after managed sticky hit.
+
+    Workspace override and ``RYK_BIN`` pins always full-probe. Failures are
+    never cached. First call is always a full hash + ``version --json``.
+    """
+    resolved = _ryk_executable(str(candidate))
+    if resolved is None:
+        return False
+    canonical = Path(resolved)
+    try:
+        stat = canonical.stat()
+    except OSError:
+        return False
+    if _managed_sticky_hit(canonical, stat):
+        return True
+    if not _has_ryk_identity(resolved):
+        return False
+    _record_sticky_managed_attest(canonical, stat)
+    return True
 
 
 def _supports_hermes_host(ryk: str) -> bool:
@@ -847,6 +922,10 @@ def _find_ryk() -> str | None:
             if _supports_hermes_host(candidate):
                 _ryk_cache_env = env_bin
                 _ryk_cache_path = candidate
+                try:
+                    _record_sticky_managed_attest(Path(candidate))
+                except OSError:
+                    pass
                 return candidate
         except OSError:
             continue

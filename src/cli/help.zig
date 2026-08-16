@@ -215,7 +215,7 @@ pub const commands =
                 "Use --json for a minimal readiness report (ready, state, policy.valid).",
                 "Use --tui for a four-pane deep-dive (Summary · Hosts · Capabilities · Next steps) on an interactive TTY; non-TTY / --json / --plain falls back to linear.",
                 "Next steps in --tui deep-link `ryk packs` and `ryk allowlist`.",
-                "Use --fix to repair protection (create policy if missing, auto-wire day-one hosts). Exit 0 when core policy is ok; host soft-fails stay partial.",
+                "Use --fix to repair protection (create policy if missing, auto-wire day-one hosts, rebind Pi/Grok hooks that point at a Zig test program). Exit 0 when core policy is ok; host soft-fails stay partial. Must run as product ryk, not a test binary.",
                 "--fix is exclusive with --check and --json (cannot combine; probe contracts stay pure).",
                 "Optional --from-install scopes ensure to install HOME/resource-root; --preset selects create-if-missing policy preset. Both require --fix.",
                 "Use --deadlock-check to replay a standard coding workflow against your active policy: exit non-zero when a normal step would ask/deny (an agent would stall) or a dangerous step would be allowed.",

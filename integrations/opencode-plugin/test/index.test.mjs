@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { realpathSync } from 'node:fs';
+import { existsSync, readFileSync, realpathSync, statSync, utimesSync } from 'node:fs';
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -1730,6 +1730,133 @@ test('findRyk accepts workspace zig-out when RYK_ALLOW_WORKSPACE_BIN=1', async (
     else process.env.RYK_BIN = prevRyk;
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+function readProbeCount(countFile) {
+  if (!existsSync(countFile)) return 0;
+  return readFileSync(countFile, 'utf8').length;
+}
+
+function versionCountingScript(countFile, product = 'ryk', version = '1.2.16') {
+  return `#!/bin/sh
+if [ "$1" = version ] && [ "$2" = --json ]; then
+  printf x >> '${countFile}'
+  printf '%s\\n' '{"product":"${product}","version":"${version}"}'
+  exit 0
+fi
+`;
+}
+
+async function withManagedCountingRyk(run, { product = 'ryk', version = '1.2.16' } = {}) {
+  const directory = await mkdtemp(join(tmpdir(), 'ryk-opencode-attest-'));
+  const localBin = join(directory, '.local', 'bin');
+  await mkdir(localBin, { recursive: true });
+  const rykBin = join(localBin, 'ryk');
+  const countFile = join(directory, 'version-count');
+  const emptyPath = join(directory, 'empty-path');
+  await mkdir(emptyPath, { recursive: true });
+  await writeFile(rykBin, versionCountingScript(countFile, product, version), { mode: 0o755 });
+  const originalPath = process.env.PATH;
+  const originalAllow = process.env.RYK_ALLOW_WORKSPACE_BIN;
+  const originalHome = process.env.HOME;
+  const originalBin = process.env.RYK_BIN;
+  delete process.env.RYK_BIN;
+  delete process.env.RYK_ALLOW_WORKSPACE_BIN;
+  process.env.HOME = directory;
+  // Empty PATH so findRyk attests the well-known managed path once per call.
+  process.env.PATH = emptyPath;
+  try {
+    return await run({ directory, rykBin, countFile, localBin });
+  } finally {
+    process.env.PATH = originalPath;
+    process.env.HOME = originalHome;
+    if (originalAllow === undefined) delete process.env.RYK_ALLOW_WORKSPACE_BIN;
+    else process.env.RYK_ALLOW_WORKSPACE_BIN = originalAllow;
+    if (originalBin === undefined) delete process.env.RYK_BIN;
+    else process.env.RYK_BIN = originalBin;
+    await rm(directory, { recursive: true, force: true });
+  }
+}
+
+test('findRyk second resolve with unchanged identity skips version --json', async () => {
+  await withManagedCountingRyk(async ({ directory, rykBin, countFile }) => {
+    assert.equal(findRyk(directory), realpathSync(rykBin));
+    assert.equal(readProbeCount(countFile), 1);
+    assert.equal(findRyk(directory), realpathSync(rykBin));
+    assert.equal(
+      readProbeCount(countFile),
+      1,
+      'unchanged managed identity must not re-exec version --json'
+    );
+  });
+});
+
+test('findRyk does not cache a failed identity', async () => {
+  await withManagedCountingRyk(async ({ directory, countFile }) => {
+    assert.equal(findRyk(directory), null);
+    assert.equal(readProbeCount(countFile), 1);
+    assert.equal(findRyk(directory), null);
+    assert.equal(readProbeCount(countFile), 2);
+  }, { product: 'not-ryk' });
+});
+
+test('findRyk size change forces a new version --json', async () => {
+  await withManagedCountingRyk(async ({ directory, rykBin, countFile }) => {
+    assert.equal(findRyk(directory), realpathSync(rykBin));
+    assert.equal(readProbeCount(countFile), 1);
+    const before = statSync(rykBin);
+    await writeFile(rykBin, `${readFileSync(rykBin, 'utf8')}\n# size-bump\n`, { mode: 0o755 });
+    assert.notEqual(statSync(rykBin).size, before.size);
+    assert.equal(findRyk(directory), realpathSync(rykBin));
+    assert.equal(readProbeCount(countFile), 2);
+  });
+});
+
+test('findRyk mtime change forces a new version --json', async () => {
+  await withManagedCountingRyk(async ({ directory, rykBin, countFile }) => {
+    assert.equal(findRyk(directory), realpathSync(rykBin));
+    assert.equal(readProbeCount(countFile), 1);
+    const before = statSync(rykBin);
+    utimesSync(rykBin, before.atime, new Date(before.mtimeMs + 5_000));
+    assert.ok(statSync(rykBin).mtimeMs !== before.mtimeMs, 'mtime must change to force re-attest');
+    assert.equal(findRyk(directory), realpathSync(rykBin));
+    assert.equal(readProbeCount(countFile), 2);
+  });
+});
+
+test('findRyk RYK_BIN pin always re-runs version --json', async () => {
+  await withManagedCountingRyk(async ({ directory, rykBin, countFile }) => {
+    process.env.RYK_BIN = rykBin;
+    assert.equal(findRyk(directory), realpathSync(rykBin));
+    assert.equal(findRyk(directory), realpathSync(rykBin));
+    assert.equal(readProbeCount(countFile), 2);
+  });
+});
+
+test('findRyk RYK_ALLOW_WORKSPACE_BIN always re-runs version --json', async () => {
+  await withManagedCountingRyk(async ({ directory, rykBin, countFile }) => {
+    process.env.RYK_ALLOW_WORKSPACE_BIN = '1';
+    assert.equal(findRyk(directory), realpathSync(rykBin));
+    assert.equal(findRyk(directory), realpathSync(rykBin));
+    assert.equal(readProbeCount(countFile), 2);
+  });
+});
+
+test('findRyk still rejects a vanished binary after sticky success', async () => {
+  await withManagedCountingRyk(async ({ directory, rykBin, countFile }) => {
+    assert.equal(findRyk(directory), realpathSync(rykBin));
+    assert.equal(readProbeCount(countFile), 1);
+    await rm(rykBin);
+    assert.equal(findRyk(directory), null);
+    assert.equal(readProbeCount(countFile), 1);
+  });
+});
+
+test('OpenCode resolve-time attest does not hash the ryk binary', async () => {
+  const src = await readFile(join(pluginRoot, 'src/index.ts'), 'utf8');
+  assert.doesNotMatch(src, /createHash\s*\(/);
+  assert.doesNotMatch(src, /sha256/i);
+  assert.doesNotMatch(src, /readFileSync\s*\(/);
 });
 
 test('findRyk resolves ryk.exe on a Windows-style PATH', async () => {

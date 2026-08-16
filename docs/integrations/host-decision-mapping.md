@@ -45,7 +45,19 @@ host `--ci`):
 | **Claude Code** | `PreToolUse` / `PermissionRequest` | `permissionDecision: allow` | `permissionDecision: deny` | **allow** (unattended/`--ci` → deny) | proceed as allow | No | Host-shaped stdout JSON via `hookSpecificOutput` (hook grade; exit 0). Residual ask is permit so agents can work. |
 | **Codex** | `PreToolUse` / `PermissionRequest` | allow | deny | **allow** (unattended/`--ci` → deny) | warn | No | Residual ask is permit; unattended wires ask to block. |
 | **Pi** | tool hooks | allow | deny | **allow** (unattended → auto-deny) | warn | No | Residual ask is permit. `RYK_UNATTENDED` / `CI` auto-denies. |
+| **Grok** | `PreToolUse` (Bash / Read) | exit 0 | `{"decision":"deny","reason":…}` + exit 2 | **deny** JSON + exit 2 (no resume) | exit 0 | **No** | **hook** + `ryk grok` **wrapper**. Missing/non-executable `ryk` emits deny JSON + exit 2. See below. |
 | **Cursor** | `beforeShellExecution` (bare `ryk` stdin hook) | `permission: allow` JSON, exit 0 | `permission: deny` JSON, exit 0 | **allow** (unattended → deny) | log + allow | No | Residual ask is permit. Malformed/oversized/unknown payloads: dual-contract deny JSON + exit 2. |
+
+### Grok hook fail-closed contract
+
+Official Grok Build treats hook stdout + exit as:
+
+- allow / warn → exit 0 (generic hook JSON from `ryk hook grok`)
+- block / ask / error → `{"decision":"deny","reason":…}` + exit 2 (no resume)
+
+The managed hook command is `/bin/sh -c '…' -- <absolute ryk>`: if the pinned file is missing or not executable, the wrapper prints that deny JSON and exits 2. `ryk doctor --fix` and `ryk start` rewrite legacy direct `…/ryk hook grok PreToolUse` entries (those still fail-open on exit 127).
+
+Residual (host-side, not ryk-fixable): timeouts, crashes, and non-0/2 exits are **fail-open** unless the host adds its own fail-closed setting. Grade remains **hook**, not OS-enforced. Prefer `ryk grok` / `ryk run -- grok` for the wrapper boundary.
 
 ### Cursor bare-hook fail-closed contract
 

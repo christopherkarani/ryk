@@ -281,17 +281,19 @@ pub fn collectHostStatuses(io: std.Io, allocator: std.mem.Allocator, doctor_repo
     errdefer list.deinit(allocator);
 
     for (supported_hosts) |host_name| {
-        // Pi uses extension inspection; grok uses PATH + settings hook evidence;
-        // remaining day-one hosts use PATH + plugin report.
+        // Pi/Grok leftover glue is inspect-backed so a zig/other bake still
+        // counts when the host CLI is off PATH. Other day-one hosts use PATH.
         // Cursor (W3 writer pending): binary detect ok; never claim wired without a writer.
         const detected = if (std.mem.eql(u8, host_name, "pi"))
-            @import("host_status.zig").inspectPi(io, allocator).binary_detected
+            @import("host_status.zig").inspectPi(io, allocator).detected()
+        else if (std.mem.eql(u8, host_name, "grok"))
+            @import("host_status.zig").inspectGrok(io, allocator).detected()
         else
             plugin.binaryInPath(io, allocator, host_name);
         const installed = if (std.mem.eql(u8, host_name, "pi"))
             @import("host_status.zig").inspectPi(io, allocator).extension_installed
         else if (std.mem.eql(u8, host_name, "grok"))
-            @import("grok_install.zig").installed(io, allocator)
+            @import("host_status.zig").inspectGrok(io, allocator).hook_installed
         else if (std.mem.eql(u8, host_name, "cursor"))
             // Fail-closed until W3 Cursor writer: detect-only, never mark installed.
             false
@@ -938,6 +940,68 @@ test "DayOneHost collectHostStatuses iterates only day-one membership set" {
     for (supported_hosts, 0..) |want, i| {
         try std.testing.expectEqualStrings(want, statuses[i].name);
     }
+}
+
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+
+fn dayOneHostDupEnvZ(name: [*:0]const u8) !?[:0]u8 {
+    if (std.c.getenv(name)) |value| {
+        return try std.testing.allocator.dupeZ(u8, std.mem.span(value));
+    }
+    return null;
+}
+
+fn dayOneHostRestoreEnv(name: [*:0]const u8, prev: ?[:0]u8) void {
+    if (prev) |value| {
+        _ = setenv(name, value.ptr, 1);
+        std.testing.allocator.free(value);
+    } else {
+        _ = unsetenv(name);
+    }
+}
+
+test "DayOneHost leftover zig Grok hook is detected off PATH" {
+    // Leftover-repair predicate must match inspectGrok (hook_installed), not
+    // grok_install.installed() / isRykGrokHookCommand — a zig bake is broken
+    // even when `grok` is missing from PATH.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "empty-bin");
+    try tmp.dir.createDirPath(std.testing.io, "home/.grok/hooks");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "home/.grok/hooks/ryk.json",
+        .data =
+        \\{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"/Users/me/.local/zig/zig-aarch64-macos/zig hook grok PreToolUse","timeout":30}]}]}}
+        \\
+        ,
+    });
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, "home", std.testing.allocator);
+    defer std.testing.allocator.free(home);
+    const empty_bin = try tmp.dir.realPathFileAlloc(std.testing.io, "empty-bin", std.testing.allocator);
+    defer std.testing.allocator.free(empty_bin);
+    const home_z = try std.testing.allocator.dupeZ(u8, home);
+    defer std.testing.allocator.free(home_z);
+    const path_z = try std.testing.allocator.dupeZ(u8, empty_bin);
+    defer std.testing.allocator.free(path_z);
+
+    const prev_home = try dayOneHostDupEnvZ("HOME");
+    defer dayOneHostRestoreEnv("HOME", prev_home);
+    const prev_path = try dayOneHostDupEnvZ("PATH");
+    defer dayOneHostRestoreEnv("PATH", prev_path);
+    try std.testing.expectEqual(@as(c_int, 0), setenv("HOME", home_z.ptr, 1));
+    try std.testing.expectEqual(@as(c_int, 0), setenv("PATH", path_z.ptr, 1));
+
+    const statuses = try collectHostStatuses(std.testing.io, std.testing.allocator, dayOneHostEmptyPluginReport());
+    defer std.testing.allocator.free(statuses);
+    const grok = blk: {
+        for (statuses) |st| {
+            if (std.mem.eql(u8, st.name, "grok")) break :blk st;
+        }
+        return error.TestUnexpectedResult;
+    };
+    try std.testing.expect(grok.detected);
+    try std.testing.expect(grok.installed);
 }
 
 test "DayOneHost ensure HostWireTable membership keys onboarding isSupportedHost (F2)" {

@@ -64,6 +64,20 @@ Run `ryk doctor`. If a feature is `limited`, `wrapper-only`, `observe-only`, or 
 
 **This session’s** enforcement class is `RYK_SESSION_SANDBOX_GRADE` / the banner `Session grade:` line (`strong-mediated`, `fs-attached`, `wrapper-only`, `unrestricted-escape`). See `docs/platform-macos.md` and `docs/commands.md`.
 
+## Every Pi or Grok tool fail-closes with malformed JSON
+
+If `echo`, `pwd`, `read`, and the deny-set all fail closed at once, the hook is probably calling a Zig **test** binary (or the Zig compiler) instead of product `ryk`. Doctor will show that host as `wired: broken` and say the hook is a test program.
+
+**Fix** from a normal terminal, using the installed `ryk` (not `./scripts/zig` and not a zig-cache `test` binary):
+
+```sh
+ryk doctor --fix
+```
+
+Then restart Pi or Grok. If `ryk doctor --fix` itself says this process is a Zig test program, you are still running the wrong binary — use the path `ryk version` prints, typically `~/.local/bin/ryk`.
+
+This is hook-grade repair. It is not OS-enforced.
+
 ## Pi tools fail with malformed JSON / evaluation errors
 
 Protocol failures (timeout, malformed JSON, spawn failure, inconsistent exit) **fail closed for that tool call only**. Pi retries decide/evaluate **once** only for *transient* classes (`timeout`, `malformed_json`, `spawn_failed`, `output_too_large`, `inconsistent_exit`); schema-valid `decision: "error"` is not retried. Messages include a failure **class** token (e.g. `[malformed_json]`). After several consecutive protocol failures, Pi notifies **protocol degraded** once — still fail-closed per call, never silent allow. `allow-with-warning` soft-allows only `spawn_failed` (binary missing); other protocol classes still block. Retry the tool; if it persists, `/ryk-setup` then `/ryk-doctor`. Do not pass blanket `--ci` to interactive decide.

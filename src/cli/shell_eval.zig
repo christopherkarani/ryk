@@ -260,9 +260,11 @@ pub fn loadProductShellStores(
     const project_path = try std.fs.path.join(allocator, &.{ workspace_root, ".ryk", "allowlist.toml" });
     defer allocator.free(project_path);
 
+    // loadMerged caches raw layers only (deep copy). Re-apply M-10 and the
+    // os_sandbox_active gate on every product load — never cache allow_once_path.
     // loadMerged only fails on OOM; corrupt/missing → empty store (fail closed, no unlock).
     // Cached on inode/size/mtime so a revocation rewrite cannot be served stale.
-    const outcome = try shell_engine.allowlist_store.loadMergedCached(
+    const outcome = try shell_engine.allowlist_store.loadMerged(
         runtime_io,
         allocator,
         user_path,
@@ -3608,6 +3610,63 @@ test "s-product-wire: loadProductShellStores strips project command keeps rule +
     try std.testing.expect(!saw_project_cmd);
     try std.testing.expect(saw_project_rule);
     try std.testing.expect(saw_user_cmd);
+}
+
+test "s-product-wire: loadProductShellStores twice still strips M-10 and leaves allow-once null" {
+    const allocator = std.testing.allocator;
+    var xdg = try sProductWireIsolateXdg();
+    defer xdg.deinit();
+    var ws = try sProductWireGitWorkspace();
+    defer ws.deinit();
+
+    try sProductWireWriteProjectCommandAllow(ws.root, "git reset --hard HEAD", "project-cmd-should-drop");
+    try sProductWireWriteProjectRuleAllow(ws.root, "core.git:reset-hard", "project-rule-keep");
+    try sProductWireWriteUserCommandAllow(xdg.config_root, "npm test", "user-cmd-keep");
+
+    var first: ProductShellStores = .{};
+    try loadProductShellStores(std.testing.io, allocator, ws.root, &first, false);
+    defer first.deinit(allocator);
+    var second: ProductShellStores = .{};
+    try loadProductShellStores(std.testing.io, allocator, ws.root, &second, false);
+    defer second.deinit(allocator);
+
+    try std.testing.expect(first.allow_once_path == null);
+    try std.testing.expect(second.allow_once_path == null);
+
+    var saw_project_cmd = false;
+    var saw_project_rule = false;
+    var saw_user_cmd = false;
+    for (second.permanent.entries) |e| {
+        if (e.layer == .project and e.kind == .command) saw_project_cmd = true;
+        if (e.layer == .project and e.kind == .rule) saw_project_rule = true;
+        if (e.layer == .user and e.kind == .command) saw_user_cmd = true;
+    }
+    try std.testing.expect(!saw_project_cmd);
+    try std.testing.expect(saw_project_rule);
+    try std.testing.expect(saw_user_cmd);
+}
+
+test "s-product-wire: loadProductShellStores allow_once_path follows current os_sandbox_active" {
+    const allocator = std.testing.allocator;
+    var xdg = try sProductWireIsolateXdg();
+    defer xdg.deinit();
+    var ws = try sProductWireGitWorkspace();
+    defer ws.deinit();
+
+    var off: ProductShellStores = .{};
+    try loadProductShellStores(std.testing.io, allocator, ws.root, &off, false);
+    defer off.deinit(allocator);
+    try std.testing.expect(off.allow_once_path == null);
+
+    var on: ProductShellStores = .{};
+    try loadProductShellStores(std.testing.io, allocator, ws.root, &on, true);
+    defer on.deinit(allocator);
+    try std.testing.expect(on.allow_once_path != null);
+
+    var off_again: ProductShellStores = .{};
+    try loadProductShellStores(std.testing.io, allocator, ws.root, &off_again, false);
+    defer off_again.deinit(allocator);
+    try std.testing.expect(off_again.allow_once_path == null);
 }
 
 test "s-product-wire: zigEvaluator loads user permanent allowlist from XDG_CONFIG_HOME" {
