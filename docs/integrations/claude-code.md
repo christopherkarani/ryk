@@ -214,7 +214,7 @@ For `PreToolUse` and `PermissionRequest`, `ryk hook claude` emits Claude-native 
 }
 ```
 
-- `permissionDecision`: `allow` | `deny` | `ask` (CI / `--ci` hardens ryk `ask` to `deny`)
+- `permissionDecision`: `allow` | `deny` (residual `ask` is permit; unattended / `--ci` hardens to `deny`)
 - `permissionDecisionReason`: short one-line reason (no Recourse/Next walls)
 - Process exit is `0` with structured JSON (Claude plugin-compatible)
 - Operator Recourse/Next remain on **stderr**, not in the reason string

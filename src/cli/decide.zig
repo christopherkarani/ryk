@@ -219,6 +219,7 @@ pub const PluginDecision = enum {
     block,
     warn,
     ask,
+    stage,
     context_only,
     err,
 
@@ -229,7 +230,7 @@ pub const PluginDecision = enum {
             .ask => if (ci_mode) .block else .ask,
             .observe => .context_only,
             .redact => .warn,
-            .stage => if (ci_mode) .block else .ask,
+            .stage => if (ci_mode) .block else .stage,
             .broker => .err,
         };
     }
@@ -245,7 +246,7 @@ pub const PluginDecision = enum {
         return switch (self) {
             .allow, .context_only => exit_codes.success,
             .block => exit_codes.denial,
-            .ask => exit_codes.ask,
+            .ask, .stage => exit_codes.ask,
             .warn => exit_codes.warn,
             .err => exit_codes.general,
         };
@@ -545,7 +546,7 @@ fn pluginDecisionRestrictiveness(decision: PluginDecision) u8 {
         .allow => 0,
         .context_only => 1,
         .warn => 2,
-        .ask => 3,
+        .ask, .stage => 3,
         .block => 4,
         .err => 5,
     };
@@ -607,6 +608,7 @@ fn buildMessage(allocator: std.mem.Allocator, decision: PluginDecision, category
         .block => try std.fmt.allocPrint(allocator, "{s} blocked by ryk policy.", .{category}),
         .warn => try std.fmt.allocPrint(allocator, "{s} flagged by ryk policy. Review before proceeding.", .{category}),
         .ask => try std.fmt.allocPrint(allocator, "{s} requires user approval per ryk policy.", .{category}),
+        .stage => try std.fmt.allocPrint(allocator, "{s} staged for review by ryk policy.", .{category}),
         .context_only => try std.fmt.allocPrint(allocator, "{s} allowed for context only. No side effects permitted.", .{category}),
         .err => try std.fmt.allocPrint(allocator, "ryk could not evaluate {s}. Fail closed.", .{category}),
     };
@@ -713,7 +715,7 @@ fn badgeForDecision(decision: PluginDecision) tui.BadgeKind {
     return switch (decision) {
         .allow => .allow,
         .block, .err => .deny,
-        .ask => .ask,
+        .ask, .stage => .ask,
         .warn => .warn,
         .context_only => .info,
     };
@@ -848,12 +850,20 @@ test "PluginDecision exitCode mapping" {
         .{ .context_only, exit_codes.success },
         .{ .block, exit_codes.denial },
         .{ .ask, exit_codes.ask },
+        .{ .stage, exit_codes.ask },
         .{ .warn, exit_codes.warn },
         .{ .err, exit_codes.general },
     };
     for (cases) |entry| {
         try std.testing.expectEqual(entry[1], entry[0].exitCode());
     }
+}
+
+test "fromDecisionResult keeps stage distinct from leftover ask" {
+    try std.testing.expectEqual(PluginDecision.stage, PluginDecision.fromDecisionResult(.stage, false));
+    try std.testing.expectEqual(PluginDecision.block, PluginDecision.fromDecisionResult(.stage, true));
+    try std.testing.expectEqual(PluginDecision.ask, PluginDecision.fromDecisionResult(.ask, false));
+    try std.testing.expectEqual(PluginDecision.block, PluginDecision.fromDecisionResult(.ask, true));
 }
 
 test "decide command help and invalid kind" {

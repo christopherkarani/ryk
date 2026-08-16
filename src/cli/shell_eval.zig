@@ -447,6 +447,18 @@ pub const PluginDecision = enum {
     }
 };
 
+/// Why a product `.ask` exists. Leftover unused policy ask may be permitted on
+/// attended coding hosts. SoftBlock and FM steward ask must never become allow.
+pub const AskOrigin = enum {
+    leftover,
+    soft_block,
+    fm,
+
+    pub fn mayPermitOnCodingHost(self: AskOrigin) bool {
+        return self == .leftover;
+    }
+};
+
 pub const RiskLevel = enum {
     low,
     medium,
@@ -632,6 +644,8 @@ pub const AfterHardFenceDecision = struct {
 /// Full product decision from WP4 orchestration (includes sticky + fail-closed).
 pub const ShellWithPolicyDecision = struct {
     decision: PluginDecision,
+    /// Distinguishes leftover unused policy ask from SoftBlock / FM hold.
+    ask_origin: AskOrigin = .leftover,
     /// Static reason for fail-closed / hard-fence / sticky / strict refuse; null for plain matrix.
     /// When `owned_reason` is set, prefer that (FM upgrade path).
     reason: ?[]const u8 = null,
@@ -1050,6 +1064,8 @@ const OwnedRunDecision = struct {
     /// FM `ask_sticky_candidate` hints (allocator-owned when set). Free via `deinit`.
     suggested_sticky_scope: ?[]const u8 = null,
     suggested_effect_class: ?[]const u8 = null,
+    /// SoftBlock / FM ask must not ride the leftover-unused-ask permit wire.
+    ask_origin: AskOrigin = .leftover,
 
     pub fn deinit(self: OwnedRunDecision, allocator: std.mem.Allocator) void {
         allocator.free(self.owned_reason);
@@ -1214,7 +1230,11 @@ pub fn decisionFromDaemonResultWithPolicy(
             const plugin_decision = pluginDecisionFromDaemonAllow(result).applyCiMode(ci_mode);
             var after_fm = try applyFmSoftSeatbelt(
                 allocator,
-                .{ .decision = plugin_decision, .reason = null },
+                .{
+                    .decision = plugin_decision,
+                    .reason = null,
+                    .ask_origin = if (plugin_decision == .ask) .soft_block else .leftover,
+                },
                 fmContextFromOpts(opts),
             );
             // Re-apply CI after FM: steward may upgrade allow→ask; CI must harden ask/warn→block.
@@ -1254,6 +1274,7 @@ pub fn decisionFromDaemonResultWithPolicy(
                 .owned_reason = reason,
                 .suggested_sticky_scope = sticky_hints.scope,
                 .suggested_effect_class = sticky_hints.effect_class,
+                .ask_origin = after_fm.ask_origin,
             };
         },
         .deny => blk: {
@@ -1371,6 +1392,7 @@ pub fn decisionFromDaemonResultWithPolicy(
                 .owned_rule_id = rule,
                 .suggested_sticky_scope = sticky_hints.scope,
                 .suggested_effect_class = sticky_hints.effect_class,
+                .ask_origin = after_fm.ask_origin,
             };
         },
         // Engine Error / unexpected shapes are fail-closed via the typed flag on

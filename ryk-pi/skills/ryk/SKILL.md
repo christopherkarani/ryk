@@ -12,7 +12,7 @@ ryk evaluates Pi actions before they run:
 | `bash` | `ryk evaluate --json --stdin` |
 | `write` / `edit` | `ryk decide file` with `operation: write` |
 | `read` | `ryk decide file` with `operation: read` |
-| `grep` / `find` / `ls` | Root preflight plus explicit approval |
+| `grep` / `find` / `ls` | Root preflight via `ryk decide file` |
 | Other tool names | `ryk decide tool` name gate |
 
 A block is a security decision. Explain its redacted reason and rule id when
