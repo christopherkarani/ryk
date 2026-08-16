@@ -69,17 +69,17 @@ pub fn prompt(reader: *std.Io.Reader, writer: anytype, request: PromptRequest) !
         request.risk_reason,
         request.policy_reason,
     });
-    // Secondary detail only — recovery is Once/Always/Never, not rule ids.
+    // Secondary detail only — recovery is Once/Session/Never, not rule ids.
     if (request.matched_rule) |rule| try writer.print("  matched rule: {s}\n", .{rule});
     try writer.writeAll(
         \\
         \\Options:
         \\  [a] Once — allow this time
-        \\  [A] Always this session
+        \\  [A] Session — allow this session
         \\  [d] Never / Deny
         \\  [?] Explain risk
         \\
-        \\Choice (once / always / never):
+        \\Choice (once / session / never):
     );
 
     while (true) {
@@ -87,16 +87,17 @@ pub fn prompt(reader: *std.Io.Reader, writer: anytype, request: PromptRequest) !
         const trimmed = std.mem.trim(u8, line, " \t\r\n");
         if (parseChoice(trimmed)) |choice| return choice;
         if (std.mem.eql(u8, trimmed, "?")) {
-            try writer.print("\nRisk explanation: {s}\nChoice (once / always / never): ", .{request.risk_reason});
+            try writer.print("\nRisk explanation: {s}\nChoice (once / session / never): ", .{request.risk_reason});
             continue;
         }
-        try writer.writeAll("Choose once, always, never (or a, A, d, ?). Choice: ");
+        try writer.writeAll("Choose once, session, never (or a, A, d, ?). Choice: ");
     }
 }
 
 /// Map interactive input to an approval choice.
-/// Shortcuts: `a` Once, `A` Always (session), `d` Never.
-/// Words (case-insensitive): once | always | session | never | deny.
+/// Shortcuts: `a` Once, `A` Session, `d` Never.
+/// Words (case-insensitive): once | session | never | deny.
+/// `always` still maps to session (legacy alias; not advertised).
 /// Empty line denies (fail closed). Rule ids are never required.
 fn parseChoice(trimmed: []const u8) ?ApprovalChoice {
     if (trimmed.len == 0) return .deny;
@@ -161,7 +162,7 @@ test "approval prompt supports explain and session allow" {
     try std.testing.expect(std.mem.indexOf(u8, output_writer.buffered(), "Risk explanation") != null);
 }
 
-test "approval prompt presents Once Always Never labels" {
+test "approval prompt presents Once Session Never labels without Always" {
     var input: std.Io.Reader = .fixed("d\n");
     var output_buf: [1024]u8 = undefined;
     var output_writer: std.Io.Writer = .fixed(&output_buf);
@@ -175,8 +176,12 @@ test "approval prompt presents Once Always Never labels" {
     try std.testing.expectEqual(ApprovalChoice.deny, choice);
     const out = output_writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, out, "Once") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "Always") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Session") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "Never") != null);
+    // Session sticky is not a permanent ryk allowlist write — never say Always.
+    try std.testing.expect(std.mem.indexOf(u8, out, "Always") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "always") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Choice (once / session / never):") != null);
     // Rule id is secondary detail, not the recovery path.
     try std.testing.expect(std.mem.indexOf(u8, out, "matched rule: core.filesystem:destructive_rm") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "allowlist") == null);
@@ -334,7 +339,9 @@ test "approval prompt re-prompts on garbage then denies never" {
     });
     try std.testing.expectEqual(ApprovalChoice.deny, choice);
     const out = output_writer.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, out, "Choose once, always, never") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Choose once, session, never") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Always") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "always") == null);
 }
 
 test "parseChoice empty string denies fail-closed" {

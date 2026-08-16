@@ -186,7 +186,7 @@ pub fn ruleIdFromDaemonResult(allocator: std.mem.Allocator, result: std.json.Val
 /// Format human-facing next-step lines after a shell deny (no trailing newline).
 /// `command_display` must already be redacted for presentation.
 ///
-/// Day-1 recovery is the interactive Once/Always/Never prompt (not rule ids).
+/// Day-1 recovery is the interactive Once/Session/Never prompt (not rule ids).
 /// Progressive next-steps for a deny (ISS-DENY-01):
 /// 1. Understand (explain) → 2. Temporary (allow-once) → 3. Permanent advanced (allowlist).
 /// Tip, when present, is a separate advisory line above the numbered What-now block.

@@ -4,17 +4,29 @@ const std = @import("std");
 const shell_engine = @import("../shell_engine/mod.zig");
 const theme = @import("../tui/theme.zig");
 const terminal_text = @import("../tui/terminal_text.zig");
+const reasons = @import("../tui/reasons.zig");
 
-/// Glanceable human receipt: decision, why, one next command.
+/// Glanceable human receipt: decision + why. Deny names the rule and a safer
+/// command. Allow stays quiet (no Always / allowlist / Safer chrome).
 pub fn writePretty(io: std.Io, writer: anytype, command_text: []const u8, eval: shell_engine.Evaluation) !void {
     _ = io;
     const dec_label = switch (eval.decision) {
         .allow => "ALLOW",
         .deny => "DENY",
     };
-    try writer.print("Decision: {s}\nWhy: {s}\nNext: ryk test \"", .{ dec_label, eval.reason });
-    try terminal_text.write(writer, command_text, .single_line);
-    try writer.writeAll("\"\n");
+    try writer.print("Decision: {s}\nWhy: {s}\n", .{ dec_label, eval.reason });
+    if (eval.decision == .deny) {
+        if (eval.rule_id) |rid| try writer.print("Rule: {s}\n", .{rid});
+        const alts = try reasons.safeAlternatives(std.heap.smp_allocator, command_text);
+        defer {
+            for (alts) |a| std.heap.smp_allocator.free(a.command);
+            std.heap.smp_allocator.free(alts);
+        }
+        if (alts.len > 0) try writer.print("Safer: {s}\n", .{alts[0].command});
+        try writer.writeAll("Next: ryk test \"");
+        try terminal_text.write(writer, command_text, .single_line);
+        try writer.writeAll("\"\n");
+    }
 }
 
 /// Verbose DCG-style decision tree (regex / latency stay in JSON).
@@ -233,11 +245,16 @@ test "writePretty is a glanceable decision receipt" {
         .latency_ms = 12,
         .owned = false,
     };
-    try writePretty(std.testing.io, &w, "rm -rf", eval);
+    try writePretty(std.testing.io, &w, "rm -rf /", eval);
     const out = w.buffered();
     try std.testing.expect(std.mem.indexOf(u8, out, "Decision: DENY") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "Why: destructive") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "Next: ryk test \"rm -rf\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Rule: core.filesystem:rm-rf-general") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Safer:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "rm -rf ./build") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Always") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "always") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Next: ryk test \"rm -rf /\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "Pipeline Trace") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "full_evaluation") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "Regex") == null);
@@ -267,6 +284,11 @@ test "writePretty allow path is a glanceable receipt" {
     const out = w.buffered();
     try std.testing.expect(std.mem.indexOf(u8, out, "Decision: ALLOW") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "Why: No destructive pack matched.") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "Next: ryk test \"git status\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Next:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Always") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "always") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "allowlist") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Safer:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Rule:") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "full_evaluation") == null);
 }

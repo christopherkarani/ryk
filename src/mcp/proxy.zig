@@ -941,7 +941,7 @@ const ApprovalFingerprint = struct {
     }
 };
 
-/// Always-this-session key: JSON-RPC method + canonical args.
+/// Session-sticky key: JSON-RPC method + canonical args.
 /// Stringify overflow is not persistable — never store `args=[arguments omitted]`.
 fn approvalFingerprint(
     allocator: std.mem.Allocator,

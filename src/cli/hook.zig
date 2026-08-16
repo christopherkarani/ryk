@@ -787,13 +787,11 @@ fn writeHumanShellExplain(io: std.Io, allocator: std.mem.Allocator, stderr: anyt
     try stderr.writeAll("  Next: ryk explain \"<command>\" for the full decision tree\n");
 }
 
-/// Operator stderr companion for JSON-emitting hosts: full explain on block,
-/// otherwise the matched rule line.
+/// Operator stderr companion for JSON-emitting hosts: full explain on block.
+/// Allow / context-only stay quiet — host-UI allow is not a ryk sticky write (A5).
 fn writeBlockExplainOrRule(io: std.Io, allocator: std.mem.Allocator, stderr: anytype, result: HookResponse) !void {
     if (result.decision == .block) {
         try writeHumanShellExplain(io, allocator, stderr, result);
-    } else if (result.rule) |rule| {
-        try stderr.print("[hook] matched rule: {s}\n", .{rule});
     }
 }
 
@@ -6146,6 +6144,36 @@ test "hook Claude permissionDecisionReason redacts secrets in stdout JSON" {
     if (parsed.value.object.get("systemMessage")) |sm| {
         try std.testing.expect(std.mem.indexOf(u8, sm.string, secret) == null);
     }
+}
+
+test "host-UI allow is quiet and does not claim ryk sticky or allowlist" {
+    // A5: host-UI allow is not a ryk sticky write. Operator stderr must stay
+    // quiet on allow and must not talk like Always / allowlist / sticky.
+    const allocator = std.testing.allocator;
+    var result = HookResponse{
+        .version = 1,
+        .decision = .allow,
+        .risk = .low,
+        .category = try allocator.dupe(u8, "command"),
+        .reason = try allocator.dupe(u8, "command allowed by ryk policy"),
+        .rule = try allocator.dupe(u8, "core.filesystem:ok"),
+        .message = try allocator.dupe(u8, "command allowed by ryk policy."),
+        .redactions = &.{},
+        .host_limitations = &.{},
+        .suggestions = &.{},
+        .remediation_commands = &.{},
+    };
+    defer result.deinit(allocator);
+
+    var stderr_buf: [1024]u8 = undefined;
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+    try writeBlockExplainOrRule(std.testing.io, allocator, &stderr_writer, result);
+    const out = stderr_writer.buffered();
+    try std.testing.expectEqualStrings("", out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Always") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "always") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "allowlist") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "sticky") == null);
 }
 
 test "hook Claude pre-eval fail-closed PreToolUse is host-shaped deny" {

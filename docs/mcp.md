@@ -45,7 +45,7 @@ ryk policy-gates:
 - `prompts/get`
 - sampling requests, default-denied unless policy permits them
 
-An interactive **Always this session** approval is kept for the lifetime of that `ryk mcp proxy` process when the JSON-RPC method and canonical args match. **Once** still applies to a single call. `ask` is never treated as allow. Args that cannot be stringified are not stored as a shared Always key. CI and non-interactive proxy runs convert `ask` to deny.
+An interactive **Session** approval is kept for the lifetime of that `ryk mcp proxy` process when the JSON-RPC method and canonical args match. That is process-session sticky, not a permanent ryk allowlist write. **Once** still applies to a single call. `ask` is never treated as allow. Args that cannot be stringified are not stored as a shared session key. CI and non-interactive proxy runs convert `ask` to deny.
 
 ryk also observes and audits `tools/list`, `resources/list`, and `prompts/list` metadata so later calls can be evaluated with the discovered risk context.
 
