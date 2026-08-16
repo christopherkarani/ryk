@@ -124,10 +124,10 @@ ryk returns host-actionable decisions on hook stdout. Codex interprets them:
 |---|---|
 | `allow` | Proceed |
 | `block` | Deny the tool / permission |
-| `ask` | Prefer Codex’s native permission / approval UI when the event supports it (`PermissionRequest` / gated tools). If the host surface cannot prompt, fail closed to deny — do not treat a model-visible note as approval. |
+| `ask` | **allow** so coding agents can work. Unattended / `--ci` hardens to deny. Explicit `block` stays deny. |
 | `warn` | Advisory; do not silently equate to hard deny unless policy/CI requires it |
 
-CI / noninteractive (`ryk hook ... --ci` or env) hardens `ask` → `block` in ryk before the host sees it.
+Unattended (`ryk hook ... --ci`, `RYK_UNATTENDED`, `CI`) hardens residual `ask` → `block`. Attended coding sessions permit residual ask.
 
 ## Strongest protection warning
 

@@ -128,13 +128,14 @@ pub fn appendGlobalRecordWithOptions(
 }
 
 fn rotateGlobalFeedIfNeeded(io: std.Io, allocator: std.mem.Allocator, dashboard_root: []const u8, events_path: []const u8) !void {
-    const file = std.Io.Dir.cwd().openFile(io, events_path, .{}) catch |err| switch (err) {
-        error.FileNotFound => return,
-        else => return err,
+    const size = blk: {
+        const file = std.Io.Dir.cwd().openFile(io, events_path, .{}) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
+        defer file.close(io);
+        break :blk (try file.stat(io)).size;
     };
-    errdefer file.close(io);
-    const size = (try file.stat(io)).size;
-    file.close(io);
     if (size < core.limits.max_dashboard_feed_len) return;
 
     const rotated_path = try std.fs.path.join(allocator, &.{ dashboard_root, rotated_global_events_file_name });

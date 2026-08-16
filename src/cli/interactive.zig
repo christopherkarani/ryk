@@ -135,11 +135,15 @@ pub fn deinitMultiSelectResult(result: *MultiSelectResult, allocator: std.mem.Al
 /// Useful for logging / summaries in guided flows.
 pub fn getSelectedLabels(allocator: std.mem.Allocator, items: []const SelectionItem) ![][]const u8 {
     var list: std.ArrayList([]const u8) = .empty;
-    defer list.deinit(allocator);
+    errdefer {
+        for (list.items) |item| allocator.free(item);
+        list.deinit(allocator);
+    }
 
     for (items) |item| {
         if (item.checked) {
             const owned = try allocator.dupe(u8, item.label);
+            errdefer allocator.free(owned);
             try list.append(allocator, owned);
         }
     }
@@ -258,6 +262,20 @@ test "interactive: getSelectedLabels returns only checked items" {
     try std.testing.expectEqual(@as(usize, 2), labels.len);
     try std.testing.expectEqualStrings("OpenCode", labels[0]);
     try std.testing.expectEqualStrings("OpenClaw", labels[1]);
+}
+
+fn getSelectedLabelsOomProbe(allocator: std.mem.Allocator) !void {
+    const items = [_]SelectionItem{
+        .{ .label = "one", .checked = true },
+        .{ .label = "two", .checked = true },
+    };
+    const labels = try getSelectedLabels(allocator, &items);
+    for (labels) |label| allocator.free(label);
+    allocator.free(labels);
+}
+
+test "interactive: getSelectedLabels does not leak on OOM" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, getSelectedLabelsOomProbe, .{});
 }
 
 test "interactive: deinitMultiSelectResult frees memory cleanly" {

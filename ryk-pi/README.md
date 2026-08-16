@@ -11,7 +11,7 @@ Pi setup is required.
 | `bash` | `ryk evaluate --json --stdin`; failures block by default |
 | `write` / `edit` | `ryk decide file` with `operation: write` |
 | `read` | `ryk decide file` with `operation: read` |
-| `grep` / `find` / `ls` | Root preflight plus explicit approval |
+| `grep` / `find` / `ls` | Root preflight via `ryk decide file` (same as read). Residual ask is permit. |
 | `contact_supervisor` / `intercom` / `subagent` | Passthrough (no name-gate) |
 | Other custom tool names | `ryk decide tool` name gate |
 
@@ -28,22 +28,23 @@ environment-variable reference before the model sees the message.
   output, or times out.
 - `/ryk-setup`, `/ryk-start`, `/ryk-stop`, `/ryk-doctor`, and `/ryk-mode`
   manage the current Pi integration.
-- `RYK_PI_MODE=auto` is the default: interactive sessions ask; noninteractive
-  sessions block. Use `RYK_PI_MODE=strict` for the strongest fail-closed posture.
+- Residual policy `ask` is permit so coding agents can work. ryk only
+  hard-stops explicit deny. Set `RYK_UNATTENDED=1` (or `CI` / `RYK_CI` /
+  `RYK_NONINTERACTIVE`) to auto-deny residual ask. `RYK_PI_MODE=strict`
+  fail-closes protocol/eval failures; it does not turn residual ask into deny.
 - Process-level environment, network, and secretless controls require launching
   Pi through `ryk run -- pi`.
 
 ### Policy `ask` session matrix
 
-When `ryk evaluate` / `ryk decide` returns policy **`ask`**, the extension
-never silently allows the tool call:
+When `ryk evaluate` / `ryk decide` returns policy **`ask`**, residual ask is
+permit unless the operator set an unattended flag:
 
 | Session class | Detection | Policy `ask` outcome |
 |---------------|-----------|----------------------|
-| Interactive parent TUI | `hasUI === true` and mode not `print` / `json` / `noninteractive` | Human prompt (`select`) — once / Block / session disable / show reason |
-| Noninteractive Pi (`-p`, print, json, headless) | `hasUI !== true` or mode is `print` / `json` / `noninteractive` | **Auto-deny** with explicit reason; no UI hang |
-| Subagent / child agent | `PI_SUBAGENT_PARENT_SESSION` set (non-empty) | **Parent-forward ask** (file IPC); timeout / missing parent → **deny** |
-| Strict / noninteractive-block | `RYK_PI_MODE=strict` (or once-bypass disabled) | Block; no once-bypass option on interactive ask |
+| Attended (interactive, print, subagent) | no `RYK_UNATTENDED` / `CI` / `RYK_CI` | **Permit** — ryk only hard-stops explicit deny |
+| Unattended | `RYK_UNATTENDED`, `CI`, `RYK_CI`, or `RYK_NONINTERACTIVE` | **Auto-deny** with explicit reason |
+| Strict | `RYK_PI_MODE=strict` | Protocol/eval failure fail-closes. Residual policy ask still permits unless unattended. |
 
 ### Protocol failure recovery
 
@@ -51,10 +52,8 @@ When `ryk evaluate` / `ryk decide` fails (timeout, malformed JSON, spawn error):
 
 | Session | Outcome |
 |---------|---------|
-| Interactive parent | One recovery prompt: **Allow for this session**, allow once, **Block** (sticky for session) |
+| Any session (including interactive / subagent) | Fail-closed **block** (short reason + `/ryk-doctor`). No recovery ask. |
 | After sticky block | Further protocol errors auto-block without another prompt |
-| Subagent | Parent-forward recovery (same IPC as policy ask); parent block sticks on that child |
-| Noninteractive / strict | Fail-closed block (short reason + `/ryk-doctor`) |
 
 Card copy stays short (`Fail-closed. /ryk-doctor`).
 
@@ -67,16 +66,10 @@ replaced.
 
 Parent-ask IPC mkdir is best-effort. Under an attached OS sandbox, creating
 `~/.local/state/ryk/pi-ask/<session>` can EPERM; the extension must not throw.
-Main-TUI ask/block still works. Subagent parent-forward stays fail-closed if
-the IPC dir cannot be created.
 
 Auto-deny records a transcript audit event (`ryk_ask_auto_deny`) when the host
-supports `sendMessage`, and still blocks if audit is unavailable. Subagent policy
-`ask` and protocol recovery are forwarded to the parent via file IPC
-(`RYK_PI_ASK_ROOT` / XDG runtime); the parent ryk extension must be loaded.
-Timeout or missing parent fails closed. Session tool grants
-(`Allow this tool for this Pi session`) inherit to children via `grants.json`
-under the parent session id.
+supports `sendMessage`, and still blocks if audit is unavailable. Protocol
+recovery does not prompt. There is no host ask UI for residual policy ask.
 
 ## Security properties
 

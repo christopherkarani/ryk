@@ -138,6 +138,7 @@ pub fn applyFmSoftSeatbelt(
             );
             return .{
                 .decision = .ask,
+                .ask_origin = .fm,
                 .reason = policy_out.reason,
                 .owned_reason = owned,
                 .suggested_sticky_scope = sticky_scope,

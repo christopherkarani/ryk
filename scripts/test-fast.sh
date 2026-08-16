@@ -29,6 +29,8 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
 
 # Incremental compile; -j1 keeps test binary runs serial (parallel hangs on some hosts).
+# One `zig build` evaluates the graph once: default `install` (CLI) plus the
+# requested test-fast step. Do not split into a second process entry.
 ZIG_BUILD=(./scripts/zig build -fincremental -j1 -Dincremental=true)
 
 mode="${1:-${RYK_TEST_FAST:-full}}"
@@ -59,22 +61,18 @@ step_begin "Toolchain check (want 0.16.0 from .zigversion)"
 ./scripts/ensure-zig-toolchain.sh --check
 step_end "toolchain"
 
-step_begin "Build ryk CLI"
-"${ZIG_BUILD[@]}"
-step_end "build"
-
 if [[ "${mode}" == "compile" ]]; then
-  step_begin "Compile test-fast artifacts (no run)"
-  "${ZIG_BUILD[@]}" compile-test-fast
-  step_end "compile-test-fast"
+  step_begin "Build ryk CLI + compile test-fast artifacts (no run)"
+  "${ZIG_BUILD[@]}" install compile-test-fast
+  step_end "build+compile-test-fast"
   total=$(( $(date +%s) - gate_start ))
   echo "[test-fast] Compile-only gate passed in ${total}s."
   exit 0
 fi
 
-step_begin "Unit tests (lib + ryk_core via test-fast)"
-"${ZIG_BUILD[@]}" test-fast
-step_end "units"
+step_begin "Build ryk CLI + unit tests (lib + ryk_core via test-fast)"
+"${ZIG_BUILD[@]}" install test-fast
+step_end "build+units"
 
 if [[ "${mode}" == "units" ]]; then
   total=$(( $(date +%s) - gate_start ))

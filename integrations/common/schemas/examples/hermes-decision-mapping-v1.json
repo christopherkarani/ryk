@@ -8,10 +8,8 @@
       "allow": { "mode": "proceed" },
       "block": { "mode": "hard_block", "host_action": "block" },
       "ask": {
-        "mode": "native_approve_and_resume",
-        "host_action": "approve",
-        "rule_key": true,
-        "notes": "Hermes human gate once/session/always/deny; CI hardens to block; rule_key ryk|{rule}|{tool}|{args_fp}"
+        "mode": "proceed",
+        "notes": "Residual ask is permit so agents can work. Unattended/CI hardens to block."
       },
       "warn": {
         "mode": "advisory_log",

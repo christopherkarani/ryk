@@ -465,8 +465,15 @@ fn appendStringValue(
     }
     if (string_bytes.* >= max_string_scan_bytes) return;
     const take = @min(s.len, max_string_scan_bytes - string_bytes.*);
-    try strings.append(allocator, try allocator.dupe(u8, s[0..take]));
-    try string_keys.append(allocator, try allocator.dupe(u8, key));
+    // #380: own both slices, reserve list slots, then transfer — no partial-append leak.
+    const new_s = try allocator.dupe(u8, s[0..take]);
+    errdefer allocator.free(new_s);
+    const new_k = try allocator.dupe(u8, key);
+    errdefer allocator.free(new_k);
+    try strings.ensureUnusedCapacity(allocator, 1);
+    try string_keys.ensureUnusedCapacity(allocator, 1);
+    strings.appendAssumeCapacity(new_s);
+    string_keys.appendAssumeCapacity(new_k);
     string_bytes.* += take;
 }
 

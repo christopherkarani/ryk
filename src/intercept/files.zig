@@ -82,6 +82,42 @@ pub const StagedEntry = struct {
         allocator.free(self.actor);
         self.* = undefined;
     }
+
+    fn initOwned(
+        allocator: std.mem.Allocator,
+        original_path: []const u8,
+        normalized_path: []const u8,
+        staged_path: []const u8,
+        original_hash: ?[]const u8,
+        staged_hash: ?[]const u8,
+        operation: Operation,
+        timestamp: []const u8,
+        actor: []const u8,
+    ) !StagedEntry {
+        const original_path_owned = try allocator.dupe(u8, original_path);
+        errdefer allocator.free(original_path_owned);
+        const normalized_path_owned = try allocator.dupe(u8, normalized_path);
+        errdefer allocator.free(normalized_path_owned);
+        const staged_path_owned = try allocator.dupe(u8, staged_path);
+        errdefer allocator.free(staged_path_owned);
+        const original_hash_owned = if (original_hash) |hash| try allocator.dupe(u8, hash) else null;
+        errdefer if (original_hash_owned) |hash| allocator.free(hash);
+        const staged_hash_owned = if (staged_hash) |hash| try allocator.dupe(u8, hash) else null;
+        errdefer if (staged_hash_owned) |hash| allocator.free(hash);
+        const timestamp_owned = try allocator.dupe(u8, timestamp);
+        errdefer allocator.free(timestamp_owned);
+        const actor_owned = try allocator.dupe(u8, actor);
+        return .{
+            .original_path = original_path_owned,
+            .normalized_path = normalized_path_owned,
+            .staged_path = staged_path_owned,
+            .original_hash = original_hash_owned,
+            .staged_hash = staged_hash_owned,
+            .operation = operation,
+            .timestamp = timestamp_owned,
+            .actor = actor_owned,
+        };
+    }
 };
 
 pub const StageResult = struct {
@@ -302,15 +338,27 @@ pub fn stageDelete(
 
     var index = try loadIndex(io, allocator, workspace_root, session_dir);
     defer index.deinit();
+    // #375: build via initOwned so mid-construct OOM cannot leak partial field dupes.
+    // original_hash is already owned; hand off after successful initOwned of path/time fields.
+    const original_path_owned = try allocator.dupe(u8, normalized.resolved_path);
+    errdefer allocator.free(original_path_owned);
+    const normalized_path_owned = try allocator.dupe(u8, normalized.relative_path);
+    errdefer allocator.free(normalized_path_owned);
+    const staged_path_owned = try stagedPathForEntry(allocator, session_dir, normalized.relative_path);
+    errdefer allocator.free(staged_path_owned);
+    const timestamp_owned = try timestampNowAlloc(io, allocator);
+    errdefer allocator.free(timestamp_owned);
+    const actor_owned = try allocator.dupe(u8, "ryk");
+    errdefer allocator.free(actor_owned);
     const new_entry: StagedEntry = .{
-        .original_path = try allocator.dupe(u8, normalized.resolved_path),
-        .normalized_path = try allocator.dupe(u8, normalized.relative_path),
-        .staged_path = try stagedPathForEntry(allocator, session_dir, normalized.relative_path),
+        .original_path = original_path_owned,
+        .normalized_path = normalized_path_owned,
+        .staged_path = staged_path_owned,
         .original_hash = original_hash,
         .staged_hash = null,
         .operation = .delete,
-        .timestamp = try timestampNowAlloc(io, allocator),
-        .actor = try allocator.dupe(u8, "ryk"),
+        .timestamp = timestamp_owned,
+        .actor = actor_owned,
     };
     original_hash = null;
     try index.upsert(new_entry);
@@ -525,15 +573,24 @@ fn stageBytes(
 
     var index = try loadIndex(io, allocator, workspace_root, session_dir);
     defer index.deinit();
+    // #376: locals + errdefer before transfer; avoid multi-dupe struct-literal partial ownership.
+    const original_path_owned = try allocator.dupe(u8, normalized.resolved_path);
+    errdefer allocator.free(original_path_owned);
+    const normalized_path_owned = try allocator.dupe(u8, normalized.relative_path);
+    errdefer allocator.free(normalized_path_owned);
+    const timestamp_owned = try timestampNowAlloc(io, allocator);
+    errdefer allocator.free(timestamp_owned);
+    const actor_owned = try allocator.dupe(u8, "ryk");
+    errdefer allocator.free(actor_owned);
     const new_entry: StagedEntry = .{
-        .original_path = try allocator.dupe(u8, normalized.resolved_path),
-        .normalized_path = try allocator.dupe(u8, normalized.relative_path),
+        .original_path = original_path_owned,
+        .normalized_path = normalized_path_owned,
         .staged_path = staged_path.?,
         .original_hash = original_hash,
         .staged_hash = staged_hash,
         .operation = if (existed) .update else .create,
-        .timestamp = try timestampNowAlloc(io, allocator),
-        .actor = try allocator.dupe(u8, "ryk"),
+        .timestamp = timestamp_owned,
+        .actor = actor_owned,
     };
     original_hash = null;
     staged_hash = null;
@@ -793,16 +850,22 @@ fn loadIndex(io: std.Io, allocator: std.mem.Allocator, workspace_root_raw: []con
         const normalized_path_text = try jsonString(entry_object.get("normalized_path") orelse return error.InvalidStagingIndex);
         const staged_path_text = try jsonString(entry_object.get("staged_path") orelse return error.InvalidStagingIndex);
         try validateLoadedIndexEntry(allocator, workspace_root, session_dir, original_path_text, normalized_path_text, staged_path_text);
-        var entry: StagedEntry = .{
-            .original_path = try allocator.dupe(u8, original_path_text),
-            .normalized_path = try allocator.dupe(u8, normalized_path_text),
-            .staged_path = try allocator.dupe(u8, staged_path_text),
-            .original_hash = try jsonNullableStringAlloc(allocator, entry_object.get("original_hash") orelse return error.InvalidStagingIndex),
-            .staged_hash = try jsonNullableStringAlloc(allocator, entry_object.get("staged_hash") orelse return error.InvalidStagingIndex),
-            .operation = Operation.parse(operation_text) orelse return error.InvalidStagingIndex,
-            .timestamp = try allocator.dupe(u8, try jsonString(entry_object.get("timestamp") orelse return error.InvalidStagingIndex)),
-            .actor = try allocator.dupe(u8, try jsonString(entry_object.get("actor") orelse return error.InvalidStagingIndex)),
-        };
+        const original_hash_text = try jsonNullableString(entry_object.get("original_hash") orelse return error.InvalidStagingIndex);
+        const staged_hash_text = try jsonNullableString(entry_object.get("staged_hash") orelse return error.InvalidStagingIndex);
+        const operation = Operation.parse(operation_text) orelse return error.InvalidStagingIndex;
+        const timestamp_text = try jsonString(entry_object.get("timestamp") orelse return error.InvalidStagingIndex);
+        const actor_text = try jsonString(entry_object.get("actor") orelse return error.InvalidStagingIndex);
+        var entry = try StagedEntry.initOwned(
+            allocator,
+            original_path_text,
+            normalized_path_text,
+            staged_path_text,
+            original_hash_text,
+            staged_hash_text,
+            operation,
+            timestamp_text,
+            actor_text,
+        );
         errdefer entry.deinit(allocator);
         try index.entries.append(allocator, entry);
     }
@@ -885,9 +948,9 @@ fn jsonString(value: std.json.Value) ![]const u8 {
     };
 }
 
-fn jsonNullableStringAlloc(allocator: std.mem.Allocator, value: std.json.Value) !?[]u8 {
+fn jsonNullableString(value: std.json.Value) !?[]const u8 {
     if (value == .null) return null;
-    return try allocator.dupe(u8, try jsonString(value));
+    return try jsonString(value);
 }
 
 fn validateSessionId(session_id: []const u8) !void {
@@ -920,16 +983,17 @@ fn validateLoadedIndexEntry(
 }
 
 fn cloneEntry(allocator: std.mem.Allocator, entry: StagedEntry) !StagedEntry {
-    return .{
-        .original_path = try allocator.dupe(u8, entry.original_path),
-        .normalized_path = try allocator.dupe(u8, entry.normalized_path),
-        .staged_path = try allocator.dupe(u8, entry.staged_path),
-        .original_hash = if (entry.original_hash) |hash| try allocator.dupe(u8, hash) else null,
-        .staged_hash = if (entry.staged_hash) |hash| try allocator.dupe(u8, hash) else null,
-        .operation = entry.operation,
-        .timestamp = try allocator.dupe(u8, entry.timestamp),
-        .actor = try allocator.dupe(u8, entry.actor),
-    };
+    return StagedEntry.initOwned(
+        allocator,
+        entry.original_path,
+        entry.normalized_path,
+        entry.staged_path,
+        entry.original_hash,
+        entry.staged_hash,
+        entry.operation,
+        entry.timestamp,
+        entry.actor,
+    );
 }
 
 fn auditFileEvent(audit_context: ?AuditContext, event_type: core.event.EventType, target: []const u8, decision: core.decision.Decision) !void {
@@ -1938,4 +2002,25 @@ test "upsert deinits new entry when append fails" {
         .actor = try std.testing.allocator.dupe(u8, "ryk"),
     };
     try std.testing.expectError(error.OutOfMemory, index.upsert(new_entry));
+}
+
+fn cloneEntryOomProbe(allocator: std.mem.Allocator, src: StagedEntry) !void {
+    var cloned = try cloneEntry(allocator, src);
+    cloned.deinit(allocator);
+}
+
+test "cloneEntry OOM ownership does not leak partial fields" {
+    const allocator = std.testing.allocator;
+    var src = StagedEntry{
+        .original_path = try allocator.dupe(u8, "/ws/src/a.txt"),
+        .normalized_path = try allocator.dupe(u8, "src/a.txt"),
+        .staged_path = try allocator.dupe(u8, "/ws/.ryk/sessions/s/staged/src/a.txt"),
+        .original_hash = try allocator.dupe(u8, "aa"),
+        .staged_hash = try allocator.dupe(u8, "bb"),
+        .operation = .update,
+        .timestamp = try allocator.dupe(u8, "2026-01-01T00:00:00Z"),
+        .actor = try allocator.dupe(u8, "ryk"),
+    };
+    defer src.deinit(allocator);
+    try std.testing.checkAllAllocationFailures(allocator, cloneEntryOomProbe, .{src});
 }
