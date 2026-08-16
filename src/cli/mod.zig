@@ -240,7 +240,8 @@ fn isMachineArgv(argv: []const []const u8) bool {
 
 /// True when the compact brand banner should open this invocation. The banner
 /// is a presentation-only header; it never appears on `--json`/machine/raw paths
-/// (byte-identity invariant) nor on `--help`/`help <cmd>` reference output.
+/// (byte-identity invariant), `init --quiet` script output, nor on `--help`/`help <cmd>`
+/// reference output.
 fn shouldShowBanner(command: []const u8, argv: []const []const u8) bool {
     // Self-banner commands render their own header (version key-value grid, top
     // help redesign, run session banner). Host launch aliases rewrite into run.
@@ -286,6 +287,13 @@ fn shouldShowBanner(command: []const u8, argv: []const []const u8) bool {
     // `help <cmd>` is command-specific reference help (no banner); bare `help`
     // is top help and renders its own banner inside help.write.
     if (std.mem.eql(u8, command, "help")) return false;
+    // `--quiet` is an init-only presentation gate (#213). Other commands keep
+    // the brand banner; #215 owns the general "drop the shield" policy.
+    if (std.mem.eql(u8, command, "init")) {
+        for (argv[1..]) |arg| {
+            if (std.mem.eql(u8, arg, "--quiet")) return false;
+        }
+    }
     // Scan subcommand args (argv[1..]) for machine/help tokens.
     var i: usize = 1;
     while (i < argv.len) : (i += 1) {
@@ -416,7 +424,8 @@ fn runWithCwdUsing(
     // Compact brand header at the entry of every HUMAN command (Phase 2 brand
     // cohesion). Suppressed for self-banner commands (version/help/run render
     // their own header), always-machine/raw commands, --json/--stdin/--format
-    // json machine paths, --help reference output, and unknown commands.
+    // json machine paths, init --quiet script output, --help reference output, and
+    // unknown commands.
     try writeInvocationPresentation(io, command, argv, stdout);
     if (std.mem.eql(u8, command, "help")) {
         if (argv.len == 1) {
@@ -1404,6 +1413,39 @@ test "banner renders on a human command (doctor)" {
     try std.testing.expect(std.mem.indexOf(u8, out, "\u{1F6E1}  ryk") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "Summary:") != null);
     try std.testing.expectEqualStrings("", stderr_writer.buffered());
+}
+
+test "shouldShowBanner is false for init --quiet" {
+    try std.testing.expect(!shouldShowBanner("init", &.{ "init", "--quiet" }));
+    try std.testing.expect(!shouldShowBanner("init", &.{ "init", "--preset", "generic-agent", "--quiet" }));
+    try std.testing.expect(!shouldShowBanner("init", &.{ "init", "--force", "--quiet" }));
+    try std.testing.expect(shouldShowBanner("init", &.{"init"}));
+    try std.testing.expect(shouldShowBanner("init", &.{ "init", "--preset", "generic-agent" }));
+}
+
+test "shouldShowBanner is true for doctor --quiet" {
+    try std.testing.expect(shouldShowBanner("doctor", &.{ "doctor", "--quiet" }));
+}
+
+test "init --quiet has no process-level banner" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var stdout_buf: [4096]u8 = undefined;
+    var stderr_buf: [1024]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+
+    const code = try testRunWithCwd(tmp.dir, &.{ "init", "--quiet" }, &stdout_writer, &stderr_writer);
+    try std.testing.expectEqual(exit_codes.success, code);
+    const out = stdout_writer.buffered();
+    const err = stderr_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "\u{1F6E1}") == null);
+    try std.testing.expect(std.mem.indexOf(u8, err, "\u{1F6E1}") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Created") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Next") == null);
+    try std.testing.expectEqualStrings("", out);
+    try std.testing.expectEqualStrings("", err);
 }
 
 test "start owns its onboarding banner" {
