@@ -485,20 +485,18 @@ fn tryAllowOnce(
     defer allocator.free(detail);
     try endOuterStep(options.trace, .{ .message = detail });
 
-    const exception = allowExceptionOwned(
-        allocator,
-        entry.reason,
-        "allow_once",
-        null,
-        null,
-    ) catch {
-        // keep need_restore so defer re-inserts consumed grant
-        return try storeFail(allocator, options, started_ms);
-    };
+    // finalizeEval errdefer-deinits the owned exception on failure (no leak).
+    // keep need_restore true until success so a consumed grant is restored.
     const eval = finalizeEval(
         allocator,
         options.trace,
-        exception,
+        try allowExceptionOwned(
+            allocator,
+            entry.reason,
+            "allow_once",
+            null,
+            null,
+        ),
         elapsedMs(started_ms),
     ) catch {
         return try storeFail(allocator, options, started_ms);

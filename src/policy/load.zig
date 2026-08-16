@@ -40,7 +40,15 @@ const PolicyFileCache = struct {
         }
     }
 
-    fn get(path: []const u8, st_size: u64, st_mtime_sec: i128, st_mtime_nsec: i32) ?[]const u8 {
+    /// Copy cached bytes under the lock. Caller owns the result (must free).
+    /// Returning a bare slice would UAF if another thread put/clears the cache.
+    fn getCopy(
+        allocator: std.mem.Allocator,
+        path: []const u8,
+        st_size: u64,
+        st_mtime_sec: i128,
+        st_mtime_nsec: i32,
+    ) ?[]u8 {
         // Tests use GPA leak/nondeterminism checks; skip process-global cache there.
         if (builtin.is_test) return null;
         lock();
@@ -49,23 +57,25 @@ const PolicyFileCache = struct {
         if (path_len != path.len) return null;
         if (!std.mem.eql(u8, path_buf[0..path_len], path)) return null;
         if (size != st_size or mtime_sec != st_mtime_sec or mtime_nsec != st_mtime_nsec) return null;
-        return text.?;
+        return allocator.dupe(u8, text.?) catch null;
     }
 
-    fn put(allocator: std.mem.Allocator, path: []const u8, st_size: u64, st_mtime_sec: i128, st_mtime_nsec: i32, body: []const u8) void {
+    fn put(path: []const u8, st_size: u64, st_mtime_sec: i128, st_mtime_nsec: i32, body: []const u8) void {
         if (builtin.is_test) return;
         if (path.len > path_buf.len) return;
         lock();
         defer mu.unlock();
+        // Always process-owned so a put cannot free bytes another thread might still hold
+        // if we ever switch back to borrowed slices. getCopy already returns owned dupes.
+        const owned = std.heap.page_allocator.dupe(u8, body) catch return;
         clearLocked();
-        const owned = allocator.dupe(u8, body) catch return;
         @memcpy(path_buf[0..path.len], path);
         path_len = path.len;
         size = st_size;
         mtime_sec = st_mtime_sec;
         mtime_nsec = st_mtime_nsec;
         text = owned;
-        text_allocator = allocator;
+        text_allocator = std.heap.page_allocator;
     }
 };
 
@@ -645,7 +655,9 @@ pub fn loadFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !sch
     if (st) |info| {
         const m_sec: i128 = info.mtime.toSeconds();
         // Size + mtime seconds is enough to invalidate on rewrite; nsec not required.
-        if (PolicyFileCache.get(path, info.size, m_sec, 0)) |cached| {
+        // getCopy returns caller-owned bytes (no UAF vs concurrent put).
+        if (PolicyFileCache.getCopy(allocator, path, info.size, m_sec, 0)) |cached| {
+            defer allocator.free(cached);
             if (cached.len > core.limits.max_policy_file_len) return error.PolicyFileTooLarge;
             return parseFromSlice(allocator, cached, path);
         }
@@ -657,8 +669,7 @@ pub fn loadFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !sch
 
     if (st) |info| {
         const m_sec: i128 = info.mtime.toSeconds();
-        // Cache with page_allocator so caller frees of policy do not invalidate bytes.
-        PolicyFileCache.put(std.heap.page_allocator, path, info.size, m_sec, 0, file_text);
+        PolicyFileCache.put(path, info.size, m_sec, 0, file_text);
     }
     return parseFromSlice(allocator, file_text, path);
 }
