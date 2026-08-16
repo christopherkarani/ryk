@@ -36,7 +36,7 @@ Host input, prompts, tool calls, and hook payloads are untrusted. The host can e
 | Mutate | Change host configuration | Requires `--yes` and explicit user approval |
 | Actuate | Trigger an external effect | Not exposed by default |
 
-The CLI does not silently overwrite host configuration. CI mode never prompts, and `ask` must not be silently downgraded to `allow`.
+The CLI does not silently overwrite host configuration. CI / unattended never prompts: residual `ask` hardens to deny. Attended coding hosts permit residual `ask` so agents can work. Explicit deny never becomes allow.
 
 ## Secret handling
 

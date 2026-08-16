@@ -16,6 +16,7 @@ const std = @import("std");
 const build_options = @import("build_options");
 
 const brand = @import("brand.zig");
+const env_util = @import("../env_util.zig");
 const exit_codes = @import("exit_codes.zig");
 const shell_eval = @import("shell_eval.zig");
 const fm_steward_client = @import("fm_steward_client.zig");
@@ -107,7 +108,6 @@ fn envFlagTruthy(name: [*:0]const u8) bool {
 /// hostile process env cannot silently downgrade bare Cursor/agent hooks.
 /// Prefer `ryk run` (session `shim_mode`) for intentional soft modes.
 pub fn resolveModeFromEnv() policy.schema.Mode {
-    const env_util = @import("../env_util.zig");
     const floor: policy.schema.Mode = .strict;
     const allow_soften = env_util.getenvBrandFlagTruthy("ALLOW_MODE_SOFTEN");
 
@@ -146,6 +146,8 @@ pub const EvaluatePayloadOpts = struct {
     fm_client: ?fm_steward_client.Client = null,
     /// Session id for FM risk-card-v1 (default product id when host omits one).
     session_id: []const u8 = brand.default_session_id,
+    /// Null reads `RYK_UNATTENDED` / `CI`. Tests inject true/false.
+    unattended: ?bool = null,
 };
 
 pub fn evaluatePayload(
@@ -234,7 +236,10 @@ pub fn evaluatePayloadWithModeOpts(
     // `fm_client` on evaluatePayloadWithModeOpts to exercise the seatbelt.
     // Bare agent-hook has no policy YAML, so permit is empty (matrix + sticky
     // only); sticky is process-session store.
-    // Cursor shell still maps `.ask` → deny (no ask UI); agent_hook keeps `.ask` JSON.
+    // Leftover unused policy ask is permit on Cursor / Claude-compatible
+    // agent_hook so coding agents can work. SoftBlock, FM steward ask, and
+    // staged writes never become allow. Unattended / mode=.ci hardens leftover
+    // ask → deny.
     const decision = try shell_eval.decisionFromDaemonResultWithPolicy(
         allocator,
         daemon_response.value.result,
@@ -267,12 +272,22 @@ pub fn evaluatePayloadWithModeOpts(
             defer allocator.free(reason);
             try writeDeny(stdout, format, reason);
         },
-        // Binary host contracts: Claude-compatible agent_hook can express "ask";
-        // Cursor shell only has allow/deny — fail closed to deny so approval is not skipped.
         .ask => {
-            const reason = try core_api.redactAlloc(allocator, decision.owned_reason);
-            defer allocator.free(reason);
-            try writeAsk(stdout, format, reason);
+            const unattended = opts.unattended orelse env_util.getenvUnattended() or mode == .ci;
+            const leftover = decision.ask_origin.mayPermitOnCodingHost();
+            if (!leftover) {
+                // SoftBlock / FM: hold on Claude-compatible agent_hook; Cursor
+                // has no ask channel so writeAsk denies.
+                const reason = try core_api.redactAlloc(allocator, decision.owned_reason);
+                defer allocator.free(reason);
+                try writeAsk(stdout, format, reason);
+            } else if (unattended) {
+                const reason = try core_api.redactAlloc(allocator, decision.owned_reason);
+                defer allocator.free(reason);
+                try writeDeny(stdout, format, reason);
+            } else {
+                try writeAllow(stdout, format);
+            }
         },
         // observe is intentional warn-allow (proceed while recording risk).
         .allow, .observe => try writeAllow(stdout, format),
@@ -686,21 +701,34 @@ test "evaluatePayload keeps non-shell agent hook pass-through" {
 // fm-steward cannot invent ask and break soft allow/warn/ask expectations.
 const test_no_fm = EvaluatePayloadOpts{ .disable_fm = true };
 
-test "ask mode high-severity deny emits ask for agent_hook and deny for cursor" {
+test "ask mode high-severity residual ask is permit unless unattended" {
     const allocator = std.testing.allocator;
     const agent_payload = "{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"git push --force\"}}";
     const cursor_payload = "{\"command\":\"git push --force\",\"cwd\":\"/tmp\"}";
 
     var agent_buf: [1024]u8 = undefined;
     var agent_stdout: std.Io.Writer = .fixed(&agent_buf);
-    _ = try evaluatePayloadWithModeOpts(allocator, agent_payload, &agent_stdout, shell_eval.mockDaemonDenyHighEvaluator, .ask, test_no_fm);
-    try std.testing.expect(std.mem.indexOf(u8, agent_stdout.buffered(), "\"permissionDecision\":\"ask\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, agent_stdout.buffered(), "requires approval") != null);
+    _ = try evaluatePayloadWithModeOpts(allocator, agent_payload, &agent_stdout, shell_eval.mockDaemonDenyHighEvaluator, .ask, .{
+        .disable_fm = true,
+        .unattended = false,
+    });
+    try std.testing.expectEqual(@as(usize, 0), agent_stdout.buffered().len);
 
     var cursor_buf: [1024]u8 = undefined;
     var cursor_stdout: std.Io.Writer = .fixed(&cursor_buf);
-    _ = try evaluatePayloadWithModeOpts(allocator, cursor_payload, &cursor_stdout, shell_eval.mockDaemonDenyHighEvaluator, .ask, test_no_fm);
-    try std.testing.expect(std.mem.indexOf(u8, cursor_stdout.buffered(), "\"permission\":\"deny\"") != null);
+    _ = try evaluatePayloadWithModeOpts(allocator, cursor_payload, &cursor_stdout, shell_eval.mockDaemonDenyHighEvaluator, .ask, .{
+        .disable_fm = true,
+        .unattended = false,
+    });
+    try std.testing.expect(std.mem.indexOf(u8, cursor_stdout.buffered(), "\"permission\":\"allow\"") != null);
+
+    var unattended_buf: [1024]u8 = undefined;
+    var unattended_stdout: std.Io.Writer = .fixed(&unattended_buf);
+    _ = try evaluatePayloadWithModeOpts(allocator, agent_payload, &unattended_stdout, shell_eval.mockDaemonDenyHighEvaluator, .ask, .{
+        .disable_fm = true,
+        .unattended = true,
+    });
+    try std.testing.expect(std.mem.indexOf(u8, unattended_stdout.buffered(), "\"permissionDecision\":\"deny\"") != null);
 }
 
 test "observe mode high-severity deny is warn-allow (empty agent / allow cursor)" {
@@ -719,12 +747,15 @@ test "observe mode high-severity deny is warn-allow (empty agent / allow cursor)
     try std.testing.expect(std.mem.indexOf(u8, cursor_stdout.buffered(), "\"permission\":\"allow\"") != null);
 }
 
-test "SoftBlock allow maps to ask on agent_hook (not silent allow)" {
+test "SoftBlock ask is not permit on agent_hook" {
     const allocator = std.testing.allocator;
     var stdout_buf: [1024]u8 = undefined;
     var stdout: std.Io.Writer = .fixed(&stdout_buf);
     const payload = "{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"risky\"}}";
-    _ = try evaluatePayloadWithModeOpts(allocator, payload, &stdout, shell_eval.mockDaemonSoftBlockAllowEvaluator, .strict, test_no_fm);
+    _ = try evaluatePayloadWithModeOpts(allocator, payload, &stdout, shell_eval.mockDaemonSoftBlockAllowEvaluator, .strict, .{
+        .disable_fm = true,
+        .unattended = false,
+    });
     try std.testing.expect(std.mem.indexOf(u8, stdout.buffered(), "\"permissionDecision\":\"ask\"") != null);
 }
 
@@ -774,16 +805,22 @@ test "sticky session turns ask-mode high deny into allow on agent_hook" {
     const agent_payload = "{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"git push --force\"}}";
     const cursor_payload = "{\"command\":\"git push --force\",\"cwd\":\"/tmp\"}";
 
-    // First hit: no sticky → ask (agent) / deny (cursor maps ask→deny).
+    // First hit: residual ask is permit on attended coding hosts.
     var agent_buf: [1024]u8 = undefined;
     var agent_stdout: std.Io.Writer = .fixed(&agent_buf);
-    _ = try evaluatePayloadWithModeOpts(allocator, agent_payload, &agent_stdout, shell_eval.mockDaemonDenyHighEvaluator, .ask, test_no_fm);
-    try std.testing.expect(std.mem.indexOf(u8, agent_stdout.buffered(), "\"permissionDecision\":\"ask\"") != null);
+    _ = try evaluatePayloadWithModeOpts(allocator, agent_payload, &agent_stdout, shell_eval.mockDaemonDenyHighEvaluator, .ask, .{
+        .disable_fm = true,
+        .unattended = false,
+    });
+    try std.testing.expectEqual(@as(usize, 0), agent_stdout.buffered().len);
 
     var cursor_buf: [1024]u8 = undefined;
     var cursor_stdout: std.Io.Writer = .fixed(&cursor_buf);
-    _ = try evaluatePayloadWithModeOpts(allocator, cursor_payload, &cursor_stdout, shell_eval.mockDaemonDenyHighEvaluator, .ask, test_no_fm);
-    try std.testing.expect(std.mem.indexOf(u8, cursor_stdout.buffered(), "\"permission\":\"deny\"") != null);
+    _ = try evaluatePayloadWithModeOpts(allocator, cursor_payload, &cursor_stdout, shell_eval.mockDaemonDenyHighEvaluator, .ask, .{
+        .disable_fm = true,
+        .unattended = false,
+    });
+    try std.testing.expect(std.mem.indexOf(u8, cursor_stdout.buffered(), "\"permission\":\"allow\"") != null);
 
     // Record sticky as if the host approved once for this session.
     try shell_eval.recordStickyFromAsk(shell_eval.getSessionStickyStore(), cmd, .session, .high);

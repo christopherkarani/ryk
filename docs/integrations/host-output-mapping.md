@@ -74,10 +74,10 @@ Claude only. Informational allow.
 |---|---|---|
 | `allow` | `allow` | Policy allows |
 | `deny` | `block` | Policy denies |
-| `ask` | `ask` | Needs user confirmation |
+| `ask` | `allow` on Claude/Codex/OpenCode/Cursor/Pi; `block` when unattended | Leftover unused policy ask is permit so agents can work. Stage, FM steward ask, and SoftBlock never ride this wire. Explicit deny is unchanged. |
 | `observe` | `context_only` | Log only |
 | `redact` | `warn` | Secrets detected |
-| `stage` | `ask` | Staged write pending review |
+| `stage` | hold (`ask` on Claude `permissionDecision`) or `stage`/`block` on generic hook JSON; never `allow` | Staged write pending review. Unattended/`--ci` hardens to `block`. |
 | `broker` | `error` | Evaluation failure |
 
 ## Risk Level Reference
@@ -140,7 +140,7 @@ Claude Code expects native host JSON so blocks surface as real permission denial
 | Field | Notes |
 |---|---|
 | `hookSpecificOutput.hookEventName` | Matches the event (`PreToolUse` or `PermissionRequest`) |
-| `hookSpecificOutput.permissionDecision` | `allow` \| `deny` \| `ask` |
+| `hookSpecificOutput.permissionDecision` | `allow` \| `deny` |
 | `hookSpecificOutput.permissionDecisionReason` | Short one-line reason; no Recourse/Next walls; no redeemable allow-once codes |
 | `systemMessage` | Optional short notice on deny/ask (UX only; not a substitute for `permissionDecision`) |
 
@@ -149,7 +149,7 @@ Claude Code expects native host JSON so blocks surface as real permission denial
 | ryk hook decision | Claude `permissionDecision` | Notes |
 |---|---|---|
 | `block` / `error` | `deny` | Hard veto |
-| `ask` | `ask` | Interactive; under `--ci` ryk hardens `ask`→`block` before emit → `deny` |
+| `ask` | `allow` | Residual ask is permit on Claude/Codex so agents can work; `--ci` / unattended → `deny` |
 | `allow` / `context_only` | `allow` | Proceed |
 | `warn` | `allow` | Warn is not a hard veto on this surface (documented proceed; not a silent silent-allow of blocked tools) |
 
@@ -287,7 +287,7 @@ For headless runs, ryk should report the CI limitation directly instead of prete
 
 ## Cross-host decision mapping
 
-The living multi-host matrix (Hermes native approve-and-resume, OpenClaw/OpenCode ask→block limitations, prompt-path honesty) lives in:
+The living multi-host matrix (residual ask is permit on coding hosts, OpenClaw ask→block until a resume contract exists, prompt-path honesty) lives in:
 
 - `docs/integrations/host-decision-mapping.md`
 - `integrations/common/schemas/host-decision-mapping-v1.json`
