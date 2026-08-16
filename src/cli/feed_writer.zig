@@ -24,10 +24,16 @@ pub fn appendRecord(io: std.Io, allocator: std.mem.Allocator, workspace_root: []
     const feed_path = try feedPath(allocator, workspace_root);
     defer allocator.free(feed_path);
 
-    try appendRecordAtPath(io, allocator, feed_path, record);
+    try appendRecordAtPath(io, allocator, feed_path, record, true);
 }
 
-fn appendRecordAtPath(io: std.Io, allocator: std.mem.Allocator, path: []const u8, record: rust_visibility.RustShellFeedRecord) !void {
+fn appendRecordAtPath(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    record: rust_visibility.RustShellFeedRecord,
+    sync_after: bool,
+) !void {
     var file = try std.Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = false, .lock = .exclusive });
     defer file.close(io);
     const end_offset = (try file.stat(io)).size;
@@ -43,7 +49,7 @@ fn appendRecordAtPath(io: std.Io, allocator: std.mem.Allocator, path: []const u8
     defer allocator.free(bytes);
     try file_writer.interface.writeAll(bytes);
     try file_writer.interface.flush();
-    try file.sync(io);
+    if (sync_after) try file.sync(io);
 }
 
 pub fn appendGlobalRecord(
@@ -51,6 +57,16 @@ pub fn appendGlobalRecord(
     allocator: std.mem.Allocator,
     dashboard_root: []const u8,
     record: rust_visibility.RustShellFeedRecord,
+) !void {
+    return appendGlobalRecordWithSync(io, allocator, dashboard_root, record, true);
+}
+
+fn appendGlobalRecordWithSync(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    dashboard_root: []const u8,
+    record: rust_visibility.RustShellFeedRecord,
+    sync_after: bool,
 ) !void {
     try std.Io.Dir.cwd().createDirPath(io, dashboard_root);
 
@@ -64,7 +80,7 @@ pub fn appendGlobalRecord(
     const events_path = try std.fs.path.join(allocator, &.{ dashboard_root, global_events_file_name });
     defer allocator.free(events_path);
     try rotateGlobalFeedIfNeeded(io, allocator, dashboard_root, events_path);
-    try appendRecordAtPath(io, allocator, events_path, record);
+    try appendRecordAtPath(io, allocator, events_path, record, sync_after);
     try updateWorkspaceRegistry(io, allocator, dashboard_root, record);
 }
 
@@ -93,7 +109,9 @@ pub fn appendRecordBestEffort(io: std.Io, allocator: std.mem.Allocator, workspac
     if (processGlobalWritesDisabled()) return;
     const dashboard_root = resolveGlobalDashboardRoot(allocator) catch return;
     defer allocator.free(dashboard_root);
-    appendGlobalRecord(io, allocator, dashboard_root, record) catch {};
+    // Hook path: keep the exclusive lock, skip events.jsonl fsync. Workspace
+    // feed and the workspace registry stay durable. Feed must not fail-close.
+    appendGlobalRecordWithSync(io, allocator, dashboard_root, record, false) catch {};
 }
 
 pub fn processGlobalWritesDisabled() bool {
@@ -864,6 +882,42 @@ test "global feed matching loader retains only bounded blocked records" {
     defer loaded.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 2), loaded.records.len);
     for (loaded.records) |item| try std.testing.expect(rust_visibility.isBlockedFeedRecord(item.record));
+}
+
+test "global feed append without fsync is still readable" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const dashboard_root = try std.fs.path.join(std.testing.allocator, &.{ root, "dashboard" });
+    defer std.testing.allocator.free(dashboard_root);
+
+    var record = try rust_visibility.buildFeedRecordFromHookDecision(
+        std.testing.allocator,
+        std.testing.io,
+        root,
+        "codex",
+        "healthy",
+        "deny",
+        "blocked",
+        null,
+        null,
+        null,
+        null,
+        null,
+    );
+    defer record.deinit(std.testing.allocator);
+    try appendGlobalRecordWithSync(std.testing.io, std.testing.allocator, dashboard_root, record, false);
+
+    var loaded = try loadGlobalRecentMatchingWithHealth(
+        std.testing.io,
+        std.testing.allocator,
+        dashboard_root,
+        1,
+        .blocked,
+    );
+    defer loaded.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), loaded.records.len);
 }
 
 test "feed loader accepts histories larger than 64 MiB by reading a bounded tail" {
