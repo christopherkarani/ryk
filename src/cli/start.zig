@@ -588,9 +588,9 @@ fn writeSuccessEndCard(
     } else if (verification) |outcome| {
         if (outcome.host_evidence == .not_applicable and selected_hosts.len == 0) {
             const body = if (policy_created)
-                "Policy written. Verify passed."
+                "Policy written. Policy check passed."
             else
-                "Policy unchanged. Verify passed.";
+                "Policy unchanged. Policy check passed.";
             try tui.render.callout(io, stdout, .success, "Setup complete", body);
         } else if (outcome.host_evidence == .not_applicable) {
             const body = if (policy_created)
@@ -618,7 +618,7 @@ fn writeSuccessEndCard(
         else if (v.host_evidence == .native)
             "passed"
         else if (v.host_evidence == .not_applicable)
-            if (selected_hosts.len == 0) "passed" else "deferred"
+            if (selected_hosts.len == 0) "policy check" else "deferred"
         else
             v.host_evidence.label()
     else
@@ -901,10 +901,11 @@ test "start first-run create copy names what happened without leftover jargon" {
     const output = stdout_writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, output, "Creating .ryk/policy.yaml") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Policy created.") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "Policy written. Verify passed.") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "Verify       passed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Policy written. Policy check passed.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Verify       policy check") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Setup complete") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Next: ryk doctor") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Verify passed") == null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Existing policy files are kept") == null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Existing policy is preserved") == null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Existing policy preserved.") == null);
@@ -1171,8 +1172,9 @@ test "start leave-alone empty-host card says policy unchanged after verify" {
     );
 
     const written = output.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, written, "Policy unchanged. Verify passed.") != null);
-    try std.testing.expect(std.mem.indexOf(u8, written, "Verify       passed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "Policy unchanged. Policy check passed.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "Verify       policy check") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "Verify passed") == null);
     try std.testing.expect(std.mem.indexOf(u8, written, "activation evidence pending") == null);
     try std.testing.expect(std.mem.indexOf(u8, written, "not applicable") == null);
 }
