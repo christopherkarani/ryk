@@ -245,7 +245,9 @@ fn evaluateSurface(
 ) !Decision {
     const destination = parseDestination(destination_text) catch |err| {
         if (effective_mode == .ci or effective_mode == .strict or policy.network.effectiveMode() == .off or policy.network.effectiveMode() == .allowlist) {
+            // #374: free target if reason dupe fails (dual-dupe ownership).
             const target = try allocator.dupe(u8, "[invalid-network-destination]");
+            errdefer allocator.free(target);
             const reason = try allocator.dupe(u8, "invalid or ambiguous network destination");
             return .{
                 .destination = .{ .raw = destination_text, .host = "", .host_class = .invalid },
