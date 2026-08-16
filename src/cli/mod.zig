@@ -240,7 +240,7 @@ fn isMachineArgv(argv: []const []const u8) bool {
 
 /// True when the compact brand banner should open this invocation. The banner
 /// is a presentation-only header; it never appears on `--json`/machine/raw paths
-/// (byte-identity invariant), `--quiet` script output, nor on `--help`/`help <cmd>`
+/// (byte-identity invariant), `init --quiet` script output, nor on `--help`/`help <cmd>`
 /// reference output.
 fn shouldShowBanner(command: []const u8, argv: []const []const u8) bool {
     // Self-banner commands render their own header (version key-value grid, top
@@ -287,12 +287,18 @@ fn shouldShowBanner(command: []const u8, argv: []const []const u8) bool {
     // `help <cmd>` is command-specific reference help (no banner); bare `help`
     // is top help and renders its own banner inside help.write.
     if (std.mem.eql(u8, command, "help")) return false;
+    // `--quiet` is an init-only presentation gate (#213). Other commands keep
+    // the brand banner; #215 owns the general "drop the shield" policy.
+    if (std.mem.eql(u8, command, "init")) {
+        for (argv[1..]) |arg| {
+            if (std.mem.eql(u8, arg, "--quiet")) return false;
+        }
+    }
     // Scan subcommand args (argv[1..]) for machine/help tokens.
     var i: usize = 1;
     while (i < argv.len) : (i += 1) {
         const a = argv[i];
-        if (std.mem.eql(u8, a, "--json") or std.mem.eql(u8, a, "--stdin") or
-            std.mem.eql(u8, a, "--quiet")) return false;
+        if (std.mem.eql(u8, a, "--json") or std.mem.eql(u8, a, "--stdin")) return false;
         if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) return false;
         if (std.mem.eql(u8, a, "--format") and i + 1 < argv.len and std.mem.eql(u8, argv[i + 1], "json")) return false;
     }
@@ -418,7 +424,7 @@ fn runWithCwdUsing(
     // Compact brand header at the entry of every HUMAN command (Phase 2 brand
     // cohesion). Suppressed for self-banner commands (version/help/run render
     // their own header), always-machine/raw commands, --json/--stdin/--format
-    // json machine paths, --quiet script output, --help reference output, and
+    // json machine paths, init --quiet script output, --help reference output, and
     // unknown commands.
     try writeInvocationPresentation(io, command, argv, stdout);
     if (std.mem.eql(u8, command, "help")) {
@@ -1415,6 +1421,10 @@ test "shouldShowBanner is false for init --quiet" {
     try std.testing.expect(!shouldShowBanner("init", &.{ "init", "--force", "--quiet" }));
     try std.testing.expect(shouldShowBanner("init", &.{"init"}));
     try std.testing.expect(shouldShowBanner("init", &.{ "init", "--preset", "generic-agent" }));
+}
+
+test "shouldShowBanner is true for doctor --quiet" {
+    try std.testing.expect(shouldShowBanner("doctor", &.{ "doctor", "--quiet" }));
 }
 
 test "init --quiet has no process-level banner" {
