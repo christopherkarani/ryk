@@ -20,11 +20,10 @@ pub fn redactAlloc(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
     if (value.len > max_structured_input) return allocator.dupe(u8, redacted_value);
     if (try encodedContainsSecret(allocator, value)) return allocator.dupe(u8, redacted_value);
     // A vendor/SAS span must not skip classify-only secrets on the same value
-    // (JWT / PEM / high-entropy beside a Slack token or SAS URL). Bounded
-    // already classifies first; keep span replacement for slack/github/SAS.
-    if (classifyString(value)) |match| {
-        if (isOpaqueSecretLabel(match.label)) return allocator.dupe(u8, redacted_value);
-    }
+    // (JWT / PEM / high-entropy / AKIA beside a Slack token or SAS URL).
+    // Scan every token, not only the first `classifyString` label — Slack
+    // before a JWT would otherwise win and leave the JWT in the clear.
+    if (containsOpaqueSecret(value)) return allocator.dupe(u8, redacted_value);
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     var start: usize = 0;
@@ -270,7 +269,30 @@ fn isOpaqueSecretLabel(label: []const u8) bool {
         std.mem.eql(u8, label, "secret:high_entropy") or
         std.mem.eql(u8, label, "secret:pem_private_key") or
         std.mem.eql(u8, label, "secret:ssh_private_key") or
-        std.mem.eql(u8, label, "secret:cloud_credentials_json");
+        std.mem.eql(u8, label, "secret:cloud_credentials_json") or
+        std.mem.eql(u8, label, "secret:aws_access_key");
+}
+
+fn containsOpaqueSecret(value: []const u8) bool {
+    if (classifySecretValue(value)) |match| {
+        if (isOpaqueSecretLabel(match.label)) return true;
+    }
+    var tokens = std.mem.tokenizeAny(u8, value, " \t\r\n?&=|,;:\"'()[]{}<>");
+    while (tokens.next()) |raw_token| {
+        const token = std.mem.trim(u8, raw_token, ":");
+        if (classifySecretValue(token)) |match| {
+            if (isOpaqueSecretLabel(match.label)) return true;
+        }
+    }
+    var assignments = std.mem.tokenizeAny(u8, value, " \t\r\n");
+    while (assignments.next()) |raw_token| {
+        if (parseEnvAssignment(trimCommandToken(raw_token))) |assignment| {
+            if (classifySecretValue(assignment.value)) |match| {
+                if (isOpaqueSecretLabel(match.label)) return true;
+            }
+        }
+    }
+    return false;
 }
 
 fn startsWithIgnoreCase(value: []const u8, prefix: []const u8) bool {
@@ -1178,6 +1200,25 @@ test "opaque secrets beside vendor or sas spans redact the whole alloc value" {
     defer std.testing.allocator.free(pem_owned);
     try std.testing.expectEqualStrings(redacted_value, pem_owned);
     try std.testing.expect(std.mem.indexOf(u8, pem_owned, "BEGIN PRIVATE KEY") == null);
+
+    const slack_then_jwt = "xoxb-fakeSynthetic eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJmYWtlIn0.c2lnbmF0dXJl";
+    const slack_jwt_owned = try redactAlloc(std.testing.allocator, slack_then_jwt);
+    defer std.testing.allocator.free(slack_jwt_owned);
+    try std.testing.expectEqualStrings(redacted_value, slack_jwt_owned);
+    try std.testing.expect(std.mem.indexOf(u8, slack_jwt_owned, "eyJ") == null);
+
+    const entropy_and_slack = "Aa0Bb1Cc2Dd3Ee4Ff5Gg6Hh7Ii8Jj9Kk xoxb-fakeSynthetic";
+    try expectSecretLabel("Aa0Bb1Cc2Dd3Ee4Ff5Gg6Hh7Ii8Jj9Kk", "secret:high_entropy");
+    const entropy_slack_owned = try redactAlloc(std.testing.allocator, entropy_and_slack);
+    defer std.testing.allocator.free(entropy_slack_owned);
+    try std.testing.expectEqualStrings(redacted_value, entropy_slack_owned);
+    try std.testing.expect(std.mem.indexOf(u8, entropy_slack_owned, "Aa0Bb1") == null);
+
+    const akia_and_slack = "AKIAIOSFODNN7EXAMPLE xoxb-fakeSynthetic";
+    const akia_owned = try redactAlloc(std.testing.allocator, akia_and_slack);
+    defer std.testing.allocator.free(akia_owned);
+    try std.testing.expectEqualStrings(redacted_value, akia_owned);
+    try std.testing.expect(std.mem.indexOf(u8, akia_owned, "AKIA") == null);
 }
 
 test "azure sas accepts connection-string semicolon and entity-escaped delimiters" {
