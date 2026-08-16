@@ -958,6 +958,10 @@ test "resolveHostIdentity planted ./grok and /tmp/evil/grok stay generic" {
         .sub_path = ".grok/auth.json",
         .data = "{\"accessToken\":\"synthetic\"}\n",
     });
+    try home_tmp.dir.writeFile(io, .{
+        .sub_path = ".grok/active_sessions.lock",
+        .data = "lock\n",
+    });
 
     var env_map = std.process.Environ.Map.init(allocator);
     defer env_map.deinit();

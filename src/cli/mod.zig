@@ -144,6 +144,8 @@ test {
     _ = readiness;
     _ = doctor;
     _ = @import("doctor_mcp.zig");
+    // Unknown-command / option "did you mean?" ranking (length-scaled edit distance).
+    _ = suggestions;
     _ = danger_confirmation;
     _ = run_command;
     _ = shim; // PATH-shim audit mode session attestation (F36)
@@ -238,7 +240,8 @@ fn isMachineArgv(argv: []const []const u8) bool {
 
 /// True when the compact brand banner should open this invocation. The banner
 /// is a presentation-only header; it never appears on `--json`/machine/raw paths
-/// (byte-identity invariant) nor on `--help`/`help <cmd>` reference output.
+/// (byte-identity invariant), `init --quiet` script output, nor on `--help`/`help <cmd>`
+/// reference output.
 fn shouldShowBanner(command: []const u8, argv: []const []const u8) bool {
     // Self-banner commands render their own header (version key-value grid, top
     // help redesign, run session banner). Host launch aliases rewrite into run.
@@ -262,9 +265,9 @@ fn shouldShowBanner(command: []const u8, argv: []const []const u8) bool {
     // human error remediation remains presentation-capable. JSON is still
     // classified as machine output by isMachineArgv.
     if (std.mem.eql(u8, command, "report")) return false;
-    // `history --live` is intercepted by the Zig CLI before daemon passthrough.
-    // Treat its non-TTY rejection as a human surface so it matches `replay --tui`,
-    // while keeping machine conflicts/banner-free JSON byte contracts raw.
+    // `history --live` is a library/test surface (product dispatch is the
+    // hide-list stub). Treat --live as a human surface so it matches
+    // `replay --tui`, while keeping machine conflicts/banner-free JSON raw.
     if (std.mem.eql(u8, command, "history")) {
         var live = false;
         var i: usize = 1;
@@ -284,6 +287,13 @@ fn shouldShowBanner(command: []const u8, argv: []const []const u8) bool {
     // `help <cmd>` is command-specific reference help (no banner); bare `help`
     // is top help and renders its own banner inside help.write.
     if (std.mem.eql(u8, command, "help")) return false;
+    // `--quiet` is an init-only presentation gate (#213). Other commands keep
+    // the brand banner; #215 owns the general "drop the shield" policy.
+    if (std.mem.eql(u8, command, "init")) {
+        for (argv[1..]) |arg| {
+            if (std.mem.eql(u8, arg, "--quiet")) return false;
+        }
+    }
     // Scan subcommand args (argv[1..]) for machine/help tokens.
     var i: usize = 1;
     while (i < argv.len) : (i += 1) {
@@ -414,7 +424,8 @@ fn runWithCwdUsing(
     // Compact brand header at the entry of every HUMAN command (Phase 2 brand
     // cohesion). Suppressed for self-banner commands (version/help/run render
     // their own header), always-machine/raw commands, --json/--stdin/--format
-    // json machine paths, --help reference output, and unknown commands.
+    // json machine paths, init --quiet script output, --help reference output, and
+    // unknown commands.
     try writeInvocationPresentation(io, command, argv, stdout);
     if (std.mem.eql(u8, command, "help")) {
         if (argv.len == 1) {
@@ -514,7 +525,13 @@ fn runWithCwdUsing(
         return exit_codes.success;
     }
     if (std.mem.eql(u8, command, "env")) {
-        if (argv.len > 1) return env_schema_command.command(io, argv[1..], stdout, stderr);
+        if (argv.len > 1) {
+            if (argv.len == 2 and (std.mem.eql(u8, argv[1], "--help") or std.mem.eql(u8, argv[1], "-h"))) {
+                _ = try help.writeCommand(io, stdout, "env");
+                return exit_codes.success;
+            }
+            return env_schema_command.command(io, argv[1..], stdout, stderr);
+        }
         try writeInstallEnv(io, stdout);
         return exit_codes.success;
     }
@@ -1398,6 +1415,39 @@ test "banner renders on a human command (doctor)" {
     try std.testing.expectEqualStrings("", stderr_writer.buffered());
 }
 
+test "shouldShowBanner is false for init --quiet" {
+    try std.testing.expect(!shouldShowBanner("init", &.{ "init", "--quiet" }));
+    try std.testing.expect(!shouldShowBanner("init", &.{ "init", "--preset", "generic-agent", "--quiet" }));
+    try std.testing.expect(!shouldShowBanner("init", &.{ "init", "--force", "--quiet" }));
+    try std.testing.expect(shouldShowBanner("init", &.{"init"}));
+    try std.testing.expect(shouldShowBanner("init", &.{ "init", "--preset", "generic-agent" }));
+}
+
+test "shouldShowBanner is true for doctor --quiet" {
+    try std.testing.expect(shouldShowBanner("doctor", &.{ "doctor", "--quiet" }));
+}
+
+test "init --quiet has no process-level banner" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var stdout_buf: [4096]u8 = undefined;
+    var stderr_buf: [1024]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+
+    const code = try testRunWithCwd(tmp.dir, &.{ "init", "--quiet" }, &stdout_writer, &stderr_writer);
+    try std.testing.expectEqual(exit_codes.success, code);
+    const out = stdout_writer.buffered();
+    const err = stderr_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "\u{1F6E1}") == null);
+    try std.testing.expect(std.mem.indexOf(u8, err, "\u{1F6E1}") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Created") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Next") == null);
+    try std.testing.expectEqualStrings("", out);
+    try std.testing.expectEqualStrings("", err);
+}
+
 test "start owns its onboarding banner" {
     try std.testing.expect(!shouldShowBanner("start", &.{"start"}));
     try std.testing.expect(!shouldShowBanner("start", &.{ "start", "--auto" }));
@@ -1421,6 +1471,75 @@ test "banner suppressed for raw env output" {
     try std.testing.expect(std.mem.indexOf(u8, out, "PATH") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\u{1F6E1}  ryk") == null);
     try std.testing.expectEqualStrings("", stderr_writer.buffered());
+}
+
+test "env --help exits 0 and names eval verbs" {
+    var stdout_buf: [4096]u8 = undefined;
+    var stderr_buf: [256]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+
+    const code = try testRun(&.{ "env", "--help" }, &stdout_writer, &stderr_writer);
+    try std.testing.expectEqual(exit_codes.success, code);
+    const out = stdout_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "eval \"$(ryk env)\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "schema --agent") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "export PATH=") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "set \"PATH=") == null);
+
+    stdout_writer = .fixed(&stdout_buf);
+    stderr_writer = .fixed(&stderr_buf);
+    const short_code = try testRun(&.{ "env", "-h" }, &stdout_writer, &stderr_writer);
+    try std.testing.expectEqual(exit_codes.success, short_code);
+    const short_out = stdout_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, short_out, "eval \"$(ryk env)\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, short_out, "schema --agent") != null);
+}
+
+test "env schema --help exits 0 and is not usage-as-error" {
+    var stdout_buf: [4096]u8 = undefined;
+    var stderr_buf: [256]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+
+    const cases = [_][]const []const u8{
+        &.{ "env", "schema", "--help" },
+        &.{ "env", "schema", "-h" },
+        &.{ "env", "schema", "--agent", "--help" },
+    };
+    for (cases) |argv| {
+        stdout_writer = .fixed(&stdout_buf);
+        stderr_writer = .fixed(&stderr_buf);
+        const code = try testRun(argv, &stdout_writer, &stderr_writer);
+        try std.testing.expectEqual(exit_codes.success, code);
+        try std.testing.expectEqualStrings("", stderr_writer.buffered());
+        const out = stdout_writer.buffered();
+        try std.testing.expect(out.len > 0);
+        try std.testing.expect(std.mem.indexOf(u8, out, "schema --agent") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "export PATH=") == null);
+    }
+}
+
+test "env schema without --agent stays usage" {
+    var stdout_buf: [4096]u8 = undefined;
+    var stderr_buf: [256]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+
+    const cases = [_][]const []const u8{
+        &.{ "env", "schema" },
+        &.{ "env", "--agent" },
+    };
+    for (cases) |argv| {
+        stdout_writer = .fixed(&stdout_buf);
+        stderr_writer = .fixed(&stderr_buf);
+        const code = try testRun(argv, &stdout_writer, &stderr_writer);
+        try std.testing.expectEqual(exit_codes.usage, code);
+        try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "Usage: ryk env schema --agent") != null);
+        const out = stdout_writer.buffered();
+        try std.testing.expect(std.mem.indexOf(u8, out, "eval \"$(ryk env)\"") == null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "export PATH=") == null);
+    }
 }
 
 test "banner suppressed for completions raw output" {
@@ -2084,6 +2203,26 @@ test "top-level command suggestions reject ambiguous short prefixes" {
 test "completely unknown command has no suggestion" {
     const suggestion = suggestCommand("xyz123neveracmd");
     try std.testing.expect(suggestion == null);
+}
+
+test "unknown command foo does not suggest hook" {
+    // Regression for #210: weak edit distance must not recommend power commands.
+    try std.testing.expect(suggestCommand("foo") == null);
+    try std.testing.expectEqualStrings("doctor", suggestCommand("docter").?);
+    try std.testing.expectEqualStrings("policy", suggestCommand("polcy").?);
+
+    var stdout_buf: [128]u8 = undefined;
+    var stderr_buf: [256]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+    const code = try testRun(&.{"foo"}, &stdout_writer, &stderr_writer);
+    try std.testing.expectEqual(exit_codes.usage, code);
+    try std.testing.expectEqualStrings("", stdout_writer.buffered());
+    const err = stderr_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, err, "unknown command") != null);
+    try std.testing.expect(std.mem.indexOf(u8, err, "Did you mean") == null);
+    try std.testing.expect(std.mem.indexOf(u8, err, "hook") == null);
+    try std.testing.expect(std.mem.indexOf(u8, err, "Run 'ryk help' for usage.") != null);
 }
 
 test "init dispatch creates policy in provided working directory" {

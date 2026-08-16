@@ -64,7 +64,7 @@ State: `.release-cut/state.env` (gitignored)
 
    ```sh
    set -euo pipefail
-   REPO="${RYK_REPO:-$HOME/CodingProjects/ryk}"
+   REPO="${RYK_REPO:-$HOME/ryk}"
    BUMP="$1"   # or wire Shortcut variable
    cd "$REPO"
    # Show computed version for confirm
@@ -96,7 +96,7 @@ PY
 
    ```sh
    set -euo pipefail
-   REPO="${RYK_REPO:-$HOME/CodingProjects/ryk}"
+   REPO="${RYK_REPO:-$HOME/ryk}"
    BUMP="$1"
    cd "$REPO"
    # PATH for GUI-launched Shortcuts (adjust if needed)

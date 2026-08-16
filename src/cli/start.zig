@@ -65,9 +65,7 @@ pub fn runStart(
 
     try tui.render.banner(io, stdout, build_options.version, null);
     try stdout.writeAll(
-        \\ryk will configure protection for your workspace, verify shell evaluation when needed,
-        \\install host integrations you choose, and run safe verification checks.
-        \\Existing policy files are kept unless you run `ryk init --force`.
+        \\ryk will set up this workspace and run a quick check.
         \\
         \\
     );
@@ -79,7 +77,6 @@ pub fn runStart(
     // Posture line is printed after ensure, from the YAML that was just written
     // (or left alone). Do not claim Ask/strict before that file exists.
     const protection = resolveProtectionMode(flags);
-    try stdout.writeAll("  Existing policy is preserved; claims below follow the policy file mode.\n\n");
 
     var doctor_report = try plugin.collectPluginDoctorReport(io, allocator);
     defer plugin.deinitPluginDoctorReport(&doctor_report, allocator);
@@ -260,6 +257,7 @@ pub fn runStart(
         daemon_check,
         verification,
         policy_mode,
+        ensure_outcome.policy_created,
     );
     setup_succeeded = true;
     return exit_codes.success;
@@ -532,6 +530,7 @@ fn writeSuccessEndCard(
     daemon_check: onboarding.DaemonCheck,
     verification: ?onboarding.VerificationOutcome,
     policy_mode: ?[]const u8,
+    policy_created: bool,
 ) !void {
     const mode = policy_mode orelse "unknown";
     const ask_equivalent = policyModeIsAskEquivalent(mode);
@@ -587,7 +586,21 @@ fn writeSuccessEndCard(
         defer allocator.free(residual_body);
         try tui.render.callout(io, stdout, .warn, "Setup complete — residual policy mode", residual_body);
     } else if (verification) |outcome| {
-        try tui.render.callout(io, stdout, .warn, "Setup complete — activation evidence pending", outcome.host_evidence.label());
+        if (outcome.host_evidence == .not_applicable and selected_hosts.len == 0) {
+            const body = if (policy_created)
+                "Policy written. Verify passed."
+            else
+                "Policy unchanged. Verify passed.";
+            try tui.render.callout(io, stdout, .success, "Setup complete", body);
+        } else if (outcome.host_evidence == .not_applicable) {
+            const body = if (policy_created)
+                "Policy written. Host verify deferred."
+            else
+                "Policy unchanged. Host verify deferred.";
+            try tui.render.callout(io, stdout, .success, "Setup complete", body);
+        } else {
+            try tui.render.callout(io, stdout, .warn, "Setup complete", outcome.host_evidence.label());
+        }
     } else {
         try tui.render.callout(io, stdout, .warn, "Setup complete — verification skipped", "Configuration was written, but ryk did not claim active protection without verification.");
     }
@@ -602,10 +615,10 @@ fn writeSuccessEndCard(
     const verify_line: []const u8 = if (verification) |v|
         if (!v.passed())
             "failed"
-        else if (v.host_evidence == .not_applicable and selected_hosts.len > 0)
-            v.host_evidence.label()
-        else if (v.host_evidence == .native or v.host_evidence == .not_applicable)
+        else if (v.host_evidence == .native)
             "passed"
+        else if (v.host_evidence == .not_applicable)
+            if (selected_hosts.len == 0) "passed" else "deferred"
         else
             v.host_evidence.label()
     else
@@ -849,6 +862,54 @@ test "start on clean workspace writes generic-agent strict and banner matches po
     const output = stdout_writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, output, "Ask on risk") == null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Setup path: strict") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Existing policy files are kept") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Existing policy is preserved") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "activation evidence pending") == null);
+}
+
+test "start first-run create copy names what happened without leftover jargon" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, ".git", .default_dir);
+
+    var stdout_buf: [16384]u8 = undefined;
+    var stderr_buf: [1024]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+
+    const flags = onboarding.StartFlags{
+        .auto = true,
+        .skip_verify = false,
+        .hosts_csv = "",
+    };
+
+    const mock_checker = struct {
+        fn check(_: std.mem.Allocator, _: bool) !void {}
+    }.check;
+
+    const code = try runStart(
+        std.testing.io,
+        tmp.dir,
+        flags,
+        &stdout_writer,
+        &stderr_writer,
+        mock_checker,
+        onboarding.mockOnboardingEvaluator,
+    );
+    try std.testing.expectEqual(exit_codes.success, code);
+
+    const output = stdout_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, output, "Creating .ryk/policy.yaml") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Policy created.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Policy written. Verify passed.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Verify       passed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Setup complete") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Next: ryk doctor") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Existing policy files are kept") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Existing policy is preserved") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Existing policy preserved.") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "activation evidence pending") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "not applicable") == null);
 }
 
 test "start auto mode with mock daemon completes in temp workspace" {
@@ -968,6 +1029,7 @@ test "start verified completion states hook grade without unqualified protection
         daemon_check,
         verification,
         "ask",
+        true,
     );
 
     const written = output.buffered();
@@ -1017,6 +1079,7 @@ test "start verified firewall-only completion states mediated-session scope" {
         daemon_check,
         verification,
         "ask",
+        true,
     );
 
     const written = output.buffered();
@@ -1061,12 +1124,57 @@ test "start OpenClaw completion is explicit about wrapper-required evidence" {
         daemon_check,
         verification,
         "ask",
+        true,
     );
 
     const written = output.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "You're now " ++ "protected by ryk") == null);
-    try std.testing.expect(std.mem.indexOf(u8, written, "activation evidence pending") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "activation evidence pending") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "not applicable") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "Verify passed") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "Setup complete") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "ryk run -- openclaw") != null);
+}
+
+test "start leave-alone empty-host card says policy unchanged after verify" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+
+    const verification = onboarding.VerificationOutcome{
+        .safe_allowed = true,
+        .dangerous_denied = true,
+        .host_evidence = .not_applicable,
+        .detail = "ok",
+    };
+    const daemon_check = onboarding.DaemonCheck{
+        .status = .compatible,
+        .detail = "in-process",
+        .remediation = "none",
+    };
+    var output_buffer: [16 * 1024]u8 = undefined;
+    var output: std.Io.Writer = .fixed(&output_buffer);
+    try writeSuccessEndCard(
+        std.testing.io,
+        std.testing.allocator,
+        &output,
+        root,
+        "generic-agent",
+        .command_guard,
+        &.{},
+        &.{},
+        daemon_check,
+        verification,
+        "strict",
+        false,
+    );
+
+    const written = output.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "Policy unchanged. Verify passed.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "Verify       passed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "activation evidence pending") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "not applicable") == null);
 }
 
 test "start unattended completion never claims active protection before health" {
@@ -1101,6 +1209,7 @@ test "start unattended completion never claims active protection before health" 
         daemon_check,
         verification,
         "strict",
+        true,
     );
 
     const written = output.buffered();
@@ -1147,6 +1256,7 @@ test "start success card does not claim cursor hooks or failed Pi skip" {
         daemon_check,
         verification,
         "strict",
+        true,
     );
     const written = output.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "hooks verified for claude") != null);
@@ -1263,6 +1373,9 @@ test "start cursor-only selection is deferred not incomplete" {
     try std.testing.expect(std.mem.indexOf(u8, output, "Setup incomplete") == null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Integrations configured") == null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Verify       passed") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Policy written. Verify passed.") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Host verify deferred.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "not applicable") == null);
 }
 
 test "start firewall path verifies without daemon or shell evaluator" {
@@ -1348,6 +1461,10 @@ test "start with existing observe policy does not claim Ask protection" {
     try std.testing.expect(std.mem.indexOf(u8, output, "Setup path: observe") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "policy mode=observe") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "not Ask") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Policy already exists") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Existing policy files are kept") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Existing policy is preserved; claims below") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "activation evidence pending") == null);
     try std.testing.expect(std.mem.indexOf(u8, output, "You're now " ++ "protected by ryk") == null);
     // Residual callout, not full Ask protection claim.
     try std.testing.expect(std.mem.indexOf(u8, output, "residual policy mode") != null or std.mem.indexOf(u8, output, "Setup complete") != null);

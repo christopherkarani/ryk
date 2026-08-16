@@ -724,6 +724,8 @@ fn commandWithStdioAndEnv(io: std.Io, argv: []const []const u8, stdout: anytype,
         audit_context: *AuditContext,
         session_grade: SessionSandboxGrade,
         shim_audit_degraded: bool,
+        /// Exact host-launch handoff (`ryk grok`): skip SHIELD wall + audit=degraded line.
+        quiet_host_handoff: bool,
 
         pub fn print(context: *anyopaque, session: core.session.Session) !void {
             const self: *@This() = @ptrCast(@alignCast(context));
@@ -744,10 +746,14 @@ fn commandWithStdioAndEnv(io: std.Io, argv: []const []const u8, stdout: anytype,
                 self.apply_result.receipt,
                 self.session_grade,
                 self.shim_audit_degraded,
+                self.quiet_host_handoff,
             );
             // Flush before the shield dwell so the card is on-screen, not buffered.
             try flushIfSupported(self.writer);
-            holdShieldCardIfNeeded(self.io, self.writer, self.apply_result.receipt);
+            // One-click host handoff skips the SHIELD dwell (#221 feel).
+            if (!self.quiet_host_handoff) {
+                holdShieldCardIfNeeded(self.io, self.writer, self.apply_result.receipt);
+            }
         }
     };
 
@@ -771,6 +777,9 @@ fn commandWithStdioAndEnv(io: std.Io, argv: []const []const u8, stdout: anytype,
         }
     };
 
+    const quiet_host_handoff = options.command_argv.len > 0 and
+        host_launch.isExactHostLaunchArgv0(options.command_argv[0]) and
+        apply_result.requiresChildApply();
     var start_printer: StartPrinter = .{
         .io = io,
         .writer = stdout,
@@ -783,6 +792,7 @@ fn commandWithStdioAndEnv(io: std.Io, argv: []const []const u8, stdout: anytype,
         .audit_context = &audit_context,
         .session_grade = session_grade,
         .shim_audit_degraded = shim_audit_degraded,
+        .quiet_host_handoff = quiet_host_handoff,
     };
 
     var session_approvals = intercept.approvals.SessionApprovals.init(allocator);
@@ -1455,11 +1465,20 @@ fn commandWithStdioAndEnv(io: std.Io, argv: []const []const u8, stdout: anytype,
             }
             if (secret_boundary == .empty_backpack) {
                 const stdio_risk = sandbox.host_config_grants.parentStdioHasUngrantedHostTmpRisk(io);
-                // Agent stdio is usually inherited (not retained here). Path-walk residual
-                // is classified when agent_output is available; generic tip also names it.
+                // Inherit mode does not retain agent stdio; classify from flags + any
+                // captured output when present (tests / future capture paths).
+                const interactive_needs_tty = blk: {
+                    if (options.command_argv.len == 0) break :blk false;
+                    if (!host_launch.isExactHostLaunchArgv0(options.command_argv[0])) break :blk false;
+                    if (sandbox.host_config_grants.isAgentHelpOrVersionOnly(options.command_argv)) break :blk false;
+                    if (agentArgvLooksHeadless(options.command_argv)) break :blk false;
+                    const stdin_tty = std.Io.File.stdin().isTty(io) catch false;
+                    break :blk !stdin_tty;
+                };
                 try stderr.writeAll(sandbox.host_config_grants.selectEmptyBackpackAgentExitTip(.{
                     .stdio_host_tmp_risk = stdio_risk,
                     .agent_output = null,
+                    .interactive_needs_tty = interactive_needs_tty,
                 }));
             }
         }
@@ -2228,22 +2247,26 @@ fn printSessionStart(
     os_receipt: sandbox.posture.AttachReceipt,
     session_grade: SessionSandboxGrade,
     shim_audit_degraded: bool,
+    quiet_host_handoff: bool,
 ) !void {
     // Compact brand banner + Session / Workspace / Mode / Name grid. Celebration stays in printSessionEnd.
-    try tui.render.banner(io, stdout, build_options.version, "watching this session");
+    // Exact host-launch handoff (`ryk grok`) skips the banner/grid wall so the agent TUI is first (#221).
+    if (!quiet_host_handoff) {
+        try tui.render.banner(io, stdout, build_options.version, "watching this session");
 
-    var rows: [4]tui.render.KV = .{
-        .{ .label = "Session", .value = session.id.slice() },
-        .{ .label = "Workspace", .value = session.workspace_root },
-        .{ .label = "Mode", .value = session.mode.toString() },
-        .{ .label = "Name", .value = "" },
-    };
-    var count: usize = 3;
-    if (session.session_name) |name| {
-        rows[3].value = name;
-        count = 4;
+        var rows: [4]tui.render.KV = .{
+            .{ .label = "Session", .value = session.id.slice() },
+            .{ .label = "Workspace", .value = session.workspace_root },
+            .{ .label = "Mode", .value = session.mode.toString() },
+            .{ .label = "Name", .value = "" },
+        };
+        var count: usize = 3;
+        if (session.session_name) |name| {
+            rows[3].value = name;
+            count = 4;
+        }
+        try tui.render.keyValue(io, stdout, rows[0..count]);
     }
-    try tui.render.keyValue(io, stdout, rows[0..count]);
 
     // Mechanism-neutral OS sandbox line (S-GLO-03) — never "Seatbelt"/"Landlock" here.
     // Sized for longest production landlock route-forced banner (see posture.session_banner_buf_len).
@@ -2270,14 +2293,20 @@ fn printSessionStart(
         .{session_grade.toString()},
     );
     // E0: one greppable audit=degraded line per session when in-shim audit is known dead.
+    // Host-launch handoff suppresses this line on the success path (#221 feel).
     var audit_line_buf: [48]u8 = undefined;
-    const audit_line: ?[]const u8 = if (shim_audit_degraded)
+    const audit_line: ?[]const u8 = if (shim_audit_degraded and !quiet_host_handoff)
         try std.fmt.bufPrint(&audit_line_buf, "audit=degraded\n", .{})
     else
         null;
 
     const card_posture = tui.sandbox_card.PostureKind.parse(@tagName(os_receipt.posture));
-    if (card_posture.isDramatic()) {
+    // One-click host handoff: machine-readable posture only — no SHIELD UP wall.
+    if (quiet_host_handoff) {
+        try stdout.writeAll(posture_line);
+        try stdout.writeAll(os_line);
+        try stdout.writeAll("\n");
+    } else if (card_posture.isDramatic()) {
         const grade_str: ?[]const u8 = if (os_receipt.seatbelt_profile) |g| g.toString() else null;
         try tui.sandbox_card.render(io, stdout, .{
             .posture = card_posture,
@@ -2302,6 +2331,25 @@ fn printSessionStart(
         if (audit_line) |line| try stdout.writeAll(line);
         try stdout.writeAll("\n");
     }
+}
+
+/// True when agent argv looks headless (print/prompt/non-TUI), not bare interactive.
+fn agentArgvLooksHeadless(command_argv: []const []const u8) bool {
+    if (command_argv.len < 2) return false;
+    for (command_argv[1..]) |arg| {
+        if (std.mem.eql(u8, arg, "-p") or
+            std.mem.eql(u8, arg, "--print") or
+            std.mem.eql(u8, arg, "--prompt") or
+            std.mem.eql(u8, arg, "-q") or
+            std.mem.eql(u8, arg, "--quiet") or
+            std.mem.startsWith(u8, arg, "--output-format") or
+            std.mem.eql(u8, arg, "--json") or
+            std.mem.eql(u8, arg, "--no-interactive"))
+        {
+            return true;
+        }
+    }
+    return false;
 }
 
 fn printSessionEnd(
@@ -7030,7 +7078,7 @@ test "session start banner is mechanism-neutral for disabled OS sandbox" {
         .mode = .observe,
         .platform = core.platform.detectOs(),
     };
-    try printSessionStart(std.testing.io, &writer, session, .ask, false, false, false, false, sandbox.posture.disabledReceipt(), .wrapper_only, false);
+    try printSessionStart(std.testing.io, &writer, session, .ask, false, false, false, false, sandbox.posture.disabledReceipt(), .wrapper_only, false, false);
     const out = writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, out, "OS sandbox: disabled") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "Session grade: wrapper-only") != null);
@@ -7056,6 +7104,7 @@ test "session start banner is mechanism-neutral for disabled OS sandbox" {
         ),
         .strong_mediated,
         true,
+        false,
     );
     const active_out = writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, active_out, "SHIELD UP") != null);
@@ -7067,6 +7116,33 @@ test "session start banner is mechanism-neutral for disabled OS sandbox" {
     try std.testing.expect(std.mem.indexOf(u8, active_out, "audit=degraded") != null);
     try std.testing.expect(std.mem.indexOf(u8, active_out, "Seatbelt") == null);
     try std.testing.expect(std.mem.indexOf(u8, active_out, "network: unrestricted") != null);
+
+    // #221: exact host-launch handoff skips SHIELD wall and audit=degraded line.
+    writer = .fixed(&buf);
+    try printSessionStart(
+        std.testing.io,
+        &writer,
+        session,
+        .allowlist,
+        true,
+        false,
+        false,
+        false,
+        try sandbox.posture.activeReceipt(
+            .seatbelt,
+            active_hash,
+            "workspace RW, system RO, platform tmp RW, no home",
+        ),
+        .strong_mediated,
+        true,
+        true,
+    );
+    const quiet_out = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, quiet_out, "SHIELD UP") == null);
+    try std.testing.expect(std.mem.indexOf(u8, quiet_out, "audit=degraded") == null);
+    try std.testing.expect(std.mem.indexOf(u8, quiet_out, "sandbox=active") != null);
+    try std.testing.expect(std.mem.indexOf(u8, quiet_out, "OS sandbox: active") != null);
+    try std.testing.expect(std.mem.indexOf(u8, quiet_out, "secret-boundary=on") != null);
 }
 
 test "computeSessionSandboxGrade: mediated attach vs open escape" {

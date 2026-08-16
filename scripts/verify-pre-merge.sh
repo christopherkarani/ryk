@@ -37,6 +37,7 @@ echo "[verify-pre-merge] Homebrew formula contract"
 ./scripts/test-homebrew-formula.sh
 
 echo "[verify-pre-merge] First-user install and uninstall regressions"
+./scripts/install-overwrite-identity-test.sh
 ./scripts/install-first-user-regression-test.sh
 ./scripts/uninstall-first-user-regression-test.sh
 

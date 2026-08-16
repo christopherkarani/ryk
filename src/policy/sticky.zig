@@ -43,6 +43,10 @@ fn isCritical(severity: anytype) bool {
     return severity == .critical;
 }
 
+/// Cap sticky maps so long-lived hosts cannot grow unbounded (M013).
+/// once shrinks on consume; session/effect_classes only grow without a cap.
+pub const max_sticky_entries: usize = 4096;
+
 /// In-memory sticky trust map for one agent/hook session.
 pub const Store = struct {
     allocator: std.mem.Allocator,
@@ -133,6 +137,9 @@ fn freeOwnedKeys(map: *std.StringHashMap(void), allocator: std.mem.Allocator) vo
 fn putOwnedKey(map: *std.StringHashMap(void), allocator: std.mem.Allocator, raw: []const u8) !void {
     const normalized = normalize(raw);
     if (map.contains(normalized)) return;
+    // Cap: skip insert when full so long sessions re-ask instead of growing forever (M013).
+    // Soft miss is safer than erroring the whole allow path mid-ask.
+    if (map.count() >= max_sticky_entries) return;
     const owned = try allocator.dupe(u8, normalized);
     errdefer allocator.free(owned);
     try map.put(owned, {});
@@ -239,4 +246,24 @@ test "sticky hasOnce peeks without consuming once grant" {
     try std.testing.expect(store.allows("npm install bad")); // consume
     try std.testing.expect(!store.hasOnce("npm install bad"));
     try std.testing.expect(!store.allows("npm install bad"));
+}
+
+test "sticky session map soft-caps at max_sticky_entries" {
+    const allocator = std.testing.allocator;
+    var store = Store.init(allocator);
+    defer store.deinit();
+
+    var buf: [32]u8 = undefined;
+    var i: usize = 0;
+    while (i < max_sticky_entries) : (i += 1) {
+        const key = try std.fmt.bufPrint(&buf, "cmd-{d}", .{i});
+        try store.recordAllowSession(key);
+    }
+    try std.testing.expectEqual(@as(usize, max_sticky_entries), store.session.count());
+
+    // Cap full: insert is a soft no-op (re-ask), not unbounded growth or hard error.
+    try store.recordAllowSession("overflow-key");
+    try std.testing.expectEqual(@as(usize, max_sticky_entries), store.session.count());
+    try std.testing.expect(!store.allows("overflow-key"));
+    try std.testing.expect(store.allows("cmd-0"));
 }
