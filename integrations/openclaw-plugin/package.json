@@ -1,6 +1,6 @@
 {
   "name": "ryk",
-  "version": "0.2.19",
+  "version": "0.2.20",
   "description": "OpenClaw plugin wrapper for ryk runtime guardrails.",
   "type": "module",
   "main": "dist/index.js",

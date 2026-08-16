@@ -11,7 +11,7 @@
 class Ryk < Formula
   desc "Local runtime firewall for AI agents"
   homepage "https://github.com/christopherkarani/ryk"
-  version "0.2.19"
+  version "0.2.20"
   license "Apache-2.0"
 
   on_macos do
