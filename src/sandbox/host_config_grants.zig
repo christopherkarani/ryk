@@ -1583,6 +1583,14 @@ test "collectHostConfigPaths grants existing Grok product dirs not whole tree" {
     try std.testing.expect(saw_skills);
     try std.testing.expect(saw_user_settings);
     try std.testing.expect(saw_lock);
+    var lock_is_login = false;
+    for (specForHost("grok").?.login_markers) |rel| {
+        if (std.mem.eql(u8, rel, ".grok/active_sessions.lock")) lock_is_login = true;
+    }
+    try std.testing.expect(!lock_is_login);
+    try std.testing.expect(specForHost("grok").?.login_markers.len > 0);
+    try std.testing.expect(!hostUsableAuthPresent(io, "grok", home));
+    try std.testing.expect(shouldFailClosedMissingAuth("grok", false, false, false));
 }
 
 // Issue #194: grok 1.0.4 opens ~/.grok/config.toml after Seatbelt attach.
@@ -1978,11 +1986,14 @@ test "collectHostConfigPaths grants grok 1.0.4 active_sessions.lock create/RDWR 
     try std.testing.expect(!listed_tty);
 
     var listed_lock_authority = false;
+    var listed_user_settings_authority = false;
     for (spec.authority_home_rel_files) |rel| {
         if (std.mem.eql(u8, rel, ".grok/active_sessions.lock")) listed_lock_authority = true;
+        if (std.mem.eql(u8, rel, ".grok/user-settings.json")) listed_user_settings_authority = true;
         try std.testing.expect(std.mem.indexOf(u8, rel, "models_cache") == null);
         try std.testing.expect(std.mem.indexOf(u8, rel, "/dev/tty") == null);
     }
+    try std.testing.expect(listed_user_settings_authority);
     try std.testing.expect(!listed_lock_authority);
 
     const paths = try collectHostConfigPaths(io, allocator, "grok", home);

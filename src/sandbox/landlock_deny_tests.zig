@@ -1078,9 +1078,12 @@ test "real FS: grok missing active_sessions.lock O_RDWR create allowed; docs log
         try std.testing.expect(!std.mem.eql(u8, p, grok_dir));
     }
     try std.testing.expect(saw_lock);
+    var saw_user_settings_deny = false;
     for (write_denies) |p| {
+        if (std.mem.endsWith(u8, p, "/.grok/user-settings.json")) saw_user_settings_deny = true;
         try std.testing.expect(!std.mem.endsWith(u8, p, "/.grok/active_sessions.lock"));
     }
+    try std.testing.expect(saw_user_settings_deny);
 
     var compiled = try profile.compileProfile(allocator, .{
         .workspace_root = ws_root,
