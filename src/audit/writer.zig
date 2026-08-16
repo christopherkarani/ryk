@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 const core = @import("../core/public.zig");
 const hash_chain = @import("hash_chain.zig");
@@ -125,7 +126,9 @@ pub const SessionWriter = struct {
         try file_writer.seekTo(write_offset);
         try file_writer.interface.writeAll(line);
         try file_writer.interface.flush();
-        try self.events_file.sync(self.io);
+        // Durability is required per event (hash-chain evidence). Prefer
+        // fdatasync so we flush file data without a full metadata fsync (#394).
+        try syncEventsDurable(self);
 
         self.previous_hash = hash;
         self.event_count += 1;
@@ -194,6 +197,20 @@ fn safeAuditDirName(value: []const u8) bool {
         for (part) |byte| if (byte < 0x20 or byte == 0x7f) return false;
     }
     return true;
+}
+
+/// Flush event bytes to stable storage. Data-only sync is enough for the
+/// hash-chain payload; fall back to full `File.sync` when fdatasync is
+/// unavailable or fails. Do not drop this call — appends are evidence.
+fn syncEventsDurable(self: *SessionWriter) !void {
+    switch (builtin.os.tag) {
+        .linux, .macos, .freebsd, .netbsd, .openbsd, .dragonfly => {
+            std.posix.fdatasync(self.events_file.handle) catch {
+                try self.events_file.sync(self.io);
+            };
+        },
+        else => try self.events_file.sync(self.io),
+    }
 }
 
 const ExistingState = struct {
