@@ -1,5 +1,6 @@
 const std = @import("std");
 const exit_codes = @import("exit_codes.zig");
+const hook_client = @import("hook_client.zig");
 
 /// Exact host names that rewrite to `ryk run -- <host> …`.
 /// Canonical allowlist for dispatch, help, and completions.
@@ -104,6 +105,7 @@ pub fn tryDispatch(
         , .{ command, command, command, command });
         return exit_codes.success;
     }
+    hook_client.prewarmBestEffort(io, allocator);
     const run_argv = try buildRunArgv(allocator, command, rest);
     defer allocator.free(run_argv);
     return try runFn(io, environ_map, run_argv, stdout, stderr);

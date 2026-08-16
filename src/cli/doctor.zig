@@ -711,6 +711,8 @@ fn writeReportRaw(io: std.Io, stdout: anytype, os: core.platform.Os, backend_rep
         });
     }
 
+    try writeHookServerLine(io, context.allocator, stdout);
+
     if (!verbose) {
         try writeDefaultPanels(io, stdout, os, backend_report, context, policy_status, counts);
         try writeMcpSetupReport(io, stdout, context);
@@ -851,6 +853,16 @@ fn writePolicyFreshnessNotices(stdout: anytype, context: IntegrationContext) !vo
         }
     }
     try stdout.writeByte('\n');
+}
+
+fn writeHookServerLine(io: std.Io, allocator: std.mem.Allocator, stdout: anytype) !void {
+    const path = cli.hook_client.socketPathForDoctor(io, allocator) catch {
+        try stdout.writeAll("hook server: not running\n\n");
+        return;
+    };
+    defer allocator.free(path);
+    const status = if (cli.hook_client.socketIsLive(path)) "running" else "not running";
+    try stdout.print("hook server: {s}\n  socket: {s}\n\n", .{ status, path });
 }
 
 fn writeDefaultPanels(
@@ -1731,6 +1743,7 @@ test "doctor renders a compact summary from an injected context" {
 
     const output = stdout_writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, output, "Summary:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "hook server:") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "active") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Recommended next step:") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Capabilities:") == null);
