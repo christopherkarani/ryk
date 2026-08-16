@@ -37,6 +37,25 @@ test "sockaddrUnFromPath rejects empty and overlong paths" {
     try std.testing.expectError(error.SocketPathTooLong, sockaddrUnFromPath(&overlong));
 }
 
+test "bindListenUnixSocket accepts backlog and rejects empty paths" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    try std.testing.expectError(error.InvalidSocketPath, bindListenUnixSocket("", 128));
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(dir);
+    const sock = try std.fs.path.join(std.testing.allocator, &.{ dir, "hook-backlog.sock" });
+    defer std.testing.allocator.free(sock);
+
+    const fd = try bindListenUnixSocket(sock, 128);
+    defer {
+        _ = std.c.close(fd);
+        unlinkUnixSocketPath(sock);
+    }
+    try std.testing.expect(fd >= 0);
+}
+
 pub fn openUnixStreamSocket() !std.posix.fd_t {
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .macos) return error.UnsupportedOs;
     const fd = std.c.socket(afUnix(), sockStream(), 0);
@@ -55,7 +74,7 @@ pub fn connectUnixSocket(path: []const u8) !std.posix.fd_t {
     return fd;
 }
 
-pub fn bindListenUnixSocket(path: []const u8) !std.posix.fd_t {
+pub fn bindListenUnixSocket(path: []const u8, backlog: u31) !std.posix.fd_t {
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .macos) return error.UnsupportedOs;
     unlinkUnixSocketPath(path);
 
@@ -64,7 +83,7 @@ pub fn bindListenUnixSocket(path: []const u8) !std.posix.fd_t {
 
     const sockaddr = try sockaddrUnFromPath(path);
     if (std.c.bind(fd, @ptrCast(&sockaddr.addr), sockaddr.len) < 0) return error.SocketConnectFailed;
-    if (std.c.listen(fd, 1) < 0) return error.SocketConnectFailed;
+    if (std.c.listen(fd, backlog) < 0) return error.SocketConnectFailed;
     return fd;
 }
 
