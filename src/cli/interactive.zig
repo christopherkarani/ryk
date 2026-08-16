@@ -52,9 +52,12 @@ pub fn runMultiSelect(
 
     const owned = try list.toOwnedSlice(allocator);
     list = .empty;
+    // Ownership transferred out of list — free on any error before return (M002).
+    var result: MultiSelectResult = .{ .items = owned, .confirmed = false };
+    errdefer deinitMultiSelectResult(&result, allocator);
 
     try stdout.writeAll("\nDetected agent hosts:\n");
-    for (owned, 0..) |item, i| {
+    for (result.items, 0..) |item, i| {
         const marker = if (item.checked) "[x]" else "[ ]";
         try stdout.print("  {s} {d}) {s}\n", .{ marker, i + 1, item.label });
     }
@@ -69,12 +72,9 @@ pub fn runMultiSelect(
     };
     const input = std.mem.trim(u8, raw, " \t\r");
 
-    applyMultiSelectInput(owned, input);
-
-    return .{
-        .items = owned,
-        .confirmed = true,
-    };
+    applyMultiSelectInput(result.items, input);
+    result.confirmed = true;
+    return result;
 }
 
 fn flushIfSupported(writer: anytype) !void {
