@@ -775,6 +775,7 @@ pub const commands =
             "Reads a JSON payload from stdin, normalizes host-specific events to ryk decisions,",
             "and emits a host-valid JSON response to stdout. Debug logs go to stderr only.",
             "Shell PreToolUse / PermissionRequest (and equivalent host tool-before events) evaluate commands via the in-process Zig shell_engine; legacy Rust evaluator selection is rejected.",
+            "Pi is extension-only (`ryk evaluate` / bundled extension); it is not a hook host.",
             "Events:",
             "  ryk hook codex SessionStart",
             "  ryk hook codex UserPromptSubmit",
