@@ -144,6 +144,8 @@ test {
     _ = readiness;
     _ = doctor;
     _ = @import("doctor_mcp.zig");
+    // Unknown-command / option "did you mean?" ranking (length-scaled edit distance).
+    _ = suggestions;
     _ = danger_confirmation;
     _ = run_command;
     _ = shim; // PATH-shim audit mode session attestation (F36)
@@ -2084,6 +2086,26 @@ test "top-level command suggestions reject ambiguous short prefixes" {
 test "completely unknown command has no suggestion" {
     const suggestion = suggestCommand("xyz123neveracmd");
     try std.testing.expect(suggestion == null);
+}
+
+test "unknown command foo does not suggest hook" {
+    // Regression for #210: weak edit distance must not recommend power commands.
+    try std.testing.expect(suggestCommand("foo") == null);
+    try std.testing.expectEqualStrings("doctor", suggestCommand("docter").?);
+    try std.testing.expectEqualStrings("policy", suggestCommand("polcy").?);
+
+    var stdout_buf: [128]u8 = undefined;
+    var stderr_buf: [256]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+    const code = try testRun(&.{"foo"}, &stdout_writer, &stderr_writer);
+    try std.testing.expectEqual(exit_codes.usage, code);
+    try std.testing.expectEqualStrings("", stdout_writer.buffered());
+    const err = stderr_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, err, "unknown command") != null);
+    try std.testing.expect(std.mem.indexOf(u8, err, "Did you mean") == null);
+    try std.testing.expect(std.mem.indexOf(u8, err, "hook") == null);
+    try std.testing.expect(std.mem.indexOf(u8, err, "Run 'ryk help' for usage.") != null);
 }
 
 test "init dispatch creates policy in provided working directory" {
