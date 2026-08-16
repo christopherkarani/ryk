@@ -285,7 +285,7 @@ pub fn evaluatePayloadWithModeOpts(
     // Live agent-hook sets disable_fm (no fm-steward spawn). Tests may inject
     // `fm_client` on evaluatePayloadWithModeOpts to exercise the seatbelt.
     // Bare agent-hook has no policy YAML, so permit is empty (matrix + sticky
-    // only); sticky is process-session store.
+    // only); sticky is keyed by host session id.
     // Cursor shell still maps `.ask` → deny (no ask UI); agent_hook keeps `.ask` JSON.
     const decision = try shell_eval.decisionFromDaemonResultWithPolicy(
         allocator,
@@ -294,7 +294,7 @@ pub fn evaluatePayloadWithModeOpts(
         .{
             .command = owned_command,
             .permit = .{},
-            .sticky = shell_eval.getSessionStickyStore(),
+            .sticky = shell_eval.getSessionStickyStoreFor(opts.session_id),
             .effect_class = null,
             .disable_fm = opts.disable_fm,
             .fm_client = opts.fm_client,

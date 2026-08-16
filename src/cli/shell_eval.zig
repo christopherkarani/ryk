@@ -920,15 +920,111 @@ pub fn decideShellWithPolicy(
 // Process/session sticky store (hook/agent process lifetime; no disk)
 // ---------------------------------------------------------------------------
 
-var g_session_sticky: ?policy.sticky.Store = null;
+/// Cap session sticky buckets so a long-lived hook-serve cannot grow without bound.
+pub const session_sticky_map_cap: usize = 16;
 
-/// In-memory sticky store for the current hook/agent process. Lazy-init with
-/// page_allocator (process lifetime — not testing.allocator).
-pub fn getSessionStickyStore() *policy.sticky.Store {
-    if (g_session_sticky == null) {
-        g_session_sticky = policy.sticky.Store.init(std.heap.page_allocator);
+const SessionStickyEntry = struct {
+    session_id: []u8,
+    store: policy.sticky.Store,
+    last_used: u64,
+};
+
+const SessionStickyMap = struct {
+    entries: [session_sticky_map_cap]?SessionStickyEntry = [_]?SessionStickyEntry{null} ** session_sticky_map_cap,
+    clock: u64 = 0,
+
+    fn count(self: *const SessionStickyMap) usize {
+        var n: usize = 0;
+        for (self.entries) |entry| {
+            if (entry != null) n += 1;
+        }
+        return n;
     }
-    return &(g_session_sticky.?);
+
+    fn indexOf(self: *const SessionStickyMap, session_id: []const u8) ?usize {
+        for (self.entries, 0..) |entry, idx| {
+            if (entry) |item| {
+                if (std.mem.eql(u8, item.session_id, session_id)) return idx;
+            }
+        }
+        return null;
+    }
+
+    fn freeOrLru(self: *const SessionStickyMap) usize {
+        var oldest_idx: usize = 0;
+        var oldest_used: u64 = std.math.maxInt(u64);
+        for (self.entries, 0..) |entry, idx| {
+            if (entry == null) return idx;
+            if (entry.?.last_used < oldest_used) {
+                oldest_used = entry.?.last_used;
+                oldest_idx = idx;
+            }
+        }
+        return oldest_idx;
+    }
+
+    fn deinit(self: *SessionStickyMap) void {
+        for (&self.entries) |*slot| {
+            if (slot.*) |*entry| {
+                entry.store.deinit();
+                std.heap.page_allocator.free(entry.session_id);
+            }
+            slot.* = null;
+        }
+        self.clock = 0;
+    }
+
+    fn get(self: *SessionStickyMap, session_id: []const u8) *policy.sticky.Store {
+        const key = normalizeSessionStickyId(session_id);
+        self.clock += 1;
+        if (self.indexOf(key)) |idx| {
+            if (self.entries[idx]) |*entry| {
+                entry.last_used = self.clock;
+                return &entry.store;
+            }
+        }
+
+        const slot = self.freeOrLru();
+        if (self.entries[slot]) |*old| {
+            old.store.deinit();
+            std.heap.page_allocator.free(old.session_id);
+            self.entries[slot] = null;
+        }
+        const owned = std.heap.page_allocator.dupe(u8, key) catch return fallbackSessionStickyStore();
+        self.entries[slot] = .{
+            .session_id = owned,
+            .store = policy.sticky.Store.init(std.heap.page_allocator),
+            .last_used = self.clock,
+        };
+        return &self.entries[slot].?.store;
+    }
+};
+
+var g_session_sticky_map: SessionStickyMap = .{};
+var g_fallback_session_sticky: ?policy.sticky.Store = null;
+
+fn normalizeSessionStickyId(session_id: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, session_id, " \t\r\n");
+    if (trimmed.len == 0) return brand.default_session_id;
+    return trimmed;
+}
+
+fn fallbackSessionStickyStore() *policy.sticky.Store {
+    if (g_fallback_session_sticky == null) {
+        g_fallback_session_sticky = policy.sticky.Store.init(std.heap.page_allocator);
+    }
+    return &(g_fallback_session_sticky.?);
+}
+
+/// Default bucket (`ryk-shell`) for callers that have no host session id.
+pub fn getSessionStickyStore() *policy.sticky.Store {
+    return getSessionStickyStoreFor("");
+}
+
+/// In-memory sticky store keyed by host/launch session id. Lazy-init with
+/// page_allocator (process lifetime — not testing.allocator). Cap 16 LRU.
+pub fn getSessionStickyStoreFor(session_id: []const u8) *policy.sticky.Store {
+    return g_session_sticky_map.get(session_id);
 }
 
 /// Record sticky trust after host ask→allow. Uses `recordFromAsk` so **critical
@@ -992,9 +1088,10 @@ pub fn recordStickyFromAskWithHints(
 /// Test-only: tear down process sticky so tests do not leak page_allocator keys
 /// across cases that used `getSessionStickyStore`.
 pub fn resetSessionStickyStoreForTests() void {
-    if (g_session_sticky) |*store| {
+    g_session_sticky_map.deinit();
+    if (g_fallback_session_sticky) |*store| {
         store.deinit();
-        g_session_sticky = null;
+        g_fallback_session_sticky = null;
     }
 }
 
@@ -1556,7 +1653,7 @@ pub fn evaluateCommand(
         .{
             .command = display,
             .permit = permit,
-            .sticky = getSessionStickyStore(),
+            .sticky = getSessionStickyStoreFor(card_session_id),
             .effect_class = null,
             .cwd = cwd,
             .session_id = card_session_id,
@@ -2678,6 +2775,35 @@ test "evaluateCommand strict permit refuse on-list and yolo no refuse" {
         try std.testing.expectEqual(core.decision.DecisionResult.allow, yolo.decision.result);
         try std.testing.expect(std.mem.indexOf(u8, yolo.decision.reason, "strict: not on allowlist") == null);
     }
+}
+
+test "session sticky stores are isolated by session id" {
+    defer resetSessionStickyStoreForTests();
+    resetSessionStickyStoreForTests();
+    const cmd = "git push --force";
+    const fp = policy.sticky.fingerprintCommand(cmd, null);
+    try recordStickyFromAsk(getSessionStickyStoreFor("sess-a"), cmd, .session, .high);
+    try std.testing.expect(getSessionStickyStoreFor("sess-a").allows(fp));
+    try std.testing.expect(!getSessionStickyStoreFor("sess-b").allows(fp));
+}
+
+test "session sticky map caps at 16 LRU entries" {
+    defer resetSessionStickyStoreForTests();
+    resetSessionStickyStoreForTests();
+    var i: usize = 0;
+    while (i < 18) : (i += 1) {
+        var name_buf: [16]u8 = undefined;
+        const id = try std.fmt.bufPrint(&name_buf, "sess-{d}", .{i});
+        _ = getSessionStickyStoreFor(id);
+    }
+    try std.testing.expectEqual(@as(usize, session_sticky_map_cap), g_session_sticky_map.count());
+}
+
+test "empty session id shares the default sticky bucket" {
+    defer resetSessionStickyStoreForTests();
+    resetSessionStickyStoreForTests();
+    try std.testing.expect(getSessionStickyStore() == getSessionStickyStoreFor(""));
+    try std.testing.expect(getSessionStickyStore() == getSessionStickyStoreFor(brand.default_session_id));
 }
 
 test "evaluateCommand session sticky e2e skips re-ask once critical and ci" {

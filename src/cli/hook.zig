@@ -1946,7 +1946,7 @@ fn buildAgentVisibleDaemonDeny(
             shell_risk,
             cmd,
             permit,
-            shell_eval.getSessionStickyStore(),
+            shell_eval.getSessionStickyStoreFor(fm_opts.session_id),
             null,
         );
         // CI hardens ask/warn → block before FM (same order as decisionFromDaemonResultWithPolicy).
@@ -2268,7 +2268,7 @@ fn hookResponseFromDaemonEvaluate(
                     .low,
                     cmd,
                     permit,
-                    shell_eval.getSessionStickyStore(),
+                    shell_eval.getSessionStickyStoreFor(fm_opts.session_id),
                     null,
                 );
                 if (policy_out.decision == .block) {

@@ -617,7 +617,7 @@ fn writeEvaluationResponse(
         .{
             .command = request.command,
             .permit = permit,
-            .sticky = shell_eval.getSessionStickyStore(),
+            .sticky = shell_eval.getSessionStickyStoreFor(request.session_id orelse brand.default_session_id),
             .effect_class = null,
             .session_id = request.session_id orelse brand.default_session_id,
             .tool = "bash",

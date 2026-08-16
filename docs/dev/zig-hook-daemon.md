@@ -145,7 +145,7 @@ Claude in one repo, Grok in another, Codex in the first. One server. Concurrent 
 
 ### Session sticky
 
-Today sticky is “this process,” so Grok never keeps session sticky (new process per tool). The server keys sticky by `session_id` (host payload or launch session). That is a behavior improvement, not a silent policy weaken: YOLO / sticky still cannot unlock a critical deny. Document it. Cap the session map.
+Today sticky is “this process,” so Grok never keeps session sticky (new process per tool). The server keys sticky by `session_id` (host payload or launch session), cap 16 LRU. That is a behavior improvement, not a silent policy weaken: YOLO / sticky still cannot unlock a critical deny. Empty / missing ids share the `ryk-shell` bucket.
 
 `--probe` and install smokes must not mint allow-once codes (already true; the server must pass `probe` through).
 
