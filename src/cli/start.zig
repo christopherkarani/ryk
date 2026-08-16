@@ -364,7 +364,6 @@ fn resolveSelectedHosts(
         allocator.free(options);
     }
 
-    var visible_idx: usize = 0;
     for (host_statuses) |status| {
         if (!status.detected) continue;
         const marker = if (status.installed) " (installed)" else "";
@@ -374,13 +373,12 @@ fn resolveSelectedHosts(
         errdefer allocator.free(label);
         const id = try allocator.dupe(u8, status.name);
         errdefer allocator.free(id);
-        options[visible_idx] = .{
+        options[filled] = .{
             .label = label,
             .checked = !std.mem.eql(u8, status.name, "cursor"),
             .id = id,
         };
         filled += 1;
-        visible_idx += 1;
     }
 
     const confirmed = try tui.prompt.multiSelect(io, allocator, stdout, options, "Select agent hosts to integrate", null);
