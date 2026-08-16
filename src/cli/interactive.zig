@@ -264,28 +264,18 @@ test "interactive: getSelectedLabels returns only checked items" {
     try std.testing.expectEqualStrings("OpenClaw", labels[1]);
 }
 
-test "interactive: getSelectedLabels does not leak on OOM" {
+fn getSelectedLabelsOomProbe(allocator: std.mem.Allocator) !void {
     const items = [_]SelectionItem{
         .{ .label = "one", .checked = true },
         .{ .label = "two", .checked = true },
     };
-    var saw_oom = false;
-    var saw_success = false;
-    var fail_index: usize = 0;
-    while (fail_index < 8) : (fail_index += 1) {
-        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
-        const labels = getSelectedLabels(failing.allocator(), &items) catch |err| {
-            try std.testing.expectEqual(error.OutOfMemory, err);
-            saw_oom = true;
-            continue;
-        };
-        for (labels) |label| failing.allocator().free(label);
-        failing.allocator().free(labels);
-        saw_success = true;
-        break;
-    }
-    try std.testing.expect(saw_oom);
-    try std.testing.expect(saw_success);
+    const labels = try getSelectedLabels(allocator, &items);
+    for (labels) |label| allocator.free(label);
+    allocator.free(labels);
+}
+
+test "interactive: getSelectedLabels does not leak on OOM" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, getSelectedLabelsOomProbe, .{});
 }
 
 test "interactive: deinitMultiSelectResult frees memory cleanly" {

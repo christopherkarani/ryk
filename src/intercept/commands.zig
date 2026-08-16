@@ -1674,24 +1674,18 @@ test "approval hashes are bounded and consumable without raw command persistence
     try std.testing.expect(!approvalEnvMatches(&env_map, command));
 }
 
+fn tokenizeShellLikeOomProbe(allocator: std.mem.Allocator) !void {
+    var tokens = try tokenizeShellLike(allocator, "echo hello | cat | wc");
+    tokens.deinit();
+}
+
+fn protectedPathReplaceOomProbe(allocator: std.mem.Allocator, selected: *const policy.schema.Policy) !void {
+    var decision = try evaluate(allocator, selected, .ask, &.{ "mkdir", ".ryk/x" });
+    decision.deinit(allocator);
+}
+
 test "tokenizeShellLike OOM ownership does not leak tokens" {
-    const text = "echo hello | cat | wc";
-    var saw_oom = false;
-    var saw_success = false;
-    var fail_index: usize = 0;
-    while (fail_index < 32) : (fail_index += 1) {
-        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
-        var tokens = tokenizeShellLike(failing.allocator(), text) catch |err| {
-            try std.testing.expectEqual(error.OutOfMemory, err);
-            saw_oom = true;
-            continue;
-        };
-        tokens.deinit();
-        saw_success = true;
-        break;
-    }
-    try std.testing.expect(saw_oom);
-    try std.testing.expect(saw_success);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, tokenizeShellLikeOomProbe, .{});
 }
 
 test "evaluate protected-path replacement OOM does not double-free" {
@@ -1702,21 +1696,9 @@ test "evaluate protected-path replacement OOM does not double-free" {
         \\  default: allow
     , "allow-all.yaml");
     defer selected.deinit();
-
-    var saw_oom = false;
-    var saw_success = false;
-    var fail_index: usize = 0;
-    while (fail_index < 128) : (fail_index += 1) {
-        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
-        var decision = evaluate(failing.allocator(), &selected, .ask, &.{ "mkdir", ".ryk/x" }) catch |err| {
-            try std.testing.expectEqual(error.OutOfMemory, err);
-            saw_oom = true;
-            continue;
-        };
-        decision.deinit(failing.allocator());
-        saw_success = true;
-        break;
-    }
-    try std.testing.expect(saw_oom);
-    try std.testing.expect(saw_success);
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        protectedPathReplaceOomProbe,
+        .{&selected},
+    );
 }
