@@ -10,6 +10,10 @@ const ParsedInbound = protocol.ParsedInbound;
 pub const AuditKind = types.AuditKind;
 pub const AuditEvent = types.AuditEvent;
 
+/// Cap in-memory provider-gateway audit trail (#371). Older events dropped FIFO.
+/// Mirrors intercept proxy max_audit_events — not a durability store.
+const max_audit_events: usize = 256;
+
 const ProviderConfig = struct {
     logical_host: []const u8,
     env_var: []const u8,
@@ -148,6 +152,10 @@ const State = struct {
         const io = self.threaded.io();
         try self.audit_mutex.lock(io);
         defer self.audit_mutex.unlock(io);
+        // #371: bound in-memory trail (FIFO), same pattern as intercept proxy max_audit_events.
+        while (self.audit_events.items.len >= max_audit_events) {
+            _ = self.audit_events.orderedRemove(0);
+        }
         try self.audit_events.append(self.allocator, .{
             .kind = kind,
             .provider = self.provider,

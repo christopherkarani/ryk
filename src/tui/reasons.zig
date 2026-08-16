@@ -71,7 +71,11 @@ pub const Alternative = struct {
 /// dynamic replacements (e.g. `rm -rf /` -> `rm -rf ./build`).
 pub fn safeAlternatives(allocator: std.mem.Allocator, command: []const u8) ![]Alternative {
     var list: std.ArrayList(Alternative) = .empty;
-    errdefer list.deinit(allocator);
+    // #383: free owned commands on error so a second-suggestion OOM cannot leak the first.
+    errdefer {
+        for (list.items) |alt| allocator.free(alt.command);
+        list.deinit(allocator);
+    }
 
     // Ownership contract: every `.command` returned here is allocator-owned so
     // the caller can free them uniformly (`for (alts) |a| allocator.free(a.command)`
@@ -81,11 +85,16 @@ pub fn safeAlternatives(allocator: std.mem.Allocator, command: []const u8) ![]Al
     if (std.mem.indexOf(u8, command, "rm -rf") != null) {
         const target = extractRmTarget(command);
         if (target.len > 0 and (std.mem.eql(u8, target, "/") or std.mem.startsWith(u8, target, "/") or std.mem.eql(u8, target, "~"))) {
-            try list.append(allocator, .{ .command = try allocator.dupe(u8, "rm -rf ./build"), .note = "scoped to your project" });
-            try list.append(allocator, .{ .command = try allocator.dupe(u8, "rm -rf /tmp/ryk-cleanup"), .note = "scoped to a temp directory" });
+            const first = try allocator.dupe(u8, "rm -rf ./build");
+            errdefer allocator.free(first);
+            try list.append(allocator, .{ .command = first, .note = "scoped to your project" });
+            const second = try allocator.dupe(u8, "rm -rf /tmp/ryk-cleanup");
+            errdefer allocator.free(second);
+            try list.append(allocator, .{ .command = second, .note = "scoped to a temp directory" });
         } else if (target.len > 0) {
             // Build a scoped form of the same deletion target under ./ for visibility.
             const scoped = try std.fmt.allocPrint(allocator, "rm -rf .{s}", .{target});
+            errdefer allocator.free(scoped);
             try list.append(allocator, .{ .command = scoped, .note = "scoped to your project root" });
         }
         return list.toOwnedSlice(allocator);
@@ -93,7 +102,9 @@ pub fn safeAlternatives(allocator: std.mem.Allocator, command: []const u8) ![]Al
 
     // `git push --force` / `-f` — lease is also force-equivalent and stays denied.
     if (std.mem.indexOf(u8, command, "push --force") != null or std.mem.indexOf(u8, command, "push -f") != null) {
-        try list.append(allocator, .{ .command = try allocator.dupe(u8, "git push"), .note = "fast-forward only; force-equivalent stays denied" });
+        const cmd = try allocator.dupe(u8, "git push");
+        errdefer allocator.free(cmd);
+        try list.append(allocator, .{ .command = cmd, .note = "fast-forward only; force-equivalent stays denied" });
         return list.toOwnedSlice(allocator);
     }
 
@@ -101,13 +112,17 @@ pub fn safeAlternatives(allocator: std.mem.Allocator, command: []const u8) ![]Al
     if ((std.mem.indexOf(u8, command, "curl") != null or std.mem.indexOf(u8, command, "wget") != null) and
         (std.mem.indexOf(u8, command, "| sh") != null or std.mem.indexOf(u8, command, "| bash") != null or std.mem.indexOf(u8, command, "|sh") != null))
     {
-        try list.append(allocator, .{ .command = try allocator.dupe(u8, "curl -fsSL <url> -o /tmp/install.sh && less /tmp/install.sh"), .note = "inspect before running" });
+        const cmd = try allocator.dupe(u8, "curl -fsSL <url> -o /tmp/install.sh && less /tmp/install.sh");
+        errdefer allocator.free(cmd);
+        try list.append(allocator, .{ .command = cmd, .note = "inspect before running" });
         return list.toOwnedSlice(allocator);
     }
 
     // `chmod 777`
     if (std.mem.indexOf(u8, command, "chmod 777") != null) {
-        try list.append(allocator, .{ .command = try allocator.dupe(u8, "chmod 755"), .note = "owner write, others read+execute" });
+        const cmd = try allocator.dupe(u8, "chmod 755");
+        errdefer allocator.free(cmd);
+        try list.append(allocator, .{ .command = cmd, .note = "owner write, others read+execute" });
         return list.toOwnedSlice(allocator);
     }
 
