@@ -543,7 +543,7 @@ fn hookCommand(io: std.Io, host: Host, event: Event, original_event_name: []cons
 
     const needs_policy = eventNeedsPolicy(event);
     const fail_closed_pre_eval = shouldFailClosedOnPreEval(host, event);
-    const needs_workspace = needs_policy or fail_closed_pre_eval or host == .hermes;
+    const needs_workspace = hookNeedsWorkspace(host, event, request_event);
     const root = if (needs_workspace)
         supervisor.resolveWorkspaceRoot(io, allocator, null, ".") catch try allocator.dupe(u8, ".")
     else
@@ -1171,6 +1171,17 @@ fn eventNeedsPolicy(event: Event) bool {
         .UserPromptSubmit, .PreToolUse, .PermissionRequest => true,
         .SessionStart, .Stop, .SessionEnd, .PostToolUse => false,
     };
+}
+
+// Ancestor walk vs informational short-circuit. Never bind workspace from
+// payload cwd, tool cwd, or RYK_WORKSPACE_ROOT (F36/M-9).
+fn hookNeedsWorkspace(host: Host, event: Event, request_event: []const u8) bool {
+    if (eventNeedsPolicy(event) or shouldFailClosedOnPreEval(host, event)) return true;
+    if (host != .hermes) return false;
+    // Hermes records feed activity under the workspace root except for
+    // informational events that do not write (post_llm_call).
+    if (!isHermesInformationalEvent(request_event)) return true;
+    return std.mem.eql(u8, request_event, "subagent_stop");
 }
 
 fn evaluateInformationalEvent(
@@ -3812,6 +3823,39 @@ test "isHermesInformationalEvent identifies informational events" {
     try std.testing.expect(isHermesInformationalEvent("subagent_stop"));
     try std.testing.expect(!isHermesInformationalEvent("pre_tool_call"));
     try std.testing.expect(!isHermesInformationalEvent("on_session_start"));
+}
+
+test "hook informational events skip workspace walk except hermes activity writers" {
+    // OpenCode / OpenClaw informational already short-circuit before resolve.
+    try std.testing.expect(!hookNeedsWorkspace(.opencode, .SessionStart, "permission.replied"));
+    try std.testing.expect(!hookNeedsWorkspace(.opencode, .SessionStart, "file.edited"));
+    try std.testing.expect(!hookNeedsWorkspace(.opencode, .SessionStart, "command.executed"));
+    try std.testing.expect(!hookNeedsWorkspace(.openclaw, .SessionStart, "permission.after"));
+    try std.testing.expect(!hookNeedsWorkspace(.openclaw, .SessionStart, "session.end"));
+
+    // Hermes informational that does not record activity skips the ancestor walk.
+    try std.testing.expect(!hookNeedsWorkspace(.hermes, .SessionStart, "post_llm_call"));
+
+    // subagent_stop records feed activity and still resolves the workspace.
+    try std.testing.expect(hookNeedsWorkspace(.hermes, .SessionStart, "subagent_stop"));
+}
+
+test "hook informational skip keeps PreToolUse PermissionRequest workspace walk" {
+    try std.testing.expect(hookNeedsWorkspace(.claude, .PreToolUse, "PreToolUse"));
+    try std.testing.expect(hookNeedsWorkspace(.claude, .PermissionRequest, "PermissionRequest"));
+    try std.testing.expect(hookNeedsWorkspace(.codex, .PreToolUse, "PreToolUse"));
+    try std.testing.expect(hookNeedsWorkspace(.codex, .PermissionRequest, "PermissionRequest"));
+    try std.testing.expect(hookNeedsWorkspace(.hermes, .PreToolUse, "pre_tool_call"));
+    try std.testing.expect(hookNeedsWorkspace(.opencode, .PreToolUse, "tool.execute.before"));
+    try std.testing.expect(hookNeedsWorkspace(.openclaw, .PreToolUse, "tool.before"));
+
+    // fail-closed PreToolUse hosts still walk; Hermes session writers still walk.
+    try std.testing.expect(hookNeedsWorkspace(.codex, .SessionStart, "SessionStart"));
+    try std.testing.expect(hookNeedsWorkspace(.hermes, .SessionStart, "on_session_start"));
+    try std.testing.expect(hookNeedsWorkspace(.hermes, .SessionEnd, "on_session_end"));
+    try std.testing.expect(!isOpenCodeInformationalEvent("tool.execute.before"));
+    try std.testing.expect(!isHermesInformationalEvent("pre_tool_call"));
+    try std.testing.expect(!isOpenClawInformationalEvent("tool.before"));
 }
 
 test "hermes correlation extracts nested identifiers and prefers parent for subagents" {
