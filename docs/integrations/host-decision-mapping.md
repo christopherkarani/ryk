@@ -56,7 +56,7 @@ Official Grok Build treats hook stdout + exit as:
 - block / stage / SoftBlock / FM ask / error → `{"decision":"deny","reason":…}` + exit 2 (no resume)
 - unattended / `--ci` leftover `ask` → deny JSON + exit 2
 
-The managed hook command is `/bin/sh -c '…' -- <absolute ryk>`: if the pinned file is missing or not executable, the wrapper prints that deny JSON and exits 2. `ryk doctor --fix` and `ryk start` rewrite legacy direct `…/ryk hook grok PreToolUse` entries (those still fail-open on exit 127).
+The managed hook command is `/bin/sh -c '…' -- <absolute ryk>`: if the pinned file is missing or not executable, the wrapper prints that deny JSON and exits 2. A leftover direct `…/ryk hook grok PreToolUse` is doctor **broken** (not wired=yes) until `ryk doctor --fix` or `ryk start` rewrites it — those still fail-open on exit 127.
 
 Residual (host-side, not ryk-fixable): timeouts, crashes, and non-0/2 exits are **fail-open** unless the host adds its own fail-closed setting. Grade remains **hook**, not OS-enforced. Prefer `ryk grok` / `ryk run -- grok` for the wrapper boundary.
 

@@ -39,29 +39,36 @@ pub const InstallResult = struct {
     }
 };
 
-/// Return whether Grok Build will load a ryk PreToolUse Command Guard.
+/// Return whether the managed Grok hook is the fail-closed wrapper.
 ///
-/// Only `~/.grok/hooks/ryk.json` counts. Legacy entries in
-/// `user-settings.json` are not loaded by official Grok Build and must not
-/// make `doctor --fix` skip the managed install (that left hosts "wired"
-/// with no file under hooks/).
+/// Only `~/.grok/hooks/ryk.json` counts, and only the `/bin/sh -c` missing-binary
+/// wrapper is healthy. Leftover `…/ryk hook grok PreToolUse` still 127-fail-opens
+/// and must not paint doctor wired=yes. Identity for rewrite/uninstall still
+/// matches leftovers via `isRykGrokHookCommand`.
 pub fn installed(io: std.Io, allocator: std.mem.Allocator) bool {
     const home_z = std.c.getenv("HOME") orelse return false;
     return installedAtHome(io, allocator, std.mem.span(home_z));
 }
 
 pub fn installedAtHome(io: std.Io, allocator: std.mem.Allocator, home: []const u8) bool {
-    return managedHookInstalledAtHome(io, allocator, home);
+    return managedHookMatchesAtHome(io, allocator, home, .fail_closed);
 }
 
 /// True when only the legacy user-settings path has a ryk hook (migration debt).
 /// Not used for day-one wired evidence.
 pub fn legacyOnlyInstalledAtHome(io: std.Io, allocator: std.mem.Allocator, home: []const u8) bool {
-    if (managedHookInstalledAtHome(io, allocator, home)) return false;
+    if (managedHookMatchesAtHome(io, allocator, home, .identity)) return false;
     return legacySettingsInstalledAtHome(io, allocator, home);
 }
 
-fn managedHookInstalledAtHome(io: std.Io, allocator: std.mem.Allocator, home: []const u8) bool {
+const HookMatch = enum { identity, fail_closed };
+
+fn managedHookMatchesAtHome(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    home: []const u8,
+    match: HookMatch,
+) bool {
     const path = std.fs.path.join(allocator, &.{ home, managed_hook_relative_path }) catch return false;
     defer allocator.free(path);
     const bytes = std.Io.Dir.cwd().readFileAlloc(
@@ -71,7 +78,10 @@ fn managedHookInstalledAtHome(io: std.Io, allocator: std.mem.Allocator, home: []
         .limited(max_hook_file_size),
     ) catch return false;
     defer allocator.free(bytes);
-    return fileContainsRykGrokHook(allocator, bytes);
+    return switch (match) {
+        .identity => fileContainsRykGrokHook(allocator, bytes),
+        .fail_closed => fileContainsWrappedRykGrokHook(allocator, bytes),
+    };
 }
 
 fn legacySettingsInstalledAtHome(io: std.Io, allocator: std.mem.Allocator, home: []const u8) bool {
@@ -88,6 +98,14 @@ fn legacySettingsInstalledAtHome(io: std.Io, allocator: std.mem.Allocator, home:
 }
 
 fn fileContainsRykGrokHook(allocator: std.mem.Allocator, bytes: []const u8) bool {
+    return fileContainsHookMatching(allocator, bytes, false);
+}
+
+fn fileContainsWrappedRykGrokHook(allocator: std.mem.Allocator, bytes: []const u8) bool {
+    return fileContainsHookMatching(allocator, bytes, true);
+}
+
+fn fileContainsHookMatching(allocator: std.mem.Allocator, bytes: []const u8, require_wrapper: bool) bool {
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch return false;
     defer parsed.deinit();
     if (parsed.value != .object) return false;
@@ -96,7 +114,11 @@ fn fileContainsRykGrokHook(allocator: std.mem.Allocator, bytes: []const u8) bool
     const pre_tool_use = hooks.object.get("PreToolUse") orelse return false;
     if (pre_tool_use != .array) return false;
     for (pre_tool_use.array.items) |entry| {
-        if (entryContainsAnyRykHook(entry)) return true;
+        if (require_wrapper) {
+            if (entryContainsWrappedRykHook(entry)) return true;
+        } else if (entryContainsAnyRykHook(entry)) {
+            return true;
+        }
     }
     return false;
 }
@@ -607,13 +629,26 @@ fn entryContainsExactRykHook(entry: std.json.Value, expected_command: []const u8
 }
 
 fn entryContainsAnyRykHook(entry: std.json.Value) bool {
+    return entryContainsRykHook(entry, false);
+}
+
+fn entryContainsWrappedRykHook(entry: std.json.Value) bool {
+    return entryContainsRykHook(entry, true);
+}
+
+fn entryContainsRykHook(entry: std.json.Value, require_wrapper: bool) bool {
     if (entry != .object) return false;
     const hooks = entry.object.get("hooks") orelse return false;
     if (hooks != .array) return false;
     for (hooks.array.items) |hook| {
         if (hook != .object) continue;
         const command = hook.object.get("command") orelse continue;
-        if (command == .string and isRykGrokHookCommand(command.string)) return true;
+        if (command != .string) continue;
+        if (require_wrapper) {
+            if (isWrappedRykGrokHook(std.mem.trim(u8, command.string, " \t\r\n"))) return true;
+        } else if (isRykGrokHookCommand(command.string)) {
+            return true;
+        }
     }
     return false;
 }
@@ -893,6 +928,29 @@ test "Grok installed check requires managed hooks/ryk.json not legacy user-setti
     try std.testing.expect(std.mem.indexOf(u8, written, "/opt/ryk/bin/ryk") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "hook grok PreToolUse") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "ryk binary unavailable") != null);
+}
+
+test "Grok installedAtHome requires fail-closed wrapper not leftover direct hook" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, hooks_relative_dir);
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = managed_hook_relative_path,
+        .data =
+        \\{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"/opt/ryk/bin/ryk hook grok PreToolUse","timeout":30}]}]}}
+        \\
+        ,
+    });
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(home);
+
+    try std.testing.expect(isRykGrokHookCommand("/opt/ryk/bin/ryk hook grok PreToolUse"));
+    try std.testing.expect(!installedAtHome(std.testing.io, std.testing.allocator, home));
+
+    const result = try installAtHome(std.testing.io, std.testing.allocator, home, "/opt/ryk/bin/ryk");
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(result.changed);
+    try std.testing.expect(installedAtHome(std.testing.io, std.testing.allocator, home));
 }
 
 test "Grok install rejects zig-cache test binary as ryk" {
