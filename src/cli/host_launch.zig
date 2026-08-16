@@ -102,6 +102,18 @@ test "isHostLaunchAlias exact allowlist only" {
     try std.testing.expect(!isHostLaunchAlias("pi2"));
 }
 
+test "ryk claude -- --help rewrite stays agent help-only" {
+    const host_config_grants = @import("../sandbox/host_config_grants.zig");
+    const argv = try buildRunArgv(std.testing.allocator, "claude", &.{ "--", "--help" });
+    defer std.testing.allocator.free(argv);
+    try std.testing.expectEqual(@as(usize, 4), argv.len);
+    try std.testing.expectEqualStrings("--", argv[0]);
+    try std.testing.expectEqualStrings("claude", argv[1]);
+    try std.testing.expectEqualStrings("--", argv[2]);
+    try std.testing.expectEqualStrings("--help", argv[3]);
+    try std.testing.expect(host_config_grants.isAgentHelpOrVersionOnly(argv[1..]));
+}
+
 test "ryk grok -- --help rewrite stays agent help-only" {
     const host_config_grants = @import("../sandbox/host_config_grants.zig");
     const argv = try buildRunArgv(std.testing.allocator, "grok", &.{ "--", "--help" });

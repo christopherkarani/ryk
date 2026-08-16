@@ -39,6 +39,9 @@ pub const workspace_session_tmp_name = session_tmp.workspace_session_tmp_name;
 pub const classic_tmp_fallback = session_tmp.classic_tmp_fallback;
 pub const workspaceSessionTmpPath = session_tmp.workspaceSessionTmpPath;
 pub const ensureWorkspaceSessionTmp = session_tmp.ensureWorkspaceSessionTmp;
+pub const claude_code_tmpdir_env = session_tmp.claude_code_tmpdir_env;
+pub const claudeCodeTmpAccepts = session_tmp.claudeCodeTmpAccepts;
+pub const ensureClaudeCodeTmpLeaves = session_tmp.ensureClaudeCodeTmpLeaves;
 
 /// Re-export mode for callers that only touch apply.
 pub const OsSandboxMode = posture.OsSandboxMode;
@@ -525,6 +528,11 @@ pub fn prepareAttachEnvironment(
     try staged.put("TMPDIR", preferred);
     try staged.put("TMP", preferred);
     try staged.put("TEMP", preferred);
+    // Claude Code `lstat`s `{CLAUDE_CODE_TMPDIR|TMPDIR}/claude-{uid}` and refuses
+    // a missing path or attacker-planted symlink. Mint the env to the verified
+    // session temp and pre-create the leaf as a real directory.
+    if (!ensureClaudeCodeTmpLeaves(preferred)) return error.SessionTmpPrepareFailed;
+    try staged.put(claude_code_tmpdir_env, preferred);
 
     // Host-global Git configuration can contain credentials and remains denied.
     // Point Git at inert global config/ignore files so ordinary repository probes
@@ -3502,6 +3510,9 @@ test "prepareAttachEnvironment points TMPDIR at fresh workspace session temp" {
     try std.testing.expectEqualStrings(rewritten, env_map.get("TMPDIR").?);
     try std.testing.expectEqualStrings(rewritten, env_map.get("TMP").?);
     try std.testing.expectEqualStrings(rewritten, env_map.get("TEMP").?);
+    try std.testing.expectEqualStrings(rewritten, env_map.get(claude_code_tmpdir_env).?);
+    try std.testing.expect(claudeCodeTmpAccepts(rewritten));
+    try std.testing.expect(ensureClaudeCodeTmpLeaves(rewritten));
 
     // MCP package launchers must not fall back to denied host state under HOME.
     for (isolated_tool_caches) |cache| {
@@ -3525,6 +3536,36 @@ test "prepareAttachEnvironment points TMPDIR at fresh workspace session temp" {
         var cache_dir = try std.Io.Dir.openDirAbsolute(io, env_map.get(cache.env_key).?, .{});
         cache_dir.close(io);
     }
+
+    // Issue #198: Claude Code joins TMPDIR/CLAUDE_CODE_TMPDIR with claude-{uid}
+    // (or claude-0) and refuses a non-directory / planted symlink.
+    var leaf_buf: [32]u8 = undefined;
+    const leaf = session_tmp.claudeTempLeafName(&leaf_buf, session_tmp.currentUid());
+    const claude_leaf = try std.fs.path.join(std.testing.allocator, &.{ rewritten, leaf });
+    defer std.testing.allocator.free(claude_leaf);
+    try std.testing.expect(claudeCodeTmpAccepts(claude_leaf));
+    if (builtin.os.tag != .windows) {
+        const claude_zero = try std.fs.path.join(std.testing.allocator, &.{ rewritten, "claude-0" });
+        defer std.testing.allocator.free(claude_zero);
+        try std.testing.expect(claudeCodeTmpAccepts(claude_zero));
+    }
+}
+
+test "prepareAttachEnvironment overwrites host CLAUDE_CODE_TMPDIR with session tmp" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+
+    var env_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer env_map.deinit();
+    try env_map.put(claude_code_tmpdir_env, "/tmp/evil-planted-claude-tmp");
+
+    var prepared = try prepareAttachEnvironment(std.testing.allocator, &env_map, root);
+    defer prepared.deinit();
+    try std.testing.expectEqualStrings(prepared.path, env_map.get(claude_code_tmpdir_env).?);
+    try std.testing.expect(claudeCodeTmpAccepts(env_map.get(claude_code_tmpdir_env).?));
+    try std.testing.expect(!std.mem.eql(u8, env_map.get(claude_code_tmpdir_env).?, "/tmp/evil-planted-claude-tmp"));
 }
 
 test "prepareAttachEnvironment creates a fresh cache namespace per launch" {
@@ -3617,6 +3658,7 @@ test "prepareAttachEnvironment rolls back env and session temp on allocation fai
                     try std.testing.expect(env_map.get(cache.env_key) == null);
                 }
                 try std.testing.expect(env_map.get("GIT_CONFIG_GLOBAL") == null);
+                try std.testing.expect(env_map.get(claude_code_tmpdir_env) == null);
 
                 const workspace_tmp = try workspaceSessionTmpPath(std.testing.allocator, root);
                 defer std.testing.allocator.free(workspace_tmp);

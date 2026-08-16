@@ -6682,6 +6682,123 @@ test "empty backpack grok alias -- --help with official config.toml does not fai
     try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "cannot read host agent login/config") == null);
 }
 
+// Issue #198: `ryk claude -- --help` must leave a real session tmp that Claude's
+// CLAUDE_CODE_TMPDIR / `{tmpdir}/claude-{uid}` lstat check accepts.
+test "empty backpack claude alias -- --help session tmp passes Claude tmpdir check" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    try skipLinuxWorkspaceViewSelfExec();
+    try skipUnlessOsSandboxBackend();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+
+    var home_tmp = std.testing.tmpDir(.{});
+    defer home_tmp.cleanup();
+    const fake_home = try home_tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(fake_home);
+
+    var trust_tmp = std.testing.tmpDir(.{});
+    defer trust_tmp.cleanup();
+    {
+        const script = try trust_tmp.dir.createFile(std.testing.io, "claude", .{});
+        defer script.close(std.testing.io);
+        try script.writeStreamingAll(std.testing.io,
+            \\#!/bin/sh
+            \\base="${CLAUDE_CODE_TMPDIR:-${TMPDIR:-/tmp}}"
+            \\leaf="$base/claude-$(id -u)"
+            \\if [ -L "$leaf" ] || [ ! -d "$leaf" ]; then
+            \\  echo "Temp directory $leaf is not a directory (may be an attacker-planted symlink)." >&2
+            \\  exit 1
+            \\fi
+            \\echo "Usage: claude [options]"
+            \\exit 0
+            \\
+        );
+        try trust_tmp.dir.setFilePermissions(std.testing.io, "claude", @enumFromInt(0o755), .{});
+    }
+    const trust_root = try trust_tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(trust_root);
+
+    var current = std.process.Environ.Map.init(std.testing.allocator);
+    defer current.deinit();
+    try current.put("PATH", trust_root);
+    try current.put("HOME", fake_home);
+    try current.put("RYK_TRUSTED_HOST_PREFIXES", trust_root);
+
+    var stdout_buf: [8192]u8 = undefined;
+    var stderr_buf: [4096]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+    const code = try commandForTestWithEnvAndShellEvaluator(
+        &.{ "--workspace", root, "--mode", "observe", "--", "claude", "--", "--help" },
+        &stdout_writer,
+        &stderr_writer,
+        .ignore,
+        &current,
+        shell_eval.mockDaemonAllowEvaluator,
+    );
+    try std.testing.expectEqual(exit_codes.success, code);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "Usage: claude") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "attacker-planted symlink") == null);
+}
+
+test "planted cwd ./claude stays CommandDenied under strict" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    {
+        const policy_file = try tmp.dir.createFile(std.testing.io, "policy.yaml", .{});
+        defer policy_file.close(std.testing.io);
+        try policy_file.writeStreamingAll(std.testing.io,
+            \\version: 1
+            \\mode: strict
+            \\env:
+            \\  inherit: true
+            \\commands:
+            \\  default: deny
+            \\  allow:
+            \\    - "git status"
+            \\
+        );
+    }
+    const policy_path = try tmp.dir.realPathFileAlloc(std.testing.io, "policy.yaml", std.testing.allocator);
+    defer std.testing.allocator.free(policy_path);
+    {
+        const script = try tmp.dir.createFile(std.testing.io, "claude", .{});
+        defer script.close(std.testing.io);
+        try script.writeStreamingAll(std.testing.io,
+            \\#!/bin/sh
+            \\exit 0
+            \\
+        );
+        try tmp.dir.setFilePermissions(std.testing.io, "claude", @enumFromInt(0o755), .{});
+    }
+
+    var current = std.process.Environ.Map.init(std.testing.allocator);
+    defer current.deinit();
+    try current.put("PATH", "/usr/bin:/bin");
+    try current.put("HOME", root);
+
+    var stdout_buf: [4096]u8 = undefined;
+    var stderr_buf: [4096]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+    const code = try commandForTestWithEnvAndShellEvaluator(
+        &.{ "--workspace", root, "--policy", policy_path, "--mode", "strict", "--os-sandbox", "off", "--", "./claude", "--help" },
+        &stdout_writer,
+        &stderr_writer,
+        .ignore,
+        &current,
+        shell_eval.mockDaemonAllowEvaluator,
+    );
+    try std.testing.expectEqual(exit_codes.denial, code);
+}
+
 test "empty backpack grok interactive without config.toml still fail-closed" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     try skipUnlessOsSandboxBackend();
