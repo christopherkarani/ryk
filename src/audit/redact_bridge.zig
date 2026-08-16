@@ -100,18 +100,20 @@ fn findStructuredSecret(value: []const u8, from: usize) ?SecretSpan {
             // above common HF_* identifiers (`HF_HUB_OFFLINE`, `hf_home_directory`).
             .{ .prefix = "hf_", .min_after = 20 },
         };
-        for (vendor_prefixes) |vendor| {
-            if (startsWithIgnoreCase(value[i..], vendor.prefix)) {
-                var end = i + vendor.prefix.len;
-                while (end < value.len and isTokenChar(value[end])) : (end += 1) {}
-                if (end >= i + vendor.prefix.len + vendor.min_after)
-                    return .{ .start = i, .end = end };
+        // Token-char left boundary so mid-base64url `hf_` / `xoxb-` inside a
+        // JWT or high-entropy blob does not punch a hole and skip classify.
+        if (isStructuredTokenBoundary(value, i)) {
+            for (vendor_prefixes) |vendor| {
+                if (startsWithIgnoreCase(value[i..], vendor.prefix)) {
+                    var end = i + vendor.prefix.len;
+                    while (end < value.len and isTokenChar(value[end])) : (end += 1) {}
+                    if (end >= i + vendor.prefix.len + vendor.min_after)
+                        return .{ .start = i, .end = end };
+                }
             }
         }
 
-        if (startsWithIgnoreCase(value[i..], "sig=") and
-            (i == 0 or value[i - 1] == '?' or value[i - 1] == '&'))
-        {
+        if (startsWithIgnoreCase(value[i..], "sig=") and isQueryParamBoundary(value, i)) {
             if (azureSasSigAt(value, i)) |span| return span;
         }
 
@@ -243,6 +245,10 @@ pub fn isSensitiveKey(key: []const u8) bool {
 
 fn isKeyStart(value: []const u8, i: usize) bool {
     return i == 0 or !(std.ascii.isAlphanumeric(value[i - 1]) or value[i - 1] == '_');
+}
+
+fn isStructuredTokenBoundary(value: []const u8, i: usize) bool {
+    return i == 0 or !isTokenChar(value[i - 1]);
 }
 
 fn startsWithIgnoreCase(value: []const u8, prefix: []const u8) bool {
@@ -757,12 +763,17 @@ fn looksLikeGitlabToken(value: []const u8) bool {
     return looksLikePrefixedTokenChars(value, "glpat-", 12);
 }
 
+fn isQueryParamBoundary(value: []const u8, i: usize) bool {
+    if (i == 0) return true;
+    const prev = value[i - 1];
+    return prev == '?' or prev == '&' or prev == ';' or prev == '=' or
+        !(std.ascii.isAlphanumeric(prev) or prev == '_' or prev == '-');
+}
+
 fn looksLikeAzureSas(value: []const u8) bool {
     var i: usize = 0;
     while (i < value.len) : (i += 1) {
-        if (startsWithIgnoreCase(value[i..], "sig=") and
-            (i == 0 or value[i - 1] == '?' or value[i - 1] == '&'))
-        {
+        if (startsWithIgnoreCase(value[i..], "sig=") and isQueryParamBoundary(value, i)) {
             if (azureSasSigAt(value, i) != null) return true;
         }
     }
@@ -775,7 +786,7 @@ fn azureSasSigAt(value: []const u8, sig_at: usize) ?SecretSpan {
     const sig_start = sig_at + "sig=".len;
     var sig_end = sig_start;
     while (sig_end < value.len and value[sig_end] != '&' and value[sig_end] != '#' and
-        !std.ascii.isWhitespace(value[sig_end])) : (sig_end += 1)
+        value[sig_end] != ';' and !std.ascii.isWhitespace(value[sig_end])) : (sig_end += 1)
     {}
     if (!isConservativeAzureSasSig(value[sig_start..sig_end])) return null;
     return .{ .start = sig_start, .end = sig_end };
@@ -800,7 +811,7 @@ fn queryHasParam(query: []const u8, name: []const u8) bool {
         if (!startsWithIgnoreCase(query[i..], name)) continue;
         const eq = i + name.len;
         if (eq >= query.len or query[eq] != '=') continue;
-        if (i == 0 or query[i - 1] == '?' or query[i - 1] == '&') return true;
+        if (isQueryParamBoundary(query, i)) return true;
     }
     return false;
 }
@@ -1081,6 +1092,54 @@ test "vendor tokens are redacted when embedded mid-string" {
         defer std.testing.allocator.free(unchanged);
         try std.testing.expectEqualStrings(value, unchanged);
     }
+}
+
+test "vendor prefixes inside jwt and high-entropy redact the whole value" {
+    // Mid-base64url vendor prefixes must not punch a structured hole; classify
+    // then whole-value redacts so the JWT header / entropy prefix cannot leak.
+    const jwt_cases = [_][]const u8{
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJmYWtlIn0.aaaaaaaaaaahf_abcdefghijklmnopqrst",
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJmYWtlIn0.aaaaaaaaaaaxoxb-fakeSynthetic",
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJmYWtlIn0.aaaaaaaaaaaglpat-fakeSynthetic",
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJmYWtlIn0.aaaaaaaaaaask_live_fakeSynth",
+    };
+    for (jwt_cases) |value| {
+        try expectSecretLabel(value, "secret:jwt");
+        const owned = try redactAlloc(std.testing.allocator, value);
+        defer std.testing.allocator.free(owned);
+        try std.testing.expectEqualStrings(redacted_value, owned);
+        try std.testing.expect(std.mem.indexOf(u8, owned, "eyJ") == null);
+    }
+
+    const high_entropy = "Aa0Bb1Cc2Dd3Ee4Ff5Gg6Hh7Ii8Jj9Kkhf_abcdefghijklmnopqrst";
+    try expectSecretLabel(high_entropy, "secret:high_entropy");
+    const entropy_owned = try redactAlloc(std.testing.allocator, high_entropy);
+    defer std.testing.allocator.free(entropy_owned);
+    try std.testing.expectEqualStrings(redacted_value, entropy_owned);
+    try std.testing.expect(std.mem.indexOf(u8, entropy_owned, "Aa0Bb1") == null);
+
+    try expectSpanRedaction("note xoxb-fakeSynthetic here", "note [REDACTED] here");
+}
+
+test "azure sas accepts connection-string semicolon and entity-escaped delimiters" {
+    const connection =
+        "BlobEndpoint=https://example.invalid/;SharedAccessSignature=sv=2021-06-08&ss=b&srt=sco&sp=r&sig=fakeSyntheticAzureSasSigValue";
+    try expectSecretLabel(connection, "secret:azure_sas");
+    const connection_owned = try redactAlloc(std.testing.allocator, connection);
+    defer std.testing.allocator.free(connection_owned);
+    try std.testing.expect(std.mem.indexOf(u8, connection_owned, "fakeSyntheticAzureSasSigValue") == null);
+    try std.testing.expect(std.mem.indexOf(u8, connection_owned, "sv=") != null);
+    var connection_buf: [512]u8 = undefined;
+    const connection_bounded = redactStringBounded(connection, &connection_buf);
+    try std.testing.expect(std.mem.indexOf(u8, connection_bounded, "fakeSyntheticAzureSasSigValue") == null);
+
+    const amp = "https://example.invalid/blob?sv=2021-06-08&amp;sig=fakeSyntheticAzureSasSigValue";
+    try expectSecretLabel(amp, "secret:azure_sas");
+    try expectRedactsSecret(amp, "fakeSyntheticAzureSasSigValue");
+
+    const bare = "sv=2021-06-08;sig=fakeSyntheticAzureSasSigValue";
+    try expectSecretLabel(bare, "secret:azure_sas");
+    try expectRedactsSecret(bare, "fakeSyntheticAzureSasSigValue");
 }
 
 test "uppercase vendor tokens redact on env_var target path" {
