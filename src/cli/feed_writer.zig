@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 
 const core = @import("ryk_core").core;
 const core_api = @import("ryk_core").api;
+const redact_bridge = @import("ryk_core").audit.redact_bridge;
 const env_util = @import("../env_util.zig");
 const rust_visibility = @import("feed_visibility.zig");
 
@@ -514,14 +515,14 @@ fn loadOwnedFeedLine(
     line: []const u8,
     fallback_workspace_root: ?[]const u8,
 ) !LoadedFeedRecord {
-    const owned_line = try allocator.dupe(u8, line);
-    var record = parseFeedRecord(allocator, owned_line, fallback_workspace_root) catch |err| {
-        allocator.free(owned_line);
-        return err;
-    };
+    var record = try parseFeedRecord(allocator, line, fallback_workspace_root);
     errdefer record.deinit(allocator);
-    const raw = try redactOwnedAlloc(allocator, owned_line);
-    return .{ .raw = raw, .record = record };
+    // Rebuild `.raw` from already-redacted fields. Whole-line `redactAlloc`
+    // can collapse high-entropy JSONL to `[REDACTED]` and break parsers.
+    var raw_line: std.Io.Writer.Allocating = .init(allocator);
+    defer raw_line.deinit();
+    try rust_visibility.writeFeedRecordJson(&raw_line.writer, record);
+    return .{ .raw = try raw_line.toOwnedSlice(), .record = record };
 }
 
 fn parseFeedRecord(allocator: std.mem.Allocator, line: []const u8, fallback_workspace_root: ?[]const u8) !rust_visibility.RustShellFeedRecord {
@@ -559,12 +560,19 @@ fn parseFeedRecord(allocator: std.mem.Allocator, line: []const u8, fallback_work
     errdefer if (remediation) |value| allocator.free(value);
     const target_summary = try redactOwnedAlloc(allocator, try dupRequiredString(allocator, object, "target_summary"));
     errdefer allocator.free(target_summary);
-    const session_id = try dupOptionalString(allocator, object, "session_id");
+    var session_id = try dupOptionalString(allocator, object, "session_id");
     errdefer if (session_id) |value| allocator.free(value);
     if (session_id) |value| {
         // Reject path segments before aggregate joins session_id into a filesystem
         // path (directory-existence oracle via ../). Same alphabet as audit writers.
         core.session.validateSessionIdText(value) catch return error.InvalidFeedRecord;
+        // `redactAlloc` emits `[REDACTED:…]`, which fails `validateSessionIdText`
+        // and path joins. Use a path-safe alnum placeholder instead.
+        if (redact_bridge.classifySecretValue(value) != null) {
+            const placeholder = try allocator.dupe(u8, "redacted");
+            allocator.free(value);
+            session_id = placeholder;
+        }
     }
     return .{
         .timestamp = timestamp,
@@ -750,6 +758,70 @@ test "feed loader redacts historical JSONL user-controlled fields" {
     try std.testing.expect(std.mem.indexOf(u8, loaded[0].record.target_summary, fake_secret) == null);
     try std.testing.expect(std.mem.indexOf(u8, loaded[0].record.rule.?, fake_secret) == null);
     try std.testing.expect(std.mem.indexOf(u8, loaded[0].record.remediation.?, fake_secret) == null);
+}
+
+test "feed loader replaces secret-shaped session_id with path-safe placeholder" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+
+    const path = try feedPath(std.testing.allocator, root);
+    defer std.testing.allocator.free(path);
+    const parent = std.fs.path.dirname(path).?;
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, parent);
+
+    const fake_session = "ghp_fakeSyntheticTokenValue1234567890";
+    const line = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"timestamp\":\"2026-07-13T00:00:00Z\",\"workspace_root\":\"{s}\",\"event_type\":\"command_denied\",\"decision\":\"deny\",\"decision_source\":\"rust-daemon\",\"event_source\":\"hook\",\"host\":\"codex\",\"daemon_status\":\"healthy\",\"pack_id\":\"core.shell\",\"severity\":\"high\",\"reason\":\"blocked\",\"remediation\":null,\"target_summary\":\"shell command (redacted)\",\"session_id\":\"{s}\",\"verified\":false}}\n",
+        .{ root, fake_session },
+    );
+    defer std.testing.allocator.free(line);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = line });
+
+    const loaded = try loadRecent(std.testing.io, std.testing.allocator, root, 4);
+    defer {
+        for (loaded) |*item| item.deinit(std.testing.allocator);
+        std.testing.allocator.free(loaded);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), loaded.len);
+    try std.testing.expectEqualStrings("redacted", loaded[0].record.session_id.?);
+    try std.testing.expect(std.mem.indexOf(u8, loaded[0].raw, fake_session) == null);
+    try std.testing.expect(std.mem.indexOf(u8, loaded[0].record.session_id.?, fake_session) == null);
+}
+
+test "feed loader reconstructs parseable JSON raw for high-entropy fields" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+
+    const path = try feedPath(std.testing.allocator, root);
+    defer std.testing.allocator.free(path);
+    const parent = std.fs.path.dirname(path).?;
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, parent);
+
+    const high_entropy = "dG9rZW49Y29ycmVjdC1ob3JzZS1iYXR0ZXJ5LXN0YXBsZQ==";
+    const line = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"timestamp\":\"2026-07-13T00:00:00Z\",\"workspace_root\":\"{s}\",\"event_type\":\"command_denied\",\"decision\":\"deny\",\"decision_source\":\"rust-daemon\",\"event_source\":\"hook\",\"host\":\"codex\",\"daemon_status\":\"healthy\",\"pack_id\":\"core.shell\",\"severity\":\"high\",\"reason\":\"{s}\",\"remediation\":null,\"target_summary\":\"shell command (redacted)\",\"session_id\":null,\"verified\":false}}\n",
+        .{ root, high_entropy },
+    );
+    defer std.testing.allocator.free(line);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = line });
+
+    const loaded = try loadRecent(std.testing.io, std.testing.allocator, root, 4);
+    defer {
+        for (loaded) |*item| item.deinit(std.testing.allocator);
+        std.testing.allocator.free(loaded);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), loaded.len);
+    try std.testing.expect(loaded[0].raw.len > 0);
+    try std.testing.expectEqual(@as(u8, '{'), loaded[0].raw[0]);
+    try std.testing.expect(std.mem.indexOf(u8, loaded[0].raw, high_entropy) == null);
 }
 
 test "feed loader accepts legacy records without rule" {
