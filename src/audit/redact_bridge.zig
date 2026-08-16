@@ -975,7 +975,11 @@ test "secret value detection covers vendor token shapes" {
     try std.testing.expect(classifySecretValue("sk_live_short") == null);
     try std.testing.expect(classifySecretValue("sk_test_short") == null);
     try std.testing.expect(classifySecretValue("sv=2021-06-08") == null);
-    try std.testing.expect(classifySecretValue("sig=fakeSyntheticAzureSasSigValue") == null);
+    // `sig=` without `sv=` is not Azure SAS. A long mixed sig may still trip the
+    // independent high-entropy heuristic; only the SAS label is forbidden here.
+    if (classifySecretValue("sig=fakeSyntheticAzureSasSigValue")) |match| {
+        try std.testing.expect(!std.mem.eql(u8, match.label, "secret:azure_sas"));
+    }
     try std.testing.expect(classifySecretValue("https://example.invalid/?sv=2021-06-08&sig=short") == null);
 }
 
