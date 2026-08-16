@@ -1142,6 +1142,70 @@ test "duplicate workspace roots do not emit two filesystem session cards" {
     try std.testing.expectEqual(@as(usize, 1), loaded.sessions.items.len);
 }
 
+test "loadBoundedSessions evicts the new oldest after a feed timestamp bump" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    var workspace = try dupeWorkspace(std.testing.allocator, root, "", null, false);
+    defer workspace.deinit(std.testing.allocator);
+
+    const loaded_feed = [_]feed_writer.LoadedFeedRecord{
+        testLoadedFeed("2026-07-13T00:01:00Z", root, "allow", "pi", "s-old"),
+        testLoadedFeed("2026-07-13T00:03:00Z", root, "allow", "codex", "s-new"),
+        testLoadedFeed("2026-07-13T00:04:00Z", root, "allow", "pi", "s-old"),
+        testLoadedFeed("2026-07-13T00:03:30Z", root, "allow", "opencode", "s-mid"),
+    };
+    var loaded = try loadBoundedSessions(std.testing.io, std.testing.allocator, &.{workspace}, &loaded_feed, 2);
+    defer loaded.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), loaded.sessions.items.len);
+    try std.testing.expect(findSession(loaded.sessions.items, root, "s-old") != null);
+    try std.testing.expect(findSession(loaded.sessions.items, root, "s-mid") != null);
+    try std.testing.expect(findSession(loaded.sessions.items, root, "s-new") == null);
+}
+
+test "loadBoundedSessions isolates the same session id across two workspace roots" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(base);
+    const root_a = try std.fs.path.join(std.testing.allocator, &.{ base, "a" });
+    defer std.testing.allocator.free(root_a);
+    const root_b = try std.fs.path.join(std.testing.allocator, &.{ base, "b" });
+    defer std.testing.allocator.free(root_b);
+    const session_id = try core.session.generateSessionId(core.time.Timestamp.fromUnixSeconds(1_700_000_000));
+    const path_a = try std.fs.path.join(std.testing.allocator, &.{ root_a, ".ryk", "sessions", session_id.slice() });
+    defer std.testing.allocator.free(path_a);
+    const path_b = try std.fs.path.join(std.testing.allocator, &.{ root_b, ".ryk", "sessions", session_id.slice() });
+    defer std.testing.allocator.free(path_b);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, path_a);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, path_b);
+
+    var workspace_a = try dupeWorkspace(std.testing.allocator, root_a, "", null, false);
+    defer workspace_a.deinit(std.testing.allocator);
+    var workspace_b = try dupeWorkspace(std.testing.allocator, root_b, "", null, false);
+    defer workspace_b.deinit(std.testing.allocator);
+    const loaded_feed = [_]feed_writer.LoadedFeedRecord{
+        testLoadedFeed("2026-07-13T00:00:00Z", root_a, "deny", "pi", session_id.slice()),
+        testLoadedFeed("2026-07-13T00:01:00Z", root_b, "allow", "opencode", session_id.slice()),
+    };
+    var loaded = try loadBoundedSessions(
+        std.testing.io,
+        std.testing.allocator,
+        &.{ workspace_a, workspace_b },
+        &loaded_feed,
+        4,
+    );
+    defer loaded.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), loaded.sessions.items.len);
+    const index_a = findSession(loaded.sessions.items, root_a, session_id.slice()) orelse return error.TestExpectedEqual;
+    const index_b = findSession(loaded.sessions.items, root_b, session_id.slice()) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(usize, 1), loaded.sessions.items[index_a].denied_count);
+    try std.testing.expectEqualStrings("pi", loaded.sessions.items[index_a].host.?);
+    try std.testing.expectEqual(@as(usize, 0), loaded.sessions.items[index_b].denied_count);
+    try std.testing.expectEqualStrings("opencode", loaded.sessions.items[index_b].host.?);
+}
+
 test "global feed redacts legacy free-form fields and exposes rule ids" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
