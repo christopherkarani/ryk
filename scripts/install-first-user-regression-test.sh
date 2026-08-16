@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# First-user / curl-door regression (D86) for w1-install-handoff.
-# Executes scripts/install.sh against a mock product binary. After co-migration
-# the primary post-binary door is `"$DESTINATION" doctor --fix --from-install`.
-# When the mock advertises doctor --fix, start --auto is poison (must not green).
+# First-user / curl-door regression for scripts/install.sh.
+# Executes install.sh against a mock product binary. After co-migration the
+# primary post-binary door is `"$DESTINATION" doctor --fix --from-install`.
+# When the mock advertises doctor --fix, start --auto must not be the install path.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"

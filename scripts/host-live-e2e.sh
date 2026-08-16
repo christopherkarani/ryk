@@ -3,8 +3,8 @@
 # (`hook` / `evaluate` / bare stdin). This is not a live host-CLI test.
 #
 # Host binaries are noted when present but do not gate the fixture run —
-# `ryk hook claude` does not need `claude` on PATH. Cursor is bare stdin
-# (W3 writer deferred), not a first-class launch alias.
+# `ryk hook claude` does not need `claude` on PATH. Cursor uses bare stdin;
+# there is no first-class launch alias.
 #
 # Usage:
 #   ./scripts/host-live-e2e.sh              # all hosts
@@ -206,7 +206,7 @@ envelope_note() {
     hermes) echo "ryk hook hermes pre_tool_call" ;;
     grok) echo "ryk hook grok PreToolUse (deny=exit 2 + decision JSON)" ;;
     pi) echo "ryk evaluate --json --stdin (Pi extension path)" ;;
-    cursor) echo "bare ryk stdin → beforeShellExecution permission (W3 writer deferred)" ;;
+    cursor) echo "bare ryk stdin → beforeShellExecution permission (no first-class launch alias)" ;;
   esac
 }
 

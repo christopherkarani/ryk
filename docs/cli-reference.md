@@ -1,10 +1,10 @@
 # ryk CLI reference
 
-This is the command reference for the current Zig CLI. It covers commands that a user or an integration can invoke, the boundaries between those commands, and the behavior verified in the working tree.
+This is the command reference for the current Zig CLI. It covers commands that a user or an integration can invoke and the boundaries between those commands.
 
-The page was checked on 2026-08-08 against Zig 0.16.0 and a locally built `./zig-out/bin/ryk` binary. Outputs that depend on local policy, installed hosts, sessions, or daemon state are described without copying local identifiers. Run `ryk version` to confirm the installed release version.
+The CLI binary is the authority for flags, subcommands, and host-specific behavior on your installation. Run `ryk version` to confirm the installed release version. Outputs that depend on local policy, installed hosts, sessions, or daemon state are described without copying local identifiers.
 
-The primary sources are the [CLI dispatcher](../src/cli/mod.zig), [help declarations](../src/cli/help.zig), [run path](../src/cli/run.zig), [exit-code registry](../src/cli/exit_codes.zig), and the command implementations under src/cli/. The commands and examples below were cross-checked against those sources and manual probes. This page does not turn a capability report into a protection guarantee.
+The primary sources are the [CLI dispatcher](../src/cli/mod.zig), [help declarations](../src/cli/help.zig), [run path](../src/cli/run.zig), [exit-code registry](../src/cli/exit_codes.zig), and the command implementations under src/cli/. This page does not turn a capability report into a protection guarantee.
 
 ## Read the live contract first
 
@@ -447,26 +447,3 @@ These are recorded because they affect documentation and automation:
 2. ryk help decide and the parser accept --stdin. A direct pipe probe against this build failed with EndOfStream in the stdin reader, so do not treat the route as reliable in this build. Use the verified inline --json form for now. The source location is [decide.zig](../src/cli/decide.zig#L696).
 3. --json is scoped to a command implementation. In the checked build, replay --json --list rendered the list form rather than a JSON document. Treat each subcommand's help as its output contract.
 4. doctor --json can return exit 0 with ready: false; use doctor --check when readiness must control a job.
-
-## Verification record
-
-The following probes were run against the source-built binary, with state-changing probes restricted to temporary workspaces or dry-run forms:
-
-~~~sh
-./scripts/zig version
-./scripts/zig build
-./zig-out/bin/ryk help --all
-./zig-out/bin/ryk version --json
-./zig-out/bin/ryk explain "git status"
-./zig-out/bin/ryk explain --format json "rm -rf /"
-./zig-out/bin/ryk test "git status"
-./zig-out/bin/ryk test --format json "rm -rf /"
-./zig-out/bin/ryk policy check --preset strict
-./zig-out/bin/ryk packs --json
-./zig-out/bin/ryk replay --session last --verify
-./zig-out/bin/ryk report --session last --format json
-./zig-out/bin/ryk ci check --format json
-./zig-out/bin/ryk redteam --ci --json
-~~~
-
-Additional manual checks covered a temporary run workspace, child exit propagation, a denied strict-mode command, policy initialization, hook and evaluate fixtures, a loopback dashboard request, plugin diagnostics, and dry-run staged-change operations. No real host agent was launched during this documentation pass, so host alias behavior is source-verified rather than presented as a live host-session result.
