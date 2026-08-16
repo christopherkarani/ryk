@@ -674,6 +674,52 @@ pub fn matchAllowOnce(
     return owned;
 }
 
+
+/// Re-insert a previously consumed single-use entry (M-15 restore path).
+/// Used when Evaluation construction fails after a durable consume so the grant
+/// is not lost. Best-effort: if a concurrent writer already re-added an equivalent
+/// command+scope entry, this is a no-op success. Failures propagate (caller fail-closes).
+pub fn restoreAllowOnceEntry(
+    runtime_io: std.Io,
+    gpa: std.mem.Allocator,
+    allow_once_path: []const u8,
+    entry: AllowOnceEntry,
+    now_iso: []const u8,
+) !void {
+    var lock = try StoreLock.acquire(runtime_io, gpa, allow_once_path);
+    defer lock.release(runtime_io);
+
+    var state = try loadAllowOnceState(runtime_io, gpa, allow_once_path, now_iso);
+    defer {
+        freeAllowOnceEntries(gpa, state.active.items);
+        state.active.deinit(gpa);
+    }
+
+    // Dedup: same command + identical scope already present → leave store as-is.
+    for (state.active.items) |e| {
+        const same_cmd = std.mem.eql(u8, e.command_raw, entry.command_raw);
+        const same_scope = e.scope_kind == entry.scope_kind and std.mem.eql(u8, e.scope_path, entry.scope_path);
+        if (same_cmd and same_scope) {
+            if (state.dirty) {
+                try writeAllowOnceFile(runtime_io, gpa, allow_once_path, state.active.items);
+            }
+            return;
+        }
+    }
+
+    const owned = try cloneAllowOnceEntry(gpa, entry);
+    errdefer freeAllowOnceEntry(gpa, owned);
+    // Restored grants must remain single-use and unconsumed.
+    var restored = owned;
+    if (restored.consumed_at) |c| {
+        gpa.free(c);
+        restored.consumed_at = null;
+    }
+    restored.single_use = true;
+    try state.active.append(gpa, restored);
+    try writeAllowOnceFile(runtime_io, gpa, allow_once_path, state.active.items);
+}
+
 pub fn clearAllowOnce(
     runtime_io: std.Io,
     gpa: std.mem.Allocator,

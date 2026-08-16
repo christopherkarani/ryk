@@ -397,9 +397,9 @@ fn collectPermanentRuleSkipIds(
 /// collectPermanentRuleSkipIds). This is intentional dual-path policy, not an
 /// oversight — document + test both; do not apply the permanent critical fence here.
 ///
-/// Two-phase consume (M-15): peek without burning, build Evaluation, then consume
-/// single_use only after the allow Evaluation is fully constructed. Prevents losing
-/// the exception when post-match allocation fails.
+/// Allow-once match with M-15 grant safety: single store pass (optional consume),
+/// then build Evaluation. If Evaluation construction fails after a durable consume,
+/// restore the single-use entry so the grant is not lost (P001 + M-15).
 fn tryAllowOnce(
     allocator: std.mem.Allocator,
     trimmed: []const u8,
@@ -433,7 +433,9 @@ fn tryAllowOnce(
         }
     }.deny;
 
-    // Phase 1: peek (consume=false) so eval construction cannot burn the grant first.
+    // Single lock/load pass (P001): consume when requested so we do not reload+reparse
+    // the JSONL twice. M-15 is preserved by restoring the entry if Evaluation
+    // construction fails after a durable consume.
     const matched = allow_once.matchAllowOnce(
         io,
         allocator,
@@ -441,7 +443,7 @@ fn tryAllowOnce(
         trimmed,
         cwd,
         now,
-        false,
+        options.consume_allow_once,
     ) catch |err| {
         // Seatbelt residual: allow-once lives under XDG/HOME data, often unreadable
         // under "no bare home". Treat access denials as "no grant" (packs still run),
@@ -454,13 +456,23 @@ fn tryAllowOnce(
         return try storeFail(allocator, options, started_ms);
     };
     const entry = matched orelse return null;
-    defer allow_once.freeAllowOnceEntry(allocator, entry);
+    // If we consumed and later fail building Evaluation, put the grant back.
+    var need_restore = options.consume_allow_once and entry.single_use;
+    defer {
+        if (need_restore) {
+            allow_once.restoreAllowOnceEntry(io, allocator, path, entry, now) catch {};
+        }
+        allow_once.freeAllowOnceEntry(allocator, entry);
+    }
 
     // M-6: product path rejects multi-use allow-once (single_use=false). Those
     // entries act like permanent unlocks from an agent-writable store without
     // operator integrity binding. Treat as miss so packs still apply.
     // Residual: entries remain on disk until redeem/CLI validation rejects mint.
+    // Note: multi-use entries are never consumed by matchAllowOnce (consume only
+    // removes single_use), so need_restore is already false for them.
     if (!entry.single_use) {
+        need_restore = false;
         try endOuterStep(options.trace, .{ .message = "allow_once single_use=false ignored (product)" });
         return null;
     }
@@ -473,45 +485,26 @@ fn tryAllowOnce(
     defer allocator.free(detail);
     try endOuterStep(options.trace, .{ .message = detail });
 
-    var eval = try finalizeEval(
+    const exception = allowExceptionOwned(
+        allocator,
+        entry.reason,
+        "allow_once",
+        null,
+        null,
+    ) catch {
+        // keep need_restore so defer re-inserts consumed grant
+        return try storeFail(allocator, options, started_ms);
+    };
+    const eval = finalizeEval(
         allocator,
         options.trace,
-        try allowExceptionOwned(
-            allocator,
-            entry.reason,
-            "allow_once",
-            null,
-            null,
-        ),
+        exception,
         elapsedMs(started_ms),
-    );
-    // No errdefer on eval: fail paths free manually then call storeFail (which may
-    // error). errdefer + manual deinit would double-free if storeFail fails.
-
-    // Phase 2: durable consume only after Evaluation is built.
-    if (options.consume_allow_once) {
-        const consumed = allow_once.matchAllowOnce(
-            io,
-            allocator,
-            path,
-            trimmed,
-            cwd,
-            now,
-            true,
-        ) catch {
-            // Peek succeeded then consume failed (including rare access flip) — fail closed.
-            eval.deinit(allocator);
-            return try storeFail(allocator, options, started_ms);
-        };
-        if (consumed) |burned| {
-            allow_once.freeAllowOnceEntry(allocator, burned);
-        } else {
-            // Entry vanished between peek and consume (concurrent use) — fail closed.
-            eval.deinit(allocator);
-            return try storeFail(allocator, options, started_ms);
-        }
-    }
-
+    ) catch {
+        return try storeFail(allocator, options, started_ms);
+    };
+    // Success: do not restore; grant stays consumed (or was peek-only).
+    need_restore = false;
     return eval;
 }
 

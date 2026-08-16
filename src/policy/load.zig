@@ -1,9 +1,73 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 const core = @import("../core/public.zig");
 const presets = @import("presets.zig");
 const schema = @import("schema.zig");
 const validate = @import("validate.zig");
+
+// Process-local policy file text cache (P004 / #393).
+// Keyed by absolute-ish path + size + mtime. Invalidates on change.
+// Short-lived hook processes still benefit when the same process loads policy
+// more than once (tests, daemon, multi-event hosts). Does not weaken fail-closed:
+// missing/stat failure → miss and reload; parse still validates.
+const PolicyFileCache = struct {
+    // Zig 0.16: std.atomic.Mutex (not Thread.Mutex).
+    var mu: std.atomic.Mutex = .unlocked;
+    var path_buf: [4096]u8 = undefined;
+    var path_len: usize = 0;
+    var size: u64 = 0;
+    var mtime_sec: i128 = 0;
+    var mtime_nsec: i32 = 0;
+    var text: ?[]u8 = null;
+    var text_allocator: ?std.mem.Allocator = null;
+
+    fn clearLocked() void {
+        if (text) |t| {
+            if (text_allocator) |a| a.free(t);
+        }
+        text = null;
+        text_allocator = null;
+        path_len = 0;
+        size = 0;
+        mtime_sec = 0;
+        mtime_nsec = 0;
+    }
+
+    fn lock() void {
+        while (!mu.tryLock()) {
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    fn get(path: []const u8, st_size: u64, st_mtime_sec: i128, st_mtime_nsec: i32) ?[]const u8 {
+        // Tests use GPA leak/nondeterminism checks; skip process-global cache there.
+        if (builtin.is_test) return null;
+        lock();
+        defer mu.unlock();
+        if (text == null) return null;
+        if (path_len != path.len) return null;
+        if (!std.mem.eql(u8, path_buf[0..path_len], path)) return null;
+        if (size != st_size or mtime_sec != st_mtime_sec or mtime_nsec != st_mtime_nsec) return null;
+        return text.?;
+    }
+
+    fn put(allocator: std.mem.Allocator, path: []const u8, st_size: u64, st_mtime_sec: i128, st_mtime_nsec: i32, body: []const u8) void {
+        if (builtin.is_test) return;
+        if (path.len > path_buf.len) return;
+        lock();
+        defer mu.unlock();
+        clearLocked();
+        const owned = allocator.dupe(u8, body) catch return;
+        @memcpy(path_buf[0..path.len], path);
+        path_len = path.len;
+        size = st_size;
+        mtime_sec = st_mtime_sec;
+        mtime_nsec = st_mtime_nsec;
+        text = owned;
+        text_allocator = allocator;
+    }
+};
 
 pub const PolicyParseError = error{
     InvalidPolicy,
@@ -572,10 +636,31 @@ pub fn parseFromSlice(allocator: std.mem.Allocator, text: []const u8, source_pat
 }
 
 pub fn loadFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !schema.Policy {
-    const text = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, std.Io.Limit.limited(core.limits.max_policy_file_len + 1));
-    defer allocator.free(text);
-    if (text.len > core.limits.max_policy_file_len) return error.PolicyFileTooLarge;
-    return parseFromSlice(allocator, text, path);
+    // Prefer mtime+size cache of file bytes, then parse into caller allocator.
+    // Stat miss / open miss falls through to direct read (same errors as before).
+    const st = std.Io.Dir.cwd().statFile(io, path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return error.FileNotFound,
+        else => null,
+    };
+    if (st) |info| {
+        const m_sec: i128 = info.mtime.toSeconds();
+        // Size + mtime seconds is enough to invalidate on rewrite; nsec not required.
+        if (PolicyFileCache.get(path, info.size, m_sec, 0)) |cached| {
+            if (cached.len > core.limits.max_policy_file_len) return error.PolicyFileTooLarge;
+            return parseFromSlice(allocator, cached, path);
+        }
+    }
+
+    const file_text = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, std.Io.Limit.limited(core.limits.max_policy_file_len + 1));
+    defer allocator.free(file_text);
+    if (file_text.len > core.limits.max_policy_file_len) return error.PolicyFileTooLarge;
+
+    if (st) |info| {
+        const m_sec: i128 = info.mtime.toSeconds();
+        // Cache with page_allocator so caller frees of policy do not invalidate bytes.
+        PolicyFileCache.put(std.heap.page_allocator, path, info.size, m_sec, 0, file_text);
+    }
+    return parseFromSlice(allocator, file_text, path);
 }
 
 pub fn loadPreset(allocator: std.mem.Allocator, preset: presets.Preset) !schema.Policy {
