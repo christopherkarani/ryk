@@ -277,7 +277,7 @@ pub const commands =
             .details = &.{
                 "Human stats are rendered by ryk from structured history data.",
                 "Use 'ryk history --help' for actions and examples.",
-                "--live opens a scrollable alt-screen view of the current stats snapshot (TTY only; not with --json).",
+                "--live opens a scrollable alt-screen view of the current stats snapshot on an interactive TTY; non-TTY / --plain / --no-rich falls back to linear (not with --json).",
                 "Use --json, --robot, or --format for machine-readable daemon output.",
             },
         },
@@ -620,7 +620,7 @@ pub const commands =
             "Reads .ryk session artifacts, renders a timeline, and can verify session integrity.",
             "With no args and no sessions, lists available sessions instead of erroring.",
             "Use --list to print all session IDs under .ryk/sessions/.",
-            "--tui opens a scrollable alt-screen timeline view (TTY only; not with --json).",
+            "--tui opens a scrollable alt-screen timeline view on an interactive TTY; non-TTY / --plain / --no-rich falls back to linear (not with --json).",
         } },
         .{
             .name = "diff",

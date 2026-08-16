@@ -19,7 +19,8 @@ const ReplayCliOptions = struct {
     verify: bool = false,
     list: bool = false,
     /// Phase 7: opt-in alt-screen timeline view (`ryk replay --tui`). Default
-    /// stays linear (invariant #1: --json frozen). Rejected on non-TTY / --json.
+    /// stays linear (invariant #1: --json frozen). Non-TTY / --plain / --no-rich
+    /// / NO_COLOR fall back to linear; `--tui --json` stays a machine conflict.
     tui_view: bool = false,
     /// When true, a missing default `last` session lists sessions instead of erroring.
     fallback_to_list: bool = false,
@@ -57,23 +58,22 @@ fn replaySession(
     stdout: anytype,
     stderr: anytype,
 ) !u8 {
-    // Phase 7: --tui preflight BEFORE session load. --tui is a human-only
-    // alt-screen view: it must not combine with --json (frozen machine contract,
-    // invariant #1) and must not enter the alt-screen on non-interactive output
-    // (invariant #2). Reject up front so a missing session never masks the flag
-    // conflict and we never load data we'll refuse to render.
+    // --tui preflight BEFORE session load so `--tui --json` never hides behind a
+    // missing session. Machine conflict stays EXIT 2. No colour TTY / slim build
+    // / --plain / --no-rich fall through to linear (same exit as linear replay).
+    var enter_tui = false;
     if (options.tui_view) {
-        if (comptime !enable_tui) {
-            try stderr.writeAll("ryk replay: --tui is not available in this build.\n");
-            return exit_codes.usage;
-        }
         if (options.json) {
             try stderr.writeAll("ryk replay: --tui cannot be combined with --json (machine output is frozen).\n");
             return exit_codes.usage;
         }
-        if (!tui.output_policy.shouldEnterTuiIo(io, &.{"--tui"})) {
-            try stderr.writeAll("ryk replay: --tui needs an interactive colour terminal. Drop --tui, or unset NO_COLOR / --no-rich.\n");
-            return exit_codes.usage;
+        enter_tui = (comptime enable_tui) and tui.output_policy.shouldEnterTuiIo(io, &.{"--tui"});
+        if (!enter_tui) {
+            if (comptime enable_tui) {
+                try stderr.writeAll("ryk replay: --tui requires an interactive TTY (and no --json/--plain/--no-rich); using linear report.\n");
+            } else {
+                try stderr.writeAll("ryk replay: --tui requires a TUI-enabled ryk build; using linear report.\n");
+            }
         }
     }
 
@@ -110,7 +110,7 @@ fn replaySession(
 
     if (options.json) {
         try core_api.writeReplayJson(stdout, session);
-    } else if (options.tui_view) {
+    } else if (enter_tui) {
         if (comptime enable_tui) {
             const lines = try buildTimelineLinesForTui(allocator, session);
             defer freeTimelineLines(allocator, lines);
@@ -461,7 +461,9 @@ fn listSessions(io: std.Io, allocator: std.mem.Allocator, workspace_root: []cons
 
 fn parseOptions(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: anytype) !ReplayCliOptions {
     var options: ReplayCliOptions = .{
-        .fallback_to_list = argv.len == 0,
+        // Bare `ryk replay` and `ryk replay --tui` (args-minus-TUI is empty)
+        // list sessions instead of erroring when `last` is missing.
+        .fallback_to_list = argvHasOnlyTuiFlags(argv),
     };
     var index: usize = 0;
     while (index < argv.len) : (index += 1) {
@@ -494,16 +496,23 @@ fn parseOptions(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: a
             options.only_denied = true;
             options.fallback_to_list = false;
         } else if (std.mem.eql(u8, arg, "--tui")) {
-            // Phase 7: opt-in alt-screen timeline view. Linear output is the
-            // default; --json stays frozen and cannot combine with --tui.
+            // Opt-in alt-screen timeline. Linear is the default; --json stays
+            // frozen and cannot combine with --tui. No-TTY falls back to linear.
+            // Do not clear fallback_to_list: `--tui` alone is args-minus-TUI empty.
             options.tui_view = true;
-            options.fallback_to_list = false;
         } else {
             try suggestions.writeUnknownOption(stderr, "ryk replay", arg, &.{ "--list", "--session", "--json", "--verify", "--only", "--tui", "--help", "-h" }, "replay");
             return error.Usage;
         }
     }
     return options;
+}
+
+fn argvHasOnlyTuiFlags(argv: []const []const u8) bool {
+    for (argv) |arg| {
+        if (!std.mem.eql(u8, arg, "--tui")) return false;
+    }
+    return true;
 }
 
 fn sessionDirPathForError(io: std.Io, allocator: std.mem.Allocator, workspace_root: []const u8, requested: []const u8) ![]u8 {
@@ -1018,15 +1027,14 @@ test "replay human timeline collapses repeated redactions and json remains exact
 }
 
 // ---------------------------------------------------------------------------
-// Phase 7 Task D: --tui alt-screen view (rejection contracts; the raw TTY loop
-// is manual-verify per the prompt.zig:19 note). Linear + --json byte contracts
-// must be unchanged when --tui is absent.
+// --tui alt-screen view (fallback + machine-conflict contracts; the raw TTY
+// loop is manual-verify per the prompt.zig:19 note). Linear + --json byte
+// contracts must be unchanged when --tui is absent.
 // ---------------------------------------------------------------------------
 
-test "replay --tui is rejected on non-interactive output (no colour terminal)" {
-    // Fixed-buffer stdout → theme.active() resolves to capability .none → the
-    // alt-screen view must be rejected with a usage error, never entering the
-    // alt-screen on a pipe/buffer (invariant: non-TTY → plain text).
+test "replay --tui falls back to linear on non-interactive output" {
+    // Pipe / fixed-buffer / no colour TTY: --tui must not EXIT 2. Fall back to
+    // the same linear timeline the fixture would render without --tui.
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
@@ -1051,16 +1059,43 @@ test "replay --tui is rejected on non-interactive output (no colour terminal)" {
     var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
 
     const code = try command(std.testing.io, &.{ "--session", session_id, "--tui" }, &stdout_writer, &stderr_writer);
-    try std.testing.expectEqual(exit_codes.usage, code);
+    try std.testing.expectEqual(exit_codes.success, code);
     const err = stderr_writer.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, err, "--tui") != null);
-    if (enable_tui) {
-        try std.testing.expect(std.mem.indexOf(u8, err, "interactive") != null);
-    } else {
-        try std.testing.expect(std.mem.indexOf(u8, err, "not available in this build") != null);
+    try std.testing.expect(std.mem.indexOf(u8, err, "using linear") != null);
+    try std.testing.expect(std.mem.indexOf(u8, err, "Drop --tui") == null);
+    const out = stdout_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "3 secret redactions") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "secret_redacted"));
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[?1049") == null);
+}
+
+test "replay --tui with no sessions falls back to linear empty list" {
+    // args-minus-TUI of bare `--tui` is `ryk replay`: friendly empty list, EXIT 0.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, ".ryk");
+    {
+        const policy_file = try tmp.dir.createFile(std.testing.io, ".ryk/policy.yaml", .{});
+        defer policy_file.close(std.testing.io);
+        try policy_file.writeStreamingAll(std.testing.io, "version: 1\nmode: observe\n");
     }
-    // No alt-screen controls leaked onto the buffer.
-    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "\x1b[?1049") == null);
+
+    const prev_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(prev_cwd);
+    try std.process.setCurrentDir(std.testing.io, tmp.dir);
+    defer std.process.setCurrentPath(std.testing.io, prev_cwd) catch {};
+
+    var stdout_buf: [512]u8 = undefined;
+    var stderr_buf: [512]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+
+    const code = try command(std.testing.io, &.{"--tui"}, &stdout_writer, &stderr_writer);
+    try std.testing.expectEqual(exit_codes.success, code);
+    const out = stdout_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "No sessions") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "FileNotFound") == null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "using linear") != null);
 }
 
 test "replay --tui cannot combine with --json" {
@@ -1075,11 +1110,7 @@ test "replay --tui cannot combine with --json" {
     try std.testing.expectEqual(exit_codes.usage, code);
     const err = stderr_writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, err, "--tui") != null);
-    if (enable_tui) {
-        try std.testing.expect(std.mem.indexOf(u8, err, "--json") != null);
-    } else {
-        try std.testing.expect(std.mem.indexOf(u8, err, "not available") != null);
-    }
+    try std.testing.expect(std.mem.indexOf(u8, err, "--json") != null);
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "\x1b[?1049") == null);
 }
 
