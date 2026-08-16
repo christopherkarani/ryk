@@ -516,7 +516,13 @@ fn runWithCwdUsing(
         return exit_codes.success;
     }
     if (std.mem.eql(u8, command, "env")) {
-        if (argv.len > 1) return env_schema_command.command(io, argv[1..], stdout, stderr);
+        if (argv.len > 1) {
+            if (argv.len == 2 and (std.mem.eql(u8, argv[1], "--help") or std.mem.eql(u8, argv[1], "-h"))) {
+                _ = try help.writeCommand(io, stdout, "env");
+                return exit_codes.success;
+            }
+            return env_schema_command.command(io, argv[1..], stdout, stderr);
+        }
         try writeInstallEnv(io, stdout);
         return exit_codes.success;
     }
@@ -1423,6 +1429,29 @@ test "banner suppressed for raw env output" {
     try std.testing.expect(std.mem.indexOf(u8, out, "PATH") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\u{1F6E1}  ryk") == null);
     try std.testing.expectEqualStrings("", stderr_writer.buffered());
+}
+
+test "env --help exits 0 and names eval verbs" {
+    var stdout_buf: [4096]u8 = undefined;
+    var stderr_buf: [256]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+
+    const code = try testRun(&.{ "env", "--help" }, &stdout_writer, &stderr_writer);
+    try std.testing.expectEqual(exit_codes.success, code);
+    const out = stdout_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "eval \"$(ryk env)\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "schema --agent") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "export PATH=") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "set \"PATH=") == null);
+
+    stdout_writer = .fixed(&stdout_buf);
+    stderr_writer = .fixed(&stderr_buf);
+    const short_code = try testRun(&.{ "env", "-h" }, &stdout_writer, &stderr_writer);
+    try std.testing.expectEqual(exit_codes.success, short_code);
+    const short_out = stdout_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, short_out, "eval \"$(ryk env)\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, short_out, "schema --agent") != null);
 }
 
 test "banner suppressed for completions raw output" {
