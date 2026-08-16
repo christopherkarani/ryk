@@ -198,15 +198,22 @@ pub const host_config_table = [_]HostConfigSpec{
         .host = "grok",
         // Product state only — not whole ~/.grok (worktrees, agent scratch, etc.) (F19).
         // F40: do not RW-grant ~/.grok/bin (host-identity trust root — plantable privilege).
-        // user-settings.json is RO via collect paths + authority write-deny (F218).
+        // Grok CLI 1.0.4 opens ~/.grok/config.toml after Seatbelt attach (#194).
+        // Grant the file only: Seatbelt path-walk uses ancestor metadata literals
+        // on ~/.grok; do not grant the parent tree (not a trusted prefix).
+        // user-settings.json stays write-denied (F218); not a 1.0.4 config-load path.
         .home_rel_dirs = &.{
+            ".grok/config.toml",
             ".grok/skills",
             ".grok/hooks",
             ".grok/sessions",
             ".grok/plugins",
             ".grok/mcp",
         },
-        .authority_home_rel_files = &.{".grok/user-settings.json"},
+        .authority_home_rel_files = &.{
+            ".grok/config.toml",
+            ".grok/user-settings.json",
+        },
     },
 };
 
@@ -1346,6 +1353,80 @@ test "collectHostConfigPaths grants existing Grok product dirs not whole tree" {
         try std.testing.expect(!std.mem.endsWith(u8, p, "/.grok/worktrees/evil"));
         try std.testing.expect(!std.mem.eql(u8, p, home));
         try std.testing.expect(!std.mem.endsWith(u8, p, "/.grok"));
+    }
+}
+
+// Issue #194: grok 1.0.4 opens ~/.grok/config.toml after Seatbelt attach.
+// The grant must be the file (plus ancestor metadata from the profile builder),
+// not the parent ~/.grok tree (F19) and not ~/.grok/bin (F40).
+test "collectHostConfigPaths grants grok 1.0.4 config.toml not whole ~/.grok" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var home_tmp = std.testing.tmpDir(.{});
+    defer home_tmp.cleanup();
+    const home = try home_tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(home);
+
+    try home_tmp.dir.createDirPath(io, ".grok/worktrees/evil");
+    try home_tmp.dir.createDirPath(io, ".grok/bin");
+    try home_tmp.dir.createDirPath(io, "Library/Keychains");
+    try home_tmp.dir.writeFile(io, .{
+        .sub_path = ".grok/config.toml",
+        .data = "[cli]\nauto_update = false\n",
+    });
+    try home_tmp.dir.writeFile(io, .{
+        .sub_path = ".grok/bin/grok",
+        .data = "#!/bin/sh\n",
+    });
+    try home_tmp.dir.writeFile(io, .{
+        .sub_path = "Library/Keychains/login.keychain-db",
+        .data = "secret\n",
+    });
+
+    const spec = specForHost("grok").?;
+    var listed_config = false;
+    var listed_bare_grok = false;
+    var listed_bin = false;
+    for (spec.home_rel_dirs) |rel| {
+        if (std.mem.eql(u8, rel, ".grok/config.toml")) listed_config = true;
+        if (std.mem.eql(u8, rel, ".grok")) listed_bare_grok = true;
+        if (std.mem.eql(u8, rel, ".grok/bin") or std.mem.startsWith(u8, rel, ".grok/bin/")) listed_bin = true;
+    }
+    try std.testing.expect(listed_config);
+    try std.testing.expect(!listed_bare_grok);
+    try std.testing.expect(!listed_bin);
+
+    const paths = try collectHostConfigPaths(io, allocator, "grok", home);
+    defer freeHostConfigPaths(allocator, paths);
+    try std.testing.expect(paths.len >= 1);
+    var saw_config = false;
+    for (paths) |p| {
+        if (std.mem.endsWith(u8, p, "/.grok/config.toml")) saw_config = true;
+        try std.testing.expect(!std.mem.eql(u8, p, home));
+        try std.testing.expect(!std.mem.endsWith(u8, p, "/.grok"));
+        try std.testing.expect(!std.mem.endsWith(u8, p, "/.grok/bin"));
+        try std.testing.expect(!std.mem.endsWith(u8, p, "/.grok/worktrees"));
+        try std.testing.expect(!std.mem.endsWith(u8, p, "/.grok/worktrees/evil"));
+        try std.testing.expect(std.mem.indexOf(u8, p, "Library/Keychains") == null);
+    }
+    try std.testing.expect(saw_config);
+}
+
+test "collectHostConfigWriteDenies includes grok 1.0.4 config.toml" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("HOME", "/Users/synthetic");
+
+    const paths = try collectHostConfigWriteDenies(io, allocator, "grok", "/tmp/ryk-grok-repro", &env_map);
+    defer freeHostConfigWriteDenies(allocator, paths);
+    try std.testing.expect(testingContainsPath(paths, "/Users/synthetic/.grok/config.toml"));
+    try std.testing.expect(testingContainsPath(paths, "/Users/synthetic/.grok/user-settings.json"));
+    for (paths) |p| {
+        try std.testing.expect(!std.mem.eql(u8, p, "/Users/synthetic"));
+        try std.testing.expect(!std.mem.eql(u8, p, "/Users/synthetic/.grok"));
+        try std.testing.expect(std.mem.indexOf(u8, p, "Library/Keychains") == null);
     }
 }
 

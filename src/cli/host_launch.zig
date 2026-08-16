@@ -109,6 +109,8 @@ test "isExactHostLaunchArgv0 rejects basename paths" {
     try std.testing.expect(!isExactHostLaunchArgv0("./hermes"));
     try std.testing.expect(!isExactHostLaunchArgv0("/tmp/evil/hermes"));
     try std.testing.expect(!isExactHostLaunchArgv0("/workspace/planted/hermes"));
+    try std.testing.expect(!isExactHostLaunchArgv0("./grok"));
+    try std.testing.expect(!isExactHostLaunchArgv0("/tmp/evil/grok"));
     try std.testing.expect(!isExactHostLaunchArgv0("venv/bin/hermes"));
     try std.testing.expect(!isExactHostLaunchArgv0(""));
     try std.testing.expect(!isExactHostLaunchArgv0("sh"));
