@@ -1596,24 +1596,32 @@ test "top-level MCP generated surfaces preserve exact bytes" {
     ;
     const expected_trust =
         \\Direct policy mutation is not implemented for this command.
-        \\Add this snippet to your policy after reviewing the server manifest:
+        \\Add this snippet to .ryk/policy.yaml after reviewing the server manifest:
         \\
         \\mcp:
         \\  allow:
         \\    - "demo.read"
         \\
     ;
-    inline for (.{
-        .{ .argv = &.{ "mcp", "manifest", "generate", "--server", "demo" }, .expected = expected_manifest },
-        .{ .argv = &.{ "mcp", "trust", "demo", "--tool", "read" }, .expected = expected_trust },
-    }) |case| {
+    // manifest generate stays success; mcp trust is nonzero (#293) with stderr pointer.
+    {
         var stdout_buf: [2048]u8 = undefined;
         var stderr_buf: [512]u8 = undefined;
         var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
         var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
-        try std.testing.expectEqual(exit_codes.success, try testRun(case.argv, &stdout_writer, &stderr_writer));
-        try std.testing.expectEqualStrings(case.expected, stdout_writer.buffered());
+        try std.testing.expectEqual(exit_codes.success, try testRun(&.{ "mcp", "manifest", "generate", "--server", "demo" }, &stdout_writer, &stderr_writer));
+        try std.testing.expectEqualStrings(expected_manifest, stdout_writer.buffered());
         try std.testing.expectEqualStrings("", stderr_writer.buffered());
+    }
+    {
+        var stdout_buf: [2048]u8 = undefined;
+        var stderr_buf: [512]u8 = undefined;
+        var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+        var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+        try std.testing.expectEqual(exit_codes.general, try testRun(&.{ "mcp", "trust", "demo", "--tool", "read" }, &stdout_writer, &stderr_writer));
+        try std.testing.expectEqualStrings(expected_trust, stdout_writer.buffered());
+        try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "does not mutate policy") != null);
+        try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "policy.yaml") != null);
     }
 }
 
@@ -1720,8 +1728,13 @@ fn expectShortUnavailable(
     try std.testing.expect(std.mem.indexOf(u8, stderr, "not yet ported") == null);
     try std.testing.expect(std.mem.indexOf(u8, stderr, "Rust daemon") == null);
     try std.testing.expect(std.mem.indexOf(u8, stderr, "threat-model") == null);
-    // Keep the message short (plan: ~two lines; one short notice + usage hint).
-    try std.testing.expect(stderr.len < 200);
+    // Keep hide-list messages short. history gets an extra migration line (#289).
+    if (std.mem.eql(u8, command, "history")) {
+        try std.testing.expect(stderr.len < 320);
+        try std.testing.expect(std.mem.indexOf(u8, stderr, "ryk replay") != null);
+    } else {
+        try std.testing.expect(stderr.len < 200);
+    }
 }
 
 test "P0 honesty: hide-list command yields short not-available and usage exit" {
