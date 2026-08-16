@@ -1898,14 +1898,19 @@ fn collectDaemonSuggestionTexts(allocator: std.mem.Allocator, result: std.json.V
         if (description) |desc| {
             if (suggestion_cmd) |cmd| {
                 const text = try std.fmt.allocPrint(allocator, "{s} ({s})", .{ desc, cmd });
+                defer allocator.free(text);
                 const safe = try core_api.redactAlloc(allocator, text);
-                allocator.free(text);
+                errdefer allocator.free(safe);
                 try list.append(allocator, safe);
                 continue;
             }
-            try list.append(allocator, try core_api.redactAlloc(allocator, desc));
+            const safe_desc = try core_api.redactAlloc(allocator, desc);
+            errdefer allocator.free(safe_desc);
+            try list.append(allocator, safe_desc);
         } else if (suggestion_cmd) |cmd| {
-            try list.append(allocator, try core_api.redactAlloc(allocator, cmd));
+            const safe_cmd = try core_api.redactAlloc(allocator, cmd);
+            errdefer allocator.free(safe_cmd);
+            try list.append(allocator, safe_cmd);
         }
     }
     return try list.toOwnedSlice(allocator);
@@ -4484,6 +4489,23 @@ fn recordDaemonMetadataRedactionAllocationFailureProbe(allocator: std.mem.Alloca
 
 test "recordDaemonMetadataRedaction daemon metadata redaction cleans up every allocation failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, recordDaemonMetadataRedactionAllocationFailureProbe, .{});
+}
+
+fn daemonSuggestionRedactAllocationFailureProbe(allocator: std.mem.Allocator) !void {
+    const payload =
+        \\{"suggestions":[{"command":"echo fake","description":"Limit delete scope"}]}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+    defer parsed.deinit();
+    const texts = try collectDaemonSuggestionTexts(allocator, parsed.value);
+    defer {
+        for (texts) |s| allocator.free(s);
+        allocator.free(texts);
+    }
+}
+
+test "collectDaemonSuggestionTexts cleans up every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, daemonSuggestionRedactAllocationFailureProbe, .{});
 }
 
 test "hook daemon deny redacts matched_text_preview from agent-visible output" {
