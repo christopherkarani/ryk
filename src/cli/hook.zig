@@ -6252,6 +6252,20 @@ test "fromDecisionResult stage plus wireCodingHostAsk is not allow" {
     try std.testing.expect(!std.mem.eql(u8, claudePermissionDecisionString(.stage), "allow"));
 }
 
+test "unattended env lookup hardens coding-host residual ask" {
+    const Lookup = struct {
+        key: []const u8,
+        value: []const u8,
+        pub fn get(self: @This(), key: []const u8) ?[]const u8 {
+            return if (std.mem.eql(u8, key, self.key)) self.value else null;
+        }
+    };
+    const from_ci = env_util.unattendedFromLookup(Lookup{ .key = "CI", .value = "1" });
+    try std.testing.expectEqual(PluginDecision.block, wireCodingHostAsk(.claude, .ask, from_ci));
+    const attended = env_util.unattendedFromLookup(Lookup{ .key = "CI", .value = "0" });
+    try std.testing.expectEqual(PluginDecision.allow, wireCodingHostAsk(.claude, .ask, attended));
+}
+
 test "hook emit after wire rewrite is allow for attended Hermes" {
     const wired = wireCodingHostAsk(.hermes, .ask, false);
     try std.testing.expectEqual(PluginDecision.allow, wired);
