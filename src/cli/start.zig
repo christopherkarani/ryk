@@ -320,6 +320,12 @@ const SelectedHosts = struct {
     owned: bool,
 };
 
+fn appendOwnedCopy(allocator: std.mem.Allocator, list: *std.ArrayList([]const u8), bytes: []const u8) !void {
+    const owned = try allocator.dupe(u8, bytes);
+    errdefer allocator.free(owned);
+    try list.append(allocator, owned);
+}
+
 fn resolveSelectedHosts(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -339,7 +345,7 @@ fn resolveSelectedHosts(
         }
         for (host_statuses) |status| {
             if (!shouldAutoSelectHost(status.name, status.detected)) continue;
-            try list.append(allocator, try allocator.dupe(u8, status.name));
+            try appendOwnedCopy(allocator, &list, status.name);
         }
         return .{ .items = try list.toOwnedSlice(allocator), .owned = true };
     }
@@ -358,22 +364,28 @@ fn resolveSelectedHosts(
     defer allocator.free(options);
 
     var visible_idx: usize = 0;
+    defer {
+        for (options[0..visible_idx]) |opt| {
+            allocator.free(opt.label);
+            if (opt.id) |id| allocator.free(id);
+        }
+    }
     for (host_statuses) |status| {
         if (!status.detected) continue;
         const marker = if (status.installed) " (installed)" else "";
         var label_buf: [64]u8 = undefined;
         const label = std.fmt.bufPrint(&label_buf, "{s}{s}", .{ status.name, marker }) catch status.name;
-        options[visible_idx] = .{
-            .label = try allocator.dupe(u8, label),
-            .checked = !std.mem.eql(u8, status.name, "cursor"),
-            .id = try allocator.dupe(u8, status.name),
-        };
-        visible_idx += 1;
-    }
-    defer {
-        for (options) |opt| {
-            allocator.free(opt.label);
-            if (opt.id) |id| allocator.free(id);
+        {
+            const owned_label = try allocator.dupe(u8, label);
+            errdefer allocator.free(owned_label);
+            const owned_id = try allocator.dupe(u8, status.name);
+            errdefer allocator.free(owned_id);
+            options[visible_idx] = .{
+                .label = owned_label,
+                .checked = !std.mem.eql(u8, status.name, "cursor"),
+                .id = owned_id,
+            };
+            visible_idx += 1;
         }
     }
 
@@ -391,7 +403,7 @@ fn resolveSelectedHosts(
     for (options) |item| {
         if (!item.checked) continue;
         const host_name = item.id orelse item.label;
-        try list.append(allocator, try allocator.dupe(u8, host_name));
+        try appendOwnedCopy(allocator, &list, host_name);
     }
     return .{ .items = try list.toOwnedSlice(allocator), .owned = true };
 }
@@ -1292,6 +1304,77 @@ test "start auto-select skips detect-only cursor" {
     try std.testing.expect(shouldAutoSelectHost("claude", true));
     try std.testing.expect(!shouldAutoSelectHost("cursor", true));
     try std.testing.expect(!shouldAutoSelectHost("claude", false));
+}
+
+fn hostsListOomResolveSelectedHostsAutoProbe(allocator: std.mem.Allocator) !void {
+    var stdout_buf: [256]u8 = undefined;
+    var stdout: std.Io.Writer = .fixed(&stdout_buf);
+    // At least one detected non-cursor host; cursor stays auto-skipped.
+    const statuses = [_]onboarding.HostStatus{
+        .{ .name = "codex", .detected = true, .installed = false },
+        .{ .name = "cursor", .detected = true, .installed = false },
+        .{ .name = "hermes", .detected = true, .installed = false },
+    };
+    const selected = try resolveSelectedHosts(
+        std.testing.io,
+        allocator,
+        .{ .auto = true },
+        &statuses,
+        &stdout,
+    );
+    defer if (selected.owned) onboarding.deinitHostList(allocator, selected.items);
+    try std.testing.expect(selected.owned);
+    try std.testing.expectEqual(@as(usize, 2), selected.items.len);
+    try std.testing.expectEqualStrings("codex", selected.items[0]);
+    try std.testing.expectEqualStrings("hermes", selected.items[1]);
+}
+
+test "HostsListOom resolveSelectedHosts auto OOM ownership" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        hostsListOomResolveSelectedHostsAutoProbe,
+        .{},
+    );
+}
+
+test "start picker filled-prefix cleanup mid-loop OOM and cursor default-unchecked" {
+    // fail_index 3: options alloc + first label + first id stored; next dupe OOMs.
+    // Do not CAAF this path — success would enter TUI multiSelect.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 3 });
+    var stdout_buf: [512]u8 = undefined;
+    var stdout: std.Io.Writer = .fixed(&stdout_buf);
+    const statuses = [_]onboarding.HostStatus{
+        .{ .name = "codex", .detected = true, .installed = false },
+        .{ .name = "cursor", .detected = true, .installed = false },
+        .{ .name = "hermes", .detected = true, .installed = false },
+    };
+    try std.testing.expectError(
+        error.OutOfMemory,
+        resolveSelectedHosts(std.testing.io, failing.allocator(), .{}, &statuses, &stdout),
+    );
+    try std.testing.expect(failing.has_induced_failure);
+
+    // Source lock on resolveSelectedHosts only — do not drive TUI multiSelect.
+    const src = @embedFile("start.zig");
+    const fn_idx = std.mem.indexOf(u8, src, "fn resolveSelectedHosts(") orelse return error.TestUnexpectedResult;
+    const after_fn = src[fn_idx..];
+    const next_fn = std.mem.indexOf(u8, after_fn[1..], "\nfn ") orelse return error.TestUnexpectedResult;
+    const body = after_fn[0 .. 1 + next_fn];
+
+    try std.testing.expect(std.mem.indexOf(u8, body, ".checked = !std.mem.eql(u8, status.name, \"cursor\")") != null);
+
+    const alloc_idx = std.mem.indexOf(u8, body, "allocator.alloc(tui.prompt.SelectionOption") orelse
+        return error.TestUnexpectedResult;
+    const after_alloc = body[alloc_idx..];
+    const fill_idx = std.mem.indexOf(u8, after_alloc, "for (host_statuses)") orelse return error.TestUnexpectedResult;
+    const pre_fill = after_alloc[0..fill_idx];
+    // Item cleanup (filled prefix) must be registered before the fill loop.
+    try std.testing.expect(std.mem.indexOf(u8, pre_fill, "defer") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pre_fill, ".label") != null);
+
+    const label_dupe = std.mem.indexOf(u8, after_alloc, "allocator.dupe(u8, label)") orelse return error.TestUnexpectedResult;
+    const id_dupe = std.mem.indexOf(u8, after_alloc, "allocator.dupe(u8, status.name)") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(label_dupe < id_dupe);
 }
 
 test "start packs-or-verify receipt only when those steps actually failed" {
