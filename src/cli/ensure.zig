@@ -25,8 +25,29 @@ const telemetry = @import("../telemetry.zig");
 /// Teach repair door for soft host/wire failures — never `ryk start` as required.
 pub const doctor_fix_hint: []const u8 = "ryk doctor --fix";
 
+/// `--fix` ran as zig-cache `test` / `zig` and refused to rewrite hooks.
+pub const doctor_fix_not_product_hint: []const u8 =
+    "this doctor is not product ryk — run `ryk doctor --fix` from a normal terminal";
+
+/// Product `--fix` rewrote the host file but the bake is still not product ryk.
+pub const doctor_fix_bake_still_broken_hint: []const u8 =
+    "host hook still points at a non-product binary — ryk doctor --fix";
+
+/// Honesty after install-or-skip: a leftover test-program bake is not "wired".
+pub fn applyBakedEvaluatorHonesty(
+    wired: bool,
+    can_mutate: bool,
+    baked_path: ?[]const u8,
+) struct { wired: bool, hint: []const u8 } {
+    if (!wired) return .{ .wired = false, .hint = doctor_fix_hint };
+    const path = baked_path orelse return .{ .wired = true, .hint = "" };
+    if (brand.classifyEvaluator(path).isProduct()) return .{ .wired = true, .hint = "" };
+    if (can_mutate) return .{ .wired = false, .hint = doctor_fix_bake_still_broken_hint };
+    return .{ .wired = false, .hint = doctor_fix_not_product_hint };
+}
+
 // ---------------------------------------------------------------------------
-// Frozen API surface (plan §2 / D20)
+// Frozen API surface (EnsureCore contract)
 // ---------------------------------------------------------------------------
 
 /// Options for `runEnsure`. Existing fields stay stable; additive fields default off.
@@ -918,6 +939,7 @@ fn installOneHostInner(
                 error.RefusingToOverwriteUnownedFile => "refusing to overwrite unowned Pi extension",
                 error.UnsafeDestination => "unsafe Pi extension destination",
                 error.IncompleteInstall => "Pi extension install incomplete",
+                error.InvalidRykBinary, error.InvalidRykBinaryPath => "Pi ryk_binary is not product ryk",
                 else => "Pi extension install failed",
             });
             return switch (err) {
@@ -938,7 +960,13 @@ fn installOneHostInner(
     if (std.mem.eql(u8, host_id, "grok")) {
         // Day-one native Command Guard: PreToolUse Bash hook in ~/.grok/hooks/ryk.json
         // (official Grok Build discovery path; also dual-writes legacy user-settings).
-        const result = grok_install.installAtHome(io, allocator, home, self_exe) catch return .failed;
+        const result = grok_install.installAtHome(io, allocator, home, self_exe) catch |err| {
+            setInstallDetail(switch (err) {
+                error.InvalidRykBinary => "Grok hook ryk_binary is not product ryk",
+                else => "Grok hook install failed",
+            });
+            return .failed;
+        };
         result.deinit(allocator);
         return if (result.changed) .installed else .already_installed;
     }
@@ -990,8 +1018,18 @@ fn ensureProcessHome(allocator: std.mem.Allocator) ![]u8 {
 }
 
 fn ensureIsProductRykBinary(path: []const u8) bool {
-    const base = std.fs.path.basename(path);
-    return brand.isPrimaryInvocation(base);
+    return brand.classifyEvaluator(path).isProduct();
+}
+
+fn readHostBakedBinary(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    host_id: []const u8,
+    home: []const u8,
+) ?[]u8 {
+    if (std.mem.eql(u8, host_id, "pi")) return pi_install.readBakedRykBinaryAtHome(io, allocator, home);
+    if (std.mem.eql(u8, host_id, "grok")) return grok_install.readBakedRykBinaryAtHome(io, allocator, home);
+    return null;
 }
 
 fn ensureRunChild(allocator: std.mem.Allocator, argv: []const []const u8) !u8 {
@@ -1286,7 +1324,11 @@ pub fn wireDetectedHosts(
     for (statuses) |st| {
         // Dispatch only day-one membership (onboarding keys — F2).
         const entry = HostWireTable.entryFor(st.name) orelse continue;
-        if (!st.detected) continue;
+        // Leftover Pi/Grok glue counts even when the host CLI is off PATH
+        // (a misbound hook is the case `doctor --fix` must still see).
+        const consider = st.detected or
+            ((std.mem.eql(u8, st.name, "pi") or std.mem.eql(u8, st.name, "grok")) and st.installed);
+        if (!consider) continue;
 
         // Cursor W3: detect-only — never dispatch doomed plugin install.
         if (entry.installer == .deferred_w3) {
@@ -1309,6 +1351,23 @@ pub fn wireDetectedHosts(
         if (can_mutate and hostInstallerReconcilesWhenPresent(entry.installer)) {
             last_install = attemptHostInstall(io, allocator, entry, home_opt.?, self_exe_opt.?, workspace_root);
             wired = dayOneResultIsWired(last_install);
+        }
+
+        if (wired and (std.mem.eql(u8, st.name, "pi") or std.mem.eql(u8, st.name, "grok"))) {
+            const baked = if (home_opt) |home| readHostBakedBinary(io, allocator, st.name, home) else null;
+            defer if (baked) |p| allocator.free(p);
+            const honesty = applyBakedEvaluatorHonesty(wired, can_mutate, baked);
+            if (!honesty.wired) {
+                try list.append(allocator, .{
+                    .host_id = st.name,
+                    .detected = true,
+                    .wired = false,
+                    .smoke_ok = false,
+                    .fix_hint = honesty.hint,
+                    .error_class = .wire,
+                });
+                continue;
+            }
         }
 
         if (!wired) {
@@ -1369,7 +1428,7 @@ fn ensureCoreReadPolicy(dir: std.Io.Dir) ![]u8 {
 }
 
 // ---------------------------------------------------------------------------
-// EnsureCore — API freeze (plan §2)
+// EnsureCore — API freeze
 // ---------------------------------------------------------------------------
 
 test "EnsureCore API surface freezes EnsureOptions Outcome HostResult fields" {
@@ -1643,7 +1702,7 @@ test "EnsureCore host fix_hint never teaches ryk start as required repair" {
 
     try std.testing.expect(outcome.core_ok);
     for (outcome.hosts) |host| {
-        // Plan §2: fix_hint teaches doctor --fix — never "ryk start" as required.
+        // fix_hint teaches doctor --fix — never "ryk start" as required.
         if (host.fix_hint.len == 0) continue;
         if (containsIgnoreCase(host.fix_hint, "ryk start")) {
             // Only allowed if doctor --fix is also taught as the repair door.
@@ -3076,6 +3135,52 @@ test "day-one installOneHost maps cursor to deferred and unowned Pi to skipped" 
     );
 }
 
+test "day-one installOneHost rewrites leftover zig Grok hook and names InvalidRykBinary" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, grok_install.hooks_relative_dir);
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = grok_install.managed_hook_relative_path,
+        .data =
+        \\{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"/Users/me/.local/zig/zig-aarch64-macos/zig hook grok PreToolUse","timeout":30}]}]}}
+        \\
+        ,
+    });
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(home);
+    const workspace = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(workspace);
+
+    try std.testing.expectEqual(
+        DayOneInstallResult.failed,
+        installOneHost(
+            std.testing.io,
+            std.testing.allocator,
+            "grok",
+            home,
+            "/private/tmp/ryk-factory/.zig-cache/o/deadbeef/test",
+            workspace,
+        ),
+    );
+    try std.testing.expect(std.mem.indexOf(u8, lastInstallDetail(), "not product ryk") != null);
+
+    try std.testing.expectEqual(
+        DayOneInstallResult.installed,
+        installOneHost(std.testing.io, std.testing.allocator, "grok", home, "/opt/ryk/bin/ryk", workspace),
+    );
+    const hook_path = try std.fs.path.join(std.testing.allocator, &.{ home, grok_install.managed_hook_relative_path });
+    defer std.testing.allocator.free(hook_path);
+    const rewritten = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        hook_path,
+        std.testing.allocator,
+        .limited(grok_install.max_hook_file_size),
+    );
+    defer std.testing.allocator.free(rewritten);
+    try std.testing.expect(std.mem.indexOf(u8, rewritten, "/opt/ryk/bin/ryk hook grok PreToolUse") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rewritten, "/Users/me/.local/zig/zig-aarch64-macos/zig") == null);
+}
+
 test "day-one wire fix hints are non-circular and keep doctor --fix door" {
     // UX: incomplete hosts must not only say "repair: ryk doctor --fix" when that
     // path is the same broken install monopath — lead with class + concrete next.
@@ -3153,4 +3258,24 @@ test "ensureRunChildAt respects caller timeout budget for slow children" {
     const argv = [_][]const u8{ "sleep", "2" };
     const code = try ensureRunChildAt(std.testing.allocator, &argv, null, hostPluginInstallTimeoutMs("openclaw"));
     try std.testing.expectEqual(@as(u8, 0), code);
+}
+
+test "applyBakedEvaluatorHonesty treats a zig-cache bake as unwired" {
+    const test_path = "/private/tmp/ryk-factory/.zig-cache/o/deadbeef/test";
+    const product_path = "/Users/me/.local/bin/ryk";
+
+    const ok = applyBakedEvaluatorHonesty(true, false, product_path);
+    try std.testing.expect(ok.wired);
+    try std.testing.expectEqualStrings("", ok.hint);
+
+    const cannot_mutate = applyBakedEvaluatorHonesty(true, false, test_path);
+    try std.testing.expect(!cannot_mutate.wired);
+    try std.testing.expectEqualStrings(doctor_fix_not_product_hint, cannot_mutate.hint);
+
+    const mutate_still_broken = applyBakedEvaluatorHonesty(true, true, test_path);
+    try std.testing.expect(!mutate_still_broken.wired);
+    try std.testing.expectEqualStrings(doctor_fix_bake_still_broken_hint, mutate_still_broken.hint);
+
+    const missing_bake = applyBakedEvaluatorHonesty(true, false, null);
+    try std.testing.expect(missing_bake.wired);
 }

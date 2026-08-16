@@ -990,6 +990,196 @@ test "landlock inheritance: grandchild after nested exec still denies outside an
     }
 }
 
+// Issue #221 first-run: missing ~/.grok/active_sessions.lock must be created
+// as a file (not ~/.grok prefix) so O_RDWR|O_CREAT succeeds after attach.
+test "real FS: grok missing active_sessions.lock O_RDWR create allowed; docs logs models_cache denied" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (!landlock.isAbiAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const linux = std.os.linux;
+
+    var ws_tmp = std.testing.tmpDir(.{});
+    defer ws_tmp.cleanup();
+    try ws_tmp.dir.createDirPath(io, ".ryk");
+    try ws_tmp.dir.createDirPath(io, ".ryk-tmp");
+    const ws_root = try ws_tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(ws_root);
+
+    var home_tmp = std.testing.tmpDir(.{});
+    defer home_tmp.cleanup();
+    try home_tmp.dir.createDirPath(io, ".grok/docs");
+    try home_tmp.dir.createDirPath(io, ".grok/logs");
+    try home_tmp.dir.createDirPath(io, "Library/Keychains");
+    try home_tmp.dir.writeFile(io, .{
+        .sub_path = ".grok/config.toml",
+        .data = "[cli]\nauto_update = false\n",
+    });
+    try home_tmp.dir.writeFile(io, .{
+        .sub_path = ".grok/auth.json",
+        .data = "{\"accessToken\":\"synthetic\"}\n",
+    });
+    try home_tmp.dir.writeFile(io, .{
+        .sub_path = ".grok/docs/user-guide.md",
+        .data = "docs\n",
+    });
+    try home_tmp.dir.writeFile(io, .{
+        .sub_path = ".grok/logs/unified.jsonl",
+        .data = "{}\n",
+    });
+    try home_tmp.dir.writeFile(io, .{
+        .sub_path = ".grok/models_cache.json.tmp",
+        .data = "{}\n",
+    });
+    try home_tmp.dir.writeFile(io, .{
+        .sub_path = "Library/Keychains/login.keychain-db",
+        .data = "secret\n",
+    });
+    const home = try home_tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(home);
+
+    const lock_path = try std.fs.path.join(allocator, &.{ home, ".grok/active_sessions.lock" });
+    defer allocator.free(lock_path);
+    const docs_path = try std.fs.path.join(allocator, &.{ home, ".grok/docs/user-guide.md" });
+    defer allocator.free(docs_path);
+    const logs_path = try std.fs.path.join(allocator, &.{ home, ".grok/logs/unified.jsonl" });
+    defer allocator.free(logs_path);
+    const cache_path = try std.fs.path.join(allocator, &.{ home, ".grok/models_cache.json.tmp" });
+    defer allocator.free(cache_path);
+    const grok_dir = try std.fs.path.join(allocator, &.{ home, ".grok" });
+    defer allocator.free(grok_dir);
+    {
+        const missing = std.Io.Dir.cwd().openFile(io, lock_path, .{});
+        if (missing) |f| {
+            f.close(io);
+            return error.LockAlreadyExisted;
+        } else |_| {}
+    }
+
+    const host_rw = try host_config_grants.collectHostConfigPaths(io, allocator, "grok", home);
+    defer host_config_grants.freeHostConfigPaths(allocator, host_rw);
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("HOME", home);
+    const write_denies = try host_config_grants.collectHostConfigWriteDenies(
+        io,
+        allocator,
+        "grok",
+        ws_root,
+        &env_map,
+    );
+    defer host_config_grants.freeHostConfigWriteDenies(allocator, write_denies);
+
+    var saw_lock = false;
+    for (host_rw) |p| {
+        if (std.mem.endsWith(u8, p, "/.grok/active_sessions.lock")) saw_lock = true;
+        try std.testing.expect(!std.mem.eql(u8, p, home));
+        try std.testing.expect(!std.mem.eql(u8, p, grok_dir));
+    }
+    try std.testing.expect(saw_lock);
+    var saw_user_settings_deny = false;
+    for (write_denies) |p| {
+        if (std.mem.endsWith(u8, p, "/.grok/user-settings.json")) saw_user_settings_deny = true;
+        try std.testing.expect(!std.mem.endsWith(u8, p, "/.grok/active_sessions.lock"));
+    }
+    try std.testing.expect(saw_user_settings_deny);
+
+    var compiled = try profile.compileProfile(allocator, .{
+        .workspace_root = ws_root,
+        .host_rw_paths = host_rw,
+        .control_roots = write_denies,
+        .system_ro_prefixes = profile.defaultSystemRoPrefixes(),
+        .include_tmp = false,
+    });
+    defer compiled.deinit();
+    try std.testing.expect(compiled.isAgentWritable(lock_path));
+    try std.testing.expect(!compiled.isAgentWritable(docs_path));
+    try std.testing.expect(!compiled.isGrantedReadable(docs_path));
+    try std.testing.expect(!compiled.isGrantedReadable(logs_path));
+    try std.testing.expect(!compiled.isGrantedReadable(cache_path));
+    try std.testing.expect(!compiled.hasGrant(grok_dir, .rw));
+
+    var plan = try buildChildLandlockPlan(allocator, &compiled);
+    defer plan.deinit();
+
+    const pid_rc = linux.fork();
+    if (linux.errno(pid_rc) != .SUCCESS) return error.SkipZigTest;
+    if (pid_rc == 0) {
+        applySelf(&compiled, &plan, null) catch linux.exit(2);
+
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        if (lock_path.len >= path_buf.len) linux.exit(3);
+        @memcpy(path_buf[0..lock_path.len], lock_path);
+        path_buf[lock_path.len] = 0;
+        const lock_fd = linux.open(
+            path_buf[0..lock_path.len :0].ptr,
+            .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true },
+            0o600,
+        );
+        if (linux.errno(lock_fd) != .SUCCESS) linux.exit(4);
+        _ = linux.close(@intCast(lock_fd));
+
+        @memcpy(path_buf[0..docs_path.len], docs_path);
+        path_buf[docs_path.len] = 0;
+        const docs_fd = linux.open(
+            path_buf[0..docs_path.len :0].ptr,
+            .{ .ACCMODE = .WRONLY, .CREAT = true, .CLOEXEC = true },
+            0o600,
+        );
+        if (linux.errno(docs_fd) == .SUCCESS) {
+            _ = linux.close(@intCast(docs_fd));
+            linux.exit(5);
+        }
+
+        @memcpy(path_buf[0..logs_path.len], logs_path);
+        path_buf[logs_path.len] = 0;
+        const logs_fd = linux.open(
+            path_buf[0..logs_path.len :0].ptr,
+            .{ .ACCMODE = .WRONLY, .CREAT = true, .CLOEXEC = true },
+            0o600,
+        );
+        if (linux.errno(logs_fd) == .SUCCESS) {
+            _ = linux.close(@intCast(logs_fd));
+            linux.exit(6);
+        }
+
+        @memcpy(path_buf[0..cache_path.len], cache_path);
+        path_buf[cache_path.len] = 0;
+        const cache_fd = linux.open(
+            path_buf[0..cache_path.len :0].ptr,
+            .{ .ACCMODE = .WRONLY, .CREAT = true, .CLOEXEC = true },
+            0o600,
+        );
+        if (linux.errno(cache_fd) == .SUCCESS) {
+            _ = linux.close(@intCast(cache_fd));
+            linux.exit(7);
+        }
+
+        linux.exit(0);
+    }
+
+    const child_pid: i32 = @intCast(pid_rc);
+    var status: u32 = 0;
+    while (true) {
+        const waited = linux.waitpid(child_pid, &status, 0);
+        if (linux.errno(waited) == .INTR) continue;
+        if (linux.errno(waited) != .SUCCESS) return error.ApplyFailed;
+        break;
+    }
+    if ((status & 0x7f) != 0) return error.ApplyFailed;
+    switch ((status >> 8) & 0xff) {
+        0 => {},
+        2 => return error.LandlockApplyFailedOnHost,
+        3 => return error.TestPathTooLong,
+        4 => return error.GrokLockCreateDeniedAfterAttach,
+        5 => return error.GrokDocsWriteGranted,
+        6 => return error.GrokLogsWriteGranted,
+        7 => return error.GrokModelsCacheWriteGranted,
+        else => return error.UnexpectedSandboxProbeExit,
+    }
+}
+
 test "Landlock network declarations stay TCP port scoped only" {
     try std.testing.expect(@hasDecl(landlock, "handledFsRights"));
     try std.testing.expect(@hasDecl(landlock, "handledNetRights"));

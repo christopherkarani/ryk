@@ -306,7 +306,7 @@ test "interactive: runMultiSelect does not leak on allocation failure mid-initia
 }
 
 // ---------------------------------------------------------------------------
-// Phase 1: robust yes/no confirmation helper (TDD tests written FIRST)
+// Robust yes/no confirmation helper.
 // Replaces fragile single-char [0] == 'n' checks in uninstall/disable.
 // Supports full words, case-insensitive, re-prompt on garbage, default on empty.
 // Uses injected streams for full unit testability with fixedBufferStream.

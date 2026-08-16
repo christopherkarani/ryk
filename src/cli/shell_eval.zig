@@ -263,6 +263,7 @@ pub fn loadProductShellStores(
     // loadMerged caches raw layers only (deep copy). Re-apply M-10 and the
     // os_sandbox_active gate on every product load — never cache allow_once_path.
     // loadMerged only fails on OOM; corrupt/missing → empty store (fail closed, no unlock).
+    // Cached on inode/size/mtime so a revocation rewrite cannot be served stale.
     const outcome = try shell_engine.allowlist_store.loadMerged(
         runtime_io,
         allocator,
@@ -3311,9 +3312,9 @@ test "Fm decisionFromDaemonResultWithPolicy timeout keeps allow" {
 
 // ---------------------------------------------------------------------------
 // s-product-wire — product loaders on zigEvaluator (hook/run/shim)
-// Locked INITIAL tests: RED until permanent + allow-once stores are wired into
-// EvaluateOptions (permanent_allowlist / allow_once_path / io / now_iso /
-// consume_allow_once) — never via options.allowlists / policy Layered.
+// Permanent + allow-once stores load via EvaluateOptions (permanent_allowlist /
+// allow_once_path / io / now_iso / consume_allow_once) — never via
+// options.allowlists / policy Layered.
 // ---------------------------------------------------------------------------
 
 const s_product_wire_now_seed = "2099-01-01T12:00:00Z";

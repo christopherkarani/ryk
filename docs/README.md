@@ -43,6 +43,5 @@ The docs describe the current CLI and its limits. When a platform detail matters
 - [Script reference](../scripts/README.md)
 - [Release process](dev/release.md)
 - [Dependency notes](dev/dependencies.md)
-- [Binary size P4 (flags-only vs `ryk-dev`)](dev/binary-size-p4.md)
 
 For security reports, read [SECURITY.md](../SECURITY.md). For code and documentation changes, read [CONTRIBUTING.md](../CONTRIBUTING.md).

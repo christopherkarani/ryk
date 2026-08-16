@@ -543,7 +543,7 @@ fn hookCommand(io: std.Io, host: Host, event: Event, original_event_name: []cons
 
     const needs_policy = eventNeedsPolicy(event);
     const fail_closed_pre_eval = shouldFailClosedOnPreEval(host, event);
-    const needs_workspace = hookNeedsWorkspace(host, event, request_event);
+    const needs_workspace = hookNeedsWorkspaceRoot(host, event, request_event);
     const root = if (needs_workspace)
         supervisor.resolveWorkspaceRoot(io, allocator, null, ".") catch try allocator.dupe(u8, ".")
     else
@@ -1173,15 +1173,29 @@ fn eventNeedsPolicy(event: Event) bool {
     };
 }
 
-// Ancestor walk vs informational short-circuit. Never bind workspace from
-// payload cwd, tool cwd, or RYK_WORKSPACE_ROOT (F36/M-9).
-fn hookNeedsWorkspace(host: Host, event: Event, request_event: []const u8) bool {
-    if (eventNeedsPolicy(event) or shouldFailClosedOnPreEval(host, event)) return true;
-    if (host != .hermes) return false;
-    // Hermes records feed activity under the workspace root except for
-    // informational events that do not write (post_llm_call).
-    if (!isHermesInformationalEvent(request_event)) return true;
-    return std.mem.eql(u8, request_event, "subagent_stop");
+/// Workspace walk + policy discover stay mandatory for fail-closed PreToolUse /
+/// PermissionRequest / Codex. Informational Hermes events only need a real
+/// workspace when they record activity (`subagent_stop`).
+fn hookNeedsWorkspaceRoot(host: Host, event: Event, request_event: []const u8) bool {
+    if (eventNeedsPolicy(event)) return true;
+    if (shouldFailClosedOnPreEval(host, event)) return true;
+    if (host == .hermes) {
+        if (isHermesInformationalEvent(request_event)) {
+            return std.mem.eql(u8, request_event, "subagent_stop");
+        }
+        return true;
+    }
+    return false;
+}
+
+test "hookNeedsWorkspaceRoot keeps fail-closed walks and skips informational hermes" {
+    try std.testing.expect(hookNeedsWorkspaceRoot(.claude, .PreToolUse, "PreToolUse"));
+    try std.testing.expect(hookNeedsWorkspaceRoot(.codex, .SessionStart, "SessionStart"));
+    try std.testing.expect(!hookNeedsWorkspaceRoot(.claude, .SessionStart, "SessionStart"));
+    try std.testing.expect(!hookNeedsWorkspaceRoot(.hermes, .SessionStart, "post_llm_call"));
+    try std.testing.expect(hookNeedsWorkspaceRoot(.hermes, .SessionStart, "subagent_stop"));
+    try std.testing.expect(hookNeedsWorkspaceRoot(.hermes, .SessionStart, "on_session_start"));
+
 }
 
 fn evaluateInformationalEvent(
@@ -3827,32 +3841,32 @@ test "isHermesInformationalEvent identifies informational events" {
 
 test "hook informational events skip workspace walk except hermes activity writers" {
     // OpenCode / OpenClaw informational already short-circuit before resolve.
-    try std.testing.expect(!hookNeedsWorkspace(.opencode, .SessionStart, "permission.replied"));
-    try std.testing.expect(!hookNeedsWorkspace(.opencode, .SessionStart, "file.edited"));
-    try std.testing.expect(!hookNeedsWorkspace(.opencode, .SessionStart, "command.executed"));
-    try std.testing.expect(!hookNeedsWorkspace(.openclaw, .SessionStart, "permission.after"));
-    try std.testing.expect(!hookNeedsWorkspace(.openclaw, .SessionStart, "session.end"));
+    try std.testing.expect(!hookNeedsWorkspaceRoot(.opencode, .SessionStart, "permission.replied"));
+    try std.testing.expect(!hookNeedsWorkspaceRoot(.opencode, .SessionStart, "file.edited"));
+    try std.testing.expect(!hookNeedsWorkspaceRoot(.opencode, .SessionStart, "command.executed"));
+    try std.testing.expect(!hookNeedsWorkspaceRoot(.openclaw, .SessionStart, "permission.after"));
+    try std.testing.expect(!hookNeedsWorkspaceRoot(.openclaw, .SessionStart, "session.end"));
 
     // Hermes informational that does not record activity skips the ancestor walk.
-    try std.testing.expect(!hookNeedsWorkspace(.hermes, .SessionStart, "post_llm_call"));
+    try std.testing.expect(!hookNeedsWorkspaceRoot(.hermes, .SessionStart, "post_llm_call"));
 
     // subagent_stop records feed activity and still resolves the workspace.
-    try std.testing.expect(hookNeedsWorkspace(.hermes, .SessionStart, "subagent_stop"));
+    try std.testing.expect(hookNeedsWorkspaceRoot(.hermes, .SessionStart, "subagent_stop"));
 }
 
 test "hook informational skip keeps PreToolUse PermissionRequest workspace walk" {
-    try std.testing.expect(hookNeedsWorkspace(.claude, .PreToolUse, "PreToolUse"));
-    try std.testing.expect(hookNeedsWorkspace(.claude, .PermissionRequest, "PermissionRequest"));
-    try std.testing.expect(hookNeedsWorkspace(.codex, .PreToolUse, "PreToolUse"));
-    try std.testing.expect(hookNeedsWorkspace(.codex, .PermissionRequest, "PermissionRequest"));
-    try std.testing.expect(hookNeedsWorkspace(.hermes, .PreToolUse, "pre_tool_call"));
-    try std.testing.expect(hookNeedsWorkspace(.opencode, .PreToolUse, "tool.execute.before"));
-    try std.testing.expect(hookNeedsWorkspace(.openclaw, .PreToolUse, "tool.before"));
+    try std.testing.expect(hookNeedsWorkspaceRoot(.claude, .PreToolUse, "PreToolUse"));
+    try std.testing.expect(hookNeedsWorkspaceRoot(.claude, .PermissionRequest, "PermissionRequest"));
+    try std.testing.expect(hookNeedsWorkspaceRoot(.codex, .PreToolUse, "PreToolUse"));
+    try std.testing.expect(hookNeedsWorkspaceRoot(.codex, .PermissionRequest, "PermissionRequest"));
+    try std.testing.expect(hookNeedsWorkspaceRoot(.hermes, .PreToolUse, "pre_tool_call"));
+    try std.testing.expect(hookNeedsWorkspaceRoot(.opencode, .PreToolUse, "tool.execute.before"));
+    try std.testing.expect(hookNeedsWorkspaceRoot(.openclaw, .PreToolUse, "tool.before"));
 
     // fail-closed PreToolUse hosts still walk; Hermes session writers still walk.
-    try std.testing.expect(hookNeedsWorkspace(.codex, .SessionStart, "SessionStart"));
-    try std.testing.expect(hookNeedsWorkspace(.hermes, .SessionStart, "on_session_start"));
-    try std.testing.expect(hookNeedsWorkspace(.hermes, .SessionEnd, "on_session_end"));
+    try std.testing.expect(hookNeedsWorkspaceRoot(.codex, .SessionStart, "SessionStart"));
+    try std.testing.expect(hookNeedsWorkspaceRoot(.hermes, .SessionStart, "on_session_start"));
+    try std.testing.expect(hookNeedsWorkspaceRoot(.hermes, .SessionEnd, "on_session_end"));
     try std.testing.expect(!isOpenCodeInformationalEvent("tool.execute.before"));
     try std.testing.expect(!isHermesInformationalEvent("pre_tool_call"));
     try std.testing.expect(!isOpenClawInformationalEvent("tool.before"));
@@ -5929,19 +5943,16 @@ fn testJsonStringFieldRaw(haystack: []const u8, key: []const u8) ?[]const u8 {
 //
 // One real pack deny (`git reset --hard` through the real Zig evaluator) is
 // emitted through each host's production wire shape, and the agent-visible
-// field is held to the shared contract from
-// docs/handoffs/shared-short-agent-message-2026-08-11.md: one line, no operator
+// field is held to the shared contract: one line, no operator
 // Recourse/Next walls, still names ryk, never a redeemable allow-once code.
 // Operator detail stays on stderr / structured fields.
 //
 // Codex and Grok are documented exceptions on *channel*, not on shape. They have
 // no separate operator surface the model can read (exit-2 hosts), so both fold a
 // fixed placeholder recourse into that one string by design — the Codex guard
-// sentinel and `grok_deny_reason`'s footer. The code is truth here: the handoff
-// says "no Recourse in message", which holds for every host that does have a
-// second channel. For the exit-2 pair the enforced rule is narrower and still
-// meaningful: recourse may appear only in placeholder form (`<code>`), never as a
-// redeemable code, and never as a multi-line wall.
+// sentinel and `grok_deny_reason`'s footer. For the exit-2 pair the enforced
+// rule is narrower and still meaningful: recourse may appear only in placeholder
+// form (`<code>`), never as a redeemable code, and never as a multi-line wall.
 test "hook short block message parity across all hosts" {
     var xdg = try sOnceCliHookIsolateXdg();
     defer xdg.deinit();
