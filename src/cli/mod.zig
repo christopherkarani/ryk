@@ -265,9 +265,9 @@ fn shouldShowBanner(command: []const u8, argv: []const []const u8) bool {
     // human error remediation remains presentation-capable. JSON is still
     // classified as machine output by isMachineArgv.
     if (std.mem.eql(u8, command, "report")) return false;
-    // `history --live` is intercepted by the Zig CLI before daemon passthrough.
-    // Treat its non-TTY rejection as a human surface so it matches `replay --tui`,
-    // while keeping machine conflicts/banner-free JSON byte contracts raw.
+    // `history --live` is a library/test surface (product dispatch is the
+    // hide-list stub). Treat --live as a human surface so it matches
+    // `replay --tui`, while keeping machine conflicts/banner-free JSON raw.
     if (std.mem.eql(u8, command, "history")) {
         var live = false;
         var i: usize = 1;

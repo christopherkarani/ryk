@@ -25,7 +25,7 @@ Bare `ryk replay` loads the **last** session and highlights denied actions. No s
 
 ## Alt-screen timeline
 
-`--tui` opens the replay timeline in an interactive alt-screen view for terminals that support rich output. It is opt-in; the default replay output stays linear for logs and copy/paste. `--tui` is TTY-only and cannot be combined with `--json` because replay JSON is a frozen machine contract.
+`--tui` opens the replay timeline in an interactive alt-screen view for terminals that support rich output. It is opt-in; the default replay output stays linear for logs and copy/paste. On a pipe, `--plain`, `--no-rich`, or `NO_COLOR`, `--tui` falls back to that linear timeline (same exit as linear replay). `--tui` cannot be combined with `--json` because replay JSON is a frozen machine contract.
 
 ## Hash-chain Verification
 
