@@ -29,7 +29,7 @@ Doctor / platform reports are **not** a second taxonomy. Map them to grades:
 | Protected agent launch + successful child attach | `OS-enforced` (FS, that session) | `ryk <agent>` uses the run engine; advanced `ryk run --os-sandbox` exposes explicit attach flags. Landlock ABI ≥ 3 (kernel 6.2+; ABI 1/2 lack truncation mediation) or Seatbelt majors 14–26 (capability gate; CI attach evidence: linux amd64. Seatbelt attach is local.) |
 | doctor `observe-only` / `limited` / `unavailable` | no enforcement claim | Decision or partial path only |
 | MCP stdio proxy `active` | `proxy` (MCP path) | Only for mediated MCP traffic |
-| `ryk start` default (**Ask on risk**) | multi-grade aspirational (`hook` + `wrapper` when available) | Public path has no `--protection` flag; wires host hooks + policy; not `OS-enforced` from doctor probes alone |
+| `ryk start` default (**generic-agent / DCG strict**) | multi-grade aspirational (`hook` + `wrapper` when available) | Public path has no `--protection` flag; wires host hooks + policy; not `OS-enforced` from doctor probes alone |
 | Host hooks that fire and honor veto | primarily `hook` (+ daemon for shell eval) | Depends on host install path; hooks alone are not process wrap |
 | Host aliases / advanced run engine / PATH shims | primarily `wrapper` | Not kernel firewall; absolute paths may bypass |
 

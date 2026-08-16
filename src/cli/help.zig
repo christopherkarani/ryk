@@ -104,7 +104,7 @@ pub const commands =
         },
         .{
             .name = "start",
-            .summary = "Guided setup: multi-select hosts, policy, and Ask posture",
+            .summary = "Guided setup: policy, hosts, and verification",
             .usage = "ryk start [--auto|--yes|--no-interact] [--hosts <list>] [--preset <name>] [--skip-verify]",
             .category = .getting_started,
             .public = true,
@@ -117,7 +117,7 @@ pub const commands =
                 "Primary first-run onboarding — the only Safe Launch door.",
                 "Creates a policy if missing (coding DCG defaults via generic-agent: matrix-only strict, no ask main loop).",
                 "Wires detected host integrations and verifies daemon/hook paths when available.",
-                "Auto-selects the best available Ask posture — no protection-grade menu.",
+                "No protection-grade menu; the banner names the posture from the written policy YAML.",
                 "On interactive terminals, prompts only for host selection when hosts are detected.",
                 "On non-TTY terminals, auto-selects safe defaults (no --auto required).",
                 "Use --auto to force non-interactive mode on a TTY; optional --hosts and --preset.",

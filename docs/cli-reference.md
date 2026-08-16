@@ -39,7 +39,7 @@ For a new workspace, use the single onboarding command:
 ryk start
 ~~~
 
-start creates a policy when one is missing, uses Ask posture by default, selects detected hosts, and verifies available integration paths. It can change local policy and host configuration. The non-interactive forms are:
+start creates a policy when one is missing, uses generic-agent / DCG strict by default, selects detected hosts, and verifies available integration paths. It can change local policy and host configuration. The non-interactive forms are:
 
 ~~~sh
 ryk start --auto
