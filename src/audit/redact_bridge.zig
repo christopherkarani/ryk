@@ -19,6 +19,12 @@ const max_structured_input = 64 * 1024;
 pub fn redactAlloc(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
     if (value.len > max_structured_input) return allocator.dupe(u8, redacted_value);
     if (try encodedContainsSecret(allocator, value)) return allocator.dupe(u8, redacted_value);
+    // A vendor/SAS span must not skip classify-only secrets on the same value
+    // (JWT / PEM / high-entropy beside a Slack token or SAS URL). Bounded
+    // already classifies first; keep span replacement for slack/github/SAS.
+    if (classifyString(value)) |match| {
+        if (isOpaqueSecretLabel(match.label)) return allocator.dupe(u8, redacted_value);
+    }
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     var start: usize = 0;
@@ -248,7 +254,23 @@ fn isKeyStart(value: []const u8, i: usize) bool {
 }
 
 fn isStructuredTokenBoundary(value: []const u8, i: usize) bool {
-    return i == 0 or !isTokenChar(value[i - 1]);
+    if (i == 0) return true;
+    const prev = value[i - 1];
+    if (!isTokenChar(prev)) return true;
+    // `-glpat` / `--glpat` are diff / CLI / YAML-list boundaries. A hyphen
+    // that continues an alnum/_ run is base64url (`aaa-glpat` inside a JWT).
+    if (prev != '-') return false;
+    if (i < 2) return true;
+    const before = value[i - 2];
+    return !(std.ascii.isAlphanumeric(before) or before == '_');
+}
+
+fn isOpaqueSecretLabel(label: []const u8) bool {
+    return std.mem.eql(u8, label, "secret:jwt") or
+        std.mem.eql(u8, label, "secret:high_entropy") or
+        std.mem.eql(u8, label, "secret:pem_private_key") or
+        std.mem.eql(u8, label, "secret:ssh_private_key") or
+        std.mem.eql(u8, label, "secret:cloud_credentials_json");
 }
 
 fn startsWithIgnoreCase(value: []const u8, prefix: []const u8) bool {
@@ -734,9 +756,15 @@ fn looksLikeAnthropicKey(value: []const u8) bool {
 }
 
 fn looksLikePrefixedTokenChars(value: []const u8, prefix: []const u8, min_after: usize) bool {
-    if (!startsWithIgnoreCase(value, prefix)) return false;
+    var token = value;
+    var stripped: usize = 0;
+    while (stripped < 2 and token.len > 0 and token[0] == '-') {
+        token = token[1..];
+        stripped += 1;
+    }
+    if (!startsWithIgnoreCase(token, prefix)) return false;
     var n: usize = 0;
-    const rest = value[prefix.len..];
+    const rest = token[prefix.len..];
     while (n < rest.len and isTokenChar(rest[n])) : (n += 1) {}
     // Whole-value classify: the suffix must be the token-char run (no `!` padding).
     return n == rest.len and n >= min_after;
@@ -1121,6 +1149,37 @@ test "vendor prefixes inside jwt and high-entropy redact the whole value" {
     try expectSpanRedaction("note xoxb-fakeSynthetic here", "note [REDACTED] here");
 }
 
+test "hyphen-prefixed vendor tokens redact on classify and alloc" {
+    const cases = [_]struct { value: []const u8, label: []const u8 }{
+        .{ .value = "-glpat-01234567890123456789", .label = "secret:gitlab_token" },
+        .{ .value = "--glpat-01234567890123456789", .label = "secret:gitlab_token" },
+        .{ .value = "-xoxb-fakeSynthetic", .label = "secret:slack_token" },
+        .{ .value = "-sk_live_fakeSynth", .label = "secret:stripe_api_key" },
+        .{ .value = "-hf_fakeSyntheticHuggingFaceTok", .label = "secret:huggingface_token" },
+    };
+    for (cases) |case| {
+        try expectSecretLabel(case.value, case.label);
+        try expectRedactsSecret(case.value, case.value[if (case.value[1] == '-') 2 else 1 ..]);
+    }
+    try expectSpanRedaction("diff -glpat-01234567890123456789", "diff -[REDACTED]");
+}
+
+test "opaque secrets beside vendor or sas spans redact the whole alloc value" {
+    const jwt_and_slack = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJmYWtlIn0.c2lnbmF0dXJl xoxb-fakeSynthetic";
+    try expectSecretLabel("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJmYWtlIn0.c2lnbmF0dXJl", "secret:jwt");
+    const jwt_owned = try redactAlloc(std.testing.allocator, jwt_and_slack);
+    defer std.testing.allocator.free(jwt_owned);
+    try std.testing.expectEqualStrings(redacted_value, jwt_owned);
+    try std.testing.expect(std.mem.indexOf(u8, jwt_owned, "eyJ") == null);
+
+    const pem =
+        "-----BEGIN PRIVATE KEY-----\nFAKE\n-----END PRIVATE KEY----- https://example.invalid/blob?sv=2021-06-08&sig=fakeSyntheticAzureSasSigValue";
+    const pem_owned = try redactAlloc(std.testing.allocator, pem);
+    defer std.testing.allocator.free(pem_owned);
+    try std.testing.expectEqualStrings(redacted_value, pem_owned);
+    try std.testing.expect(std.mem.indexOf(u8, pem_owned, "BEGIN PRIVATE KEY") == null);
+}
+
 test "azure sas accepts connection-string semicolon and entity-escaped delimiters" {
     const connection =
         "BlobEndpoint=https://example.invalid/;SharedAccessSignature=sv=2021-06-08&ss=b&srt=sco&sp=r&sig=fakeSyntheticAzureSasSigValue";
@@ -1135,11 +1194,11 @@ test "azure sas accepts connection-string semicolon and entity-escaped delimiter
 
     const amp = "https://example.invalid/blob?sv=2021-06-08&amp;sig=fakeSyntheticAzureSasSigValue";
     try expectSecretLabel(amp, "secret:azure_sas");
-    try expectRedactsSecret(amp, "fakeSyntheticAzureSasSigValue");
+    try expectSpanRedaction(amp, "https://example.invalid/blob?sv=2021-06-08&amp;sig=[REDACTED]");
 
     const bare = "sv=2021-06-08;sig=fakeSyntheticAzureSasSigValue";
     try expectSecretLabel(bare, "secret:azure_sas");
-    try expectRedactsSecret(bare, "fakeSyntheticAzureSasSigValue");
+    try expectSpanRedaction(bare, "sv=2021-06-08;sig=[REDACTED]");
 }
 
 test "uppercase vendor tokens redact on env_var target path" {
