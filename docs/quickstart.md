@@ -24,7 +24,7 @@ For a release install, use the checksum-verified curl installer in [install.md](
 
 `ryk start` onboards a workspace:
 
-- creates `.ryk/policy.yaml` when missing (Ask on risk / `generic-agent` preset)
+- creates `.ryk/policy.yaml` when missing (`generic-agent` / DCG strict)
 - wires host integrations
 - verifies core readiness
 - prints next steps: run an agent, then `doctor` / `scan` / `replay`

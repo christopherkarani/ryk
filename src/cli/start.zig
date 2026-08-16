@@ -76,13 +76,9 @@ pub fn runStart(
     defer allocator.free(workspace_root);
 
     // Auto-select best available setup path — no interactive grade menu.
-    // Active protection wording is deferred until after ensure (existing mode may differ).
+    // Posture line is printed after ensure, from the YAML that was just written
+    // (or left alone). Do not claim Ask/strict before that file exists.
     const protection = resolveProtectionMode(flags);
-    if (std.mem.eql(u8, flags.preset, "unattended")) {
-        try stdout.writeAll("Setup path: Unattended fail-closed (auto).\n");
-    } else {
-        try stdout.writeAll("Setup path: Ask on risk (auto).\n");
-    }
     try stdout.writeAll("  Existing policy is preserved; claims below follow the policy file mode.\n\n");
 
     var doctor_report = try plugin.collectPluginDoctorReport(io, allocator);
@@ -119,9 +115,11 @@ pub fn runStart(
     defer if (policy_mode) |m| allocator.free(m);
     if (!ensure_outcome.core_ok) {
         try tui.render.stepLine(io, stdout, .failed, "Policy", "Policy setup failed.", 80);
+        try writeSetupPathLine(stdout, flags.preset, null);
         failures += 1;
     } else {
         policy_mode = readWorkspacePolicyMode(io, allocator, workspace_root);
+        try writeSetupPathLine(stdout, flags.preset, policy_mode);
         if (policy_mode) |mode| {
             if (!policyModeIsAskEquivalent(mode)) {
                 try stdout.print("  Note: policy mode={s} (not Ask) — existing policy left unchanged.\n", .{mode});
@@ -282,6 +280,31 @@ fn policyModeIsAskEquivalent(mode: []const u8) bool {
         .ask, .yolo, .strict, .ci, .redteam => true,
         .observe, .trusted => false,
     };
+}
+
+/// One-line posture from the written YAML mode. Ask stays Ask; deny/strict stays strict.
+fn postureLabel(mode: []const u8) []const u8 {
+    if (std.mem.eql(u8, mode, "ask") or std.mem.eql(u8, mode, "yolo")) return "Ask";
+    if (std.mem.eql(u8, mode, "strict") or std.mem.eql(u8, mode, "ci") or std.mem.eql(u8, mode, "redteam")) return "strict";
+    return mode;
+}
+
+/// Banner / first-run receipt line. Names the YAML that was just written (or left alone).
+fn writeSetupPathLine(stdout: anytype, preset: []const u8, policy_mode: ?[]const u8) !void {
+    if (policy_mode) |mode| {
+        const label = postureLabel(mode);
+        if (std.mem.eql(u8, preset, "unattended")) {
+            try stdout.print("Setup path: Unattended fail-closed ({s}).\n", .{label});
+        } else {
+            try stdout.print("Setup path: {s}.\n", .{label});
+        }
+        return;
+    }
+    if (std.mem.eql(u8, preset, "unattended")) {
+        try stdout.writeAll("Setup path: Unattended fail-closed (policy unread).\n");
+    } else {
+        try stdout.writeAll("Setup path: policy unread.\n");
+    }
 }
 
 /// Load workspace policy mode after ensurePolicy. Returns null when missing/unreadable.
@@ -592,19 +615,24 @@ fn writeSuccessEndCard(
     defer allocator.free(daemon_status_line);
     const policy_status_line = try std.fmt.allocPrint(allocator, "Policy       {s}", .{policy_line});
     defer allocator.free(policy_status_line);
-    // Honesty: surface real mode; only claim "Ask on risk" when mode is ask.
-    const protection_status_line = if (std.mem.eql(u8, mode, "ask"))
-        try allocator.dupe(u8, "Protection   Ask on risk")
+    // Honesty: name the written YAML posture. Ask stays Ask; deny/strict stays strict.
+    const protection_status_line = if (std.mem.eql(u8, mode, "ask") or std.mem.eql(u8, mode, "yolo"))
+        try allocator.dupe(u8, "Protection   Ask")
     else if (ask_equivalent)
-        try std.fmt.allocPrint(allocator, "Protection   mode={s} (enforcing)", .{mode})
+        try std.fmt.allocPrint(allocator, "Protection   {s}", .{postureLabel(mode)})
     else
-        try std.fmt.allocPrint(allocator, "Protection   mode={s} (not Ask)", .{mode});
+        try std.fmt.allocPrint(allocator, "Protection   {s} (not Ask)", .{postureLabel(mode)});
     defer allocator.free(protection_status_line);
     const verify_status_line = try std.fmt.allocPrint(allocator, "Verify       {s}", .{verify_line});
     defer allocator.free(verify_status_line);
-    const status_lines = [_][]const u8{ daemon_status_line, policy_status_line, protection_status_line, verify_status_line };
-    try tui.render.panel(io, stdout, "Status", &status_lines);
+    try stdout.writeAll(daemon_status_line);
     try stdout.writeAll("\n");
+    try stdout.writeAll(policy_status_line);
+    try stdout.writeAll("\n");
+    try stdout.writeAll(protection_status_line);
+    try stdout.writeAll("\n");
+    try stdout.writeAll(verify_status_line);
+    try stdout.writeAll("\n\n");
 
     // Host install results: selected hosts get ✓ / failed; unselected shown as skipped when CG.
     var host_lines: std.ArrayList([]const u8) = .empty;
@@ -640,17 +668,16 @@ fn writeSuccessEndCard(
             try host_lines.append(allocator, try std.fmt.allocPrint(allocator, "  {s}  {s}", .{ host, mark }));
         }
     }
-    try tui.render.panel(io, stdout, "Hosts", host_lines.items);
-    try stdout.writeAll("\n");
+    if (host_lines.items.len > 0) {
+        try stdout.writeAll("Hosts\n");
+        for (host_lines.items) |line| {
+            try stdout.writeAll(line);
+            try stdout.writeAll("\n");
+        }
+        try stdout.writeAll("\n");
+    }
 
-    try tui.theme.paintBold(io, stdout, .brand, "Try next");
-    try stdout.writeAll("\n");
-    try stdout.writeAll("  ryk claude          # or codex / pi / opencode / grok / …\n");
-    try stdout.writeAll("  ryk doctor\n");
-    try stdout.writeAll("  ryk replay\n");
-    try stdout.writeAll("\n");
-    try tui.theme.paint(io, stdout, .muted, "Re-run safely: ryk start · off-ramp: ryk stop");
-    try stdout.writeAll("\n");
+    try stdout.writeAll("Next: ryk doctor\n");
 }
 
 fn protectionClaimReady(
@@ -720,19 +747,9 @@ fn writeFailureSummary(
     try style.maybeColor(io, stdout, style.Style.red, "Setup incomplete");
     try stdout.writeAll("\n\n");
     if (policy_mode) |mode| {
-        if (std.mem.eql(u8, mode, "ask")) {
-            try stdout.writeAll("Protection posture: Ask on risk\n");
-        } else if (policyModeIsAskEquivalent(mode)) {
-            try stdout.print("Protection posture: mode={s} (enforcing)\n", .{mode});
-        } else {
-            try stdout.print("Protection posture: mode={s} (not Ask)\n", .{mode});
-        }
+        try stdout.print("Protection posture: {s}\n", .{postureLabel(mode)});
     } else {
-        if (std.mem.eql(u8, preset, "unattended")) {
-            try stdout.writeAll("Protection posture: setup path Unattended fail-closed (auto); policy mode unread\n");
-        } else {
-            try stdout.writeAll("Protection posture: setup path Ask on risk (auto); policy mode unread\n");
-        }
+        try writeSetupPathLine(stdout, preset, null);
     }
     try stdout.print("Protection active now: {s}\n", .{if (protection_active) "partially or fully" else "no"});
     try stdout.print("Daemon: {s} — {s}\n", .{ daemon_check.status.label(), daemon_check.detail });
@@ -792,9 +809,52 @@ fn flattenWhitespace(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
     return try out.toOwnedSlice(allocator);
 }
 
+test "start on clean workspace writes generic-agent strict and banner matches policy" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, ".git", .default_dir);
+
+    var stdout_buf: [16384]u8 = undefined;
+    var stderr_buf: [1024]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+
+    const flags = onboarding.StartFlags{
+        .auto = true,
+        .skip_verify = true,
+        .hosts_csv = "",
+    };
+
+    const mock_checker = struct {
+        fn check(_: std.mem.Allocator, _: bool) !void {}
+    }.check;
+
+    const code = try runStart(
+        std.testing.io,
+        tmp.dir,
+        flags,
+        &stdout_writer,
+        &stderr_writer,
+        mock_checker,
+        onboarding.mockOnboardingEvaluator,
+    );
+    try std.testing.expectEqual(exit_codes.success, code);
+
+    const policy = try tmp.dir.readFileAlloc(std.testing.io, ".ryk/policy.yaml", std.testing.allocator, .limited(64 * 1024));
+    defer std.testing.allocator.free(policy);
+    try std.testing.expect(std.mem.indexOf(u8, policy, "# ryk preset: generic-agent") != null);
+    try std.testing.expect(std.mem.indexOf(u8, policy, "mode: strict") != null);
+    try std.testing.expect(std.mem.indexOf(u8, policy, "mode: ask") == null);
+
+    const output = stdout_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, output, "Ask on risk") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Setup path: strict") != null);
+}
+
 test "start auto mode with mock daemon completes in temp workspace" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, ".git", .default_dir);
 
     var stdout_buf: [16384]u8 = undefined;
     var stderr_buf: [1024]u8 = undefined;
@@ -824,14 +884,14 @@ test "start auto mode with mock daemon completes in temp workspace" {
 
     const output = stdout_writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, output, "\u{1F6E1}  ryk") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "Ask on risk") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Setup path: strict") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Ask on risk") == null);
     try std.testing.expect(std.mem.indexOf(u8, output, "You're now " ++ "protected by ryk") == null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Verification skipped (--skip-verify).") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Daemon") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Policy") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Hosts") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "ryk claude") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "ryk doctor") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Next: ryk doctor") != null);
     // No interactive grade menu on the Safe Launch path.
     try std.testing.expect(std.mem.indexOf(u8, output, "Choose your protection mode") == null);
     try std.testing.expect(std.mem.indexOf(u8, output, "command-guard") == null);
@@ -1245,6 +1305,7 @@ test "start firewall path verifies without daemon or shell evaluator" {
 test "start with existing observe policy does not claim Ask protection" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, ".git", .default_dir);
 
     // Pre-seed observe policy — ensurePolicy must leave it unchanged.
     try tmp.dir.createDirPath(std.testing.io, ".ryk");
@@ -1284,6 +1345,7 @@ test "start with existing observe policy does not claim Ask protection" {
     try std.testing.expectEqual(exit_codes.success, code);
 
     const output = stdout_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, output, "Setup path: observe") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "policy mode=observe") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "not Ask") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "You're now " ++ "protected by ryk") == null);
@@ -1303,6 +1365,33 @@ test "policyModeIsAskEquivalent covers ask/enforce not observe/trusted" {
     try std.testing.expect(!policyModeIsAskEquivalent("observe"));
     try std.testing.expect(!policyModeIsAskEquivalent("trusted"));
     try std.testing.expect(!policyModeIsAskEquivalent("unknown"));
+}
+
+test "postureLabel names Ask vs strict from YAML mode" {
+    try std.testing.expectEqualStrings("Ask", postureLabel("ask"));
+    try std.testing.expectEqualStrings("Ask", postureLabel("yolo"));
+    try std.testing.expectEqualStrings("strict", postureLabel("strict"));
+    try std.testing.expectEqualStrings("strict", postureLabel("ci"));
+    try std.testing.expectEqualStrings("strict", postureLabel("redteam"));
+    try std.testing.expectEqualStrings("observe", postureLabel("observe"));
+    try std.testing.expectEqualStrings("trusted", postureLabel("trusted"));
+}
+
+test "writeSetupPathLine names YAML posture in one line" {
+    var ask_buf: [128]u8 = undefined;
+    var ask_out: std.Io.Writer = .fixed(&ask_buf);
+    try writeSetupPathLine(&ask_out, "generic-agent", "ask");
+    try std.testing.expectEqualStrings("Setup path: Ask.\n", ask_out.buffered());
+
+    var strict_buf: [128]u8 = undefined;
+    var strict_out: std.Io.Writer = .fixed(&strict_buf);
+    try writeSetupPathLine(&strict_out, "generic-agent", "strict");
+    try std.testing.expectEqualStrings("Setup path: strict.\n", strict_out.buffered());
+
+    var unattended_buf: [128]u8 = undefined;
+    var unattended_out: std.Io.Writer = .fixed(&unattended_buf);
+    try writeSetupPathLine(&unattended_out, "unattended", "strict");
+    try std.testing.expectEqualStrings("Setup path: Unattended fail-closed (strict).\n", unattended_out.buffered());
 }
 
 test "start verification failure detected by allow-only mock evaluator" {
@@ -1328,6 +1417,7 @@ test "start resolveProtectionMode auto-selects default without interactive menu"
 test "start auto default path has no protection grade menu jargon in stdout" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, ".git", .default_dir);
 
     var stdout_buf: [16384]u8 = undefined;
     var stderr_buf: [1024]u8 = undefined;
@@ -1358,7 +1448,8 @@ test "start auto default path has no protection grade menu jargon in stdout" {
     try std.testing.expect(std.mem.indexOf(u8, output, "Command Guard") == null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Maximum Protection") == null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Firewall-only mode") == null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "Ask on risk") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Ask on risk") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Setup path: strict") != null);
 }
 
 // ---------------------------------------------------------------------------

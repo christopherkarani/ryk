@@ -2149,7 +2149,8 @@ test "start dispatch appears in help and runs with --auto --skip-verify (no prot
     const output = stdout_writer.buffered();
     try std.testing.expect(code == exit_codes.success or code == exit_codes.general);
     try std.testing.expect(std.mem.indexOf(u8, output, "\u{1F6E1}  ryk") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "Ask on risk") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Ask on risk") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Setup path: strict") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Choose your protection mode") == null);
     try std.testing.expect(std.mem.indexOf(u8, output, "command-guard") == null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Maximum Protection") == null);
@@ -2168,7 +2169,8 @@ test "start auto-runs on non-TTY without --auto and without protection flag" {
     const output = stdout_writer.buffered();
     try std.testing.expect(code == exit_codes.success or code == exit_codes.general);
     try std.testing.expect(std.mem.indexOf(u8, output, "\u{1F6E1}  ryk") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "Ask on risk") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Ask on risk") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Setup path: strict") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Choose your protection mode") == null);
 }
 
