@@ -601,12 +601,17 @@ fn recordInvocationInner(
         if (contract.classifyReliabilityInvocation(argv, exit_code)) |summary| summaries.addReliability(summary);
     }
 
-    // Named `ryk hook` is not a CLI command event, but its pending summaries
-    // (enforcement/session) must still reach the queue.
+    // Named `ryk hook` is not a CLI command event. Do not spawn a second `ryk`
+    // on the hook return path; summaries stay in-process and may be dropped.
     const invocation = if (named_hook) null else classifyInvocation(argv, exit_code);
     if (!transportConfigured() or hardDisabled(environ_map)) return;
+    if (!shouldSpawnBatch(argv)) return;
 
     spawnBatch(io, environ_map, allocator, invocation, summaries) catch {};
+}
+
+fn shouldSpawnBatch(argv: []const []const u8) bool {
+    return !isHookHotPath(argv);
 }
 
 fn isHookHotPath(argv: []const []const u8) bool {
@@ -1168,6 +1173,13 @@ test "isHookHotPath only matches the named hook subcommand" {
     try std.testing.expect(!isHookHotPath(&.{"doctor"}));
     try std.testing.expect(isHookHotPath(&.{"hook"}));
     try std.testing.expect(isHookHotPath(&.{ "hook", "claude", "PreToolUse" }));
+}
+
+test "named hook path does not spawn telemetry batch" {
+    try std.testing.expect(!shouldSpawnBatch(&.{"hook"}));
+    try std.testing.expect(!shouldSpawnBatch(&.{ "hook", "grok", "PreToolUse" }));
+    try std.testing.expect(shouldSpawnBatch(&.{"doctor"}));
+    try std.testing.expect(shouldSpawnBatch(&.{"evaluate"}));
 }
 
 test "classifyInvocation emits only fixed command metadata" {

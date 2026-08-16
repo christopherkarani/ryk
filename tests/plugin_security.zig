@@ -1,5 +1,6 @@
 const std = @import("std");
 
+const env_util = @import("ryk").env_util;
 const exit_codes = @import("ryk").cli.exit_codes;
 
 // ---------------------------------------------------------------------------
@@ -46,11 +47,15 @@ fn readPipeToAlloc(io: std.Io, allocator: std.mem.Allocator, file: std.Io.File, 
 
 fn runRyk(allocator: std.mem.Allocator, args: []const []const u8, stdin_data: ?[]const u8) !struct { stdout: []u8, stderr: []u8, code: u8 } {
     const io = std.testing.io;
+    var env_map = try env_util.createProcessMap(allocator);
+    defer env_map.deinit();
+    try env_map.put("RYK_HOOK_SERVER", "0");
     var child = try std.process.spawn(io, .{
         .argv = args,
         .stdin = if (stdin_data != null) .pipe else .ignore,
         .stdout = .pipe,
         .stderr = .pipe,
+        .environ_map = &env_map,
     });
 
     if (stdin_data) |data| {

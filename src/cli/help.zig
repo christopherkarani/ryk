@@ -771,6 +771,19 @@ pub const commands =
             "Exit codes: 0 allow, 2 deny, 3 evaluator failure, 64 invalid input, 1 unexpected internal error.",
             "Designed for external integrations such as Pi bash tool-call evaluation; non-shell evaluation is intentionally unsupported.",
         } },
+        .{
+            .name = "hook-serve",
+            .summary = "Long-lived hook server for warm host decisions",
+            .usage = "ryk hook-serve --socket <path>",
+            .category = .internal,
+            .hidden = true,
+            .details = &.{
+                "Accepts NDJSON ryk-hook-v1 requests from ryk hook / evaluate / bare ryk.",
+                "One server per UNIX user and ryk binary. Hosts keep spawning ryk hook; this process stays warm.",
+                "Not a second binary and not the removed Rust daemon. Idle exit after 30 minutes.",
+                "Hidden from default help; use ryk hook-serve --help.",
+            },
+        },
         .{ .name = "hook", .summary = "Receive events from AI agent hosts", .usage = "ryk hook <codex|claude|grok|opencode|openclaw|hermes> <event> [--ci]", .category = .advanced, .details = &.{
             "Reads a JSON payload from stdin, normalizes host-specific events to ryk decisions,",
             "and emits a host-valid JSON response to stdout. Debug logs go to stderr only.",
@@ -1502,6 +1515,7 @@ test "P0 honesty: default help and help --all omit hide-list and unfinished P0; 
     try std.testing.expect(!helpListsPeerCommand(top, "allow-once"));
     try std.testing.expect(!helpListsPeerCommand(top, "allow"));
     try std.testing.expect(!helpListsPeerCommand(top, "unallow"));
+    try std.testing.expect(!helpListsPeerCommand(top, "hook-serve"));
 
     writer = .fixed(&buf);
     try writeAll(std.testing.io, &writer);
@@ -1519,6 +1533,7 @@ test "P0 honesty: default help and help --all omit hide-list and unfinished P0; 
     try std.testing.expect(helpListsPeerCommand(all, "packs"));
     try std.testing.expect(helpListsPeerCommand(all, "allowlist"));
     try std.testing.expect(helpListsPeerCommand(all, "allow-once"));
+    try std.testing.expect(!helpListsPeerCommand(all, "hook-serve"));
 
     // Explicit full-text: root --all must not teach daemon allowlist wording or
     // promote allow/unallow shortcuts in Common-tasks / remediation copy.
@@ -1602,4 +1617,13 @@ test "cloud help is a localhost dashboard alias and does not sell a control plan
     const rendered = help_writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, rendered, "ryk cloud") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "dashboard --view terminal") != null);
+}
+
+test "hook-serve is hidden and has --help text" {
+    const info = findCommand("hook-serve") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(info.hidden);
+    var buf: [4096]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try std.testing.expect(try writeCommand(std.testing.io, &writer, "hook-serve"));
+    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "ryk hook-serve") != null);
 }

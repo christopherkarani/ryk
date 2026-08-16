@@ -4,6 +4,7 @@ const gpa_mod = @import("gpa.zig");
 const daemon = @import("daemon.zig");
 const exit_codes = @import("exit_codes.zig");
 const help = @import("help.zig");
+const hook_client = @import("hook_client.zig");
 const suggestions = @import("suggestions.zig");
 
 pub fn command(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: anytype) !u8 {
@@ -57,6 +58,9 @@ fn commandWithShutdownImpl(comptime shutdown_fn: anytype, io: std.Io, argv: []co
         .stopped => try stdout.writeAll("ryk daemon stopped\n"),
         .not_running => try stdout.writeAll("ryk daemon not running\n"),
         .stale_cleaned => try stdout.writeAll("ryk daemon stale artifacts cleaned\n"),
+    }
+    if (hook_client.shutdownBestEffort(io, allocator)) {
+        try stdout.writeAll("ryk hook server stopped\n");
     }
     return exit_codes.success;
 }

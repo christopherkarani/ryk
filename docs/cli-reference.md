@@ -324,6 +324,8 @@ ryk hook opencode tool.execute.before < host-payload.json
 
 The payload schema belongs to the host. Use the host integration documentation to construct it. Hook responses include host_limitations; hook enforcement is additive and does not replace supervision through ryk run. Shell tool-before events use the Zig shell engine, and the rejected Rust evaluator setting applies here too. `ryk hook --help` lists every dispatch host, including grok. Pi is extension-only (`ryk evaluate` / bundled extension); it is not a hook host.
 
+Hosts still spawn `ryk hook`, `ryk evaluate`, or bare `ryk`. Those commands try a per-user `ryk hook-serve` process for a warm decision, then fall back in-process. `ryk hook-serve` is internal (`ryk hook-serve --help`); it is not a second binary and is hidden from default help.
+
 ### Plugins and MCP
 
 Inspect integrations before changing them:

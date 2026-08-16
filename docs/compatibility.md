@@ -30,7 +30,7 @@ Doctor / platform reports are **not** a second taxonomy. Map them to grades:
 | doctor `observe-only` / `limited` / `unavailable` | no enforcement claim | Decision or partial path only |
 | MCP stdio proxy `active` | `proxy` (MCP path) | Only for mediated MCP traffic |
 | `ryk start` default (**generic-agent / DCG strict**) | multi-grade aspirational (`hook` + `wrapper` when available) | Public path has no `--protection` flag; wires host hooks + policy; not `OS-enforced` from doctor probes alone |
-| Host hooks that fire and honor veto | primarily `hook` (+ daemon for shell eval) | Depends on host install path; hooks alone are not process wrap |
+| Host hooks that fire and honor veto | primarily `hook` (+ daemon for shell eval) | Depends on host install path; hooks alone are not process wrap. The per-user Zig hook server is best-effort speed, not a new enforcement grade. |
 | Host aliases / advanced run engine / PATH shims | primarily `wrapper` | Not kernel firewall; absolute paths may bypass |
 
 Reserve marketing “firewall” / “maximum protection” for a **verified** multi-grade or **`OS-enforced`** posture. See also [threat-model.md](threat-model.md).

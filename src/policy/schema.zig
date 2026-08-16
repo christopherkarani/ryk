@@ -496,6 +496,14 @@ pub const LoadedPolicy = struct {
         allocator.free(self.path);
         self.* = undefined;
     }
+
+    pub fn mode(self: *const LoadedPolicy) Mode {
+        return self.policy.mode;
+    }
+
+    pub fn innerPtr(self: *const LoadedPolicy) *const Policy {
+        return &self.policy;
+    }
 };
 
 pub fn duplicateStringList(allocator: std.mem.Allocator, values: []const []const u8) ![]const []const u8 {
