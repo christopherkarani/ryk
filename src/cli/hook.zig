@@ -543,7 +543,7 @@ fn hookCommand(io: std.Io, host: Host, event: Event, original_event_name: []cons
 
     const needs_policy = eventNeedsPolicy(event);
     const fail_closed_pre_eval = shouldFailClosedOnPreEval(host, event);
-    const needs_workspace = needs_policy or fail_closed_pre_eval or host == .hermes;
+    const needs_workspace = hookNeedsWorkspaceRoot(host, event, request_event);
     const root = if (needs_workspace)
         supervisor.resolveWorkspaceRoot(io, allocator, null, ".") catch try allocator.dupe(u8, ".")
     else
@@ -1171,6 +1171,30 @@ fn eventNeedsPolicy(event: Event) bool {
         .UserPromptSubmit, .PreToolUse, .PermissionRequest => true,
         .SessionStart, .Stop, .SessionEnd, .PostToolUse => false,
     };
+}
+
+/// Workspace walk + policy discover stay mandatory for fail-closed PreToolUse /
+/// PermissionRequest / Codex. Informational Hermes events only need a real
+/// workspace when they record activity (`subagent_stop`).
+fn hookNeedsWorkspaceRoot(host: Host, event: Event, request_event: []const u8) bool {
+    if (eventNeedsPolicy(event)) return true;
+    if (shouldFailClosedOnPreEval(host, event)) return true;
+    if (host == .hermes) {
+        if (isHermesInformationalEvent(request_event)) {
+            return std.mem.eql(u8, request_event, "subagent_stop");
+        }
+        return true;
+    }
+    return false;
+}
+
+test "hookNeedsWorkspaceRoot keeps fail-closed walks and skips informational hermes" {
+    try std.testing.expect(hookNeedsWorkspaceRoot(.claude, .PreToolUse, "PreToolUse"));
+    try std.testing.expect(hookNeedsWorkspaceRoot(.codex, .SessionStart, "SessionStart"));
+    try std.testing.expect(!hookNeedsWorkspaceRoot(.claude, .SessionStart, "SessionStart"));
+    try std.testing.expect(!hookNeedsWorkspaceRoot(.hermes, .SessionStart, "post_llm_call"));
+    try std.testing.expect(hookNeedsWorkspaceRoot(.hermes, .SessionStart, "subagent_stop"));
+    try std.testing.expect(hookNeedsWorkspaceRoot(.hermes, .SessionStart, "on_session_start"));
 }
 
 fn evaluateInformationalEvent(
