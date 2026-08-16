@@ -133,8 +133,15 @@ const PackIdCache = struct {
     disabled: []const []const u8,
 };
 
-var pack_id_cache_mutex: std.Thread.Mutex = .{};
+// Zig 0.16: std.atomic.Mutex (not Thread.Mutex).
+var pack_id_cache_mu: std.atomic.Mutex = .unlocked;
 var pack_id_cache: ?PackIdCache = null;
+
+fn lockPackIdCache() void {
+    while (!pack_id_cache_mu.tryLock()) {
+        std.atomic.spinLoopHint();
+    }
+}
 
 fn missingPackConfigKey() PackIdCacheKey {
     return .{ .exists = false, .inode = 0, .size = 0, .mtime_ns = 0 };
@@ -190,8 +197,8 @@ fn storePackIdCache(path: []const u8, path_key: PackIdCacheKey, user_key: ?PackI
         gpa.free(path_owned);
         return;
     };
-    pack_id_cache_mutex.lock();
-    defer pack_id_cache_mutex.unlock();
+    lockPackIdCache();
+    defer pack_id_cache_mu.unlock();
     if (pack_id_cache) |*old| {
         gpa.free(old.path);
         freeOwnedSlice(gpa, old.enabled);
@@ -207,8 +214,8 @@ fn storePackIdCache(path: []const u8, path_key: PackIdCacheKey, user_key: ?PackI
 }
 
 fn cloneFromPackIdCache(allocator: std.mem.Allocator, path: []const u8, path_key: PackIdCacheKey, user_key: ?PackIdCacheKey) ?LoadedPackIds {
-    pack_id_cache_mutex.lock();
-    defer pack_id_cache_mutex.unlock();
+    lockPackIdCache();
+    defer pack_id_cache_mu.unlock();
     const cached = pack_id_cache orelse return null;
     if (!std.mem.eql(u8, cached.path, path)) return null;
     if (!keysEqual(cached.path_key, path_key)) return null;
@@ -281,8 +288,8 @@ pub fn loadPackIdsForWorkspace(
 }
 
 fn resetPackIdCacheForTests() void {
-    pack_id_cache_mutex.lock();
-    defer pack_id_cache_mutex.unlock();
+    lockPackIdCache();
+    defer pack_id_cache_mu.unlock();
     if (pack_id_cache) |*old| {
         const gpa = std.heap.page_allocator;
         gpa.free(old.path);
