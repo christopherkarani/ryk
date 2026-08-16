@@ -1018,6 +1018,22 @@ const RedactionEntry = struct {
     }
 };
 
+fn appendOwnedRedaction(
+    allocator: std.mem.Allocator,
+    redactions: *std.ArrayList(RedactionEntry),
+    field: []const u8,
+    reason: []const u8,
+) !void {
+    const owned_field = try allocator.dupe(u8, field);
+    errdefer allocator.free(owned_field);
+    const owned_reason = try allocator.dupe(u8, reason);
+    errdefer allocator.free(owned_reason);
+    try redactions.append(allocator, .{
+        .field = owned_field,
+        .reason = owned_reason,
+    });
+}
+
 const HookResponse = struct {
     version: u8 = 1,
     decision: PluginDecision,
@@ -1229,10 +1245,7 @@ fn evaluateHook(
             const had_secrets = redacted.len != prompt_text.len or !std.mem.eql(u8, redacted, prompt_text);
 
             if (had_secrets) {
-                try redactions.append(allocator, .{
-                    .field = try allocator.dupe(u8, "prompt"),
-                    .reason = try allocator.dupe(u8, "potential secret detected"),
-                });
+                try appendOwnedRedaction(allocator, &redactions, "prompt", "potential secret detected");
             }
 
             // Use policy env evaluation as a proxy for sensitivity
@@ -3410,6 +3423,19 @@ test "hook claude UserPromptSubmit with fake secret returns warn" {
     try std.testing.expectEqual(RiskLevel.high, result.risk);
     try std.testing.expect(std.mem.indexOf(u8, result.message, "sensitive data") != null);
     try std.testing.expect(result.redactions.len > 0);
+}
+
+fn appendRedactionAllocationFailureProbe(allocator: std.mem.Allocator) !void {
+    var redactions: std.ArrayList(RedactionEntry) = .empty;
+    defer {
+        for (redactions.items) |entry| entry.deinit(allocator);
+        redactions.deinit(allocator);
+    }
+    try appendOwnedRedaction(allocator, &redactions, "prompt", "potential secret detected");
+}
+
+test "hook redaction append cleans up every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, appendRedactionAllocationFailureProbe, .{});
 }
 
 test "hook claude PreToolUse with file write to protected path returns block" {
