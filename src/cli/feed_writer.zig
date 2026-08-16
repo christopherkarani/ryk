@@ -57,7 +57,16 @@ pub fn appendGlobalRecord(
     allocator: std.mem.Allocator,
     dashboard_root: []const u8,
     record: rust_visibility.RustShellFeedRecord,
-    opts: struct { sync: bool = true } = .{},
+) !void {
+    return appendGlobalRecordWithSync(io, allocator, dashboard_root, record, true);
+}
+
+fn appendGlobalRecordWithSync(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    dashboard_root: []const u8,
+    record: rust_visibility.RustShellFeedRecord,
+    sync_after: bool,
 ) !void {
     try std.Io.Dir.cwd().createDirPath(io, dashboard_root);
 
@@ -71,7 +80,7 @@ pub fn appendGlobalRecord(
     const events_path = try std.fs.path.join(allocator, &.{ dashboard_root, global_events_file_name });
     defer allocator.free(events_path);
     try rotateGlobalFeedIfNeeded(io, allocator, dashboard_root, events_path);
-    try appendRecordAtPath(io, allocator, events_path, record, opts.sync);
+    try appendRecordAtPath(io, allocator, events_path, record, sync_after);
     try updateWorkspaceRegistry(io, allocator, dashboard_root, record);
 }
 
@@ -102,7 +111,7 @@ pub fn appendRecordBestEffort(io: std.Io, allocator: std.mem.Allocator, workspac
     defer allocator.free(dashboard_root);
     // Hook path: keep the exclusive lock, skip events.jsonl fsync. Workspace
     // feed and the workspace registry stay durable. Feed must not fail-close.
-    appendGlobalRecord(io, allocator, dashboard_root, record, .{ .sync = false }) catch {};
+    appendGlobalRecordWithSync(io, allocator, dashboard_root, record, false) catch {};
 }
 
 pub fn processGlobalWritesDisabled() bool {
@@ -879,7 +888,7 @@ test "global feed append without fsync is still readable" {
         null,
     );
     defer record.deinit(std.testing.allocator);
-    try appendGlobalRecord(std.testing.io, std.testing.allocator, dashboard_root, record, .{ .sync = false });
+    try appendGlobalRecordWithSync(std.testing.io, std.testing.allocator, dashboard_root, record, false);
 
     var loaded = try loadGlobalRecentMatchingWithHealth(
         std.testing.io,
