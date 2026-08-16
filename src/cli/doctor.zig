@@ -1419,15 +1419,29 @@ fn collectHostDoctorRows(io: std.Io, allocator: std.mem.Allocator) !HostDoctorSn
         const shell_gate = host_status.shellGate(host_name);
         const fail_stance = host_status.failStance(host_name, hermes_fail_open, wired);
         const smoke = host_status.HostSmokePair{};
+        // #367: locals + errdefer before append; multi-dupe struct literal leaks on mid-row OOM.
+        const host_owned = try allocator.dupe(u8, host_name);
+        errdefer allocator.free(host_owned);
+        const wired_owned = try allocator.dupe(u8, wired);
+        errdefer allocator.free(wired_owned);
+        const shell_gate_owned = try allocator.dupe(u8, shell_gate);
+        errdefer allocator.free(shell_gate_owned);
+        const fail_stance_owned = try allocator.dupe(u8, fail_stance);
+        errdefer allocator.free(fail_stance_owned);
+        const smoke_allow_owned = try allocator.dupe(u8, smoke.allow.toString());
+        errdefer allocator.free(smoke_allow_owned);
+        const smoke_deny_owned = try allocator.dupe(u8, smoke.deny.toString());
+        errdefer allocator.free(smoke_deny_owned);
         const fix = try host_status.formatFix(allocator, host_name, wired, smoke, hermes_fail_open);
+        errdefer allocator.free(fix);
 
         try list.append(allocator, .{
-            .host = try allocator.dupe(u8, host_name),
-            .wired = try allocator.dupe(u8, wired),
-            .shell_gate = try allocator.dupe(u8, shell_gate),
-            .fail_stance = try allocator.dupe(u8, fail_stance),
-            .smoke_allow = try allocator.dupe(u8, smoke.allow.toString()),
-            .smoke_deny = try allocator.dupe(u8, smoke.deny.toString()),
+            .host = host_owned,
+            .wired = wired_owned,
+            .shell_gate = shell_gate_owned,
+            .fail_stance = fail_stance_owned,
+            .smoke_allow = smoke_allow_owned,
+            .smoke_deny = smoke_deny_owned,
             .fix = fix,
         });
     }
@@ -1437,14 +1451,27 @@ fn collectHostDoctorRows(io: std.Io, allocator: std.mem.Allocator) !HostDoctorSn
         const pi_status = host_status.inspectPi(io, allocator);
         const wired = pi_status.wiredLabel();
         const smoke = host_status.HostSmokePair{};
+        const host_owned = try allocator.dupe(u8, "pi");
+        errdefer allocator.free(host_owned);
+        const wired_owned = try allocator.dupe(u8, wired);
+        errdefer allocator.free(wired_owned);
+        const shell_gate_owned = try allocator.dupe(u8, host_status.shellGate("pi"));
+        errdefer allocator.free(shell_gate_owned);
+        const fail_stance_owned = try allocator.dupe(u8, host_status.failStance("pi", hermes_fail_open, wired));
+        errdefer allocator.free(fail_stance_owned);
+        const smoke_allow_owned = try allocator.dupe(u8, smoke.allow.toString());
+        errdefer allocator.free(smoke_allow_owned);
+        const smoke_deny_owned = try allocator.dupe(u8, smoke.deny.toString());
+        errdefer allocator.free(smoke_deny_owned);
         const fix = try host_status.formatFix(allocator, "pi", wired, smoke, hermes_fail_open);
+        errdefer allocator.free(fix);
         try list.append(allocator, .{
-            .host = try allocator.dupe(u8, "pi"),
-            .wired = try allocator.dupe(u8, wired),
-            .shell_gate = try allocator.dupe(u8, host_status.shellGate("pi")),
-            .fail_stance = try allocator.dupe(u8, host_status.failStance("pi", hermes_fail_open, wired)),
-            .smoke_allow = try allocator.dupe(u8, smoke.allow.toString()),
-            .smoke_deny = try allocator.dupe(u8, smoke.deny.toString()),
+            .host = host_owned,
+            .wired = wired_owned,
+            .shell_gate = shell_gate_owned,
+            .fail_stance = fail_stance_owned,
+            .smoke_allow = smoke_allow_owned,
+            .smoke_deny = smoke_deny_owned,
             .fix = fix,
         });
     }
@@ -1454,14 +1481,27 @@ fn collectHostDoctorRows(io: std.Io, allocator: std.mem.Allocator) !HostDoctorSn
         const grok_status = host_status.inspectGrok(io, allocator);
         const wired = grok_status.wiredLabel();
         const smoke = host_status.HostSmokePair{};
+        const host_owned = try allocator.dupe(u8, "grok");
+        errdefer allocator.free(host_owned);
+        const wired_owned = try allocator.dupe(u8, wired);
+        errdefer allocator.free(wired_owned);
+        const shell_gate_owned = try allocator.dupe(u8, host_status.shellGate("grok"));
+        errdefer allocator.free(shell_gate_owned);
+        const fail_stance_owned = try allocator.dupe(u8, host_status.failStance("grok", hermes_fail_open, wired));
+        errdefer allocator.free(fail_stance_owned);
+        const smoke_allow_owned = try allocator.dupe(u8, smoke.allow.toString());
+        errdefer allocator.free(smoke_allow_owned);
+        const smoke_deny_owned = try allocator.dupe(u8, smoke.deny.toString());
+        errdefer allocator.free(smoke_deny_owned);
         const fix = try host_status.formatFix(allocator, "grok", wired, smoke, hermes_fail_open);
+        errdefer allocator.free(fix);
         try list.append(allocator, .{
-            .host = try allocator.dupe(u8, "grok"),
-            .wired = try allocator.dupe(u8, wired),
-            .shell_gate = try allocator.dupe(u8, host_status.shellGate("grok")),
-            .fail_stance = try allocator.dupe(u8, host_status.failStance("grok", hermes_fail_open, wired)),
-            .smoke_allow = try allocator.dupe(u8, smoke.allow.toString()),
-            .smoke_deny = try allocator.dupe(u8, smoke.deny.toString()),
+            .host = host_owned,
+            .wired = wired_owned,
+            .shell_gate = shell_gate_owned,
+            .fail_stance = fail_stance_owned,
+            .smoke_allow = smoke_allow_owned,
+            .smoke_deny = smoke_deny_owned,
             .fix = fix,
         });
     }
@@ -3132,14 +3172,28 @@ fn testHostRows(allocator: std.mem.Allocator) ![]HostDoctorRow {
     const hermes_fail_open = true;
     for (hosts) |h| {
         const wired = "—";
+        // #368: same locals+errdefer ownership as production collectHostDoctorRows.
+        const host_owned = try allocator.dupe(u8, h.name);
+        errdefer allocator.free(host_owned);
+        const wired_owned = try allocator.dupe(u8, wired);
+        errdefer allocator.free(wired_owned);
+        const shell_gate_owned = try allocator.dupe(u8, h.gate);
+        errdefer allocator.free(shell_gate_owned);
+        const fail_stance_owned = try allocator.dupe(u8, h.stance);
+        errdefer allocator.free(fail_stance_owned);
+        const smoke_allow_owned = try allocator.dupe(u8, "not-run");
+        errdefer allocator.free(smoke_allow_owned);
+        const smoke_deny_owned = try allocator.dupe(u8, "not-run");
+        errdefer allocator.free(smoke_deny_owned);
         const fix = try host_status.formatFix(allocator, h.name, wired, smoke, hermes_fail_open);
+        errdefer allocator.free(fix);
         try list.append(allocator, .{
-            .host = try allocator.dupe(u8, h.name),
-            .wired = try allocator.dupe(u8, wired),
-            .shell_gate = try allocator.dupe(u8, h.gate),
-            .fail_stance = try allocator.dupe(u8, h.stance),
-            .smoke_allow = try allocator.dupe(u8, "not-run"),
-            .smoke_deny = try allocator.dupe(u8, "not-run"),
+            .host = host_owned,
+            .wired = wired_owned,
+            .shell_gate = shell_gate_owned,
+            .fail_stance = fail_stance_owned,
+            .smoke_allow = smoke_allow_owned,
+            .smoke_deny = smoke_deny_owned,
             .fix = fix,
         });
     }
