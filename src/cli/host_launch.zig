@@ -102,6 +102,19 @@ test "isHostLaunchAlias exact allowlist only" {
     try std.testing.expect(!isHostLaunchAlias("pi2"));
 }
 
+test "ryk grok -- --help rewrite stays agent help-only" {
+    const host_config_grants = @import("../sandbox/host_config_grants.zig");
+    const argv = try buildRunArgv(std.testing.allocator, "grok", &.{ "--", "--help" });
+    defer std.testing.allocator.free(argv);
+    try std.testing.expectEqual(@as(usize, 4), argv.len);
+    try std.testing.expectEqualStrings("--", argv[0]);
+    try std.testing.expectEqualStrings("grok", argv[1]);
+    try std.testing.expectEqualStrings("--", argv[2]);
+    try std.testing.expectEqualStrings("--help", argv[3]);
+    // After `ryk run` consumes the first `--`, command_argv is grok + separator + help.
+    try std.testing.expect(host_config_grants.isAgentHelpOrVersionOnly(argv[1..]));
+}
+
 test "isExactHostLaunchArgv0 rejects basename paths" {
     for (host_launch_aliases) |host| {
         try std.testing.expect(isExactHostLaunchArgv0(host));

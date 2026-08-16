@@ -1003,9 +1003,15 @@ pub fn hostUsableAuthPresent(
 
 /// True when argv after the binary is only help/version flags (no prompt / -p).
 /// Bare interactive (`claude` alone) is **not** help-only.
+///
+/// `ryk <host> -- --help` keeps the `--` separator in `command_argv`. Treat `--`
+/// as argv punctuation, not a payload flag, but still require a real help/version
+/// token so bare `["grok", "--"]` stays interactive (empty-backpack fail-closed).
 pub fn isAgentHelpOrVersionOnly(command_argv: []const []const u8) bool {
     if (command_argv.len < 2) return false;
+    var saw_help = false;
     for (command_argv[1..]) |arg| {
+        if (std.mem.eql(u8, arg, "--")) continue;
         if (std.mem.eql(u8, arg, "--help") or
             std.mem.eql(u8, arg, "-h") or
             std.mem.eql(u8, arg, "help") or
@@ -1014,11 +1020,12 @@ pub fn isAgentHelpOrVersionOnly(command_argv: []const []const u8) bool {
             std.mem.eql(u8, arg, "version") or
             std.mem.eql(u8, arg, "-V"))
         {
+            saw_help = true;
             continue;
         }
         return false;
     }
-    return true;
+    return saw_help;
 }
 
 /// True when Claude OAuth is known-expired and the launch is not help/version-only.
@@ -1410,6 +1417,37 @@ test "collectHostConfigPaths grants grok 1.0.4 config.toml not whole ~/.grok" {
         try std.testing.expect(std.mem.indexOf(u8, p, "Library/Keychains") == null);
     }
     try std.testing.expect(saw_config);
+
+    // Official 1.0.4 install: config.toml is usable auth for the alias gate.
+    // ~/.grok/bin alone is not (install layout, not product config).
+    try std.testing.expect(hostConfigPresent(io, "grok", home));
+    try std.testing.expect(hostUsableAuthPresent(io, "grok", home));
+}
+
+test "hostUsableAuthPresent grok official config.toml not bin-only install" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var home_tmp = std.testing.tmpDir(.{});
+    defer home_tmp.cleanup();
+    const home = try home_tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(home);
+
+    try home_tmp.dir.createDirPath(io, ".grok/bin");
+    try home_tmp.dir.writeFile(io, .{
+        .sub_path = ".grok/bin/grok",
+        .data = "#!/bin/sh\n",
+    });
+    try std.testing.expect(!hostConfigPresent(io, "grok", home));
+    try std.testing.expect(!hostUsableAuthPresent(io, "grok", home));
+    try std.testing.expect(shouldFailClosedMissingAuth("grok", false, false, false));
+
+    try home_tmp.dir.writeFile(io, .{
+        .sub_path = ".grok/config.toml",
+        .data = "[cli]\nauto_update = false\n",
+    });
+    try std.testing.expect(hostConfigPresent(io, "grok", home));
+    try std.testing.expect(hostUsableAuthPresent(io, "grok", home));
+    try std.testing.expect(!shouldFailClosedMissingAuth("grok", false, false, true));
 }
 
 test "collectHostConfigWriteDenies includes grok 1.0.4 config.toml" {
@@ -1599,6 +1637,14 @@ test "hostLoginMaterialPresent requires credentials not only config dir for clau
     try std.testing.expect(isAgentHelpOrVersionOnly(&.{ "claude", "--version" }));
     try std.testing.expect(!isAgentHelpOrVersionOnly(&.{"claude"}));
     try std.testing.expect(!isAgentHelpOrVersionOnly(&.{ "claude", "-p", "x" }));
+    // Documented agent help is `ryk <host> -- --help`. Alias rewrite keeps the
+    // `--` separator in command_argv (`["grok", "--", "--help"]`). That must
+    // still be help-only so the empty-backpack login gate does not fire before
+    // attach (#194 Linux). Bare `--` is interactive, not help.
+    try std.testing.expect(isAgentHelpOrVersionOnly(&.{ "grok", "--", "--help" }));
+    try std.testing.expect(isAgentHelpOrVersionOnly(&.{ "grok", "--", "-h" }));
+    try std.testing.expect(!isAgentHelpOrVersionOnly(&.{ "grok", "--" }));
+    try std.testing.expect(!isAgentHelpOrVersionOnly(&.{ "grok", "--", "-p", "hi" }));
 
     // pi has no markers → config dir alone is enough.
     try home_tmp.dir.createDirPath(io, ".pi");
@@ -1635,6 +1681,10 @@ test "shouldFailClosedMissingAuth edge matrix is host-aware" {
     // Pi / hermes: config only (no gateway substitute).
     try std.testing.expect(shouldFailClosedMissingAuth("pi", true, true, false));
     try std.testing.expect(!shouldFailClosedMissingAuth("pi", false, false, true));
+
+    // Grok: no env-key gateway. Official ~/.grok/config.toml is usable auth.
+    try std.testing.expect(shouldFailClosedMissingAuth("grok", true, true, false));
+    try std.testing.expect(!shouldFailClosedMissingAuth("grok", false, false, true));
 }
 
 test "relHasUnsafeComponents rejects traversal" {
