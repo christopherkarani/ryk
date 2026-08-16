@@ -3177,7 +3177,8 @@ test "day-one installOneHost rewrites leftover zig Grok hook and names InvalidRy
         .limited(grok_install.max_hook_file_size),
     );
     defer std.testing.allocator.free(rewritten);
-    try std.testing.expect(std.mem.indexOf(u8, rewritten, "/opt/ryk/bin/ryk hook grok PreToolUse") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rewritten, "/opt/ryk/bin/ryk") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rewritten, "/bin/sh -c ") != null);
     try std.testing.expect(std.mem.indexOf(u8, rewritten, "/Users/me/.local/zig/zig-aarch64-macos/zig") == null);
 }
 

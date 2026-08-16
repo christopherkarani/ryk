@@ -297,7 +297,7 @@ printf '%s\n' "{\"schema_version\":1,\"kind\":\"shell_command\",\"command\":\"gi
   ryk evaluate --json --stdin
 ~~~
 
-It writes its response to stdout for valid decisions and typed input errors. The tested exit contract is 0 allow, 2 deny, 3 evaluator failure, 64 invalid input, and 1 unexpected internal error. Non-shell evaluation is not supported by this API.
+It writes its response to stdout for valid decisions and typed input errors. The tested exit contract is 0 allow, 2 deny, 3 evaluator failure (including invalid, empty, or unreadable discovered policy), 64 invalid input, and 1 unexpected internal error. Missing policy files still fall back to builtin strict. Non-shell evaluation is not supported by this API.
 
 ### decide
 

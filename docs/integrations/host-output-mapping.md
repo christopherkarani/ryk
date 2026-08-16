@@ -5,7 +5,7 @@
 
 ## Overview
 
-`ryk hook` receives host lifecycle events from Codex and Claude Code plugins, normalizes the payload, evaluates the event against existing ryk policy and redaction logic, then returns a host-valid decision object.
+`ryk hook` receives host lifecycle events from Codex and Claude Code plugins, plus the Grok managed hook, normalizes the payload, evaluates the event against existing ryk policy and redaction logic, then returns a host-valid decision object.
 
 The hook is additive only. It does not replace `ryk run`. Claude tool-gating events emit native `permissionDecision` JSON so the host can veto tools when it honors that contract; grade remains **hook**, not OS-enforced sandbox.
 
@@ -15,6 +15,7 @@ The hook is additive only. It does not replace `ryk run`. Claude tool-gating eve
 |---|---|
 | Codex | `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PermissionRequest`, `PostToolUse`, `Stop` |
 | Claude | `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PermissionRequest`, `PostToolUse`, `SessionEnd` |
+| Grok | `PreToolUse` (managed matchers: Bash / Read). Native deny is `{"decision":"deny","reason":…}` + exit 2. Ask is hardened to deny (no resume). Missing `ryk` is wrapped to the same deny. |
 
 ## Event to Decision Mapping
 
