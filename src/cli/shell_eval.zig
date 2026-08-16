@@ -261,7 +261,8 @@ pub fn loadProductShellStores(
     defer allocator.free(project_path);
 
     // loadMerged only fails on OOM; corrupt/missing → empty store (fail closed, no unlock).
-    const outcome = try shell_engine.allowlist_store.loadMerged(
+    // Cached on inode/size/mtime so a revocation rewrite cannot be served stale.
+    const outcome = try shell_engine.allowlist_store.loadMergedCached(
         runtime_io,
         allocator,
         user_path,
