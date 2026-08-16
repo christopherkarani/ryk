@@ -322,7 +322,7 @@ ryk hook codex SessionStart < host-payload.json
 ryk hook opencode tool.execute.before < host-payload.json
 ~~~
 
-The payload schema belongs to the host. Use the host integration documentation to construct it. Hook responses include host_limitations; hook enforcement is additive and does not replace supervision through ryk run. Shell tool-before events use the Zig shell engine, and the rejected Rust evaluator setting applies here too. The public help registry currently omits the grok hook route, so validate that host path before relying on it.
+The payload schema belongs to the host. Use the host integration documentation to construct it. Hook responses include host_limitations; hook enforcement is additive and does not replace supervision through ryk run. Shell tool-before events use the Zig shell engine, and the rejected Rust evaluator setting applies here too. `ryk hook --help` lists every dispatch host, including grok.
 
 ### Plugins and MCP
 

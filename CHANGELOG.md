@@ -34,6 +34,7 @@
 
 ### Fixed
 
+* **`ryk hook --help` lists grok.** Dispatch already accepted `ryk hook grok`; the usage host list was a stale subset (`codex|claude|opencode|openclaw|hermes`). Help now matches `Host.parse`, and a lock test keeps the Usage group aligned with that allowlist. Pi stays on `evaluate`; cursor is not a hook host.
 * **Deny/ask copy no longer says Always for session sticky (#146).** The TTY prompt is Once / Session / Never. Session is in-memory for this ryk process; it is not a permanent allowlist write. Host-UI allow stays quiet and is not described as a ryk sticky write (A5). `ryk test` / `ryk explain` name the rule and a safer command on deny. Sticky semantics, fail-closed empty stdin, and allow-once are unchanged.
 * **Windows `ryk run` reaches child launch again.** New session audit logs now open with the read access required by Windows handle metadata queries, so EOF resynchronization no longer fails with `AccessDenied` before shim installation.
 * **`ryk explain` / `ryk test` force-push Why no longer recommends `--force-with-lease`.** Pack reasons for `core.git:push-force-long` and `push-force-short` now point at a fast-forward `git push`. `--force-with-lease` stays force-equivalent and denied. Deny of `--force`, `-f`, lease, `--force-if-includes`, `+refspec`, `--delete`, `--mirror`, and `:ref` is unchanged.
