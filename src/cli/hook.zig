@@ -818,13 +818,12 @@ fn isCodexDenyOutput(host: Host, decision: PluginDecision) bool {
     return host == .codex and decision == .block;
 }
 
-/// Leftover unused policy ask is permit so agents work. OpenClaw / Grok keep
-/// their documented veto (no resume contract / exit-2 deny). Stage, SoftBlock,
-/// and FM steward ask never enter this helper as remappable leftover ask.
+/// Leftover unused policy ask is permit so agents work. Exhaustive on `Host`
+/// so a new tag cannot silently inherit permit or veto. Stage, SoftBlock, and
+/// FM steward ask never enter this helper as remappable leftover ask.
 fn codingHostPermitsResidualAsk(host: Host) bool {
     return switch (host) {
-        .claude, .codex, .opencode, .hermes => true,
-        .grok, .openclaw => false,
+        .claude, .codex, .opencode, .hermes, .grok, .openclaw => true,
     };
 }
 
@@ -840,9 +839,9 @@ fn wireCodingHostAsk(host: Host, decision: PluginDecision, unattended: bool) Plu
 
 fn usesExitTwoDenyOutput(host: Host, decision: PluginDecision) bool {
     if (host == .codex) return decision == .block;
-    // Grok has no native approval UI for an `ask`/`stage` result. Its only
-    // enforceable non-allow contract is exit 2, so escalation and evaluator
-    // errors must block just like an explicit deny.
+    // Leftover unused ask is remapped to `.allow` before emit. A leaked
+    // `.ask`, plus stage / evaluator error, still has no Grok approval UI —
+    // the only enforceable non-allow contract is exit 2.
     if (host == .grok) {
         return decision == .block or decision == .ask or decision == .stage or decision == .err;
     }
@@ -1335,7 +1334,6 @@ test "hookNeedsWorkspaceRoot keeps fail-closed walks and skips informational her
     try std.testing.expect(!hookNeedsWorkspaceRoot(.hermes, .SessionStart, "post_llm_call"));
     try std.testing.expect(hookNeedsWorkspaceRoot(.hermes, .SessionStart, "subagent_stop"));
     try std.testing.expect(hookNeedsWorkspaceRoot(.hermes, .SessionStart, "on_session_start"));
-
 }
 
 fn evaluateInformationalEvent(
@@ -2120,11 +2118,11 @@ fn buildRemediationCommands(allocator: std.mem.Allocator, rule_id: ?[]const u8) 
 fn resolveRykDataDirForPending(allocator: std.mem.Allocator) !?[]u8 {
     if (std.c.getenv("XDG_DATA_HOME")) |xdg_z| {
         const xdg = std.mem.span(xdg_z);
-        if (xdg.len > 0) return try std.fs.path.join(allocator, &.{ xdg, "ryk"});
+        if (xdg.len > 0) return try std.fs.path.join(allocator, &.{ xdg, "ryk" });
     }
     if (std.c.getenv("HOME")) |home_z| {
         const home = std.mem.span(home_z);
-        if (home.len > 0) return try std.fs.path.join(allocator, &.{ home, ".local", "share", "ryk"});
+        if (home.len > 0) return try std.fs.path.join(allocator, &.{ home, ".local", "share", "ryk" });
     }
     return null;
 }
@@ -6438,16 +6436,19 @@ test "coding hosts permit residual ask unless unattended" {
     try std.testing.expect(codingHostPermitsResidualAsk(.codex));
     try std.testing.expect(codingHostPermitsResidualAsk(.opencode));
     try std.testing.expect(codingHostPermitsResidualAsk(.hermes));
-    try std.testing.expect(!codingHostPermitsResidualAsk(.openclaw));
-    try std.testing.expect(!codingHostPermitsResidualAsk(.grok));
+    try std.testing.expect(codingHostPermitsResidualAsk(.openclaw));
+    try std.testing.expect(codingHostPermitsResidualAsk(.grok));
 
     try std.testing.expectEqual(PluginDecision.allow, wireCodingHostAsk(.claude, .ask, false));
     try std.testing.expectEqual(PluginDecision.allow, wireCodingHostAsk(.codex, .ask, false));
     try std.testing.expectEqual(PluginDecision.allow, wireCodingHostAsk(.opencode, .ask, false));
     try std.testing.expectEqual(PluginDecision.allow, wireCodingHostAsk(.hermes, .ask, false));
+    try std.testing.expectEqual(PluginDecision.allow, wireCodingHostAsk(.grok, .ask, false));
+    try std.testing.expectEqual(PluginDecision.allow, wireCodingHostAsk(.openclaw, .ask, false));
     try std.testing.expectEqual(PluginDecision.block, wireCodingHostAsk(.claude, .ask, true));
     try std.testing.expectEqual(PluginDecision.block, wireCodingHostAsk(.hermes, .ask, true));
-    try std.testing.expectEqual(PluginDecision.ask, wireCodingHostAsk(.openclaw, .ask, false));
+    try std.testing.expectEqual(PluginDecision.block, wireCodingHostAsk(.grok, .ask, true));
+    try std.testing.expectEqual(PluginDecision.block, wireCodingHostAsk(.openclaw, .ask, true));
     try std.testing.expectEqual(PluginDecision.block, wireCodingHostAsk(.claude, .block, false));
     try std.testing.expectEqual(PluginDecision.allow, wireCodingHostAsk(.claude, .allow, true));
 }
@@ -6457,6 +6458,8 @@ test "fromDecisionResult stage plus wireCodingHostAsk is not allow" {
     try std.testing.expectEqual(PluginDecision.stage, staged);
     try std.testing.expect(wireCodingHostAsk(.claude, staged, false) != .allow);
     try std.testing.expect(wireCodingHostAsk(.hermes, staged, false) != .allow);
+    try std.testing.expect(wireCodingHostAsk(.openclaw, staged, false) != .allow);
+    try std.testing.expect(wireCodingHostAsk(.grok, staged, false) != .allow);
     try std.testing.expectEqual(PluginDecision.stage, wireCodingHostAsk(.claude, staged, false));
     try std.testing.expectEqual(PluginDecision.stage, wireCodingHostAsk(.hermes, staged, false));
     try std.testing.expectEqual(PluginDecision.block, PluginDecision.fromDecisionResult(.stage, true));
@@ -6498,6 +6501,70 @@ test "hook emit after wire rewrite is allow for attended Hermes" {
     const out = stdout_writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, out, "\"decision\": \"allow\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"decision\": \"ask\"") == null);
+}
+
+test "hook emit after wire rewrite is allow for attended Grok leftover ask" {
+    const wired = wireCodingHostAsk(.grok, .ask, false);
+    try std.testing.expectEqual(PluginDecision.allow, wired);
+    try std.testing.expectEqual(exit_codes.success, hookExitCode(.grok, wired, false));
+    try std.testing.expectEqual(AgentEmitShape.generic_json, agentEmitShape(.grok, .PreToolUse, wired));
+    // Leaked raw `.ask` still fail-closes on the Grok emit helper.
+    try std.testing.expectEqual(codex_deny_exit_code, hookExitCode(.grok, .ask, false));
+    try std.testing.expectEqual(AgentEmitShape.grok_deny_json, agentEmitShape(.grok, .PreToolUse, .ask));
+}
+
+test "hook emit after wire rewrite is deny for unattended Grok leftover ask" {
+    const wired = wireCodingHostAsk(.grok, .ask, true);
+    try std.testing.expectEqual(PluginDecision.block, wired);
+    try std.testing.expectEqual(codex_deny_exit_code, hookExitCode(.grok, wired, true));
+    try std.testing.expectEqual(AgentEmitShape.grok_deny_json, agentEmitShape(.grok, .PreToolUse, wired));
+}
+
+test "hook emit after wire rewrite is allow for attended OpenClaw leftover ask" {
+    const wired = wireCodingHostAsk(.openclaw, .ask, false);
+    try std.testing.expectEqual(PluginDecision.allow, wired);
+    try std.testing.expectEqual(exit_codes.success, hookExitCode(.openclaw, wired, false));
+    try std.testing.expectEqual(AgentEmitShape.generic_json, agentEmitShape(.openclaw, .PreToolUse, wired));
+    const result = HookResponse{
+        .decision = wired,
+        .risk = .low,
+        .category = "test",
+        .reason = "residual ask",
+        .rule = null,
+        .message = "residual ask",
+        .redactions = &.{},
+        .host_limitations = &.{},
+    };
+    var stdout_buf: [2048]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    try writeHookResponse(&stdout_writer, result);
+    const out = stdout_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"decision\": \"allow\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"decision\": \"ask\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"decision\": \"block\"") == null);
+}
+
+test "hook emit after wire rewrite is block for unattended OpenClaw leftover ask" {
+    const wired = wireCodingHostAsk(.openclaw, .ask, true);
+    try std.testing.expectEqual(PluginDecision.block, wired);
+    try std.testing.expectEqual(exit_codes.success, hookExitCode(.openclaw, wired, true));
+    try std.testing.expectEqual(AgentEmitShape.generic_json, agentEmitShape(.openclaw, .PreToolUse, wired));
+    const result = HookResponse{
+        .decision = wired,
+        .risk = .low,
+        .category = "test",
+        .reason = "unattended leftover ask",
+        .rule = null,
+        .message = "unattended leftover ask",
+        .redactions = &.{},
+        .host_limitations = &.{},
+    };
+    var stdout_buf: [2048]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    try writeHookResponse(&stdout_writer, result);
+    const out = stdout_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"decision\": \"block\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"decision\": \"allow\"") == null);
 }
 
 test "hook emit after wire does not allow staged writes" {

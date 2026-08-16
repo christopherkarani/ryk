@@ -287,7 +287,7 @@ For headless runs, ryk should report the CI limitation directly instead of prete
 
 ## Cross-host decision mapping
 
-The living multi-host matrix (residual ask is permit on coding hosts, OpenClaw ask→block until a resume contract exists, prompt-path honesty) lives in:
+The living multi-host matrix (residual unused ask is permit on coding hosts including Grok and OpenClaw; unattended leftover ask still denies; prompt-path honesty) lives in:
 
 - `docs/integrations/host-decision-mapping.md`
 - `integrations/common/schemas/host-decision-mapping-v1.json`

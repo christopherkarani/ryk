@@ -21,7 +21,7 @@ pub fn toolAskEnforcement(host: []const u8) ToolAskEnforcement {
     if (std.mem.eql(u8, host, "claude")) return .partial_host_ask;
     if (std.mem.eql(u8, host, "codex")) return .partial_host_ask;
     if (std.mem.eql(u8, host, "grok")) return .partial_host_ask;
-    if (std.mem.eql(u8, host, "openclaw")) return .hard_block_no_resume;
+    if (std.mem.eql(u8, host, "openclaw")) return .partial_host_ask;
     if (std.mem.eql(u8, host, "opencode")) return .hard_block_no_resume;
     if (std.mem.eql(u8, host, "cursor")) return .hard_block_no_resume;
     if (std.mem.eql(u8, host, "pi")) return .host_dependent;
@@ -76,10 +76,11 @@ pub fn formatWarn(allocator: std.mem.Allocator, hosts: []const []const u8) error
     return try list.toOwnedSlice(allocator);
 }
 
-test "host_ask_resume matrix: hermes resumes; openclaw/opencode/cursor hard-block" {
+test "host_ask_resume matrix: hermes resumes; opencode/cursor hard-block; openclaw leftover ask is permit" {
     try std.testing.expectEqual(ToolAskEnforcement.native_approve_and_resume, toolAskEnforcement("hermes"));
     try std.testing.expect(!hardBlocksAskWithNoResume("hermes"));
-    try std.testing.expectEqual(ToolAskEnforcement.hard_block_no_resume, toolAskEnforcement("openclaw"));
+    try std.testing.expectEqual(ToolAskEnforcement.partial_host_ask, toolAskEnforcement("openclaw"));
+    try std.testing.expect(!hardBlocksAskWithNoResume("openclaw"));
     try std.testing.expectEqual(ToolAskEnforcement.hard_block_no_resume, toolAskEnforcement("opencode"));
     try std.testing.expectEqual(ToolAskEnforcement.hard_block_no_resume, toolAskEnforcement("cursor"));
     try std.testing.expect(hardBlocksAskWithNoResume("cursor"));
@@ -88,6 +89,12 @@ test "host_ask_resume matrix: hermes resumes; openclaw/opencode/cursor hard-bloc
     try std.testing.expectEqual(ToolAskEnforcement.partial_host_ask, toolAskEnforcement("grok"));
     try std.testing.expectEqual(ToolAskEnforcement.host_dependent, toolAskEnforcement("pi"));
     try std.testing.expectEqual(ToolAskEnforcement.unknown, toolAskEnforcement("not-a-host"));
+
+    const openclaw_warn = (try formatWarn(std.testing.allocator, &.{"openclaw"})).?;
+    defer std.testing.allocator.free(openclaw_warn);
+    try std.testing.expect(std.mem.indexOf(u8, openclaw_warn, "openclaw") != null);
+    try std.testing.expect(std.mem.indexOf(u8, openclaw_warn, "ask resume is partial (hook-grade)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, openclaw_warn, "hard-blocks ask with no resume") == null);
 }
 
 test "host_ask_resume formatWarn names hard-block hosts and stays silent for hermes-only" {
