@@ -267,7 +267,7 @@ pub fn evaluatePayloadWithModeOpts(
             const unattended = opts.unattended orelse env_util.getenvUnattended() or mode == .ci;
             const leftover = decision.ask_origin.mayPermitOnCodingHost();
             if (unattended) {
-                // Leftover unused ask and hold outcomes (SoftBlock / FM) harden.
+                // Unattended / CI hardens leftover ask *and* SoftBlock/FM hold to deny.
                 const reason = try core_api.redactAlloc(allocator, decision.owned_reason);
                 defer allocator.free(reason);
                 try writeDeny(stdout, format, reason);

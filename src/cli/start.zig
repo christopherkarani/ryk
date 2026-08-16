@@ -361,32 +361,30 @@ fn resolveSelectedHosts(
     }
 
     var options = try allocator.alloc(tui.prompt.SelectionOption, detected_count);
-    defer allocator.free(options);
-
-    var visible_idx: usize = 0;
+    var filled: usize = 0;
     defer {
-        for (options[0..visible_idx]) |opt| {
+        for (options[0..filled]) |opt| {
             allocator.free(opt.label);
             if (opt.id) |id| allocator.free(id);
         }
+        allocator.free(options);
     }
+
     for (host_statuses) |status| {
         if (!status.detected) continue;
         const marker = if (status.installed) " (installed)" else "";
         var label_buf: [64]u8 = undefined;
-        const label = std.fmt.bufPrint(&label_buf, "{s}{s}", .{ status.name, marker }) catch status.name;
-        {
-            const owned_label = try allocator.dupe(u8, label);
-            errdefer allocator.free(owned_label);
-            const owned_id = try allocator.dupe(u8, status.name);
-            errdefer allocator.free(owned_id);
-            options[visible_idx] = .{
-                .label = owned_label,
-                .checked = !std.mem.eql(u8, status.name, "cursor"),
-                .id = owned_id,
-            };
-            visible_idx += 1;
-        }
+        const label_text = std.fmt.bufPrint(&label_buf, "{s}{s}", .{ status.name, marker }) catch status.name;
+        const label = try allocator.dupe(u8, label_text);
+        errdefer allocator.free(label);
+        const id = try allocator.dupe(u8, status.name);
+        errdefer allocator.free(id);
+        options[filled] = .{
+            .label = label,
+            .checked = !std.mem.eql(u8, status.name, "cursor"),
+            .id = id,
+        };
+        filled += 1;
     }
 
     const confirmed = try tui.prompt.multiSelect(io, allocator, stdout, options, "Select agent hosts to integrate", null);

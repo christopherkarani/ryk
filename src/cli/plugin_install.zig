@@ -27,35 +27,51 @@ pub fn resolveWorkspaceInstallRoot(io: std.Io, allocator: std.mem.Allocator) ![]
     return supervisor.resolveWorkspaceRoot(io, allocator, null, ".") catch try std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator);
 }
 
+const MarketplaceHostLayout = struct {
+    host_label: []const u8,
+    plugin_rel: []const []const u8,
+    marketplace_rel: []const []const u8,
+};
+
+fn marketplaceHostLayout(target: MarketplaceHost) MarketplaceHostLayout {
+    return switch (target) {
+        .codex => .{
+            .host_label = "Codex",
+            .plugin_rel = &.{ ".agents", "plugins", "ryk" },
+            .marketplace_rel = &.{ ".agents", "plugins", "marketplace.json" },
+        },
+        .claude => .{
+            .host_label = "Claude Code",
+            .plugin_rel = &.{ ".claude", "plugins", "ryk" },
+            .marketplace_rel = &.{ ".claude-plugin", "marketplace.json" },
+        },
+    };
+}
+
+fn joinUnderRoot(allocator: std.mem.Allocator, workspace_root: []const u8, rel: []const []const u8) ![]u8 {
+    var parts: [5][]const u8 = undefined;
+    parts[0] = workspace_root;
+    for (rel, 0..) |part, index| {
+        parts[index + 1] = part;
+    }
+    return std.fs.path.join(allocator, parts[0 .. rel.len + 1]);
+}
+
 pub fn marketplaceHostInstallSpec(
     allocator: std.mem.Allocator,
     workspace_root: []const u8,
     target: MarketplaceHost,
     marketplace_json: []const u8,
 ) !MarketplaceHostInstall {
-    return switch (target) {
-        .codex => blk: {
-            const plugin_dest = try std.fs.path.join(allocator, &.{ workspace_root, ".agents", "plugins", "ryk" });
-            errdefer allocator.free(plugin_dest);
-            const marketplace_path = try std.fs.path.join(allocator, &.{ workspace_root, ".agents", "plugins", "marketplace.json" });
-            break :blk .{
-                .host_label = "Codex",
-                .plugin_dest = plugin_dest,
-                .marketplace_path = marketplace_path,
-                .marketplace_json = marketplace_json,
-            };
-        },
-        .claude => blk: {
-            const plugin_dest = try std.fs.path.join(allocator, &.{ workspace_root, ".claude", "plugins", "ryk" });
-            errdefer allocator.free(plugin_dest);
-            const marketplace_path = try std.fs.path.join(allocator, &.{ workspace_root, ".claude-plugin", "marketplace.json" });
-            break :blk .{
-                .host_label = "Claude Code",
-                .plugin_dest = plugin_dest,
-                .marketplace_path = marketplace_path,
-                .marketplace_json = marketplace_json,
-            };
-        },
+    const layout = marketplaceHostLayout(target);
+    const plugin_dest = try joinUnderRoot(allocator, workspace_root, layout.plugin_rel);
+    errdefer allocator.free(plugin_dest);
+    const marketplace_path = try joinUnderRoot(allocator, workspace_root, layout.marketplace_rel);
+    return .{
+        .host_label = layout.host_label,
+        .plugin_dest = plugin_dest,
+        .marketplace_path = marketplace_path,
+        .marketplace_json = marketplace_json,
     };
 }
 

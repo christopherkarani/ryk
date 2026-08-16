@@ -60,14 +60,22 @@ pub const License = struct {
     }
 
     pub fn free(allocator: std.mem.Allocator, source: []const u8) !License {
+        // #379: sequential dupes need errdefer so a later OOM does not leak earlier strings.
+        const license_id = try allocator.dupe(u8, "free");
+        errdefer allocator.free(license_id);
+        const subject = try allocator.dupe(u8, "local user");
+        errdefer allocator.free(subject);
+        const issued_at = try allocator.dupe(u8, "not activated");
+        errdefer allocator.free(issued_at);
+        const source_owned = try allocator.dupe(u8, source);
         return .{
             .allocator = allocator,
             .tier = .free,
-            .license_id = try allocator.dupe(u8, "free"),
-            .subject = try allocator.dupe(u8, "local user"),
-            .issued_at = try allocator.dupe(u8, "not activated"),
+            .license_id = license_id,
+            .subject = subject,
+            .issued_at = issued_at,
             .expires_at = null,
-            .source = try allocator.dupe(u8, source),
+            .source = source_owned,
             .verified = false,
         };
     }

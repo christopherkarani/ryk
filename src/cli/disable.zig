@@ -444,16 +444,32 @@ pub fn runHermesDisable(allocator: std.mem.Allocator) !u8 {
 pub fn removeKnownPluginPaths(io: std.Io, allocator: std.mem.Allocator, stdout: anytype, host_name: []const u8, paths: []const []const u8) !bool {
     var removed_any = false;
     for (paths) |rel_path| {
-        if (plugin.fileExistsAbsolute(io, rel_path)) {
-            std.Io.Dir.cwd().deleteFile(io, rel_path) catch |err| {
+        // Prefer directory removal first: plugin installs are trees
+        // (e.g. `.agents/plugins/ryk/`). `fileExistsAbsolute` is true for both
+        // files and dirs via access(); deleting a dir with deleteFile yields
+        // IsDir. The old path printed that error and `continue`d, skipping
+        // deleteTree — so stop left Codex/Claude plugin dirs in place (#345).
+        if (plugin.dirExists(rel_path)) {
+            std.Io.Dir.cwd().deleteTree(io, rel_path) catch |err| {
                 try stdout.print("  {s} plugin: failed to remove {s} ({s})\n", .{ host_name, rel_path, @errorName(err) });
                 continue;
             };
             try stdout.print("  {s} plugin: removed {s}\n", .{ host_name, rel_path });
             removed_any = true;
+            continue;
         }
-        if (plugin.dirExists(rel_path)) {
-            std.Io.Dir.cwd().deleteTree(io, rel_path) catch |err| {
+        if (plugin.fileExistsAbsolute(io, rel_path)) {
+            std.Io.Dir.cwd().deleteFile(io, rel_path) catch |err| {
+                // Directory that dirExists missed (race/TOCTOU): fall through to tree delete.
+                if (err == error.IsDir) {
+                    std.Io.Dir.cwd().deleteTree(io, rel_path) catch |tree_err| {
+                        try stdout.print("  {s} plugin: failed to remove {s} ({s})\n", .{ host_name, rel_path, @errorName(tree_err) });
+                        continue;
+                    };
+                    try stdout.print("  {s} plugin: removed {s}\n", .{ host_name, rel_path });
+                    removed_any = true;
+                    continue;
+                }
                 try stdout.print("  {s} plugin: failed to remove {s} ({s})\n", .{ host_name, rel_path, @errorName(err) });
                 continue;
             };
@@ -680,4 +696,39 @@ test "stop success output points at ryk start not setup" {
     const out = stdout_writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, out, "ryk start") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "ryk setup") == null);
+}
+
+test "removeKnownPluginPaths deletes codex and claude plugin directories" {
+    // #345: planted plugin trees must be removed (not IsDir + leave on disk).
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, ".agents/plugins/ryk/hooks");
+    try tmp.dir.createDirPath(io, ".claude/plugins/ryk/hooks");
+    try tmp.dir.writeFile(io, .{ .sub_path = ".agents/plugins/ryk/README.md", .data = "plugin\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = ".claude/plugins/ryk/README.md", .data = "plugin\n" });
+
+    const prev_cwd = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(prev_cwd);
+    try std.process.setCurrentDir(io, tmp.dir);
+    defer std.process.setCurrentPath(io, prev_cwd) catch {};
+
+    var stdout_buf: [4096]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+
+    try std.testing.expect(try disableCodex(io, std.testing.allocator, &stdout_writer));
+    try std.testing.expect(!plugin.dirExists(".agents/plugins/ryk"));
+    try std.testing.expect(!plugin.fileExistsAbsolute(io, ".agents/plugins/ryk/README.md"));
+
+    stdout_writer = .fixed(&stdout_buf);
+    try std.testing.expect(try disableClaude(io, std.testing.allocator, &stdout_writer));
+    try std.testing.expect(!plugin.dirExists(".claude/plugins/ryk"));
+    try std.testing.expect(!plugin.fileExistsAbsolute(io, ".claude/plugins/ryk/README.md"));
+
+    const out = stdout_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "IsDir") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "removed") != null);
 }
