@@ -29,7 +29,16 @@ pub fn distance(a: []const u8, b: []const u8) usize {
     return previous[columns];
 }
 
-/// Returns a prefix match or the unique closest candidate within two edits.
+/// Max Levenshtein edits for an unknown token of this length.
+/// Short tokens (≤3) allow one edit only so weak rewrites like `foo`→`hook`
+/// (distance 2 on a 3-char token) never fire; longer tokens still allow two.
+fn maxEditDistance(token_len: usize) usize {
+    if (token_len <= 3) return 1;
+    return 2;
+}
+
+/// Returns a prefix match or the unique closest candidate within the length-
+/// scaled edit budget (see `maxEditDistance`).
 pub fn closest(unknown: []const u8, candidates: []const []const u8) ?[]const u8 {
     if (unknown.len == 0) return null;
     for (candidates) |candidate| {
@@ -44,8 +53,9 @@ pub fn closest(unknown: []const u8, candidates: []const []const u8) ?[]const u8 
     }
     if (prefix_match) |candidate| return candidate;
 
+    const max_edits = maxEditDistance(unknown.len);
     var best: ?[]const u8 = null;
-    var best_distance: usize = 3;
+    var best_distance: usize = max_edits + 1;
     var tied = false;
     for (candidates) |candidate| {
         const candidate_distance = distance(unknown, candidate);
@@ -57,7 +67,7 @@ pub fn closest(unknown: []const u8, candidates: []const []const u8) ?[]const u8 
             tied = true;
         }
     }
-    return if (best_distance <= 2 and !tied) best else null;
+    return if (best_distance <= max_edits and !tied) best else null;
 }
 
 pub fn writeUnknownOption(
@@ -118,6 +128,17 @@ test "closest suggests prefixes and edit-distance typos without guessing unrelat
     try std.testing.expectEqualStrings("--command", closest("--comand", candidates).?);
     try std.testing.expectEqualStrings("--manifest", closest("--man", candidates).?);
     try std.testing.expect(closest("--xyz", candidates) == null);
+}
+
+test "closest rejects weak short-token rewrites like foo to hook" {
+    // Distance 2 on a 3-char token must not suggest an unrelated power command.
+    const commands = &[_][]const u8{ "hook", "doctor", "policy", "help", "run" };
+    try std.testing.expect(closest("foo", commands) == null);
+    // One-edit typos on short tokens still suggest when unambiguous.
+    try std.testing.expectEqualStrings("hook", closest("hok", commands).?);
+    // Longer real typos still get up to two edits.
+    try std.testing.expectEqualStrings("doctor", closest("docter", commands).?);
+    try std.testing.expectEqualStrings("policy", closest("polcy", commands).?);
 }
 
 test "closest requires an unambiguous best candidate" {
