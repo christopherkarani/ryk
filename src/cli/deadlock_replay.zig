@@ -13,10 +13,10 @@
 //! Corpus: deadlock_replay_corpus.jsonl — one JSON object per line:
 //! {"command": "...", "expect": "allow"|"deny", "note": "..."}
 //!
-//! Corpus exercises lived Grok strict off-list refuse sessions and day-to-day
-//! agent scenarios. Every line must
-//! produce the same product decision on both surfaces: normal work allows,
-//! danger blocks. A failure here means an agent host can deadlock again.
+//! The corpus exercises Grok strict off-list refuse sessions and day-to-day
+//! agent scenarios. Every line must produce the same product decision on both
+//! surfaces: normal work allows, danger blocks. A failure here means an agent
+//! host can deadlock again.
 
 const std = @import("std");
 

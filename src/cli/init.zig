@@ -415,11 +415,11 @@ test "init rejects invalid preset names clearly" {
 // AINA P3 S5 — init path discovery refresh (DIS-1 / DIS-7)
 // `ryk init` runs adapters for detected hosts and refreshes managed file.
 //
-// refreshManagedDiscovery is re-exported from policy/network_discovered (shared
-// with start — start imports init, not the reverse). After policy write, call
-// refresh for known adapter keys (pi/opencode minimum) using parent HOME + abs
-// workspace_root. Soft-skip when no auth configs. Never wipe user policy
-// allows on rediscovery.
+// refreshManagedDiscovery is re-exported from policy/network_discovered (both
+// init and start re-export the same function; neither imports the other). After
+// policy write, call refresh for known adapter keys (pi/opencode minimum) using
+// parent HOME + abs workspace_root. Soft-skip when no auth configs. Never wipe
+// user policy allows on rediscovery.
 // ---------------------------------------------------------------------------
 
 const p3_init_pi_auth_json =

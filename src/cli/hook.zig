@@ -5892,11 +5892,9 @@ fn testJsonStringFieldRaw(haystack: []const u8, key: []const u8) ?[]const u8 {
 // Codex and Grok are documented exceptions on *channel*, not on shape. They have
 // no separate operator surface the model can read (exit-2 hosts), so both fold a
 // fixed placeholder recourse into that one string by design — the Codex guard
-// sentinel and `grok_deny_reason`'s footer. The code is truth here: the handoff
-// says "no Recourse in message", which holds for every host that does have a
-// second channel. For the exit-2 pair the enforced rule is narrower and still
-// meaningful: recourse may appear only in placeholder form (`<code>`), never as a
-// redeemable code, and never as a multi-line wall.
+// sentinel and `grok_deny_reason`'s footer. For the exit-2 pair the enforced
+// rule is narrower and still meaningful: recourse may appear only in placeholder
+// form (`<code>`), never as a redeemable code, and never as a multi-line wall.
 test "hook short block message parity across all hosts" {
     var xdg = try sOnceCliHookIsolateXdg();
     defer xdg.deinit();

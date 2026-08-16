@@ -1,6 +1,5 @@
 //! Read-only inference host discovery adapters (AINA P3 S2 — pi + opencode).
 //!
-//! Read-only inference host discovery adapters for pi and opencode (AINA P3).
 //! SoT: A-P3-1…A-P3-4, DIS-2/4, SEC-3/7.
 //!
 //! Public seam: `discoverForHost(io, allocator, host_key, home) → ![]const []const u8`
