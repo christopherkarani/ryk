@@ -33,30 +33,30 @@ pub fn marketplaceHostInstallSpec(
     target: MarketplaceHost,
     marketplace_json: []const u8,
 ) !MarketplaceHostInstall {
-    switch (target) {
-        .codex => {
+    return switch (target) {
+        .codex => blk: {
             const plugin_dest = try std.fs.path.join(allocator, &.{ workspace_root, ".agents", "plugins", "ryk" });
             errdefer allocator.free(plugin_dest);
             const marketplace_path = try std.fs.path.join(allocator, &.{ workspace_root, ".agents", "plugins", "marketplace.json" });
-            return .{
+            break :blk .{
                 .host_label = "Codex",
                 .plugin_dest = plugin_dest,
                 .marketplace_path = marketplace_path,
                 .marketplace_json = marketplace_json,
             };
         },
-        .claude => {
+        .claude => blk: {
             const plugin_dest = try std.fs.path.join(allocator, &.{ workspace_root, ".claude", "plugins", "ryk" });
             errdefer allocator.free(plugin_dest);
             const marketplace_path = try std.fs.path.join(allocator, &.{ workspace_root, ".claude-plugin", "marketplace.json" });
-            return .{
+            break :blk .{
                 .host_label = "Claude Code",
                 .plugin_dest = plugin_dest,
                 .marketplace_path = marketplace_path,
                 .marketplace_json = marketplace_json,
             };
         },
-    }
+    };
 }
 
 pub fn loadMarketplaceTemplate(

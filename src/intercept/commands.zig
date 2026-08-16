@@ -209,8 +209,9 @@ pub fn evaluate(
     // protected workspace write roots. Shell commands do not carry a typed
     // file-write action, so enforce the same control-directory boundary here.
     if (protectedCommandWritePath(argv)) |path| {
+        const next = try protectedCommandWriteEvaluation(allocator, effective_mode, path);
         evaluation.deinit(allocator);
-        evaluation = try protectedCommandWriteEvaluation(allocator, effective_mode, path);
+        evaluation = next;
     }
 
     const classification = classifyArgv(argv);
@@ -606,7 +607,6 @@ fn isAbsoluteOrExplicitPath(command_name: []const u8) bool {
 
 fn resolveCandidateInDir(io: std.Io, allocator: std.mem.Allocator, dir: []const u8, command_name: []const u8, shim_dir: []const u8) !?[]u8 {
     const direct = try std.fs.path.join(allocator, &.{ dir, command_name });
-    errdefer allocator.free(direct);
     if (isExecutable(io, direct) and !isWithinDir(direct, shim_dir)) return direct;
     allocator.free(direct);
 
@@ -616,7 +616,6 @@ fn resolveCandidateInDir(io: std.Io, allocator: std.mem.Allocator, dir: []const 
         const candidate_name = try std.fmt.allocPrint(allocator, "{s}{s}", .{ command_name, extension });
         defer allocator.free(candidate_name);
         const candidate = try std.fs.path.join(allocator, &.{ dir, candidate_name });
-        errdefer allocator.free(candidate);
         if (isExecutable(io, candidate) and !isWithinDir(candidate, shim_dir)) return candidate;
         allocator.free(candidate);
     }
@@ -1236,15 +1235,25 @@ fn tokenizeShellLike(allocator: std.mem.Allocator, command_text: []const u8) !To
         }
         if (std.ascii.isWhitespace(char) or char == '|' or char == ';') {
             if (current.items.len > 0) {
-                try tokens.append(allocator, try current.toOwnedSlice(allocator));
+                const tok = try current.toOwnedSlice(allocator);
+                errdefer allocator.free(tok);
+                try tokens.append(allocator, tok);
                 current = .empty;
             }
-            if (char == '|') try tokens.append(allocator, try allocator.dupe(u8, "|"));
+            if (char == '|') {
+                const pipe = try allocator.dupe(u8, "|");
+                errdefer allocator.free(pipe);
+                try tokens.append(allocator, pipe);
+            }
             continue;
         }
         try current.append(allocator, char);
     }
-    if (current.items.len > 0) try tokens.append(allocator, try current.toOwnedSlice(allocator));
+    if (current.items.len > 0) {
+        const tok = try current.toOwnedSlice(allocator);
+        errdefer allocator.free(tok);
+        try tokens.append(allocator, tok);
+    }
     return .{ .allocator = allocator, .items = try tokens.toOwnedSlice(allocator) };
 }
 
@@ -1663,4 +1672,51 @@ test "approval hashes are bounded and consumable without raw command persistence
 
     try consumeOnceApproval(std.testing.allocator, &env_map, command);
     try std.testing.expect(!approvalEnvMatches(&env_map, command));
+}
+
+test "tokenizeShellLike OOM ownership does not leak tokens" {
+    const text = "echo hello | cat | wc";
+    var saw_oom = false;
+    var saw_success = false;
+    var fail_index: usize = 0;
+    while (fail_index < 32) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        var tokens = tokenizeShellLike(failing.allocator(), text) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            saw_oom = true;
+            continue;
+        };
+        tokens.deinit();
+        saw_success = true;
+        break;
+    }
+    try std.testing.expect(saw_oom);
+    try std.testing.expect(saw_success);
+}
+
+test "evaluate protected-path replacement OOM does not double-free" {
+    var selected = try policy.load.parseFromSlice(std.testing.allocator,
+        \\version: 1
+        \\mode: ask
+        \\commands:
+        \\  default: allow
+    , "allow-all.yaml");
+    defer selected.deinit();
+
+    var saw_oom = false;
+    var saw_success = false;
+    var fail_index: usize = 0;
+    while (fail_index < 128) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        var decision = evaluate(failing.allocator(), &selected, .ask, &.{ "mkdir", ".ryk/x" }) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            saw_oom = true;
+            continue;
+        };
+        decision.deinit(failing.allocator());
+        saw_success = true;
+        break;
+    }
+    try std.testing.expect(saw_oom);
+    try std.testing.expect(saw_success);
 }
