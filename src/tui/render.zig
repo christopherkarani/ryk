@@ -707,7 +707,7 @@ fn countSeq(haystack: []const u8, needle: []const u8) usize {
 }
 
 test "stepLine: live active step is bracketed by exactly one sync pair" {
-    // Phase 7 Task B: the active step renders an inline spinner frame, atomically
+    // The active step renders an inline spinner frame, atomically
     // bracketed by exactly one synchronized-output pair (rich + motion on).
     theme.setTestActive(.{ .capability = .c256, .background = .dark });
     theme.setTestReducedMotion(false);
@@ -728,7 +728,7 @@ test "stepLine: live active step is bracketed by exactly one sync pair" {
 }
 
 test "stepLine: reduced-motion active step emits no sync controls" {
-    // Phase 7 Task B/F: under reduced-motion the active step renders a static
+    // Under reduced-motion the active step renders a static
     // glyph with NO synchronized-output controls, while colour is retained.
     theme.setTestActive(.{ .capability = .c256, .background = .dark });
     theme.setTestReducedMotion(true);
@@ -787,7 +787,7 @@ test "stepList and timeline render stable plain output" {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// Phase 7 Task C: light/dark background variants consumed by render primitives
+// Light/dark background variants consumed by render primitives
 // (mirrors theme.zig's "light variant differs from dark" contract). Confirms no
 // substantial primitive hardcodes `.dark` — all resolve tokens via theme.active().
 // ────────────────────────────────────────────────────────────────────────────

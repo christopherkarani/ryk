@@ -11,6 +11,7 @@ const onboarding = @import("onboarding.zig");
 const ensure = @import("ensure.zig");
 const pack_state = @import("pack_state.zig");
 const plugin = @import("plugin.zig");
+const host_ask_resume = @import("host_ask_resume.zig");
 const shell_eval = @import("shell_eval.zig");
 const build_options = @import("build_options");
 const env_util = @import("../env_util.zig");
@@ -588,9 +589,9 @@ fn writeSuccessEndCard(
     } else if (verification) |outcome| {
         if (outcome.host_evidence == .not_applicable and selected_hosts.len == 0) {
             const body = if (policy_created)
-                "Policy written. Verify passed."
+                "Policy written. Policy check passed."
             else
-                "Policy unchanged. Verify passed.";
+                "Policy unchanged. Policy check passed.";
             try tui.render.callout(io, stdout, .success, "Setup complete", body);
         } else if (outcome.host_evidence == .not_applicable) {
             const body = if (policy_created)
@@ -618,7 +619,7 @@ fn writeSuccessEndCard(
         else if (v.host_evidence == .native)
             "passed"
         else if (v.host_evidence == .not_applicable)
-            if (selected_hosts.len == 0) "passed" else "deferred"
+            if (selected_hosts.len == 0) "policy check" else "deferred"
         else
             v.host_evidence.label()
     else
@@ -687,6 +688,12 @@ fn writeSuccessEndCard(
             try stdout.writeAll(line);
             try stdout.writeAll("\n");
         }
+        try stdout.writeAll("\n");
+    }
+
+    if (try host_ask_resume.formatWarn(allocator, selected_hosts)) |ask_warn| {
+        defer allocator.free(ask_warn);
+        try tui.render.callout(io, stdout, .warn, "Ask resume", ask_warn);
         try stdout.writeAll("\n");
     }
 
@@ -901,10 +908,11 @@ test "start first-run create copy names what happened without leftover jargon" {
     const output = stdout_writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, output, "Creating .ryk/policy.yaml") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Policy created.") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "Policy written. Verify passed.") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "Verify       passed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Policy written. Policy check passed.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Verify       policy check") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Setup complete") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Next: ryk doctor") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Verify passed") == null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Existing policy files are kept") == null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Existing policy is preserved") == null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Existing policy preserved.") == null);
@@ -1092,7 +1100,7 @@ test "start verified firewall-only completion states mediated-session scope" {
     try std.testing.expect(std.mem.indexOf(u8, flat, "now protected") == null);
 }
 
-test "start OpenClaw completion is explicit about wrapper-required evidence" {
+test "host_ask_resume start OpenClaw completion warns about no ask resume" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
@@ -1134,6 +1142,9 @@ test "start OpenClaw completion is explicit about wrapper-required evidence" {
     try std.testing.expect(std.mem.indexOf(u8, written, "Verify passed") == null);
     try std.testing.expect(std.mem.indexOf(u8, written, "Setup complete") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "ryk run -- openclaw") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "Ask resume") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "hard-blocks ask with no resume") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "host-decision-mapping.md") != null);
 }
 
 test "start leave-alone empty-host card says policy unchanged after verify" {
@@ -1171,8 +1182,9 @@ test "start leave-alone empty-host card says policy unchanged after verify" {
     );
 
     const written = output.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, written, "Policy unchanged. Verify passed.") != null);
-    try std.testing.expect(std.mem.indexOf(u8, written, "Verify       passed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "Policy unchanged. Policy check passed.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "Verify       policy check") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "Verify passed") == null);
     try std.testing.expect(std.mem.indexOf(u8, written, "activation evidence pending") == null);
     try std.testing.expect(std.mem.indexOf(u8, written, "not applicable") == null);
 }
@@ -1569,9 +1581,7 @@ test "start auto default path has no protection grade menu jargon in stdout" {
     try std.testing.expect(std.mem.indexOf(u8, output, "Setup path: strict") != null);
 }
 
-// ---------------------------------------------------------------------------
 // AINA P3 S5 — start/init discovery refresh (DIS-1 / DIS-7 / A-P3-2 / A-P3-3)
-// Spec: planning/2026-08-02-agent-inference-network-allow-spec.md
 
 // AINA P3 discovery refresh is covered thoroughly in init.zig and
 // policy/network_discovered.zig. start re-exports the shared seam only.

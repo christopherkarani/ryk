@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const brand = @import("brand.zig");
 
 /// Official Grok Build (xai-org/grok-build) discovers global hooks from
 /// `$GROK_HOME/hooks/*.json` (default `~/.grok/hooks/`). This managed file is
@@ -257,6 +258,7 @@ pub fn installAtHome(
     ryk_binary: []const u8,
 ) !InstallResult {
     if (!std.fs.path.isAbsolute(home)) return error.InvalidHomePath;
+    if (!brand.isPrimaryInvocation(std.fs.path.basename(ryk_binary))) return error.InvalidRykBinary;
     try ensureSafeGrokDirectory(io, allocator, home);
     try ensureSafeHooksDirectory(io, allocator, home);
 
@@ -622,7 +624,7 @@ fn entryContainsAnyRykHook(entry: std.json.Value) bool {
 /// Matches:
 /// - legacy product `…/ryk hook grok PreToolUse`
 /// - staged test harness binaries (`…/test hook grok PreToolUse`)
-/// - the missing-binary wrapper (`sh -c '… exec "$1" hook grok PreToolUse …' -- <ryk>`)
+/// - the missing-binary wrapper (`/bin/sh -c '… exec "$1" hook grok PreToolUse …' -- <ryk>`)
 pub fn isRykGrokHookCommand(command: []const u8) bool {
     const trimmed = std.mem.trim(u8, command, " \t\r\n");
     if (isLegacyDirectRykGrokHook(trimmed)) return true;
@@ -630,10 +632,11 @@ pub fn isRykGrokHookCommand(command: []const u8) bool {
 }
 
 fn isLegacyDirectRykGrokHook(trimmed: []const u8) bool {
-    const suffix = " hook grok PreToolUse";
-    if (!std.mem.endsWith(u8, trimmed, suffix)) return false;
-    const executable = std.mem.trim(u8, trimmed[0 .. trimmed.len - suffix.len], " \t\r\n'");
-    if (executable.len == 0) return false;
+    const executable = hookExecutableFromDirectCommand(trimmed) orelse return false;
+    return isRecognizedRykHookExecutable(executable);
+}
+
+fn isRecognizedRykHookExecutable(executable: []const u8) bool {
     const base = std.fs.path.basename(executable);
     if (std.mem.eql(u8, base, "ryk")) return true;
     // Zig unit-test binaries that embed the same PreToolUse entrypoint.
@@ -647,6 +650,77 @@ fn isWrappedRykGrokHook(trimmed: []const u8) bool {
     if (std.mem.indexOf(u8, trimmed, "ryk binary unavailable") == null) return false;
     if (std.mem.indexOf(u8, trimmed, "exit 2") == null) return false;
     return true;
+}
+
+/// Baked ryk path from a Grok hook command. Accepts the legacy
+/// `<exe> hook grok PreToolUse` form and the missing-binary wrapper
+/// (`/bin/sh -c '…' -- <exe>`).
+pub fn hookExecutableFromCommand(command: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, command, " \t\r\n");
+    if (hookExecutableFromDirectCommand(trimmed)) |exe| return exe;
+    return hookExecutableFromWrappedCommand(trimmed);
+}
+
+fn hookExecutableFromDirectCommand(trimmed: []const u8) ?[]const u8 {
+    const suffix = " hook grok PreToolUse";
+    if (!std.mem.endsWith(u8, trimmed, suffix)) return null;
+    var executable = std.mem.trim(u8, trimmed[0 .. trimmed.len - suffix.len], " \t\r\n");
+    if (executable.len >= 2 and executable[0] == '\'' and executable[executable.len - 1] == '\'') {
+        executable = executable[1 .. executable.len - 1];
+    }
+    if (executable.len == 0) return null;
+    return executable;
+}
+
+fn hookExecutableFromWrappedCommand(trimmed: []const u8) ?[]const u8 {
+    if (!isWrappedRykGrokHook(trimmed)) return null;
+    const pin = " -- ";
+    const idx = std.mem.lastIndexOf(u8, trimmed, pin) orelse return null;
+    var executable = std.mem.trim(u8, trimmed[idx + pin.len ..], " \t\r\n");
+    if (executable.len >= 2 and executable[0] == '\'' and executable[executable.len - 1] == '\'') {
+        executable = executable[1 .. executable.len - 1];
+    }
+    if (executable.len == 0) return null;
+    return executable;
+}
+
+/// Read the baked ryk path from `$HOME/.grok/hooks/ryk.json`. Caller owns the slice.
+pub fn readBakedRykBinaryAtHome(io: std.Io, allocator: std.mem.Allocator, home: []const u8) ?[]u8 {
+    if (!std.fs.path.isAbsolute(home)) return null;
+    const path = std.fs.path.join(allocator, &.{ home, managed_hook_relative_path }) catch return null;
+    defer allocator.free(path);
+    const bytes = std.Io.Dir.cwd().readFileAlloc(
+        io,
+        path,
+        allocator,
+        .limited(max_hook_file_size),
+    ) catch return null;
+    defer allocator.free(bytes);
+    return parseBakedRykBinaryFromHookDocument(allocator, bytes);
+}
+
+pub fn parseBakedRykBinaryFromHookDocument(allocator: std.mem.Allocator, bytes: []const u8) ?[]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const hooks = parsed.value.object.get("hooks") orelse return null;
+    if (hooks != .object) return null;
+    const pre_tool_use = hooks.object.get("PreToolUse") orelse return null;
+    if (pre_tool_use != .array) return null;
+    for (pre_tool_use.array.items) |entry| {
+        if (entry != .object) continue;
+        const entry_hooks = entry.object.get("hooks") orelse continue;
+        if (entry_hooks != .array) continue;
+        for (entry_hooks.array.items) |hook| {
+            if (hook != .object) continue;
+            const command = hook.object.get("command") orelse continue;
+            if (command != .string) continue;
+            if (hookExecutableFromCommand(command.string)) |exe| {
+                return allocator.dupe(u8, exe) catch return null;
+            }
+        }
+    }
+    return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -819,6 +893,20 @@ test "Grok installed check requires managed hooks/ryk.json not legacy user-setti
     try std.testing.expect(std.mem.indexOf(u8, written, "/opt/ryk/bin/ryk") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "hook grok PreToolUse") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "ryk binary unavailable") != null);
+}
+
+test "Grok install rejects zig-cache test binary as ryk" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(home);
+    try std.testing.expectError(error.InvalidRykBinary, installAtHome(
+        std.testing.io,
+        std.testing.allocator,
+        home,
+        "/private/tmp/ryk-factory/.zig-cache/o/deadbeef/test",
+    ));
+    try std.testing.expect(!installedAtHome(std.testing.io, std.testing.allocator, home));
 }
 
 test "Grok CLI help evidence accepts official Grok Build and community CLI" {
@@ -1039,4 +1127,32 @@ test "Grok hook command fail-closes when ryk is missing" {
     }
     try std.testing.expect(std.mem.indexOf(u8, result.stdout, "\"decision\":\"deny\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.stdout, "ryk binary unavailable") != null);
+}
+
+test "Grok hookExecutableFromCommand strips quotes and keeps zig-cache test path" {
+    try std.testing.expectEqualStrings(
+        "/opt/ryk/bin/ryk",
+        hookExecutableFromCommand("/opt/ryk/bin/ryk hook grok PreToolUse").?,
+    );
+    try std.testing.expectEqualStrings(
+        "/repo/ryk/.zig-cache/o/abc/test",
+        hookExecutableFromCommand("/repo/ryk/.zig-cache/o/abc/test hook grok PreToolUse").?,
+    );
+    try std.testing.expectEqualStrings(
+        "/tmp/with spaces/ryk",
+        hookExecutableFromCommand("'/tmp/with spaces/ryk' hook grok PreToolUse").?,
+    );
+    const wrapped = try hookCommandAlloc(std.testing.allocator, "/opt/ryk/bin/ryk");
+    defer std.testing.allocator.free(wrapped);
+    try std.testing.expectEqualStrings("/opt/ryk/bin/ryk", hookExecutableFromCommand(wrapped).?);
+}
+
+test "Grok parseBakedRykBinaryFromHookDocument reads a test-harness bake" {
+    const allocator = std.testing.allocator;
+    const doc =
+        \\{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"/private/tmp/ryk-factory/.zig-cache/o/deadbeef/test hook grok PreToolUse","timeout":30}]}]}}
+    ;
+    const baked = parseBakedRykBinaryFromHookDocument(allocator, doc) orelse return error.TestUnexpectedResult;
+    defer allocator.free(baked);
+    try std.testing.expectEqualStrings("/private/tmp/ryk-factory/.zig-cache/o/deadbeef/test", baked);
 }

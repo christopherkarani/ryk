@@ -1,6 +1,5 @@
 /**
  * File IPC for parent-forward policy ask + session tool grants.
- * See planning/handoffs/subagent-ask-mcp/ADR-ipc.md.
  */
 import {
 	existsSync,

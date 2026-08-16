@@ -1,7 +1,7 @@
 /// libvaxis-backed interactive widgets: `select` (single choice) and
 /// `multiSelect` (checkbox list).
 ///
-/// Architecture (plan §3.1 hybrid — see planning/handoffs/cli-ux-phase3-to-phase4.md):
+/// Architecture:
 /// - `selectCore` / `multiSelectCore` are **stream-injected and fully unit-testable**.
 ///   They render the list with a `›` focus cursor (+ descriptions / `[x]`/`[ ]`
 ///   checkboxes) via the existing `tui.render`/`theme` layer (inline, pipe-friendly)
@@ -16,8 +16,7 @@
 /// buffers (matching the `interactive.zig` / `approvals.zig` test style) while
 /// libvaxis owns raw-mode TTY I/O + key parsing on real terminals. Colour paths
 /// are unverifiable under `builtin.is_test` (`theme.active()` returns `.none`);
-/// the TTY/libvaxis path is verified manually via subprocess, per the established
-/// Phase 0–2 discipline.
+/// the TTY/libvaxis path is verified manually via subprocess tests.
 const std = @import("std");
 const builtin = @import("builtin");
 const theme = @import("theme.zig");

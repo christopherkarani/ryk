@@ -1127,6 +1127,39 @@ test "grok host-config file grant covers auth.json without docs lock logs or key
     try std.testing.expect(compiled.has_host_config_rw);
 }
 
+// Issue #221: lock is the same file-only class as config.toml/auth.json, but
+// grok opens it O_RDWR|O_CREAT. Compile as host-config RW without a control
+// root / write-deny so create/RDWR is allowed. Still no docs/logs/models_cache
+// / Keychain / bare home / parent ~/.grok content grant.
+test "grok host-config file grant covers active_sessions.lock as create/RDWR without docs logs models_cache or keychain" {
+    const allocator = std.testing.allocator;
+    const home = "/Users/dev";
+    const ws = "/tmp/ryk-grok-repro";
+    const grok_lock = "/Users/dev/.grok/active_sessions.lock";
+    var compiled = try compileProfile(allocator, .{
+        .workspace_root = ws,
+        .system_ro_prefixes = &[_][]const u8{ "/usr", "/bin" },
+        .host_rw_paths = &.{grok_lock},
+    });
+    defer compiled.deinit();
+
+    try std.testing.expect(compiled.hasGrant(grok_lock, .rw));
+    try std.testing.expect(compiled.isGrantedReadable(grok_lock));
+    try std.testing.expect(!compiled.isControlPath(grok_lock));
+    try std.testing.expect(compiled.isAgentWritable(grok_lock));
+    try std.testing.expect(!compiled.hasGrant("/Users/dev/.grok", .rw));
+    try std.testing.expect(!compiled.isGrantedReadable("/Users/dev/.grok/docs"));
+    try std.testing.expect(!compiled.isGrantedReadable("/Users/dev/.grok/docs/user-guide.md"));
+    try std.testing.expect(!compiled.isGrantedReadable("/Users/dev/.grok/logs/unified.jsonl"));
+    try std.testing.expect(!compiled.isGrantedReadable("/Users/dev/.grok/models_cache.json.tmp"));
+    try std.testing.expect(!compiled.isGrantedReadable("/Users/dev/.grok/worktrees/evil"));
+    try std.testing.expect(!compiled.isGrantedReadable("/Users/dev/.grok/bin/grok"));
+    try std.testing.expect(!compiled.isGrantedReadable("/dev/tty"));
+    try std.testing.expect(!compiled.grantsHome(home));
+    try std.testing.expect(!compiled.isGrantedReadable("/Users/dev/Library/Keychains/login.keychain-db"));
+    try std.testing.expect(compiled.has_host_config_rw);
+}
+
 test "host config host_rw_paths compile as RW without HOME or ssh" {
     const allocator = std.testing.allocator;
     const home = "/Users/dev";

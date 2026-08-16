@@ -196,6 +196,10 @@ fn loadBoundedSessions(
     if (max_count == 0) return loaded;
 
     var health: SessionLoadHealth = .healthy;
+    var index_by_session: SessionLookupMap = .init(allocator);
+    defer index_by_session.deinit();
+    try index_by_session.ensureTotalCapacity(retainCapacity(max_count));
+    var oldest_index: usize = 0;
     for (workspaces) |workspace| {
         const sessions_root = try std.fs.path.join(allocator, &.{ workspace.root, ".ryk", "sessions" });
         defer allocator.free(sessions_root);
@@ -215,19 +219,22 @@ fn loadBoundedSessions(
             } orelse break;
             if (entry.kind != .directory) continue;
             if (core.session.validateSessionIdText(entry.name)) |_| {} else |_| continue;
+            if (index_by_session.contains(sessionLookupKey(workspace.root, entry.name))) continue;
             var session = try dupeSessionRef(allocator, workspace.root, entry.name, entry.name, null, null, 0, false);
-            try retainNewestSession(allocator, &loaded.sessions, &session, max_count);
+            try retainNewestSession(allocator, &loaded.sessions, &session, max_count, &oldest_index, &index_by_session);
         }
     }
     for (feed) |item| {
         const session_id = item.record.session_id orelse continue;
         if (core.session.validateSessionIdText(session_id)) |_| {} else |_| continue;
-        if (findSession(loaded.sessions.items, item.record.workspace_root, session_id)) |index| {
+        const key = sessionLookupKey(item.record.workspace_root, session_id);
+        if (index_by_session.get(key)) |index| {
             const session = &loaded.sessions.items[index];
             if (std.mem.order(u8, item.record.timestamp, session.timestamp) == .gt) {
                 const timestamp = try allocator.dupe(u8, item.record.timestamp);
                 allocator.free(session.timestamp);
                 session.timestamp = timestamp;
+                if (index == oldest_index) oldest_index = findOldestSessionIndex(loaded.sessions.items);
             }
             continue;
         }
@@ -246,16 +253,63 @@ fn loadBoundedSessions(
             0,
             !filesystem_backed,
         );
-        try retainNewestSession(allocator, &loaded.sessions, &session, max_count);
+        try retainNewestSession(allocator, &loaded.sessions, &session, max_count, &oldest_index, &index_by_session);
     }
     try enrichRetainedSessionsFromFeed(allocator, loaded.sessions.items, feed);
     loaded.health = health;
     return loaded;
 }
 
+const SessionLookupKey = struct {
+    workspace_root: []const u8,
+    session_id: []const u8,
+
+    fn eql(a: SessionLookupKey, b: SessionLookupKey) bool {
+        return std.mem.eql(u8, a.workspace_root, b.workspace_root) and std.mem.eql(u8, a.session_id, b.session_id);
+    }
+
+    fn hash(self: SessionLookupKey) u64 {
+        var hasher = std.hash.Wyhash.init(0);
+        hasher.update(self.workspace_root);
+        hasher.update(&.{0});
+        hasher.update(self.session_id);
+        return hasher.final();
+    }
+};
+
+const SessionLookupContext = struct {
+    pub fn hash(_: SessionLookupContext, key: SessionLookupKey) u64 {
+        return key.hash();
+    }
+    pub fn eql(_: SessionLookupContext, a: SessionLookupKey, b: SessionLookupKey) bool {
+        return SessionLookupKey.eql(a, b);
+    }
+};
+
+const SessionLookupMap = std.HashMap(SessionLookupKey, usize, SessionLookupContext, std.hash_map.default_max_load_percentage);
+
+fn sessionLookupKey(workspace_root: []const u8, session_id: []const u8) SessionLookupKey {
+    return .{ .workspace_root = workspace_root, .session_id = session_id };
+}
+
+fn retainCapacity(max_count: usize) SessionLookupMap.Size {
+    return @intCast(max_count);
+}
+
+fn rememberSessionIndex(map: *SessionLookupMap, session: SessionRef, index: usize) void {
+    const gop = map.getOrPutAssumeCapacity(sessionLookupKey(session.workspace_root, session.id));
+    if (!gop.found_existing) gop.value_ptr.* = index;
+}
+
 /// Selection stays bounded to the requested top-K. Once that set is known, rebuild
 /// its feed metadata from the complete bounded feed tail so eviction and re-entry
 /// cannot discard earlier decisions for a retained session.
+///
+/// Single-pass over the feed via session index map (O(F+K)), preserving:
+/// - last-timestamp-wins host + latest_decision (first-seen on equal timestamps)
+/// - denied_count over ALL matching blocked records for the retained session
+/// Duplicate (workspace, session) rows keep the first index so wipe+index cannot
+/// leave an earlier card at denied_count=0.
 fn enrichRetainedSessionsFromFeed(
     allocator: std.mem.Allocator,
     sessions: []SessionRef,
@@ -267,36 +321,61 @@ fn enrichRetainedSessionsFromFeed(
         session.host = null;
         session.latest_decision = null;
         session.denied_count = 0;
+    }
+    if (sessions.len == 0 or feed.len == 0) return;
 
-        var latest_feed_timestamp: ?[]const u8 = null;
-        for (feed) |item| {
-            const session_id = item.record.session_id orelse continue;
-            if (!std.mem.eql(u8, session.workspace_root, item.record.workspace_root) or
-                !std.mem.eql(u8, session.id, session_id)) continue;
+    var index_by_session: SessionLookupMap = .init(allocator);
+    defer index_by_session.deinit();
+    try index_by_session.ensureTotalCapacity(retainCapacity(sessions.len));
+    for (sessions, 0..) |session, index| {
+        rememberSessionIndex(&index_by_session, session, index);
+    }
 
-            if (rust_visibility.isBlockedFeedRecord(item.record)) session.denied_count += 1;
-            if (latest_feed_timestamp) |timestamp| {
-                if (std.mem.order(u8, item.record.timestamp, timestamp) != .gt) continue;
-            }
+    var winning_feed_index = try allocator.alloc(?usize, sessions.len);
+    defer allocator.free(winning_feed_index);
+    @memset(winning_feed_index, null);
 
-            const host = if (item.record.host) |value| try allocator.dupe(u8, value) else null;
-            errdefer if (host) |value| allocator.free(value);
-            const decision = try allocator.dupe(u8, item.record.decision);
-            errdefer allocator.free(decision);
-            if (session.host) |value| allocator.free(value);
-            if (session.latest_decision) |value| allocator.free(value);
-            session.host = host;
-            session.latest_decision = decision;
-            latest_feed_timestamp = item.record.timestamp;
+    for (feed, 0..) |item, feed_index| {
+        const session_id = item.record.session_id orelse continue;
+        const index = index_by_session.get(sessionLookupKey(item.record.workspace_root, session_id)) orelse continue;
+        if (rust_visibility.isBlockedFeedRecord(item.record)) sessions[index].denied_count += 1;
+        if (winning_feed_index[index]) |current| {
+            if (std.mem.order(u8, item.record.timestamp, feed[current].record.timestamp) != .gt) continue;
         }
+        winning_feed_index[index] = feed_index;
+    }
+
+    for (sessions, 0..) |*session, index| {
+        const feed_index = winning_feed_index[index] orelse continue;
+        const record = feed[feed_index].record;
+        const host = if (record.host) |value| try allocator.dupe(u8, value) else null;
+        errdefer if (host) |value| allocator.free(value);
+        const decision = try allocator.dupe(u8, record.decision);
+        errdefer allocator.free(decision);
+        session.host = host;
+        session.latest_decision = decision;
     }
 }
 
+fn findOldestSessionIndex(sessions: []const SessionRef) usize {
+    std.debug.assert(sessions.len > 0);
+    var oldest_index: usize = 0;
+    for (sessions[1..], 1..) |session, index| {
+        if (std.mem.order(u8, session.timestamp, sessions[oldest_index].timestamp) == .lt) oldest_index = index;
+    }
+    return oldest_index;
+}
+
+/// Keep up to max_count newest sessions by timestamp string order.
+/// At capacity, compare against a cached oldest index (rejects are O(1));
+/// only a successful replacement rescans K.
 fn retainNewestSession(
     allocator: std.mem.Allocator,
     sessions: *std.ArrayList(SessionRef),
     candidate: *SessionRef,
     max_count: usize,
+    oldest_index: *usize,
+    index_by_session: ?*SessionLookupMap,
 ) !void {
     if (max_count == 0) {
         candidate.deinit(allocator);
@@ -308,20 +387,28 @@ fn retainNewestSession(
             return err;
         };
         candidate.* = undefined;
+        const new_index = sessions.items.len - 1;
+        if (new_index == 0 or std.mem.order(u8, sessions.items[new_index].timestamp, sessions.items[oldest_index.*].timestamp) == .lt) {
+            oldest_index.* = new_index;
+        }
+        if (index_by_session) |map| rememberSessionIndex(map, sessions.items[new_index], new_index);
         return;
     }
 
-    var oldest_index: usize = 0;
-    for (sessions.items[1..], 1..) |session, index| {
-        if (std.mem.order(u8, session.timestamp, sessions.items[oldest_index].timestamp) == .lt) oldest_index = index;
-    }
-    if (std.mem.order(u8, candidate.timestamp, sessions.items[oldest_index].timestamp) != .gt) {
+    const oldest = oldest_index.*;
+    if (std.mem.order(u8, candidate.timestamp, sessions.items[oldest].timestamp) != .gt) {
         candidate.deinit(allocator);
         return;
     }
-    sessions.items[oldest_index].deinit(allocator);
-    sessions.items[oldest_index] = candidate.*;
+    if (index_by_session) |map| {
+        const evicted = sessions.items[oldest];
+        _ = map.remove(sessionLookupKey(evicted.workspace_root, evicted.id));
+    }
+    sessions.items[oldest].deinit(allocator);
+    sessions.items[oldest] = candidate.*;
     candidate.* = undefined;
+    if (index_by_session) |map| rememberSessionIndex(map, sessions.items[oldest], oldest);
+    oldest_index.* = findOldestSessionIndex(sessions.items);
 }
 
 fn sessionDirectoryExists(io: std.Io, allocator: std.mem.Allocator, workspace_root: []const u8, session_id: []const u8) !bool {
@@ -810,6 +897,313 @@ test "denied-only global feed honors max count" {
     defer output.deinit();
     try writeGlobalFeedJson(std.testing.io, std.testing.allocator, &output.writer, dashboard_root, 2, true);
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, output.writer.buffered(), "\"timestamp\":"));
+}
+
+test "single-pass enrich counts earlier denies and keeps latest host decision" {
+    // Feed order is not timestamp order: older denies after a newer allow must still
+    // count denied_count while last-timestamp-wins host/decision stays on the allow.
+    const root = "/tmp/ryk-agg-enrich-test-ws";
+    var sessions: std.ArrayList(SessionRef) = .empty;
+    defer {
+        for (sessions.items) |*session| session.deinit(std.testing.allocator);
+        sessions.deinit(std.testing.allocator);
+    }
+    var session = try dupeSessionRef(std.testing.allocator, root, "A", "A", null, null, 0, true);
+    try sessions.append(std.testing.allocator, session);
+    session = undefined;
+
+    // Borrowed string literals — LoadedFeedRecord.deinit is not called.
+    const loaded_feed = [_]feed_writer.LoadedFeedRecord{
+        .{
+            .raw = "",
+            .record = .{
+                .timestamp = "2026-07-13T00:03:00Z",
+                .workspace_root = root,
+                .event_type = "command_allowed",
+                .decision = "allow",
+                .decision_source = "rust-daemon",
+                .event_source = "hook",
+                .host = "opencode",
+                .daemon_status = "healthy",
+                .pack_id = null,
+                .rule = null,
+                .severity = null,
+                .reason = "allowed",
+                .remediation = null,
+                .target_summary = "shell",
+                .session_id = "A",
+                .verified = false,
+            },
+        },
+        .{
+            .raw = "",
+            .record = .{
+                .timestamp = "2026-07-13T00:00:00Z",
+                .workspace_root = root,
+                .event_type = "command_denied",
+                .decision = "deny",
+                .decision_source = "rust-daemon",
+                .event_source = "hook",
+                .host = "pi",
+                .daemon_status = "healthy",
+                .pack_id = null,
+                .rule = null,
+                .severity = null,
+                .reason = "blocked",
+                .remediation = null,
+                .target_summary = "shell",
+                .session_id = "A",
+                .verified = false,
+            },
+        },
+        .{
+            .raw = "",
+            .record = .{
+                .timestamp = "2026-07-13T00:01:00Z",
+                .workspace_root = root,
+                .event_type = "command_denied",
+                .decision = "deny",
+                .decision_source = "rust-daemon",
+                .event_source = "hook",
+                .host = "codex",
+                .daemon_status = "healthy",
+                .pack_id = null,
+                .rule = null,
+                .severity = null,
+                .reason = "blocked",
+                .remediation = null,
+                .target_summary = "shell",
+                .session_id = "A",
+                .verified = false,
+            },
+        },
+    };
+
+    try enrichRetainedSessionsFromFeed(std.testing.allocator, sessions.items, &loaded_feed);
+    try std.testing.expectEqual(@as(usize, 2), sessions.items[0].denied_count);
+    try std.testing.expectEqualStrings("opencode", sessions.items[0].host.?);
+    try std.testing.expectEqualStrings("allow", sessions.items[0].latest_decision.?);
+}
+
+test "retainNewestSession replaces only older timestamps at capacity" {
+    var sessions: std.ArrayList(SessionRef) = .empty;
+    defer {
+        for (sessions.items) |*session| session.deinit(std.testing.allocator);
+        sessions.deinit(std.testing.allocator);
+    }
+
+    var oldest_index: usize = 0;
+    var a = try dupeSessionRef(std.testing.allocator, "/ws", "s-a", "2026-07-13T00:01:00Z", null, null, 0, true);
+    try retainNewestSession(std.testing.allocator, &sessions, &a, 2, &oldest_index, null);
+    var b = try dupeSessionRef(std.testing.allocator, "/ws", "s-b", "2026-07-13T00:02:00Z", null, null, 0, true);
+    try retainNewestSession(std.testing.allocator, &sessions, &b, 2, &oldest_index, null);
+    var older = try dupeSessionRef(std.testing.allocator, "/ws", "s-old", "2026-07-13T00:00:00Z", null, null, 0, true);
+    try retainNewestSession(std.testing.allocator, &sessions, &older, 2, &oldest_index, null);
+    try std.testing.expectEqual(@as(usize, 2), sessions.items.len);
+    try std.testing.expect(findSession(sessions.items, "/ws", "s-old") == null);
+
+    var newer = try dupeSessionRef(std.testing.allocator, "/ws", "s-new", "2026-07-13T00:03:00Z", null, null, 0, true);
+    try retainNewestSession(std.testing.allocator, &sessions, &newer, 2, &oldest_index, null);
+    try std.testing.expectEqual(@as(usize, 2), sessions.items.len);
+    try std.testing.expect(findSession(sessions.items, "/ws", "s-new") != null);
+    try std.testing.expect(findSession(sessions.items, "/ws", "s-a") == null);
+    try std.testing.expect(findSession(sessions.items, "/ws", "s-b") != null);
+}
+
+fn testLoadedFeed(
+    timestamp: []const u8,
+    workspace_root: []const u8,
+    decision: []const u8,
+    host: ?[]const u8,
+    session_id: []const u8,
+) feed_writer.LoadedFeedRecord {
+    return .{
+        .raw = "",
+        .record = .{
+            .timestamp = timestamp,
+            .workspace_root = workspace_root,
+            .event_type = if (std.mem.eql(u8, decision, "allow")) "command_allowed" else "command_denied",
+            .decision = decision,
+            .decision_source = "rust-daemon",
+            .event_source = "hook",
+            .host = host,
+            .daemon_status = "healthy",
+            .pack_id = null,
+            .rule = null,
+            .severity = null,
+            .reason = "test",
+            .remediation = null,
+            .target_summary = "shell",
+            .session_id = session_id,
+            .verified = false,
+        },
+    };
+}
+
+test "single-pass enrich isolates same session id across workspaces" {
+    const ws_a = "/tmp/ryk-agg-ws-a";
+    const ws_b = "/tmp/ryk-agg-ws-b";
+    var sessions: std.ArrayList(SessionRef) = .empty;
+    defer {
+        for (sessions.items) |*session| session.deinit(std.testing.allocator);
+        sessions.deinit(std.testing.allocator);
+    }
+    var a = try dupeSessionRef(std.testing.allocator, ws_a, "shared", "shared", null, null, 0, true);
+    try sessions.append(std.testing.allocator, a);
+    a = undefined;
+    var b = try dupeSessionRef(std.testing.allocator, ws_b, "shared", "shared", null, null, 0, true);
+    try sessions.append(std.testing.allocator, b);
+    b = undefined;
+
+    const loaded_feed = [_]feed_writer.LoadedFeedRecord{
+        testLoadedFeed("2026-07-13T00:00:00Z", ws_a, "deny", "pi", "shared"),
+        testLoadedFeed("2026-07-13T00:01:00Z", ws_b, "allow", "opencode", "shared"),
+        testLoadedFeed("2026-07-13T00:02:00Z", ws_a, "ask", "codex", "shared"),
+    };
+    try enrichRetainedSessionsFromFeed(std.testing.allocator, sessions.items, &loaded_feed);
+    try std.testing.expectEqual(@as(usize, 2), sessions.items[0].denied_count);
+    try std.testing.expectEqualStrings("codex", sessions.items[0].host.?);
+    try std.testing.expectEqualStrings("ask", sessions.items[0].latest_decision.?);
+    try std.testing.expectEqual(@as(usize, 0), sessions.items[1].denied_count);
+    try std.testing.expectEqualStrings("opencode", sessions.items[1].host.?);
+    try std.testing.expectEqualStrings("allow", sessions.items[1].latest_decision.?);
+}
+
+test "single-pass enrich keeps first-seen host on equal timestamps and first duplicate row" {
+    const root = "/tmp/ryk-agg-equal-ts";
+    var sessions: std.ArrayList(SessionRef) = .empty;
+    defer {
+        for (sessions.items) |*session| session.deinit(std.testing.allocator);
+        sessions.deinit(std.testing.allocator);
+    }
+    var first = try dupeSessionRef(std.testing.allocator, root, "A", "A", null, null, 0, true);
+    try sessions.append(std.testing.allocator, first);
+    first = undefined;
+    var duplicate = try dupeSessionRef(std.testing.allocator, root, "A", "A", null, null, 0, true);
+    try sessions.append(std.testing.allocator, duplicate);
+    duplicate = undefined;
+
+    const loaded_feed = [_]feed_writer.LoadedFeedRecord{
+        testLoadedFeed("2026-07-13T00:00:00Z", root, "allow", "pi", "A"),
+        testLoadedFeed("2026-07-13T00:00:00Z", root, "allow", "opencode", "A"),
+        testLoadedFeed("2026-07-13T00:00:00Z", root, "deny", null, "A"),
+    };
+    try enrichRetainedSessionsFromFeed(std.testing.allocator, sessions.items, &loaded_feed);
+    try std.testing.expectEqual(@as(usize, 1), sessions.items[0].denied_count);
+    try std.testing.expectEqualStrings("pi", sessions.items[0].host.?);
+    try std.testing.expectEqualStrings("allow", sessions.items[0].latest_decision.?);
+    try std.testing.expectEqual(@as(usize, 0), sessions.items[1].denied_count);
+    try std.testing.expect(sessions.items[1].host == null);
+}
+
+test "cached oldest index survives timestamp bump of the previous oldest" {
+    var sessions: std.ArrayList(SessionRef) = .empty;
+    defer {
+        for (sessions.items) |*session| session.deinit(std.testing.allocator);
+        sessions.deinit(std.testing.allocator);
+    }
+    var oldest_index: usize = 0;
+    var a = try dupeSessionRef(std.testing.allocator, "/ws", "s-a", "2026-07-13T00:01:00Z", null, null, 0, true);
+    try retainNewestSession(std.testing.allocator, &sessions, &a, 2, &oldest_index, null);
+    var b = try dupeSessionRef(std.testing.allocator, "/ws", "s-b", "2026-07-13T00:05:00Z", null, null, 0, true);
+    try retainNewestSession(std.testing.allocator, &sessions, &b, 2, &oldest_index, null);
+    try std.testing.expectEqual(@as(usize, 0), oldest_index);
+
+    const bumped = try std.testing.allocator.dupe(u8, "2026-07-13T00:06:00Z");
+    std.testing.allocator.free(sessions.items[oldest_index].timestamp);
+    sessions.items[oldest_index].timestamp = bumped;
+    oldest_index = findOldestSessionIndex(sessions.items);
+    try std.testing.expectEqualStrings("s-b", sessions.items[oldest_index].id);
+
+    var mid = try dupeSessionRef(std.testing.allocator, "/ws", "s-mid", "2026-07-13T00:05:30Z", null, null, 0, true);
+    try retainNewestSession(std.testing.allocator, &sessions, &mid, 2, &oldest_index, null);
+    try std.testing.expectEqual(@as(usize, 2), sessions.items.len);
+    try std.testing.expect(findSession(sessions.items, "/ws", "s-a") != null);
+    try std.testing.expect(findSession(sessions.items, "/ws", "s-mid") != null);
+    try std.testing.expect(findSession(sessions.items, "/ws", "s-b") == null);
+}
+
+test "duplicate workspace roots do not emit two filesystem session cards" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const session_id = try core.session.generateSessionId(core.time.Timestamp.fromUnixSeconds(1_700_000_000));
+    const session_path = try std.fs.path.join(std.testing.allocator, &.{ root, ".ryk", "sessions", session_id.slice() });
+    defer std.testing.allocator.free(session_path);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, session_path);
+
+    var first = try dupeWorkspace(std.testing.allocator, root, "", null, false);
+    defer first.deinit(std.testing.allocator);
+    var second = try dupeWorkspace(std.testing.allocator, root, "", null, false);
+    defer second.deinit(std.testing.allocator);
+    var loaded = try loadBoundedSessions(std.testing.io, std.testing.allocator, &.{ first, second }, &.{}, 4);
+    defer loaded.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), loaded.sessions.items.len);
+}
+
+test "loadBoundedSessions evicts the new oldest after a feed timestamp bump" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    var workspace = try dupeWorkspace(std.testing.allocator, root, "", null, false);
+    defer workspace.deinit(std.testing.allocator);
+
+    const loaded_feed = [_]feed_writer.LoadedFeedRecord{
+        testLoadedFeed("2026-07-13T00:01:00Z", root, "allow", "pi", "s-old"),
+        testLoadedFeed("2026-07-13T00:03:00Z", root, "allow", "codex", "s-new"),
+        testLoadedFeed("2026-07-13T00:04:00Z", root, "allow", "pi", "s-old"),
+        testLoadedFeed("2026-07-13T00:03:30Z", root, "allow", "opencode", "s-mid"),
+    };
+    var loaded = try loadBoundedSessions(std.testing.io, std.testing.allocator, &.{workspace}, &loaded_feed, 2);
+    defer loaded.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), loaded.sessions.items.len);
+    try std.testing.expect(findSession(loaded.sessions.items, root, "s-old") != null);
+    try std.testing.expect(findSession(loaded.sessions.items, root, "s-mid") != null);
+    try std.testing.expect(findSession(loaded.sessions.items, root, "s-new") == null);
+}
+
+test "loadBoundedSessions isolates the same session id across two workspace roots" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(base);
+    const root_a = try std.fs.path.join(std.testing.allocator, &.{ base, "a" });
+    defer std.testing.allocator.free(root_a);
+    const root_b = try std.fs.path.join(std.testing.allocator, &.{ base, "b" });
+    defer std.testing.allocator.free(root_b);
+    const session_id = try core.session.generateSessionId(core.time.Timestamp.fromUnixSeconds(1_700_000_000));
+    const path_a = try std.fs.path.join(std.testing.allocator, &.{ root_a, ".ryk", "sessions", session_id.slice() });
+    defer std.testing.allocator.free(path_a);
+    const path_b = try std.fs.path.join(std.testing.allocator, &.{ root_b, ".ryk", "sessions", session_id.slice() });
+    defer std.testing.allocator.free(path_b);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, path_a);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, path_b);
+
+    var workspace_a = try dupeWorkspace(std.testing.allocator, root_a, "", null, false);
+    defer workspace_a.deinit(std.testing.allocator);
+    var workspace_b = try dupeWorkspace(std.testing.allocator, root_b, "", null, false);
+    defer workspace_b.deinit(std.testing.allocator);
+    const loaded_feed = [_]feed_writer.LoadedFeedRecord{
+        testLoadedFeed("2026-07-13T00:00:00Z", root_a, "deny", "pi", session_id.slice()),
+        testLoadedFeed("2026-07-13T00:01:00Z", root_b, "allow", "opencode", session_id.slice()),
+    };
+    var loaded = try loadBoundedSessions(
+        std.testing.io,
+        std.testing.allocator,
+        &.{ workspace_a, workspace_b },
+        &loaded_feed,
+        4,
+    );
+    defer loaded.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), loaded.sessions.items.len);
+    const index_a = findSession(loaded.sessions.items, root_a, session_id.slice()) orelse return error.TestExpectedEqual;
+    const index_b = findSession(loaded.sessions.items, root_b, session_id.slice()) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(usize, 1), loaded.sessions.items[index_a].denied_count);
+    try std.testing.expectEqualStrings("pi", loaded.sessions.items[index_a].host.?);
+    try std.testing.expectEqual(@as(usize, 0), loaded.sessions.items[index_b].denied_count);
+    try std.testing.expectEqualStrings("opencode", loaded.sessions.items[index_b].host.?);
 }
 
 test "global feed redacts legacy free-form fields and exposes rule ids" {

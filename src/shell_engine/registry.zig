@@ -217,7 +217,7 @@ fn initOnce(load_all: bool) !void {
 
     // Inflate into the process arena so pattern strings can borrow the JSON.
     // Inflate failure is RegistryInitFailed (deny), never an empty allow.
-    const packs_json = oracle_embed.inflateAlloc(a) catch return error.RegistryInitFailed;
+    const packs_json = oracle_embed.inflateAllocForInit(a, load_all) catch return error.RegistryInitFailed;
 
     var packs_list: std.ArrayList(CompiledPack) = .empty;
     errdefer {

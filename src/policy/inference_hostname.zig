@@ -1,7 +1,7 @@
 //! Pure hostname extraction from adapter-approved URL / host fields (AINA P3 S1).
 //!
-//! Normative rules: planning/2026-08-02-aina-p3-discovery-plan.md §3.3;
-//! ownership contract: `extractHostname` (producer p3-extract → adapters/managed).
+//! Hostname extraction rules for AINA P3 discovery.
+//! Ownership contract: `extractHostname` (producer p3-extract → adapters/managed).
 //!
 //! SEC-3: never emit secrets, userinfo, tokens, or credential material.
 //! Intentionally does **not** call `network_eval.parseDestination` (that helper
@@ -84,7 +84,7 @@ pub fn extractHostname(
     host = std.mem.trim(u8, host, " \t\r\n");
     if (host.len == 0 or host.len > 253) return null;
 
-    // Plan §3.3 #4: reject bare wildcards / single-char globs not product-tested.
+    // Reject bare wildcards / single-char globs not product-tested.
     if (std.mem.indexOfScalar(u8, host, '*') != null) return null;
     if (std.mem.indexOfScalar(u8, host, '?') != null) return null;
 
@@ -529,7 +529,7 @@ test "inference_hostname fragment and path never appear in extract output" {
 // ---------------------------------------------------------------------------
 
 test "inference_hostname bare wildcard pattern rejected" {
-    // Plan §3.3 #4: reject bare wildcards not already product-tested.
+    // Reject bare wildcards not already product-tested.
     const allocator = std.testing.allocator;
     const host = try extractHostname(allocator, "*.amazonaws.com");
     defer if (host) |h| allocator.free(h);

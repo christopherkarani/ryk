@@ -67,14 +67,7 @@ pub fn runWithServer(
     defer session_approvals.deinit();
 
     var metadata_gates = std.StringHashMap(MetadataGate).init(allocator);
-    defer {
-        var it = metadata_gates.iterator();
-        while (it.next()) |entry| {
-            allocator.free(entry.key_ptr.*);
-            allocator.free(entry.value_ptr.reason);
-        }
-        metadata_gates.deinit();
-    }
+    defer deinitMetadataGates(allocator, &metadata_gates);
 
     while (true) {
         const line = @import("stdio.zig").readMessageLine(client_reader, allocator) catch |err| {
@@ -418,10 +411,14 @@ fn upsertMetadataGate(
     const existing = metadata_gates.getEntry(tool_name);
     if (existing) |entry| {
         if (riskRank(risk) <= riskRank(entry.value_ptr.risk)) return;
+        // Own the replacement before releasing the stored reason (#347). A
+        // free-then-dupe leaves a dangling pointer in the map when the dupe
+        // OOMs; runWithServer teardown then double-frees it.
+        const new_reason = try allocator.dupe(u8, reason);
         allocator.free(entry.value_ptr.reason);
         entry.value_ptr.* = .{
             .risk = risk,
-            .reason = try allocator.dupe(u8, reason),
+            .reason = new_reason,
         };
         return;
     }
@@ -430,6 +427,15 @@ fn upsertMetadataGate(
     const owned_reason = try allocator.dupe(u8, reason);
     errdefer allocator.free(owned_reason);
     try metadata_gates.put(owned_name, .{ .risk = risk, .reason = owned_reason });
+}
+
+fn deinitMetadataGates(allocator: std.mem.Allocator, metadata_gates: *std.StringHashMap(MetadataGate)) void {
+    var it = metadata_gates.iterator();
+    while (it.next()) |entry| {
+        allocator.free(entry.key_ptr.*);
+        allocator.free(entry.value_ptr.reason);
+    }
+    metadata_gates.deinit();
 }
 
 fn requestServerForClient(
@@ -458,11 +464,12 @@ fn requestServerForClient(
             if (jsonrpc.idOf(parsed.value()) != null and sampling.isSamplingMethod(method_name)) {
                 // On sampling handler error, free both response and parsed.
                 try handleServerOriginatedSampling(allocator, config, client_reader, client_writer, server, parsed.value(), current, session_approvals);
-                parsed.deinit();
                 allocator.free(current);
                 response = null;
+                // errdefer owns parsed until read cannot fail (explicit deinit here would UAF on error return).
                 const read = server.read orelse return error.McpServerOriginatedSamplingRequiresReadableTransport;
                 response = try read(server.context, allocator);
+                parsed.deinit();
                 continue;
             }
         }
@@ -1077,6 +1084,10 @@ const ServerSamplingFirstServer = struct {
         if (std.mem.indexOf(u8, line, "\"result\"") != null and std.mem.indexOf(u8, line, "\"srv-1\"") != null) {
             self.saw_sampling_client_response = true;
         }
+    }
+
+    fn readFails(_: *anyopaque, _: std.mem.Allocator) ![]u8 {
+        return error.ReadFailed;
     }
 };
 
@@ -1715,6 +1726,132 @@ test "server-originated sampling rejects mismatched client response id" {
     try std.testing.expect(try @import("stdio.zig").isProtocolCleanOutput(output_writer.buffered(), std.testing.allocator));
 }
 
+test "server-originated sampling default-deny then missing read does not double-deinit" {
+    const load = policy_mod.load;
+    var policy = try load.parseFromSlice(std.testing.allocator,
+        \\version: 1
+        \\mode: strict
+    , "test.yaml");
+    defer policy.deinit();
+
+    var server = ServerSamplingFirstServer{};
+    var input: std.Io.Reader = .fixed("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}\n");
+    var output_buf: [2048]u8 = undefined;
+    var output_writer: std.Io.Writer = .fixed(&output_buf);
+    try std.testing.expectError(
+        error.McpServerOriginatedSamplingRequiresReadableTransport,
+        runWithServer(std.testing.allocator, .{
+            .server_name = "fake",
+            .server_command_display = "fake",
+            .policy = &policy,
+            .mode = .strict,
+        }, &input, &output_writer, .{
+            .context = &server,
+            .request = ServerSamplingFirstServer.request,
+            .notify = ServerSamplingFirstServer.notify,
+        }),
+    );
+    try std.testing.expect(server.saw_sampling_error);
+    try std.testing.expect(std.mem.indexOf(u8, output_writer.buffered(), "sampling/createMessage") == null);
+}
+
+test "server-originated sampling default-deny then read error does not double-deinit" {
+    const load = policy_mod.load;
+    var policy = try load.parseFromSlice(std.testing.allocator,
+        \\version: 1
+        \\mode: strict
+    , "test.yaml");
+    defer policy.deinit();
+
+    var server = ServerSamplingFirstServer{};
+    var input: std.Io.Reader = .fixed("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}\n");
+    var output_buf: [2048]u8 = undefined;
+    var output_writer: std.Io.Writer = .fixed(&output_buf);
+    try std.testing.expectError(
+        error.ReadFailed,
+        runWithServer(std.testing.allocator, .{
+            .server_name = "fake",
+            .server_command_display = "fake",
+            .policy = &policy,
+            .mode = .strict,
+        }, &input, &output_writer, .{
+            .context = &server,
+            .request = ServerSamplingFirstServer.request,
+            .notify = ServerSamplingFirstServer.notify,
+            .read = ServerSamplingFirstServer.readFails,
+        }),
+    );
+    try std.testing.expect(server.saw_sampling_error);
+    try std.testing.expect(std.mem.indexOf(u8, output_writer.buffered(), "sampling/createMessage") == null);
+}
+
+test "server-originated sampling allow then missing read does not double-deinit" {
+    const load = policy_mod.load;
+    var policy = try load.parseFromSlice(std.testing.allocator,
+        \\version: 1
+        \\mode: strict
+        \\mcp:
+        \\  allow:
+        \\    - "fake.local"
+    , "test.yaml");
+    defer policy.deinit();
+
+    var server = ServerSamplingFirstServer{};
+    var input: std.Io.Reader = .fixed("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}\n" ++
+        "{\"jsonrpc\":\"2.0\",\"id\":\"srv-1\",\"result\":{\"role\":\"assistant\",\"content\":{\"type\":\"text\",\"text\":\"ok\"}}}\n");
+    var output_buf: [4096]u8 = undefined;
+    var output_writer: std.Io.Writer = .fixed(&output_buf);
+    try std.testing.expectError(
+        error.McpServerOriginatedSamplingRequiresReadableTransport,
+        runWithServer(std.testing.allocator, .{
+            .server_name = "fake",
+            .server_command_display = "fake",
+            .policy = &policy,
+            .mode = .strict,
+        }, &input, &output_writer, .{
+            .context = &server,
+            .request = ServerSamplingFirstServer.request,
+            .notify = ServerSamplingFirstServer.notify,
+        }),
+    );
+    try std.testing.expect(server.saw_sampling_client_response);
+    try std.testing.expect(std.mem.indexOf(u8, output_writer.buffered(), "sampling/createMessage") != null);
+}
+
+test "server-originated sampling allow then read error does not double-deinit" {
+    const load = policy_mod.load;
+    var policy = try load.parseFromSlice(std.testing.allocator,
+        \\version: 1
+        \\mode: strict
+        \\mcp:
+        \\  allow:
+        \\    - "fake.local"
+    , "test.yaml");
+    defer policy.deinit();
+
+    var server = ServerSamplingFirstServer{};
+    var input: std.Io.Reader = .fixed("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}\n" ++
+        "{\"jsonrpc\":\"2.0\",\"id\":\"srv-1\",\"result\":{\"role\":\"assistant\",\"content\":{\"type\":\"text\",\"text\":\"ok\"}}}\n");
+    var output_buf: [4096]u8 = undefined;
+    var output_writer: std.Io.Writer = .fixed(&output_buf);
+    try std.testing.expectError(
+        error.ReadFailed,
+        runWithServer(std.testing.allocator, .{
+            .server_name = "fake",
+            .server_command_display = "fake",
+            .policy = &policy,
+            .mode = .strict,
+        }, &input, &output_writer, .{
+            .context = &server,
+            .request = ServerSamplingFirstServer.request,
+            .notify = ServerSamplingFirstServer.notify,
+            .read = ServerSamplingFirstServer.readFails,
+        }),
+    );
+    try std.testing.expect(server.saw_sampling_client_response);
+    try std.testing.expect(std.mem.indexOf(u8, output_writer.buffered(), "sampling/createMessage") != null);
+}
+
 test "invalid json-rpc fails safely with protocol error response" {
     const load = policy_mod.load;
     var policy = try load.loadPreset(std.testing.allocator, .strict);
@@ -2117,4 +2254,44 @@ test "proxy denies notify with structural to+body under effects.deny" {
     }, &input, &output_writer, .{ .context = &server, .request = FakeServer.request, .notify = FakeServer.notify });
     try std.testing.expect(!server.saw_safe_call);
     try std.testing.expect(std.mem.indexOf(u8, output_writer.buffered(), "\"error\"") != null);
+}
+
+test "upsertMetadataGate upgrade OOM keeps previous reason owned" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = std.math.maxInt(usize) });
+    const allocator = failing.allocator();
+
+    var metadata_gates = std.StringHashMap(MetadataGate).init(allocator);
+    defer deinitMetadataGates(allocator, &metadata_gates);
+
+    try upsertMetadataGate(allocator, &metadata_gates, "search_issues", .high, "name scan high");
+    try std.testing.expectEqual(@as(u32, 1), metadata_gates.count());
+
+    // Trip the replacement reason dupe on the upgrade arm. The previous
+    // reason must stay owned so runWithServer teardown cannot UAF/double-free.
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(
+        error.OutOfMemory,
+        upsertMetadataGate(allocator, &metadata_gates, "search_issues", .critical, "description scan critical"),
+    );
+    try std.testing.expect(failing.has_induced_failure);
+
+    const entry = metadata_gates.get("search_issues").?;
+    try std.testing.expectEqual(tools.RiskClass.high, entry.risk);
+    try std.testing.expectEqualStrings("name scan high", entry.reason);
+}
+
+test "upsertMetadataGate upgrade replaces reason only when risk increases" {
+    const allocator = std.testing.allocator;
+    var metadata_gates = std.StringHashMap(MetadataGate).init(allocator);
+    defer deinitMetadataGates(allocator, &metadata_gates);
+
+    try upsertMetadataGate(allocator, &metadata_gates, "search_issues", .high, "name scan high");
+    try upsertMetadataGate(allocator, &metadata_gates, "search_issues", .high, "same rank ignored");
+    try upsertMetadataGate(allocator, &metadata_gates, "search_issues", .medium, "lower rank ignored");
+    try std.testing.expectEqual(tools.RiskClass.high, metadata_gates.get("search_issues").?.risk);
+    try std.testing.expectEqualStrings("name scan high", metadata_gates.get("search_issues").?.reason);
+
+    try upsertMetadataGate(allocator, &metadata_gates, "search_issues", .critical, "description scan critical");
+    try std.testing.expectEqual(tools.RiskClass.critical, metadata_gates.get("search_issues").?.risk);
+    try std.testing.expectEqualStrings("description scan critical", metadata_gates.get("search_issues").?.reason);
 }

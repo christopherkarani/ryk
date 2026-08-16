@@ -946,7 +946,7 @@ test "decide human output matches captured contract fixture" {
 }
 
 test "decide human output is plain under --no-rich even when colour is available" {
-    // Phase 7 Task E exhaustiveness: the global --no-rich / RYK_NO_RICH hatch
+    // The global --no-rich / RYK_NO_RICH hatch
     // (resolved to theme.setRichEnabled(false) in mod.runWithCwdUsing) must gate
     // COLOUR output on the human path, not just banner presence. Force colour
     // on, then disable rich, and confirm no ANSI escapes leak into human output.
