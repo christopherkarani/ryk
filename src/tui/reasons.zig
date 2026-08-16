@@ -71,7 +71,10 @@ pub const Alternative = struct {
 /// dynamic replacements (e.g. `rm -rf /` -> `rm -rf ./build`).
 pub fn safeAlternatives(allocator: std.mem.Allocator, command: []const u8) ![]Alternative {
     var list: std.ArrayList(Alternative) = .empty;
-    errdefer list.deinit(allocator);
+    errdefer {
+        for (list.items) |alt| allocator.free(alt.command);
+        list.deinit(allocator);
+    }
 
     // Ownership contract: every `.command` returned here is allocator-owned so
     // the caller can free them uniformly (`for (alts) |a| allocator.free(a.command)`
@@ -81,11 +84,12 @@ pub fn safeAlternatives(allocator: std.mem.Allocator, command: []const u8) ![]Al
     if (std.mem.indexOf(u8, command, "rm -rf") != null) {
         const target = extractRmTarget(command);
         if (target.len > 0 and (std.mem.eql(u8, target, "/") or std.mem.startsWith(u8, target, "/") or std.mem.eql(u8, target, "~"))) {
-            try list.append(allocator, .{ .command = try allocator.dupe(u8, "rm -rf ./build"), .note = "scoped to your project" });
-            try list.append(allocator, .{ .command = try allocator.dupe(u8, "rm -rf /tmp/ryk-cleanup"), .note = "scoped to a temp directory" });
+            try appendAlternative(allocator, &list, "rm -rf ./build", "scoped to your project");
+            try appendAlternative(allocator, &list, "rm -rf /tmp/ryk-cleanup", "scoped to a temp directory");
         } else if (target.len > 0) {
             // Build a scoped form of the same deletion target under ./ for visibility.
             const scoped = try std.fmt.allocPrint(allocator, "rm -rf .{s}", .{target});
+            errdefer allocator.free(scoped);
             try list.append(allocator, .{ .command = scoped, .note = "scoped to your project root" });
         }
         return list.toOwnedSlice(allocator);
@@ -93,7 +97,7 @@ pub fn safeAlternatives(allocator: std.mem.Allocator, command: []const u8) ![]Al
 
     // `git push --force` / `-f` — lease is also force-equivalent and stays denied.
     if (std.mem.indexOf(u8, command, "push --force") != null or std.mem.indexOf(u8, command, "push -f") != null) {
-        try list.append(allocator, .{ .command = try allocator.dupe(u8, "git push"), .note = "fast-forward only; force-equivalent stays denied" });
+        try appendAlternative(allocator, &list, "git push", "fast-forward only; force-equivalent stays denied");
         return list.toOwnedSlice(allocator);
     }
 
@@ -101,17 +105,28 @@ pub fn safeAlternatives(allocator: std.mem.Allocator, command: []const u8) ![]Al
     if ((std.mem.indexOf(u8, command, "curl") != null or std.mem.indexOf(u8, command, "wget") != null) and
         (std.mem.indexOf(u8, command, "| sh") != null or std.mem.indexOf(u8, command, "| bash") != null or std.mem.indexOf(u8, command, "|sh") != null))
     {
-        try list.append(allocator, .{ .command = try allocator.dupe(u8, "curl -fsSL <url> -o /tmp/install.sh && less /tmp/install.sh"), .note = "inspect before running" });
+        try appendAlternative(allocator, &list, "curl -fsSL <url> -o /tmp/install.sh && less /tmp/install.sh", "inspect before running");
         return list.toOwnedSlice(allocator);
     }
 
     // `chmod 777`
     if (std.mem.indexOf(u8, command, "chmod 777") != null) {
-        try list.append(allocator, .{ .command = try allocator.dupe(u8, "chmod 755"), .note = "owner write, others read+execute" });
+        try appendAlternative(allocator, &list, "chmod 755", "owner write, others read+execute");
         return list.toOwnedSlice(allocator);
     }
 
     return list.toOwnedSlice(allocator);
+}
+
+fn appendAlternative(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayList(Alternative),
+    command: []const u8,
+    note: []const u8,
+) !void {
+    const owned = try allocator.dupe(u8, command);
+    errdefer allocator.free(owned);
+    try list.append(allocator, .{ .command = owned, .note = note });
 }
 
 /// Free dynamic alternatives (the ones whose `command` was allocator-owned).
@@ -215,6 +230,16 @@ test "safeAlternatives: harmless command returns empty" {
     const alts = try safeAlternatives(std.testing.allocator, "git status");
     defer std.testing.allocator.free(alts);
     try std.testing.expectEqual(@as(usize, 0), alts.len);
+}
+
+fn safeAlternativesOomProbe(allocator: std.mem.Allocator) !void {
+    const alts = try safeAlternatives(allocator, "rm -rf /");
+    for (alts) |alt| allocator.free(alt.command);
+    allocator.free(alts);
+}
+
+test "safeAlternatives: rm -rf OOM does not leak first suggestion" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, safeAlternativesOomProbe, .{});
 }
 
 test "extractRmTarget: extracts root and tildes" {
