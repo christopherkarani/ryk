@@ -1454,6 +1454,30 @@ test "env --help exits 0 and names eval verbs" {
     try std.testing.expect(std.mem.indexOf(u8, short_out, "schema --agent") != null);
 }
 
+test "env schema --help exits 0 and is not usage-as-error" {
+    var stdout_buf: [4096]u8 = undefined;
+    var stderr_buf: [256]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+
+    const cases = [_][]const []const u8{
+        &.{ "env", "schema", "--help" },
+        &.{ "env", "schema", "-h" },
+        &.{ "env", "schema", "--agent", "--help" },
+    };
+    for (cases) |argv| {
+        stdout_writer = .fixed(&stdout_buf);
+        stderr_writer = .fixed(&stderr_buf);
+        const code = try testRun(argv, &stdout_writer, &stderr_writer);
+        try std.testing.expectEqual(exit_codes.success, code);
+        try std.testing.expectEqualStrings("", stderr_writer.buffered());
+        const out = stdout_writer.buffered();
+        try std.testing.expect(out.len > 0);
+        try std.testing.expect(std.mem.indexOf(u8, out, "schema --agent") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "export PATH=") == null);
+    }
+}
+
 test "banner suppressed for completions raw output" {
     var stdout_buf: [4096]u8 = undefined;
     var stderr_buf: [256]u8 = undefined;

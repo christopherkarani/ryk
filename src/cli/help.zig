@@ -183,7 +183,7 @@ pub const commands =
         .{
             .name = "env",
             .summary = "Print shell environment for ryk",
-            .usage = "ryk env | ryk env schema --agent",
+            .usage = "ryk env",
             .category = .getting_started,
             .details = &.{
                 "Prints export statements for PATH and RYK_RESOURCE_ROOT.",
