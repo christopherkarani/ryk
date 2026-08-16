@@ -510,12 +510,13 @@ pub const commands =
         .{ .name = "policy", .summary = "Validate, explain, and apply policies", .usage = "ryk policy <check|explain|packs|apply-pack> [...]", .category = .core_workflow, .additional_completion_flags = &.{ "--policy", "--method", "--force", "--preset" }, .examples = &.{
             "ryk policy check",
             "ryk policy check .ryk/policy.yaml",
+            "ryk policy check --preset generic-agent",
             "ryk policy check --preset strict",
             "ryk policy explain file.read /etc/passwd",
         }, .details = &.{
             "Subcommands:",
             "  ryk policy check [policy-path]   # default: workspace .ryk/policy.yaml (not builtin)",
-            "  ryk policy check --preset <observe|ask|yolo|strict|ci|redteam|trusted>",
+            "  ryk policy check --preset <generic-agent|observe|ask|yolo|strict|ci|redteam|trusted>",
             "  ryk policy check builtin:<preset>",
             "  ryk policy explain [--policy <path>] <file.read|file.write|env|command|network|mcp|tool> <target> [--method <HTTP_METHOD>]",
             "  ryk policy packs",
@@ -774,6 +775,7 @@ pub const commands =
         .{ .name = "hook", .summary = "Receive events from AI agent hosts", .usage = "ryk hook <codex|claude|grok|opencode|openclaw|hermes> <event> [--ci]", .category = .advanced, .details = &.{
             "Reads a JSON payload from stdin, normalizes host-specific events to ryk decisions,",
             "and emits a host-valid JSON response to stdout. Debug logs go to stderr only.",
+            "Pi is extension-only (`ryk evaluate` / bundled extension), not a hook host.",
             "Shell PreToolUse / PermissionRequest (and equivalent host tool-before events) evaluate commands via the in-process Zig shell_engine; legacy Rust evaluator selection is rejected.",
             "Events:",
             "  ryk hook codex SessionStart",
@@ -1167,7 +1169,7 @@ test "mode option lists include yolo" {
         try policy_w.writeAll(line);
         try policy_w.writeAll("\n");
     }
-    try std.testing.expect(std.mem.indexOf(u8, policy_w.buffered(), "observe|ask|yolo|strict|ci|redteam|trusted") != null);
+    try std.testing.expect(std.mem.indexOf(u8, policy_w.buffered(), "generic-agent|observe|ask|yolo|strict|ci|redteam|trusted") != null);
 
     const mcp_info = findCommand("mcp") orelse return error.TestUnexpectedResult;
     var mcp_joined: [4096]u8 = undefined;
@@ -1197,6 +1199,16 @@ test "host launch allowlist is the single source for help alias entries" {
     }
     try std.testing.expect(findCommand("notanagent") == null);
     try std.testing.expect(!host_launch.isHostLaunchAlias("notanagent"));
+}
+
+test "launch aliases stay 7 including pi; hook usage stays 6" {
+    try std.testing.expectEqual(@as(usize, 7), host_launch.host_launch_aliases.len);
+    try std.testing.expect(host_launch.isHostLaunchAlias("pi"));
+    try std.testing.expect(!host_launch.isHostLaunchAlias("cursor"));
+
+    const info = findCommand("hook") orelse return error.MissingHookHelp;
+    try std.testing.expect(std.mem.indexOf(u8, info.usage, "pi") == null);
+    try std.testing.expect(std.mem.indexOf(u8, info.usage, "cursor") == null);
 }
 
 test "top help and per-host help surface claude and pi aliases" {

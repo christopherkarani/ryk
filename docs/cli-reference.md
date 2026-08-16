@@ -71,7 +71,7 @@ ryk init --preset generic-agent
 ryk policy check
 ~~~
 
-init writes .ryk/policy.yaml and may update the mapped pack configuration. It refuses to overwrite an existing policy unless --force is supplied. policy check without a path checks the workspace policy, not a built-in preset. Use ryk policy check --preset strict or ryk policy check builtin:strict for a built-in preset.
+init writes .ryk/policy.yaml and may update the mapped pack configuration. It refuses to overwrite an existing policy unless --force is supplied. policy check without a path checks the workspace policy, not a built-in preset. Use ryk policy check --preset generic-agent for the default create-path body, or ryk policy check --preset strict / ryk policy check builtin:strict for a built-in preset.
 
 env prints shell exports for the active CLI layout:
 

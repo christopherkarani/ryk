@@ -2961,6 +2961,35 @@ test "hook command help and invalid host" {
     try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "unknown host") != null);
 }
 
+test "hook help does not list pi because Host.parse rejects it" {
+    try std.testing.expect(Host.parse("pi") == null);
+    try std.testing.expect(Host.parse("cursor") == null);
+
+    const info = help.findCommand("hook") orelse return error.MissingHookHelp;
+    const open = std.mem.indexOfScalar(u8, info.usage, '<') orelse return error.MissingHostUsageGroup;
+    const close = std.mem.indexOfScalar(u8, info.usage[open..], '>') orelse return error.MissingHostUsageGroup;
+    const listed = info.usage[open + 1 .. open + close];
+
+    var listed_it = std.mem.splitScalar(u8, listed, '|');
+    var host_count: usize = 0;
+    while (listed_it.next()) |name| {
+        host_count += 1;
+        try std.testing.expect(!std.mem.eql(u8, name, "pi"));
+        try std.testing.expect(!std.mem.eql(u8, name, "cursor"));
+        try std.testing.expect(Host.parse(name) != null);
+    }
+    try std.testing.expectEqual(@as(usize, 6), host_count);
+
+    var found_honesty = false;
+    for (info.details) |line| {
+        const mentions_pi = std.mem.indexOf(u8, line, "Pi ") != null or std.mem.indexOf(u8, line, "pi ") != null;
+        const mentions_extension = std.mem.indexOf(u8, line, "extension") != null;
+        const mentions_evaluate = std.mem.indexOf(u8, line, "evaluate") != null;
+        if (mentions_pi and mentions_extension and mentions_evaluate) found_honesty = true;
+    }
+    try std.testing.expect(found_honesty);
+}
+
 test "hook help usage lists every Host.parse allowlist member including grok" {
     const info = help.findCommand("hook") orelse return error.MissingHookHelp;
     const open = std.mem.indexOfScalar(u8, info.usage, '<') orelse return error.MissingHostUsageGroup;

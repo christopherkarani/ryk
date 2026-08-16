@@ -41,7 +41,7 @@ fn check(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: anytype)
                 \\Usage:
                 \\  ryk policy check
                 \\  ryk policy check <policy-path>
-                \\  ryk policy check --preset <observe|ask|strict|ci|redteam|trusted>
+                \\  ryk policy check --preset <generic-agent|observe|ask|yolo|strict|ci|redteam|trusted>
                 \\  ryk policy check builtin:<preset>
                 \\
                 \\With no path, validates the workspace policy at .ryk/policy.yaml.
@@ -91,20 +91,20 @@ fn check(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: anytype)
     }
 
     if (preset_name) |name| {
-        const preset = policy_mod.presets.Preset.parse(name) orelse {
+        const resolved = resolveCheckPreset(name) orelse {
             try suggestions.writeInvalidValue(
                 stderr,
                 "ryk policy check",
                 "--preset",
                 name,
-                &.{ "observe", "ask", "strict", "ci", "redteam", "trusted" },
+                &check_preset_names,
                 "policy",
             );
             return exit_codes.usage;
         };
-        var policy_value = try core_api.loadPolicyPreset(allocator, preset);
+        var policy_value = try core_api.parsePolicyFromSlice(allocator, resolved.text, resolved.label);
         defer policy_value.deinit();
-        try stdout.print("Policy OK: builtin:{s}\nMode: {s}\n", .{ @tagName(preset), policy_value.mode().toString() });
+        try stdout.print("Policy OK: builtin:{s}\nMode: {s}\n", .{ resolved.label, policy_value.mode().toString() });
         return exit_codes.success;
     }
 
@@ -135,6 +135,36 @@ fn check(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: anytype)
     defer policy_value.deinit();
     try stdout.print("Policy OK: {s}\nMode: {s}\n", .{ source, policy_value.mode().toString() });
     return exit_codes.success;
+}
+
+const CheckPreset = struct {
+    label: []const u8,
+    text: []const u8,
+};
+
+const check_preset_names = [_][]const u8{
+    "generic-agent",
+    "observe",
+    "ask",
+    "yolo",
+    "strict",
+    "ci",
+    "redteam",
+    "trusted",
+};
+
+fn resolveCheckPreset(name: []const u8) ?CheckPreset {
+    if (std.mem.eql(u8, name, "generic-agent")) {
+        return .{
+            .label = "generic-agent",
+            .text = policy_mod.presets.agentPresetText(.generic_agent),
+        };
+    }
+    const preset = policy_mod.presets.Preset.parse(name) orelse return null;
+    return .{
+        .label = @tagName(preset),
+        .text = policy_mod.presets.text(preset),
+    };
 }
 
 fn explain(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: anytype) !u8 {
@@ -535,6 +565,67 @@ test "policy check --preset validates built-in only when explicit" {
     try std.testing.expectEqual(exit_codes.success, code);
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "Policy OK: builtin:strict") != null);
     try std.testing.expectEqualStrings("", stderr_writer.buffered());
+}
+
+test "policy check --preset generic-agent accepts create-path DCG body" {
+    try std.testing.expect(policy_mod.presets.Preset.parse("generic-agent") == null);
+    try std.testing.expect(policy_mod.schema.Mode.parse("generic-agent") == null);
+    try std.testing.expectEqual(policy_mod.presets.AgentPreset.generic_agent, policy_mod.presets.AgentPreset.parse("generic-agent").?);
+
+    const resolved = resolveCheckPreset("generic-agent") orelse return error.RejectedGenericAgent;
+    try std.testing.expectEqualStrings("generic-agent", resolved.label);
+    try std.testing.expectEqualStrings(policy_mod.presets.agentPresetText(.generic_agent), resolved.text);
+    try std.testing.expect(!std.mem.eql(u8, resolved.text, policy_mod.presets.text(.strict)));
+
+    var loaded = try policy_mod.load.parseFromSlice(std.testing.allocator, resolved.text, "builtin:generic-agent");
+    defer loaded.deinit();
+    try std.testing.expectEqual(policy_mod.schema.Mode.strict, loaded.mode);
+    try std.testing.expectEqual(@as(usize, 0), loaded.commands.allow.len);
+    try std.testing.expectEqual(policy_mod.schema.DecisionValue.allow, loaded.commands.default.?);
+
+    var stdout_buf: [512]u8 = undefined;
+    var stderr_buf: [512]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+    const code = try command(std.testing.io, &.{ "check", "--preset", "generic-agent" }, &stdout_writer, &stderr_writer);
+    try std.testing.expectEqual(exit_codes.success, code);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "Policy OK: builtin:generic-agent") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "Mode: strict") != null);
+    try std.testing.expectEqualStrings("", stderr_writer.buffered());
+}
+
+test "policy check --preset observe still works" {
+    var stdout_buf: [512]u8 = undefined;
+    var stderr_buf: [512]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+
+    const code = try command(std.testing.io, &.{ "check", "--preset", "observe" }, &stdout_writer, &stderr_writer);
+    try std.testing.expectEqual(exit_codes.success, code);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "Policy OK: builtin:observe") != null);
+    try std.testing.expectEqualStrings("", stderr_writer.buffered());
+}
+
+test "policy check help and invalid --preset list generic-agent" {
+    var stdout_buf: [2048]u8 = undefined;
+    var stderr_buf: [512]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+
+    const help_code = try command(std.testing.io, &.{ "check", "--help" }, &stdout_writer, &stderr_writer);
+    try std.testing.expectEqual(exit_codes.success, help_code);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "generic-agent") != null);
+
+    stdout_writer = .fixed(&stdout_buf);
+    stderr_writer = .fixed(&stderr_buf);
+    const bad_code = try command(std.testing.io, &.{ "check", "--preset", "not-a-preset" }, &stdout_writer, &stderr_writer);
+    try std.testing.expectEqual(exit_codes.usage, bad_code);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "generic-agent") != null);
+
+    stdout_writer = .fixed(&stdout_buf);
+    stderr_writer = .fixed(&stderr_buf);
+    const other_agent = try command(std.testing.io, &.{ "check", "--preset", "claude-code" }, &stdout_writer, &stderr_writer);
+    try std.testing.expectEqual(exit_codes.usage, other_agent);
 }
 
 test "policy check builtin:path form validates built-in when explicit" {
