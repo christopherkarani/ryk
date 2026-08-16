@@ -9,6 +9,7 @@
 //! filesystem/git/disk catastrophe denials. Not YOLO/Strict policy or FM.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub const types = @import("types.zig");
 pub const allowlist = @import("allowlist.zig");
@@ -120,7 +121,7 @@ pub const EvaluateOptions = struct {
 /// Empty command is a no-op allow (matches oracle). Registry init failure → deny.
 /// When `options.trace` is non-null, records real timed pipeline steps for explain.
 ///
-/// Order (plan §4.1): allow-once exact → permanent kind=command FULL ALLOW →
+/// Order: allow-once exact → permanent kind=command FULL ALLOW →
 /// packs with permanent kind=rule as skip-this-rule only (E8).
 /// Legacy `options.allowlists` Layered remains a separate pre-pack short-circuit
 /// for engine unit tests — not the product permanent API.
@@ -207,7 +208,7 @@ pub fn evaluateCommand(allocator: std.mem.Allocator, command: []const u8, option
     if (has_heredoc and !is_herestring_only and !isExecutingContext(trimmed)) {
         masked_storage = try maskNonExecutingHeredoc(allocator, trimmed);
         const working = masked_storage.?;
-        try candidates.append(allocator, working);
+        try appendUniqueCandidate(allocator, &candidates, working);
         try appendSegments(allocator, &candidates, working);
     } else {
         // Prefer per-segment evaluation so assignment values and safe prefixes
@@ -216,21 +217,19 @@ pub fn evaluateCommand(allocator: std.mem.Allocator, command: []const u8, option
         try appendSegments(allocator, &candidates, trimmed);
         if (candidates.items.len == 0) {
             // No separators — evaluate the whole line.
-            try candidates.append(allocator, trimmed);
+            try appendUniqueCandidate(allocator, &candidates, trimmed);
         } else if (candidates.items.len == 1) {
             // A lone segment can be a truncated view of the line (e.g. comment
             // handling dropped the tail). Evaluate the full original string as
             // well so a truncated candidate is never the only thing checked.
-            if (!std.mem.eql(u8, candidates.items[0], trimmed)) {
-                try candidates.append(allocator, trimmed);
-            }
+            try appendUniqueCandidate(allocator, &candidates, trimmed);
         } else {
             // Multi-segment: still include a sanitized full-string candidate for
             // spanning patterns, with assignment RHS masked.
             const masked_assign = try maskAssignmentValues(allocator, trimmed);
             if (masked_storage == null) {
                 masked_storage = masked_assign;
-                try candidates.append(allocator, masked_storage.?);
+                try appendUniqueCandidate(allocator, &candidates, masked_storage.?);
             } else {
                 allocator.free(masked_assign);
             }
@@ -239,7 +238,7 @@ pub fn evaluateCommand(allocator: std.mem.Allocator, command: []const u8, option
         if (isExecutingContext(trimmed)) {
             embeds_owned = try normalize.extractEmbeds(allocator, trimmed);
             for (embeds_owned) |e| {
-                try candidates.append(allocator, e);
+                try appendUniqueCandidate(allocator, &candidates, e);
                 try appendSegments(allocator, &candidates, e);
             }
         }
@@ -389,7 +388,7 @@ fn collectPermanentRuleSkipIds(
     }
 }
 
-/// Plan §4.1 step 1: exact allow-once hit before permanent/packs.
+/// Step 1: exact allow-once hit before permanent/packs.
 ///
 /// Product law (operator break-glass): allow-once MAY FULL ALLOW a critical pack
 /// hit after the operator redeems a deny-panel short code. Permanent kind=command
@@ -397,9 +396,9 @@ fn collectPermanentRuleSkipIds(
 /// collectPermanentRuleSkipIds). This is intentional dual-path policy, not an
 /// oversight — document + test both; do not apply the permanent critical fence here.
 ///
-/// Two-phase consume (M-15): peek without burning, build Evaluation, then consume
-/// single_use only after the allow Evaluation is fully constructed. Prevents losing
-/// the exception when post-match allocation fails.
+/// Peek does not consume. Durable consume runs only after Evaluation exists (M-15).
+/// Held generation is written under lock when identity still matches; mismatch
+/// reloads once. Vanished store is storeFail, not a pack miss.
 fn tryAllowOnce(
     allocator: std.mem.Allocator,
     trimmed: []const u8,
@@ -433,15 +432,13 @@ fn tryAllowOnce(
         }
     }.deny;
 
-    // Phase 1: peek (consume=false) so eval construction cannot burn the grant first.
-    const matched = allow_once.matchAllowOnce(
+    const peeked = allow_once.peekAllowOnce(
         io,
         allocator,
         path,
         trimmed,
         cwd,
         now,
-        false,
     ) catch |err| {
         // Seatbelt residual: allow-once lives under XDG/HOME data, often unreadable
         // under "no bare home". Treat access denials as "no grant" (packs still run),
@@ -453,14 +450,25 @@ fn tryAllowOnce(
         }
         return try storeFail(allocator, options, started_ms);
     };
-    const entry = matched orelse return null;
-    defer allow_once.freeAllowOnceEntry(allocator, entry);
+    var held = peeked orelse return null;
+    defer held.deinit(allocator);
+
+    if (builtin.is_test) {
+        if (allow_once.test_support.after_peek) |hook| {
+            hook(io, allocator, path) catch {
+                return try storeFail(allocator, options, started_ms);
+            };
+        }
+        if (allow_once.test_support.fail_eval_after_peek) {
+            return error.OutOfMemory;
+        }
+    }
 
     // M-6: product path rejects multi-use allow-once (single_use=false). Those
     // entries act like permanent unlocks from an agent-writable store without
     // operator integrity binding. Treat as miss so packs still apply.
     // Residual: entries remain on disk until redeem/CLI validation rejects mint.
-    if (!entry.single_use) {
+    if (!held.entry.single_use) {
         try endOuterStep(options.trace, .{ .message = "allow_once single_use=false ignored (product)" });
         return null;
     }
@@ -468,50 +476,34 @@ fn tryAllowOnce(
     const detail = try std.fmt.allocPrint(
         allocator,
         "allow_once matched source=allow_once reason={s}",
-        .{entry.reason},
+        .{held.entry.reason},
     );
     defer allocator.free(detail);
     try endOuterStep(options.trace, .{ .message = detail });
 
-    var eval = try finalizeEval(
+    // finalizeEval errdefer-deinits the owned exception on failure (no leak).
+    const eval = finalizeEval(
         allocator,
         options.trace,
         try allowExceptionOwned(
             allocator,
-            entry.reason,
+            held.entry.reason,
             "allow_once",
             null,
             null,
         ),
         elapsedMs(started_ms),
-    );
-    // No errdefer on eval: fail paths free manually then call storeFail (which may
-    // error). errdefer + manual deinit would double-free if storeFail fails.
+    ) catch {
+        return try storeFail(allocator, options, started_ms);
+    };
 
-    // Phase 2: durable consume only after Evaluation is built.
     if (options.consume_allow_once) {
-        const consumed = allow_once.matchAllowOnce(
-            io,
-            allocator,
-            path,
-            trimmed,
-            cwd,
-            now,
-            true,
-        ) catch {
-            // Peek succeeded then consume failed (including rare access flip) — fail closed.
-            eval.deinit(allocator);
+        allow_once.consumePeekedAllowOnce(io, allocator, path, &held, trimmed, cwd, now) catch {
+            var doomed = eval;
+            doomed.deinit(allocator);
             return try storeFail(allocator, options, started_ms);
         };
-        if (consumed) |burned| {
-            allow_once.freeAllowOnceEntry(allocator, burned);
-        } else {
-            // Entry vanished between peek and consume (concurrent use) — fail closed.
-            eval.deinit(allocator);
-            return try storeFail(allocator, options, started_ms);
-        }
     }
-
     return eval;
 }
 
@@ -520,7 +512,7 @@ fn isSandboxHomeStoreAccessError(err: anyerror) bool {
     return err == error.AccessDenied or err == error.PermissionDenied;
 }
 
-/// Plan §4.1 step 2: permanent kind=command exact → FULL ALLOW pre-pack.
+/// Step 2: permanent kind=command exact → FULL ALLOW pre-pack.
 /// Critical hard fence: permanent kind=command cannot unlock a critical pack hit.
 fn tryPermanentCommand(
     allocator: std.mem.Allocator,
@@ -1177,11 +1169,19 @@ fn unwrapPipeWrappers(stage: []const u8) []const u8 {
     return rest;
 }
 
+fn appendUniqueCandidate(allocator: std.mem.Allocator, candidates: *std.ArrayList([]const u8), cand: []const u8) !void {
+    if (cand.len == 0) return;
+    for (candidates.items) |existing| {
+        if (std.mem.eql(u8, existing, cand)) return;
+    }
+    try candidates.append(allocator, cand);
+}
+
 fn appendSegments(allocator: std.mem.Allocator, candidates: *std.ArrayList([]const u8), cmd: []const u8) !void {
     const segs = try segments.splitCommandSegments(cmd, allocator);
     defer segments.freeSegments(allocator, segs);
     for (segs) |s| {
-        try candidates.append(allocator, s);
+        try appendUniqueCandidate(allocator, candidates, s);
     }
 }
 
@@ -1900,6 +1900,24 @@ test "evaluateCommand denies compound safe then destructive" {
     try std.testing.expect(eval.decision == .deny);
 }
 
+test "appendUniqueCandidate skips exact duplicates and empty" {
+    var list: std.ArrayList([]const u8) = .empty;
+    defer list.deinit(std.testing.allocator);
+    try appendUniqueCandidate(std.testing.allocator, &list, "rm -rf /");
+    try appendUniqueCandidate(std.testing.allocator, &list, "rm -rf /");
+    try appendUniqueCandidate(std.testing.allocator, &list, "");
+    try appendUniqueCandidate(std.testing.allocator, &list, "git status");
+    try std.testing.expectEqual(@as(usize, 2), list.items.len);
+    try std.testing.expectEqualStrings("rm -rf /", list.items[0]);
+    try std.testing.expectEqualStrings("git status", list.items[1]);
+}
+
+test "evaluateCommand still denies duplicate destructive segments" {
+    var eval = try evaluateCommand(std.testing.allocator, "rm -rf /; rm -rf /", .{});
+    defer eval.deinit(std.testing.allocator);
+    try std.testing.expect(eval.decision == .deny);
+}
+
 test "evaluateCommand denies sudo wrapper" {
     var eval = try evaluateCommand(std.testing.allocator, "sudo git reset --hard", .{});
     defer eval.deinit(std.testing.allocator);
@@ -2422,9 +2440,7 @@ test "phase2 credentials cat-env Mode A" {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// s-engine — plan §4.1 evaluate order (RED until implementer wires pipeline)
-//
-// Contract pinned for implementer (mod.zig + registry.zig exclusive):
+// s-engine evaluate order
 //
 // EvaluateOptions (distinct permanent API — NOT `allowlists` / Layered):
 //   .permanent_allowlist: ?allowlist_store.Store = null
@@ -2803,7 +2819,7 @@ test "s-engine: kind=rule is not pre-pack FULL ALLOW for unrelated destructive p
 
 test "s-engine: allow-once may FULL ALLOW critical (operator break-glass); permanent cannot" {
     // Product law: permanent is hard-fenced for critical; allow-once after operator
-    // redeem is the intentional single-use recovery path (help.zig / plan §4.1).
+    // redeem is the intentional single-use recovery path (help.zig evaluate order).
     const cmd = "git reset --hard HEAD";
 
     const store = sEnginePermanentStore(&.{
@@ -3012,6 +3028,196 @@ test "s-engine: consume_allow_once false matches without consuming (explain)" {
     });
     defer burned.deinit(std.testing.allocator);
     try std.testing.expect(burned.decision == .deny);
+}
+
+test "s-engine: consume_allow_once construction failure after peek leaves grant" {
+    var tmp = try sEngineTmpRoot();
+    defer {
+        std.testing.allocator.free(tmp.path);
+        tmp.dir.cleanup();
+    }
+    const pending_path = try sEngineJoin(tmp.path, allow_once_mod.pending_file_name);
+    defer std.testing.allocator.free(pending_path);
+    const once_path = try sEngineJoin(tmp.path, allow_once_mod.allow_once_file_name);
+    defer std.testing.allocator.free(once_path);
+
+    const cmd = "git reset --hard HEAD";
+    const cwd = "/work/project";
+    try sEngineSeedAllowOnce(pending_path, once_path, cmd, cwd, "grant must survive peek-then-fail");
+
+    const before = try std.Io.Dir.cwd().statFile(std.testing.io, once_path, .{});
+    allow_once_mod.test_support.reset();
+    defer allow_once_mod.test_support.reset();
+    allow_once_mod.test_support.fail_eval_after_peek = true;
+
+    const failed = evaluateCommand(std.testing.allocator, cmd, .{
+        .cwd = cwd,
+        .allow_once_path = once_path,
+        .io = std.testing.io,
+        .consume_allow_once = true,
+        .now_iso = s_engine_now,
+    });
+    allow_once_mod.test_support.fail_eval_after_peek = false;
+    try std.testing.expectError(error.OutOfMemory, failed);
+
+    const after = try std.Io.Dir.cwd().statFile(std.testing.io, once_path, .{});
+    try std.testing.expectEqual(before.inode, after.inode);
+    try std.testing.expectEqual(before.size, after.size);
+
+    var still = try evaluateCommand(std.testing.allocator, cmd, .{
+        .cwd = cwd,
+        .allow_once_path = once_path,
+        .io = std.testing.io,
+        .consume_allow_once = false,
+        .now_iso = s_engine_now,
+    });
+    defer still.deinit(std.testing.allocator);
+    try std.testing.expect(still.decision == .allow);
+    try std.testing.expectEqualStrings("allow_once", still.exception_source.?);
+}
+
+fn sEngineDeleteAllowOnceStore(_: std.Io, _: std.mem.Allocator, path: []const u8) anyerror!void {
+    try std.Io.Dir.cwd().deleteFile(std.testing.io, path);
+}
+
+fn sEngineConsumeOtherAllowOnce(runtime_io: std.Io, gpa: std.mem.Allocator, path: []const u8) anyerror!void {
+    const hit = try allow_once_mod.matchAllowOnce(
+        runtime_io,
+        gpa,
+        path,
+        "git clean -fdx",
+        "/work/project",
+        s_engine_now,
+        true,
+    );
+    if (hit) |h| allow_once_mod.freeAllowOnceEntry(gpa, h);
+}
+
+test "s-engine: allow-once vanish after peek is storeFail not pack miss" {
+    var tmp = try sEngineTmpRoot();
+    defer {
+        std.testing.allocator.free(tmp.path);
+        tmp.dir.cleanup();
+    }
+    const pending_path = try sEngineJoin(tmp.path, allow_once_mod.pending_file_name);
+    defer std.testing.allocator.free(pending_path);
+    const once_path = try sEngineJoin(tmp.path, allow_once_mod.allow_once_file_name);
+    defer std.testing.allocator.free(once_path);
+
+    const cmd = "git reset --hard HEAD";
+    const cwd = "/work/project";
+    try sEngineSeedAllowOnce(pending_path, once_path, cmd, cwd, "vanish after peek must fail closed");
+
+    allow_once_mod.test_support.reset();
+    defer allow_once_mod.test_support.reset();
+    allow_once_mod.test_support.after_peek = &sEngineDeleteAllowOnceStore;
+
+    var eval = try evaluateCommand(std.testing.allocator, cmd, .{
+        .cwd = cwd,
+        .allow_once_path = once_path,
+        .io = std.testing.io,
+        .consume_allow_once = true,
+        .now_iso = s_engine_now,
+    });
+    defer eval.deinit(std.testing.allocator);
+    try std.testing.expect(eval.decision == .deny);
+    try std.testing.expectEqualStrings("allow-once-store-error", eval.pattern_name.?);
+}
+
+test "s-engine: allow-once concurrent other-entry consume survives peek snapshot" {
+    var tmp = try sEngineTmpRoot();
+    defer {
+        std.testing.allocator.free(tmp.path);
+        tmp.dir.cleanup();
+    }
+    const pending_path = try sEngineJoin(tmp.path, allow_once_mod.pending_file_name);
+    defer std.testing.allocator.free(pending_path);
+    const once_path = try sEngineJoin(tmp.path, allow_once_mod.allow_once_file_name);
+    defer std.testing.allocator.free(once_path);
+
+    const cmd_a = "git reset --hard HEAD";
+    const cmd_b = "git clean -fdx";
+    const cwd = "/work/project";
+    try sEngineSeedAllowOnce(pending_path, once_path, cmd_a, cwd, "consume this after peek");
+    try sEngineSeedAllowOnce(pending_path, once_path, cmd_b, cwd, "other entry must stay consumed");
+
+    allow_once_mod.test_support.reset();
+    defer allow_once_mod.test_support.reset();
+    allow_once_mod.test_support.after_peek = &sEngineConsumeOtherAllowOnce;
+
+    var first = try evaluateCommand(std.testing.allocator, cmd_a, .{
+        .cwd = cwd,
+        .allow_once_path = once_path,
+        .io = std.testing.io,
+        .consume_allow_once = true,
+        .now_iso = s_engine_now,
+    });
+    defer first.deinit(std.testing.allocator);
+    try std.testing.expect(first.decision == .allow);
+    try std.testing.expectEqualStrings("allow_once", first.exception_source.?);
+
+    var other = try evaluateCommand(std.testing.allocator, cmd_b, .{
+        .cwd = cwd,
+        .allow_once_path = once_path,
+        .io = std.testing.io,
+        .consume_allow_once = false,
+        .now_iso = s_engine_now,
+    });
+    defer other.deinit(std.testing.allocator);
+    try std.testing.expect(other.decision == .deny);
+    try std.testing.expect(other.exception_source == null);
+
+    var burned = try evaluateCommand(std.testing.allocator, cmd_a, .{
+        .cwd = cwd,
+        .allow_once_path = once_path,
+        .io = std.testing.io,
+        .consume_allow_once = true,
+        .now_iso = s_engine_now,
+    });
+    defer burned.deinit(std.testing.allocator);
+    try std.testing.expect(burned.decision == .deny);
+}
+
+test "s-engine: allow-once consume after unchanged identity is one load" {
+    var tmp = try sEngineTmpRoot();
+    defer {
+        std.testing.allocator.free(tmp.path);
+        tmp.dir.cleanup();
+    }
+    const pending_path = try sEngineJoin(tmp.path, allow_once_mod.pending_file_name);
+    defer std.testing.allocator.free(pending_path);
+    const once_path = try sEngineJoin(tmp.path, allow_once_mod.allow_once_file_name);
+    defer std.testing.allocator.free(once_path);
+
+    const cmd = "git reset --hard HEAD";
+    const cwd = "/work/project";
+    try sEngineSeedAllowOnce(pending_path, once_path, cmd, cwd, "one parse peek then consume");
+
+    allow_once_mod.test_support.reset();
+    defer allow_once_mod.test_support.reset();
+
+    var first = try evaluateCommand(std.testing.allocator, cmd, .{
+        .cwd = cwd,
+        .allow_once_path = once_path,
+        .io = std.testing.io,
+        .consume_allow_once = true,
+        .now_iso = s_engine_now,
+    });
+    defer first.deinit(std.testing.allocator);
+    try std.testing.expect(first.decision == .allow);
+    try std.testing.expectEqualStrings("allow_once", first.exception_source.?);
+    try std.testing.expectEqual(@as(u32, 1), allow_once_mod.test_support.load_count);
+
+    var second = try evaluateCommand(std.testing.allocator, cmd, .{
+        .cwd = cwd,
+        .allow_once_path = once_path,
+        .io = std.testing.io,
+        .consume_allow_once = true,
+        .now_iso = s_engine_now,
+    });
+    defer second.deinit(std.testing.allocator);
+    try std.testing.expect(second.decision == .deny);
+    try std.testing.expect(second.exception_source == null);
 }
 
 test "s-engine: allow-once exact hit is checked before permanent kind=rule" {

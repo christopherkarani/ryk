@@ -1157,6 +1157,100 @@ test "SBPL path-walk ancestor metadata for Data-volume Users workspace (M-28)" {
     try std.testing.expect(std.mem.indexOf(u8, sbpl, "(allow file-read* (subpath \"/Users/dev/projects/app\"))") != null);
 }
 
+// Issue #194: Seatbelt must content-grant the file grok 1.0.4 opens
+// (~/.grok/config.toml) and emit ancestor metadata so path-walk can lstat
+// ~/.grok. Must not content-grant bare HOME, ~/.grok/, or Keychain.
+test "SBPL grok config.toml grant covers file plus parent-walk metadata" {
+    const allocator = std.testing.allocator;
+    const grok_config = "/Users/dev/.grok/config.toml";
+    var compiled = try profile.compileProfile(allocator, .{
+        .workspace_root = "/tmp/ryk-grok-repro",
+        .system_ro_prefixes = &[_][]const u8{ "/usr", "/bin" },
+        .host_rw_paths = &.{grok_config},
+        .control_roots = &.{grok_config},
+    });
+    defer compiled.deinit();
+
+    const sbpl = try renderSbplWithOptions(allocator, &compiled, .{
+        .write_deny_literals = &.{grok_config},
+    });
+    defer allocator.free(sbpl);
+
+    try std.testing.expect(std.mem.indexOf(u8, sbpl, "(allow file-read* (subpath \"/Users/dev/.grok/config.toml\"))") != null);
+    // Parent-walk: metadata-only on ~/.grok (and HOME) so open(config.toml) can
+    // lstat intermediates. Not a content grant on those ancestors.
+    try std.testing.expect(std.mem.indexOf(u8, sbpl, "(allow file-read-metadata (literal \"/Users/dev/.grok\"))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sbpl, "(allow file-read-metadata (literal \"/Users/dev\"))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sbpl, "(allow file-read* (subpath \"/Users/dev/.grok\"))\n") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sbpl, "(allow file-read* (subpath \"/Users/dev\"))") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sbpl, "Library/Keychains") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sbpl, "(deny file-write* (literal \"/Users/dev/.grok/config.toml\"))") != null);
+}
+
+// Residual after #195: auth.json must be content-granted and write-denied as a
+// file. Parent-walk metadata stays on ~/.grok; no docs/lock/logs/Keychain grant.
+test "SBPL grok auth.json grant covers file plus parent-walk metadata" {
+    const allocator = std.testing.allocator;
+    const grok_auth = "/Users/dev/.grok/auth.json";
+    var compiled = try profile.compileProfile(allocator, .{
+        .workspace_root = "/tmp/ryk-grok-repro",
+        .system_ro_prefixes = &[_][]const u8{ "/usr", "/bin" },
+        .host_rw_paths = &.{grok_auth},
+        .control_roots = &.{grok_auth},
+    });
+    defer compiled.deinit();
+
+    const sbpl = try renderSbplWithOptions(allocator, &compiled, .{
+        .write_deny_literals = &.{grok_auth},
+    });
+    defer allocator.free(sbpl);
+
+    try std.testing.expect(std.mem.indexOf(u8, sbpl, "(allow file-read* (subpath \"/Users/dev/.grok/auth.json\"))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sbpl, "(allow file-read-metadata (literal \"/Users/dev/.grok\"))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sbpl, "(allow file-read* (subpath \"/Users/dev/.grok\"))\n") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sbpl, "(allow file-read* (subpath \"/Users/dev\"))") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sbpl, "Library/Keychains") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sbpl, "/dev/tty") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sbpl, ".grok/docs") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sbpl, "active_sessions.lock") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sbpl, "unified.jsonl") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sbpl, "(deny file-write* (literal \"/Users/dev/.grok/auth.json\"))") != null);
+}
+
+// Issue #221: lock must be content-granted as create/RDWR (file-write* allow,
+// no authority write-deny). Parent-walk metadata stays on ~/.grok; no docs /
+// logs / models_cache / /dev/tty / Keychain grant.
+test "SBPL grok active_sessions.lock grant covers file create/RDWR plus parent-walk metadata" {
+    const allocator = std.testing.allocator;
+    const grok_lock = "/Users/dev/.grok/active_sessions.lock";
+    var compiled = try profile.compileProfile(allocator, .{
+        .workspace_root = "/tmp/ryk-grok-repro",
+        .system_ro_prefixes = &[_][]const u8{ "/usr", "/bin" },
+        .host_rw_paths = &.{grok_lock},
+    });
+    defer compiled.deinit();
+
+    const sbpl = try renderSbpl(allocator, &compiled);
+    defer allocator.free(sbpl);
+
+    try std.testing.expect(std.mem.indexOf(u8, sbpl, "(allow file-read* (subpath \"/Users/dev/.grok/active_sessions.lock\"))") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        sbpl,
+        "(allow file-write* (require-all (subpath \"/Users/dev/.grok/active_sessions.lock\")))",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(u8, sbpl, "(deny file-write* (literal \"/Users/dev/.grok/active_sessions.lock\"))") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sbpl, "(deny file-write* (subpath \"/Users/dev/.grok/active_sessions.lock\"))") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sbpl, "(allow file-read-metadata (literal \"/Users/dev/.grok\"))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sbpl, "(allow file-read* (subpath \"/Users/dev/.grok\"))\n") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sbpl, "(allow file-read* (subpath \"/Users/dev\"))") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sbpl, "Library/Keychains") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sbpl, "/dev/tty") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sbpl, ".grok/docs") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sbpl, "unified.jsonl") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sbpl, "models_cache") == null);
+}
+
 test "SBPL host config host_rw_paths emit subpath RW without bare HOME" {
     const allocator = std.testing.allocator;
     const claude_cfg = "/Users/dev/.claude";

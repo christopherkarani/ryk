@@ -41,13 +41,14 @@ pub const SessionApprovals = struct {
 
     pub fn allowForSession(self: *SessionApprovals, command: []const u8, reason: []const u8) !void {
         if (self.contains(command)) return;
-        const command_owned = try self.allocator.dupe(u8, command);
-        errdefer self.allocator.free(command_owned);
-        const reason_owned = try self.allocator.dupe(u8, reason);
-        errdefer self.allocator.free(reason_owned);
+        // Locals + errdefer: dual-dupe in one append orphaned command on reason/append OOM (M001).
+        const owned_command = try self.allocator.dupe(u8, command);
+        errdefer self.allocator.free(owned_command);
+        const owned_reason = try self.allocator.dupe(u8, reason);
+        errdefer self.allocator.free(owned_reason);
         try self.entries.append(self.allocator, .{
-            .command = command_owned,
-            .reason = reason_owned,
+            .command = owned_command,
+            .reason = owned_reason,
         });
     }
 };

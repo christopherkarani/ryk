@@ -1,6 +1,10 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const gpa_mod = @import("gpa.zig");
 const build_options = @import("build_options");
+
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 
 const core = @import("ryk_core").core;
 const core_api = @import("ryk_core").api;
@@ -76,6 +80,7 @@ const ErrorCode = enum {
     daemon_incompatible,
     daemon_timeout,
     protocol_error,
+    policy_load_failed,
     internal_error,
 
     fn toString(self: ErrorCode) []const u8 {
@@ -527,7 +532,29 @@ fn writeEvaluationResponse(
     var loaded_opt: ?core_api.LoadedPolicy = null;
     defer if (loaded_opt) |*loaded| loaded.deinit();
     if (wire.mode_override == null or wire.commands_allow_override == null) {
-        loaded_opt = core_api.discoverPolicy(io, allocator, null, workspace_root) catch null;
+        loaded_opt = core_api.discoverPolicy(io, allocator, null, workspace_root) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => {
+                // discover() already falls back to builtin on FileNotFound.
+                // Any other load error (invalid/empty/unreadable) must fail closed.
+                telemetry.recordReliability("evaluate", "evaluator_error", "evaluate");
+                const message = "ryk evaluate: failed to load policy; ryk blocked it before evaluation.";
+                recordProductEvaluationBestEffort(
+                    io,
+                    allocator,
+                    request,
+                    "error",
+                    message,
+                    null,
+                    null,
+                    null,
+                    null,
+                    feed_destination,
+                );
+                try writePolicyLoadError(stdout, request.request_id, message);
+                return exit_evaluator_error;
+            },
+        };
     }
 
     const mode: policy.schema.Mode = if (wire.mode_override) |m|
@@ -733,6 +760,18 @@ fn writeProtocolError(stdout: anytype, request_id: ?[]const u8, message: []const
         .daemon_status = .unknown,
         .daemon_compatible = false,
         .error_info = .{ .code = .protocol_error, .message = message },
+    });
+}
+
+fn writePolicyLoadError(stdout: anytype, request_id: ?[]const u8, message: []const u8) !void {
+    try writeErrorResponse(stdout, .{
+        .request_id = request_id,
+        .decision = "error",
+        .reason = message,
+        .daemon_protocol_version = null,
+        .daemon_status = .unknown,
+        .daemon_compatible = false,
+        .error_info = .{ .code = .policy_load_failed, .message = message },
     });
 }
 
@@ -1339,4 +1378,137 @@ test "evaluate FM timeout keeps soft allow without inventing ask" {
     const output = stdout.buffered();
     try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"allow\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"ask\"") == null);
+}
+
+test "evaluate fail-closes when workspace policy is invalid" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, ".git", .default_dir);
+    try tmp.dir.createDir(std.testing.io, ".ryk", .default_dir);
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = ".ryk/policy.yaml",
+        .data = "mode: not-a-real-mode\n",
+    });
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    const payload = try validPayload(allocator, "echo hello", root);
+    defer allocator.free(payload);
+    var stdout_buf: [4096]u8 = undefined;
+    var stdout: std.Io.Writer = .fixed(&stdout_buf);
+
+    const code = try evaluatePayload(std.testing.io, allocator, payload, &stdout, mockAllow, .disabled, .{
+        .disable_fm = true,
+    });
+    try std.testing.expectEqual(exit_evaluator_error, code);
+    const output = stdout.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"error\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "policy_load_failed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"allow\"") == null);
+}
+
+test "evaluate fail-closes when workspace policy is empty" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, ".git", .default_dir);
+    try tmp.dir.createDir(std.testing.io, ".ryk", .default_dir);
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = ".ryk/policy.yaml",
+        .data = "",
+    });
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    const payload = try validPayload(allocator, "echo hello", root);
+    defer allocator.free(payload);
+    var stdout_buf: [4096]u8 = undefined;
+    var stdout: std.Io.Writer = .fixed(&stdout_buf);
+
+    const code = try evaluatePayload(std.testing.io, allocator, payload, &stdout, mockAllow, .disabled, .{
+        .disable_fm = true,
+    });
+    try std.testing.expectEqual(exit_evaluator_error, code);
+    const output = stdout.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"error\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "policy_load_failed") != null);
+}
+
+test "evaluate fail-closes when workspace policy is unreadable" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, ".git", .default_dir);
+    try tmp.dir.createDir(std.testing.io, ".ryk", .default_dir);
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = ".ryk/policy.yaml",
+        .data = "version: 1\nmode: strict\n",
+    });
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    const policy_path = try std.fs.path.join(allocator, &.{ root, ".ryk", "policy.yaml" });
+    defer allocator.free(policy_path);
+    const policy_z = try allocator.dupeZ(u8, policy_path);
+    defer allocator.free(policy_z);
+    if (std.c.chmod(policy_z.ptr, 0) != 0) return error.SkipZigTest;
+    defer _ = std.c.chmod(policy_z.ptr, 0o644);
+    if (std.Io.Dir.cwd().readFileAlloc(std.testing.io, policy_path, allocator, .limited(4096))) |leaked| {
+        allocator.free(leaked);
+        return error.SkipZigTest;
+    } else |_| {}
+
+    const payload = try validPayload(allocator, "echo hello", root);
+    defer allocator.free(payload);
+    var stdout_buf: [4096]u8 = undefined;
+    var stdout: std.Io.Writer = .fixed(&stdout_buf);
+
+    const code = try evaluatePayload(std.testing.io, allocator, payload, &stdout, mockAllow, .disabled, .{
+        .disable_fm = true,
+    });
+    try std.testing.expectEqual(exit_evaluator_error, code);
+    const output = stdout.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"error\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "policy_load_failed") != null);
+}
+
+test "evaluate missing workspace policy still uses builtin strict" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, ".git", .default_dir);
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+
+    var home_tmp = std.testing.tmpDir(.{});
+    defer home_tmp.cleanup();
+    const home = try home_tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(home);
+    const home_z = try allocator.dupeZ(u8, home);
+    defer allocator.free(home_z);
+    const prev_home = if (std.c.getenv("HOME")) |value| try allocator.dupeZ(u8, std.mem.span(value)) else null;
+    defer if (prev_home) |value| allocator.free(value);
+    try std.testing.expectEqual(@as(c_int, 0), setenv("HOME", home_z.ptr, 1));
+    defer {
+        if (prev_home) |value| {
+            _ = setenv("HOME", value.ptr, 1);
+        } else {
+            _ = unsetenv("HOME");
+        }
+    }
+
+    const payload = try validPayload(allocator, "echo hello", root);
+    defer allocator.free(payload);
+    var stdout_buf: [4096]u8 = undefined;
+    var stdout: std.Io.Writer = .fixed(&stdout_buf);
+
+    const code = try evaluatePayload(std.testing.io, allocator, payload, &stdout, mockAllow, .disabled, .{
+        .disable_fm = true,
+    });
+    try std.testing.expectEqual(exit_allowed, code);
+    const output = stdout.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"allow\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "policy_load_failed") == null);
 }

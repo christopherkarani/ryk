@@ -22,6 +22,7 @@ const host_status = @import("host_status.zig");
 const pack_state = @import("pack_state.zig");
 const readiness = @import("readiness.zig");
 const ensure = @import("ensure.zig");
+const brand = @import("brand.zig");
 const policy_migrate = @import("policy_migrate.zig");
 const deadlock_check = @import("deadlock_check.zig");
 const enable_tui = @import("build_options").enable_tui;
@@ -202,6 +203,9 @@ pub fn command(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: an
     // (D25: 0 iff core_ok). No hard-dep on daemon ensure_running (D41).
     // Default / --check / --json remain diagnose or probe-only (D42).
     if (options.fix) {
+        try writeNonProductFixWarning(io, allocator, stderr);
+        const pi_before = host_status.inspectPi(io, allocator);
+        const grok_before = host_status.inspectGrok(io, allocator);
         var outcome = try ensure.runEnsure(
             io,
             allocator,
@@ -221,6 +225,7 @@ pub fn command(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: an
         if (outcome.protection_label == .partial or outcome.protection_label == .core_failed) {
             try ensure.writeEnsureReceipt(stdout, outcome);
         }
+        try writeBakeRepairNotes(stdout, pi_before, host_status.inspectPi(io, allocator), grok_before, host_status.inspectGrok(io, allocator));
         return ensure.processExitForOutcome(outcome);
     }
 
@@ -717,6 +722,7 @@ fn writeReportRaw(io: std.Io, stdout: anytype, os: core.platform.Os, backend_rep
         try writeHostStatusTable(io, stdout, context);
         try writePacksSection(io, stdout, context);
         try writeHermesFailOpenWarning(io, stdout, context);
+        try writeBrokenEvaluatorWarning(io, stdout, context);
         try writePiNote(stdout);
         try writePolicyFreshnessNotices(stdout, context);
         try writeRecommendations(stdout, context);
@@ -730,6 +736,7 @@ fn writeReportRaw(io: std.Io, stdout: anytype, os: core.platform.Os, backend_rep
     try writeHostStatusTable(io, stdout, context);
     try writePacksSection(io, stdout, context);
     try writeHermesFailOpenWarning(io, stdout, context);
+    try writeBrokenEvaluatorWarning(io, stdout, context);
     try writePiNote(stdout);
     try stdout.print("Secret boundary: {s}\n\n", .{secretBoundaryCapability(backend_report)});
     try stdout.writeAll("Capabilities:\n");
@@ -1163,7 +1170,52 @@ fn writeHermesFailOpenWarning(io: std.Io, stdout: anytype, context: IntegrationC
 
 fn writePiNote(stdout: anytype) !void {
     try stdout.writeAll("\nPi: bundled extension setup is managed by `ryk doctor --fix` (no npm step).\n");
-    try stdout.writeAll("  Process env/network isolation: ryk run -- pi · verify: ryk doctor\n");
+    try stdout.writeAll("  Process env/network isolation: ryk run -- pi (doctor is a probe, not live attach)\n");
+}
+
+fn writeBrokenEvaluatorWarning(io: std.Io, stdout: anytype, context: IntegrationContext) !void {
+    var any = false;
+    for (context.host_rows) |row| {
+        if (std.mem.eql(u8, row.wired, "broken")) {
+            any = true;
+            break;
+        }
+    }
+    if (!any) return;
+    try stdout.writeAll("\n");
+    try tui.render.callout(
+        io,
+        stdout,
+        .danger,
+        "Hook is a test program, not ryk",
+        "Pi or Grok is calling a Zig test binary (or another non-product file) instead of ryk. Every tool fail-closes. Run `ryk doctor --fix` from a normal terminal using the installed ryk binary, then restart the host.",
+    );
+}
+
+fn writeNonProductFixWarning(io: std.Io, allocator: std.mem.Allocator, stderr: anytype) !void {
+    const exe = std.process.executablePathAlloc(io, allocator) catch return;
+    defer allocator.free(exe);
+    const kind = brand.classifyEvaluator(exe);
+    if (kind.isProduct()) return;
+    try stderr.print(
+        "ryk doctor --fix: this process is a {s} ({s}), not product ryk. Host hooks were not rewritten. Run `ryk doctor --fix` from a normal terminal using the installed ryk binary.\n",
+        .{ kind.diagnoseLabel(), std.fs.path.basename(exe) },
+    );
+}
+
+fn writeBakeRepairNotes(
+    stdout: anytype,
+    pi_before: host_status.PiStatus,
+    pi_after: host_status.PiStatus,
+    grok_before: host_status.GrokStatus,
+    grok_after: host_status.GrokStatus,
+) !void {
+    if (host_status.bakeRepairLine("pi", pi_before.evaluator_ok, pi_after.evaluator_ok, pi_after.extension_installed)) |line| {
+        try stdout.print("{s}\n", .{line});
+    }
+    if (host_status.bakeRepairLine("grok", grok_before.evaluator_ok, grok_after.evaluator_ok, grok_after.hook_installed)) |line| {
+        try stdout.print("{s}\n", .{line});
+    }
 }
 
 fn writePacksSection(io: std.Io, stdout: anytype, context: IntegrationContext) !void {
@@ -1391,6 +1443,23 @@ fn collectHostDoctorRows(io: std.Io, allocator: std.mem.Allocator) !HostDoctorSn
             .wired = try allocator.dupe(u8, wired),
             .shell_gate = try allocator.dupe(u8, host_status.shellGate("pi")),
             .fail_stance = try allocator.dupe(u8, host_status.failStance("pi", hermes_fail_open, wired)),
+            .smoke_allow = try allocator.dupe(u8, smoke.allow.toString()),
+            .smoke_deny = try allocator.dupe(u8, smoke.deny.toString()),
+            .fix = fix,
+        });
+    }
+
+    // Grok: native PreToolUse Command Guard (not marketplace-plugin-managed).
+    {
+        const grok_status = host_status.inspectGrok(io, allocator);
+        const wired = grok_status.wiredLabel();
+        const smoke = host_status.HostSmokePair{};
+        const fix = try host_status.formatFix(allocator, "grok", wired, smoke, hermes_fail_open);
+        try list.append(allocator, .{
+            .host = try allocator.dupe(u8, "grok"),
+            .wired = try allocator.dupe(u8, wired),
+            .shell_gate = try allocator.dupe(u8, host_status.shellGate("grok")),
+            .fail_stance = try allocator.dupe(u8, host_status.failStance("grok", hermes_fail_open, wired)),
             .smoke_allow = try allocator.dupe(u8, smoke.allow.toString()),
             .smoke_deny = try allocator.dupe(u8, smoke.deny.toString()),
             .fix = fix,
@@ -1969,6 +2038,7 @@ test "doctor host table lists managed hosts and shell gates" {
     try std.testing.expect(std.mem.indexOf(u8, written, "hermes") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "pre_tool_call") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "pi") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "grok") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "extension-managed (smoke not run)") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "SMOKE ALLOW") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "SMOKE DENY") != null);
@@ -1980,6 +2050,23 @@ test "doctor host table lists managed hosts and shell gates" {
     try std.testing.expect(std.mem.indexOf(u8, written, "ryk doctor --fix") != null);
     // Forbidden start-onboard needle must not appear in rendered host table / Pi note.
     try std.testing.expect(std.mem.indexOf(u8, written, "ryk" ++ " start") == null);
+}
+
+test "doctor names a test-program host bake and teaches doctor --fix" {
+    var stdout_buf: [16384]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    const report = sandbox.backend.detect(.linux);
+    var context = try testContext(std.testing.allocator, .{ .broken_evaluator_host = "pi" });
+    defer context.deinit();
+
+    try writeReport(std.testing.io, &stdout_writer, .linux, report, context, false);
+    const written = stdout_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "broken") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "Hook is a test program, not ryk") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "ryk doctor --fix") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "test/non-product") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "OS-enforced") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "evaluator not product ryk") != null);
 }
 
 test "doctor warns when Hermes is explicitly fail-open" {
@@ -2616,7 +2703,7 @@ test "doctorFix --fix command path invokes ensure mutation door" {
     // Acceptance (2): --fix early-branches to ensure. Contrast with probe-only:
     // under empty tmpDir, doctor --fix must create-if-missing .ryk/policy.yaml
     // (ensure core). Host wire may soft-fail under zig-test binary; policy create is
-    // the greppable ensure side effect. RED until production wires the fix door.
+    // the greppable ensure side effect.
     const io = std.testing.io;
     const allocator = std.testing.allocator;
 
@@ -2859,6 +2946,8 @@ test "MessageMigrate doctor production teaches doctor --fix repair door" {
     const window_end = @min(prod.len, pi_idx + 200);
     const pi_window = prod[pi_idx..window_end];
     try std.testing.expect(std.mem.indexOf(u8, pi_window, "doctor --fix") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pi_window, "probe") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pi_window, "verify: ryk doctor") == null);
     try std.testing.expect(std.mem.indexOf(u8, pi_window, messageMigrateForbiddenStartNeedle()) == null);
 }
 
@@ -2966,10 +3055,23 @@ const TestContextOptions = struct {
     daemon_detail: []const u8 = "running daemon answered with a compatible handshake.",
     hermes_fail_open: bool = true,
     hermes_installed: bool = false,
+    /// When set, that host row is marked wired=broken (test-program bake).
+    broken_evaluator_host: ?[]const u8 = null,
 };
 
 fn testContext(allocator: std.mem.Allocator, options: TestContextOptions) !IntegrationContext {
     const host_rows = try testHostRows(allocator);
+    if (options.broken_evaluator_host) |host| {
+        for (host_rows) |*row| {
+            if (!std.mem.eql(u8, row.host, host)) continue;
+            allocator.free(row.wired);
+            row.wired = try allocator.dupe(u8, "broken");
+            allocator.free(row.fail_stance);
+            row.fail_stance = try allocator.dupe(u8, host_status.failStance(host, options.hermes_fail_open, "broken"));
+            allocator.free(row.fix);
+            row.fix = try host_status.formatFix(allocator, host, "broken", .{}, options.hermes_fail_open);
+        }
+    }
     return .{
         .allocator = allocator,
         .workspace_root = try allocator.dupe(u8, "."),
@@ -3009,6 +3111,7 @@ fn testHostRows(allocator: std.mem.Allocator) ![]HostDoctorRow {
         .{ .name = "openclaw", .gate = "tool.before", .stance = "fail-closed shell" },
         .{ .name = "hermes", .gate = "pre_tool_call", .stance = "fail-closed" },
         .{ .name = "pi", .gate = "extension-managed (smoke not run)", .stance = "mode-dependent" },
+        .{ .name = "grok", .gate = "PreToolUse", .stance = "fail-closed shell" },
     };
     var list: std.ArrayList(HostDoctorRow) = .empty;
     errdefer {

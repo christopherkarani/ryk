@@ -2,6 +2,7 @@ const std = @import("std");
 const exit_codes = @import("exit_codes.zig");
 const contracts = @import("daemon_contracts.zig");
 const tui = @import("ryk").tui;
+const enable_tui = @import("build_options").enable_tui;
 
 pub fn command(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: anytype) !u8 {
     return commandWithExecutor(realExecute, io, argv, stdout, stderr);
@@ -68,12 +69,9 @@ fn passThrough(comptime execute_cli: anytype, io: std.Io, argv: []const []const 
     return execute_cli(io, daemon_argv, stdout, stderr);
 }
 
-/// Phase 7: render the current `history stats` snapshot inside the alt-screen
-/// viewer. Fetches the structured stats JSON (same path as `history stats`),
-/// renders the human form into a buffer, splits it into lines, and hands them to
-/// `tui.live_view.run` for scrollable display. Rejected on `--json`/`--robot`
-/// (frozen machine contract) and on non-interactive output (non-TTY / NO_COLOR /
-/// --no-rich) — the alt-screen never enters on a pipe.
+/// Render the current `history stats` snapshot. On an interactive colour TTY
+/// this is the alt-screen viewer; otherwise the same linear human stats (exit
+/// as linear `history stats` would). `--json`/`--robot` stay a machine conflict.
 fn renderLiveStats(comptime execute_cli: anytype, io: std.Io, argv: []const []const u8, stdout: anytype, stderr: anytype) !u8 {
     for (argv) |arg| {
         if (std.mem.eql(u8, arg, "--json") or std.mem.eql(u8, arg, "--robot")) {
@@ -81,10 +79,12 @@ fn renderLiveStats(comptime execute_cli: anytype, io: std.Io, argv: []const []co
             return exit_codes.usage;
         }
     }
-    if (!tui.theme.active(io, stdout).capability.hasColor()) {
-        try stderr.writeAll("ryk history: --live needs an interactive colour terminal. Drop --live, or unset NO_COLOR / --no-rich.\n");
-        return exit_codes.usage;
-    }
+    // Colour TTY plus no presentation escape. Honour `--plain` / `--no-rich`
+    // as linear (issue #217). Do not treat leftover `--format json` as a TUI
+    // escape — that reopens a human/machine mash. `--json`/`--robot` stay
+    // rejected above.
+    const enter_tui = (comptime enable_tui) and tui.theme.active(io, stdout).capability.hasColor() and
+        !argvHasPresentationEscape(argv);
 
     const allocator = std.heap.smp_allocator;
     const live_args = try buildLiveStatsArgv(allocator, argv);
@@ -111,6 +111,15 @@ fn renderLiveStats(comptime execute_cli: anytype, io: std.Io, argv: []const []co
     };
     defer parsed.deinit();
 
+    if (!enter_tui) {
+        if (comptime enable_tui) {
+            try stderr.writeAll("ryk history: --live requires an interactive TTY; using linear report.\n");
+        } else {
+            try stderr.writeAll("ryk history: --live requires a TUI-enabled ryk build; using linear report.\n");
+        }
+        return renderHumanAlloc(allocator, io, parsed.value, stdout);
+    }
+
     // Render the human form into a buffer, then split into lines for the viewer.
     // This reuses the canonical stats renderer so the live view carries exactly
     // the same information as the linear form (no divergence to maintain).
@@ -120,7 +129,9 @@ fn renderLiveStats(comptime execute_cli: anytype, io: std.Io, argv: []const []co
     const lines = try splitLines(allocator, human_buf.written());
     defer freeLines(allocator, lines);
 
-    try tui.live_view.run(io, stdout, "history · stats", lines, null, null);
+    if (comptime enable_tui) {
+        try tui.live_view.run(io, stdout, "history · stats", lines, null, null);
+    }
     return exit_codes.success;
 }
 
@@ -159,6 +170,13 @@ fn isLiveRequest(argv: []const []const u8) bool {
     return false;
 }
 
+fn argvHasPresentationEscape(argv: []const []const u8) bool {
+    for (argv) |arg| {
+        if (std.mem.eql(u8, arg, "--plain") or std.mem.eql(u8, arg, "--no-rich")) return true;
+    }
+    return false;
+}
+
 /// Pure: build the daemon argv for the --live stats snapshot, dropping `--live`,
 /// normalising a leading `stats`, and appending `--json`. Returns the args
 /// AFTER the `history` subcommand (the caller prepends `history`). Unit-tested.
@@ -169,6 +187,8 @@ fn buildLiveStatsArgv(allocator: std.mem.Allocator, argv: []const []const u8) ![
     var saw_stats = false;
     for (argv) |arg| {
         if (std.mem.eql(u8, arg, "--live")) continue; // never forwarded
+        // Presentation escapes are not history-stats flags; do not forward.
+        if (std.mem.eql(u8, arg, "--plain") or std.mem.eql(u8, arg, "--no-rich")) continue;
         if (!saw_stats and std.mem.eql(u8, arg, "stats")) {
             saw_stats = true; // drop a leading stats (we prepended one above)
             continue;
@@ -405,7 +425,7 @@ fn fakeStats(_: std.Io, argv: []const []const u8, stdout: anytype, _: anytype) !
 }
 
 // ---------------------------------------------------------------------------
-// Phase 7 Task D: --live alt-screen view (rejection contracts + the pure
+// --live alt-screen view (rejection contracts + the pure
 // argv builder; the raw TTY loop is manual-verify per the prompt.zig:19 note).
 // ---------------------------------------------------------------------------
 
@@ -415,6 +435,8 @@ test "buildLiveStatsArgv: drops --live, normalises stats, appends --json" {
         .{ .in = &.{ "--live", "--days", "7" }, .want = &.{ "stats", "--days", "7", "--json" } },
         .{ .in = &.{ "stats", "--live", "--days", "7" }, .want = &.{ "stats", "--days", "7", "--json" } },
         .{ .in = &.{"--live"}, .want = &.{ "stats", "--json" } },
+        .{ .in = &.{ "--live", "--plain", "--days", "7" }, .want = &.{ "stats", "--days", "7", "--json" } },
+        .{ .in = &.{ "--live", "--no-rich" }, .want = &.{ "stats", "--json" } },
     };
     for (cases) |c| {
         const got = try buildLiveStatsArgv(std.testing.allocator, c.in);
@@ -423,18 +445,74 @@ test "buildLiveStatsArgv: drops --live, normalises stats, appends --json" {
     }
 }
 
-test "history --live is rejected on non-interactive output (no colour terminal)" {
-    // Fixed-buffer stdout → no colour capability → --live must be rejected with
-    // a usage error and must never fetch from the daemon or enter the alt-screen.
-    var out: [256]u8 = undefined;
-    var err: [256]u8 = undefined;
+test "history --live falls back to linear on non-interactive output" {
+    // Pipe / fixed-buffer / no colour TTY: --live must not EXIT 2. Fetch the
+    // stats snapshot and render the linear human form instead of the alt-screen.
+    var out: [8192]u8 = undefined;
+    var err: [512]u8 = undefined;
     var stdout: std.Io.Writer = .fixed(&out);
     var stderr: std.Io.Writer = .fixed(&err);
-    const code = try commandWithExecutor(unexpectedExecutor, std.testing.io, &.{"--live"}, &stdout, &stderr);
-    try std.testing.expectEqual(exit_codes.usage, code);
-    try std.testing.expect(std.mem.indexOf(u8, stderr.buffered(), "--live") != null);
-    try std.testing.expect(std.mem.indexOf(u8, stderr.buffered(), "interactive") != null);
+    const code = try commandWithExecutor(fakeStats, std.testing.io, &.{ "--live", "--days", "7" }, &stdout, &stderr);
+    try std.testing.expectEqual(exit_codes.success, code);
+    try std.testing.expect(std.mem.indexOf(u8, stderr.buffered(), "using linear") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr.buffered(), "Drop --live") == null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout.buffered(), "PATTERN") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout.buffered(), "19.05%") != null);
     try std.testing.expect(std.mem.indexOf(u8, stdout.buffered(), "\x1b[?1049") == null);
+}
+
+test "history --live --plain does not forward --plain to daemon" {
+    // Leftover --plain is a presentation escape, not a history-stats flag.
+    var out: [8192]u8 = undefined;
+    var err: [512]u8 = undefined;
+    var stdout: std.Io.Writer = .fixed(&out);
+    var stderr: std.Io.Writer = .fixed(&err);
+    const code = try commandWithExecutor(fakeStats, std.testing.io, &.{ "--live", "--plain", "--days", "7" }, &stdout, &stderr);
+    try std.testing.expectEqual(exit_codes.success, code);
+    try std.testing.expect(std.mem.indexOf(u8, stderr.buffered(), "using linear") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout.buffered(), "PATTERN") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout.buffered(), "\x1b[?1049") == null);
+}
+
+test "history --live --plain on a colour TTY stays linear" {
+    tui.theme.setTestActive(.{ .capability = .truecolor, .background = .dark });
+    defer tui.theme.setTestActive(null);
+
+    var out: [8192]u8 = undefined;
+    var err: [512]u8 = undefined;
+    var stdout: std.Io.Writer = .fixed(&out);
+    var stderr: std.Io.Writer = .fixed(&err);
+    const code = try commandWithExecutor(fakeStats, std.testing.io, &.{ "--live", "--plain", "--days", "7" }, &stdout, &stderr);
+    try std.testing.expectEqual(exit_codes.success, code);
+    try std.testing.expect(std.mem.indexOf(u8, stderr.buffered(), "using linear") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout.buffered(), "PATTERN") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout.buffered(), "\x1b[?1049") == null);
+}
+
+test "history --live --format json is not a TUI escape mash" {
+    // Colour-only gate: leftover --format json must not skip the alt-screen
+    // and then print human stats. Under a forced colour theme the live path
+    // is taken (is_test stub); linear "using linear" must not fire.
+    tui.theme.setTestActive(.{ .capability = .truecolor, .background = .dark });
+    defer tui.theme.setTestActive(null);
+
+    var out: [8192]u8 = undefined;
+    var err: [512]u8 = undefined;
+    var stdout: std.Io.Writer = .fixed(&out);
+    var stderr: std.Io.Writer = .fixed(&err);
+    const code = try commandWithExecutor(fakeStatsFormatJson, std.testing.io, &.{ "--live", "--format", "json" }, &stdout, &stderr);
+    try std.testing.expectEqual(exit_codes.success, code);
+    if (enable_tui) {
+        try std.testing.expect(std.mem.indexOf(u8, stderr.buffered(), "using linear") == null);
+    } else {
+        try std.testing.expect(std.mem.indexOf(u8, stderr.buffered(), "using linear") != null);
+    }
+}
+
+fn fakeStatsFormatJson(_: std.Io, argv: []const []const u8, stdout: anytype, _: anytype) !u8 {
+    try std.testing.expectEqualSlices([]const u8, &.{ "history", "stats", "--format", "json", "--json" }, argv);
+    try stdout.writeAll(@embedFile("test-fixtures/daemon-history-stats.json"));
+    return exit_codes.success;
 }
 
 test "history --live cannot combine with --json" {

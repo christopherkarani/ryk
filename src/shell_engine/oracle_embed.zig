@@ -1,9 +1,15 @@
 //! Compressed oracle pack catalog.
 //!
 //! `oracle_packs.json` remains the editable source of truth (regex must stay
-//! byte-identical). The product binary embeds only the gzip. Regenerate with:
+//! byte-identical). The product binary embeds two gzip catalogs:
+//!
+//! - `oracle_packs.json.gz` — full oracle (`load_all=true`)
+//! - `oracle_packs.default.json.gz` — `core.*` + `system.disk` (hook / `load_all=false`)
+//!
+//! Regenerate with:
 //!
 //!   gzip -9n -c src/shell_engine/oracle_packs.json > src/shell_engine/oracle_packs.json.gz
+//!   ./scripts/gen-default-oracle-packs.sh
 //!
 //! Drift is caught by the inflate-identity test (raw JSON is test-only).
 //! Inflate failure is fail-closed: never return empty JSON to an eval caller.
@@ -11,17 +17,25 @@
 const std = @import("std");
 
 const compressed = @embedFile("oracle_packs.json.gz");
+const compressed_default = @embedFile("oracle_packs.default.json.gz");
 
 /// Hard cap against a hostile/corrupt stream. Real catalog is 289,521 bytes.
 const max_inflated_len: usize = 512 * 1024;
 
 pub const compressed_len = compressed.len;
+pub const compressed_default_len = compressed_default.len;
 
 pub const Error = error{ PacksInflateFailed, OutOfMemory };
 
 /// Inflate the embedded gzip into an allocator-owned buffer.
 pub fn inflateAlloc(allocator: std.mem.Allocator) Error![]u8 {
     return inflateSlice(allocator, compressed);
+}
+
+/// Full catalog when `load_all`, otherwise the default-pack subset (hook path).
+pub fn inflateAllocForInit(allocator: std.mem.Allocator, load_all: bool) Error![]u8 {
+    if (load_all) return inflateAlloc(allocator);
+    return inflateSlice(allocator, compressed_default);
 }
 
 /// Inflate `compressed` gzip bytes. Empty or oversize output is a failure.
@@ -60,6 +74,17 @@ fn looksLikePacksArray(json: []const u8) bool {
         }
     }
     return false;
+}
+
+test "default gzip inflates to only core.* and system.disk packs" {
+    const inflated = try inflateAllocForInit(std.testing.allocator, false);
+    defer std.testing.allocator.free(inflated);
+    try std.testing.expect(looksLikePacksArray(inflated));
+    try std.testing.expect(inflated.len < 64 * 1024);
+    try std.testing.expect(std.mem.indexOf(u8, inflated, "\"id\":\"core.git\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, inflated, "\"id\":\"system.disk\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, inflated, "\"id\":\"apigateway.") == null);
+    try std.testing.expect(compressed_default_len < compressed_len);
 }
 
 test "embedded gzip inflates to byte-identical oracle_packs.json" {

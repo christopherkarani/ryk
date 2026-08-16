@@ -543,7 +543,7 @@ fn hookCommand(io: std.Io, host: Host, event: Event, original_event_name: []cons
 
     const needs_policy = eventNeedsPolicy(event);
     const fail_closed_pre_eval = shouldFailClosedOnPreEval(host, event);
-    const needs_workspace = needs_policy or fail_closed_pre_eval or host == .hermes;
+    const needs_workspace = hookNeedsWorkspaceRoot(host, event, request_event);
     const root = if (needs_workspace)
         supervisor.resolveWorkspaceRoot(io, allocator, null, ".") catch try allocator.dupe(u8, ".")
     else
@@ -1171,6 +1171,31 @@ fn eventNeedsPolicy(event: Event) bool {
         .UserPromptSubmit, .PreToolUse, .PermissionRequest => true,
         .SessionStart, .Stop, .SessionEnd, .PostToolUse => false,
     };
+}
+
+/// Workspace walk + policy discover stay mandatory for fail-closed PreToolUse /
+/// PermissionRequest / Codex. Informational Hermes events only need a real
+/// workspace when they record activity (`subagent_stop`).
+fn hookNeedsWorkspaceRoot(host: Host, event: Event, request_event: []const u8) bool {
+    if (eventNeedsPolicy(event)) return true;
+    if (shouldFailClosedOnPreEval(host, event)) return true;
+    if (host == .hermes) {
+        if (isHermesInformationalEvent(request_event)) {
+            return std.mem.eql(u8, request_event, "subagent_stop");
+        }
+        return true;
+    }
+    return false;
+}
+
+test "hookNeedsWorkspaceRoot keeps fail-closed walks and skips informational hermes" {
+    try std.testing.expect(hookNeedsWorkspaceRoot(.claude, .PreToolUse, "PreToolUse"));
+    try std.testing.expect(hookNeedsWorkspaceRoot(.codex, .SessionStart, "SessionStart"));
+    try std.testing.expect(!hookNeedsWorkspaceRoot(.claude, .SessionStart, "SessionStart"));
+    try std.testing.expect(!hookNeedsWorkspaceRoot(.hermes, .SessionStart, "post_llm_call"));
+    try std.testing.expect(hookNeedsWorkspaceRoot(.hermes, .SessionStart, "subagent_stop"));
+    try std.testing.expect(hookNeedsWorkspaceRoot(.hermes, .SessionStart, "on_session_start"));
+
 }
 
 fn evaluateInformationalEvent(
@@ -2996,6 +3021,50 @@ test "hook help usage lists every Host.parse allowlist member including grok" {
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), info.usage) != null);
 }
 
+test "hook help documents pi as extension-only and dispatch rejects it" {
+    const host_launch = @import("host_launch.zig");
+    try std.testing.expect(Host.parse("pi") == null);
+    try std.testing.expect(Host.parse("cursor") == null);
+    try std.testing.expect(host_launch.isHostLaunchAlias("pi"));
+    try std.testing.expect(!host_launch.isHostLaunchAlias("cursor"));
+    try std.testing.expectEqual(@as(usize, 7), host_launch.host_launch_aliases.len);
+
+    const info = help.findCommand("hook") orelse return error.MissingHookHelp;
+    const open = std.mem.indexOfScalar(u8, info.usage, '<') orelse return error.MissingHostUsageGroup;
+    const close = std.mem.indexOfScalar(u8, info.usage[open..], '>') orelse return error.MissingHostUsageGroup;
+    const listed = info.usage[open + 1 .. open + close];
+    var listed_it = std.mem.splitScalar(u8, listed, '|');
+    while (listed_it.next()) |name| {
+        try std.testing.expect(!std.mem.eql(u8, name, "pi"));
+        try std.testing.expect(!std.mem.eql(u8, name, "cursor"));
+    }
+
+    var found_pi_note = false;
+    for (info.details) |line| {
+        const mentions_pi = std.mem.indexOf(u8, line, "Pi") != null or std.mem.indexOf(u8, line, "pi") != null;
+        const mentions_extension = std.mem.indexOf(u8, line, "extension") != null;
+        const mentions_evaluate = std.mem.indexOf(u8, line, "evaluate") != null;
+        if (mentions_pi and mentions_extension and mentions_evaluate) found_pi_note = true;
+    }
+    try std.testing.expect(found_pi_note);
+
+    var stdout_buf: [4096]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_buf: [256]u8 = undefined;
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+    const help_code = try command(std.testing.io, &.{"--help"}, &stdout_writer, &stderr_writer);
+    try std.testing.expectEqual(exit_codes.success, help_code);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "extension") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "evaluate") != null);
+
+    stdout_writer = .fixed(&stdout_buf);
+    stderr_writer = .fixed(&stderr_buf);
+    const pi_code = try command(std.testing.io, &.{"pi"}, &stdout_writer, &stderr_writer);
+    try std.testing.expectEqual(exit_codes.usage, pi_code);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "unknown host") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "'pi'") != null);
+}
+
 test "hook recognizes Grok as a PreToolUse host with exit-two deny semantics" {
     try std.testing.expectEqual(Host.grok, Host.parse("grok").?);
     try std.testing.expect(shouldFailClosedOnPreEval(.grok, .PreToolUse));
@@ -3768,6 +3837,39 @@ test "isHermesInformationalEvent identifies informational events" {
     try std.testing.expect(isHermesInformationalEvent("subagent_stop"));
     try std.testing.expect(!isHermesInformationalEvent("pre_tool_call"));
     try std.testing.expect(!isHermesInformationalEvent("on_session_start"));
+}
+
+test "hook informational events skip workspace walk except hermes activity writers" {
+    // OpenCode / OpenClaw informational already short-circuit before resolve.
+    try std.testing.expect(!hookNeedsWorkspaceRoot(.opencode, .SessionStart, "permission.replied"));
+    try std.testing.expect(!hookNeedsWorkspaceRoot(.opencode, .SessionStart, "file.edited"));
+    try std.testing.expect(!hookNeedsWorkspaceRoot(.opencode, .SessionStart, "command.executed"));
+    try std.testing.expect(!hookNeedsWorkspaceRoot(.openclaw, .SessionStart, "permission.after"));
+    try std.testing.expect(!hookNeedsWorkspaceRoot(.openclaw, .SessionStart, "session.end"));
+
+    // Hermes informational that does not record activity skips the ancestor walk.
+    try std.testing.expect(!hookNeedsWorkspaceRoot(.hermes, .SessionStart, "post_llm_call"));
+
+    // subagent_stop records feed activity and still resolves the workspace.
+    try std.testing.expect(hookNeedsWorkspaceRoot(.hermes, .SessionStart, "subagent_stop"));
+}
+
+test "hook informational skip keeps PreToolUse PermissionRequest workspace walk" {
+    try std.testing.expect(hookNeedsWorkspaceRoot(.claude, .PreToolUse, "PreToolUse"));
+    try std.testing.expect(hookNeedsWorkspaceRoot(.claude, .PermissionRequest, "PermissionRequest"));
+    try std.testing.expect(hookNeedsWorkspaceRoot(.codex, .PreToolUse, "PreToolUse"));
+    try std.testing.expect(hookNeedsWorkspaceRoot(.codex, .PermissionRequest, "PermissionRequest"));
+    try std.testing.expect(hookNeedsWorkspaceRoot(.hermes, .PreToolUse, "pre_tool_call"));
+    try std.testing.expect(hookNeedsWorkspaceRoot(.opencode, .PreToolUse, "tool.execute.before"));
+    try std.testing.expect(hookNeedsWorkspaceRoot(.openclaw, .PreToolUse, "tool.before"));
+
+    // fail-closed PreToolUse hosts still walk; Hermes session writers still walk.
+    try std.testing.expect(hookNeedsWorkspaceRoot(.codex, .SessionStart, "SessionStart"));
+    try std.testing.expect(hookNeedsWorkspaceRoot(.hermes, .SessionStart, "on_session_start"));
+    try std.testing.expect(hookNeedsWorkspaceRoot(.hermes, .SessionEnd, "on_session_end"));
+    try std.testing.expect(!isOpenCodeInformationalEvent("tool.execute.before"));
+    try std.testing.expect(!isHermesInformationalEvent("pre_tool_call"));
+    try std.testing.expect(!isOpenClawInformationalEvent("tool.before"));
 }
 
 test "hermes correlation extracts nested identifiers and prefers parent for subagents" {
@@ -5841,19 +5943,16 @@ fn testJsonStringFieldRaw(haystack: []const u8, key: []const u8) ?[]const u8 {
 //
 // One real pack deny (`git reset --hard` through the real Zig evaluator) is
 // emitted through each host's production wire shape, and the agent-visible
-// field is held to the shared contract from
-// docs/handoffs/shared-short-agent-message-2026-08-11.md: one line, no operator
+// field is held to the shared contract: one line, no operator
 // Recourse/Next walls, still names ryk, never a redeemable allow-once code.
 // Operator detail stays on stderr / structured fields.
 //
 // Codex and Grok are documented exceptions on *channel*, not on shape. They have
 // no separate operator surface the model can read (exit-2 hosts), so both fold a
 // fixed placeholder recourse into that one string by design — the Codex guard
-// sentinel and `grok_deny_reason`'s footer. The code is truth here: the handoff
-// says "no Recourse in message", which holds for every host that does have a
-// second channel. For the exit-2 pair the enforced rule is narrower and still
-// meaningful: recourse may appear only in placeholder form (`<code>`), never as a
-// redeemable code, and never as a multi-line wall.
+// sentinel and `grok_deny_reason`'s footer. For the exit-2 pair the enforced
+// rule is narrower and still meaningful: recourse may appear only in placeholder
+// form (`<code>`), never as a redeemable code, and never as a multi-line wall.
 test "hook short block message parity across all hosts" {
     var xdg = try sOnceCliHookIsolateXdg();
     defer xdg.deinit();

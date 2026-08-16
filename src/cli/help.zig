@@ -188,6 +188,7 @@ pub const commands =
             .details = &.{
                 "Prints export statements for PATH and RYK_RESOURCE_ROOT.",
                 "Use with eval: eval \"$(ryk env)\"",
+                "ryk env schema --agent prints the agent schema export.",
             },
         },
         .{
@@ -214,7 +215,7 @@ pub const commands =
                 "Use --json for a minimal readiness report (ready, state, policy.valid).",
                 "Use --tui for a four-pane deep-dive (Summary · Hosts · Capabilities · Next steps) on an interactive TTY; non-TTY / --json / --plain falls back to linear.",
                 "Next steps in --tui deep-link `ryk packs` and `ryk allowlist`.",
-                "Use --fix to repair protection (create policy if missing, auto-wire day-one hosts). Exit 0 when core policy is ok; host soft-fails stay partial.",
+                "Use --fix to repair protection (create policy if missing, auto-wire day-one hosts, rebind Pi/Grok hooks that point at a Zig test program). Exit 0 when core policy is ok; host soft-fails stay partial. Must run as product ryk, not a test binary.",
                 "--fix is exclusive with --check and --json (cannot combine; probe contracts stay pure).",
                 "Optional --from-install scopes ensure to install HOME/resource-root; --preset selects create-if-missing policy preset. Both require --fix.",
                 "Use --deadlock-check to replay a standard coding workflow against your active policy: exit non-zero when a normal step would ask/deny (an agent would stall) or a dangerous step would be allowed.",
@@ -264,20 +265,17 @@ pub const commands =
         },
         .{
             .name = "history",
-            .summary = "Review protected command history",
-            .usage = "ryk history [stats|check|analyze|interactive|export|prune|backup] [options] [--days N] [--strict] [--live] [--json|--robot|--format <value>]",
+            .summary = "Not available (hide-list stub)",
+            .usage = "ryk history  (not available)",
             .category = .diagnostics,
             .hidden = true, // use `replay` for history-like review
             .examples = &.{
-                "ryk history stats --days 7",
-                "ryk history check --strict",
-                "ryk history --live",
+                "ryk replay",
+                "ryk replay --tui",
             },
             .details = &.{
-                "Human stats are rendered by ryk from structured history data.",
-                "Use 'ryk history --help' for actions and examples.",
-                "--live opens a scrollable alt-screen view of the current stats snapshot (TTY only; not with --json).",
-                "Use --json, --robot, or --format for machine-readable daemon output.",
+                "Hide-list stub: command 'history' is not available.",
+                "The product review surface is ryk replay (optional --tui).",
             },
         },
         .{
@@ -609,7 +607,7 @@ pub const commands =
             "run 'find . -type d -name .ryk' to locate them manually.",
             "Package-manager binaries (Homebrew/Scoop/WinGet) are left in place; uninstall there separately.",
         } },
-        .{ .name = "replay", .summary = "Replay an audit session", .usage = "ryk replay [--list] [--session <id|last>] [--json] [--only denied] [--verify] [--tui]", .category = .core_workflow, .public = true, .examples = &.{
+        .{ .name = "replay", .summary = "Replay an audit session", .usage = "ryk replay [--list] [--session <id|last>] [--json] [--only denied] [--verify] [--tui] [--plain]", .category = .core_workflow, .public = true, .examples = &.{
             "ryk replay",
             "ryk replay --list",
             "ryk replay --session last",
@@ -619,7 +617,7 @@ pub const commands =
             "Reads .ryk session artifacts, renders a timeline, and can verify session integrity.",
             "With no args and no sessions, lists available sessions instead of erroring.",
             "Use --list to print all session IDs under .ryk/sessions/.",
-            "--tui opens a scrollable alt-screen timeline view (TTY only; not with --json).",
+            "--tui opens a scrollable alt-screen timeline view on an interactive TTY; non-TTY / --plain / --no-rich falls back to linear (not with --json).",
         } },
         .{
             .name = "diff",
@@ -709,7 +707,7 @@ pub const commands =
                 "  --yes              Skip the confirmation prompt.",
                 "  --version <semver> Install a specific release instead of latest.",
                 "  --json             Machine-readable status.",
-                "  --force            Allow curl installer on package-managed installs, or downgrade with --version.",
+                "  --force            Overwrite a non-ryk destination, allow package-managed installs, or downgrade with --version.",
                 "Legacy Homebrew/npm/scoop/winget installs are not upgraded through their package manager.",
                 "Migrate them to the supported curl installer (use --force to overwrite in place).",
                 "See also: docs/install.md",
@@ -750,6 +748,8 @@ pub const commands =
             "One-click repair: `ryk doctor --fix`. Guided multi-select setup: `ryk start`.",
             "Bare install never mutates; mutation requires an explicit host or `all` plus --yes (confirm default No on TTY).",
             "Plugin doctor does not print secrets.",
+            "Grok is hook-managed (`ryk hook grok` / `ryk grok`); it is not a `plugin install` host.",
+            "Pi is extension-only (`ryk evaluate` / bundled extension); it is not a `plugin install` host.",
         } },
         .{ .name = "decide", .summary = "Ask ryk whether an action is allowed by policy", .usage = "ryk decide <command|file|prompt|tool> (--json <payload>|--stdin) [--ci] [--human]", .category = .advanced, .details = &.{
             "Evaluates a policy decision for host plugins (Codex, Claude Code, OpenCode, etc.).",
@@ -775,6 +775,7 @@ pub const commands =
             "Reads a JSON payload from stdin, normalizes host-specific events to ryk decisions,",
             "and emits a host-valid JSON response to stdout. Debug logs go to stderr only.",
             "Shell PreToolUse / PermissionRequest (and equivalent host tool-before events) evaluate commands via the in-process Zig shell_engine; legacy Rust evaluator selection is rejected.",
+            "Pi is extension-only (`ryk evaluate` / bundled extension); it is not a hook host.",
             "Events:",
             "  ryk hook codex SessionStart",
             "  ryk hook codex UserPromptSubmit",
@@ -1220,6 +1221,40 @@ test "top help and per-host help surface claude and pi aliases" {
     try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "ryk pi") != null);
 }
 
+test "plugin help mentions grok and pi as non-install hosts" {
+    var buf: [4096]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try std.testing.expect(try writeCommand(std.testing.io, &writer, "plugin"));
+    const printed = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, printed, "grok") != null);
+    try std.testing.expect(std.mem.indexOf(u8, printed, "Pi") != null);
+
+    const info = findCommand("plugin") orelse return error.TestUnexpectedResult;
+    var found_grok_note = false;
+    var found_pi_note = false;
+    for (info.details) |line| {
+        const not_install_host = std.mem.indexOf(u8, line, "not a `plugin install` host") != null;
+        const mentions_grok = std.mem.indexOf(u8, line, "Grok") != null or std.mem.indexOf(u8, line, "grok") != null;
+        const mentions_hook = std.mem.indexOf(u8, line, "hook") != null;
+        if (mentions_grok and mentions_hook and not_install_host) found_grok_note = true;
+
+        const mentions_pi = std.mem.indexOf(u8, line, "Pi") != null;
+        const mentions_extension = std.mem.indexOf(u8, line, "extension") != null;
+        if (mentions_pi and mentions_extension and not_install_host) found_pi_note = true;
+
+        if (std.mem.indexOf(u8, line, "plugin install <") != null) {
+            try std.testing.expect(std.mem.indexOf(u8, line, "grok") == null);
+            try std.testing.expect(std.mem.indexOf(u8, line, "pi") == null);
+        }
+        if (std.mem.indexOf(u8, line, "ryk plugin <") != null) {
+            try std.testing.expect(std.mem.indexOf(u8, line, "grok") == null);
+            try std.testing.expect(std.mem.indexOf(u8, line, "pi") == null);
+        }
+    }
+    try std.testing.expect(found_grok_note);
+    try std.testing.expect(found_pi_note);
+}
+
 /// True when root help lists `name` as a left-column peer command (not Common tasks / prose).
 fn helpListsPeerCommand(text: []const u8, name: []const u8) bool {
     var lines = std.mem.splitScalar(u8, text, '\n');
@@ -1393,6 +1428,23 @@ test "P0 honesty: hide-list verbs are marked hidden; live P0 + shutdown are not"
     try std.testing.expect(!allow_info.hidden);
     const unallow_info = findCommand("unallow") orelse return error.TestUnexpectedResult;
     try std.testing.expect(!unallow_info.hidden);
+}
+
+test "history help catalog does not advertise --live as working" {
+    // Product dispatch is legacy_stub.unavailable("history"); catalog must stay
+    // hidden and must not teach `ryk history --live` as a working alt-screen.
+    const info = findCommand("history") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(info.hidden);
+
+    var buf: [4096]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try std.testing.expect(try writeCommand(std.testing.io, &writer, "history"));
+    const out = writer.buffered();
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "opens a scrollable alt-screen") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "ryk history --live") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "not available") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "replay") != null);
 }
 
 /// True when root help text teaches unfinished/hide-list verbs outside peer rows

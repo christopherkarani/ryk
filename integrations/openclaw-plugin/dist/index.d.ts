@@ -95,6 +95,7 @@ export declare function findRyk(cwd?: string, platform?: NodeJS.Platform): strin
 export declare function isUntrustedCandidate(path: string, cwd?: string, allowWorkspaceOverride?: boolean): boolean;
 /** Validate the installer-generated path-bound checksum receipt. */
 export declare function installerProvenanceValid(binaryPath: string, receiptPath?: string): boolean;
+export declare function attestRykCandidate(path: string, cwd?: string, platform?: NodeJS.Platform, allowWorkspaceOverride?: boolean): boolean;
 /** Normalize OpenClaw tool events into the envelope ryk hook understands. */
 export declare function normalizeOpenClawToolEvent(event: unknown): Record<string, unknown>;
 /** Extract the stable OpenClaw session identity used for ryk audit correlation. */

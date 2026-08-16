@@ -1252,3 +1252,9 @@ test "machine status aggregates Hermes approval blocks into sessions and blocked
     try std.testing.expect(std.mem.indexOf(u8, out, "\"decision\":\"ask\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"denied_count\":1") != null);
 }
+
+test {
+    _ = aggregate;
+    _ = blocked_actions;
+}
+

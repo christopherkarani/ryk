@@ -294,7 +294,7 @@ fn commandWithStdioAndEnv(io: std.Io, argv: []const []const u8, stdout: anytype,
 
     // Product path: trusted host key selects overlay (not basename spoof). AINA P3:
     // pass abs workspace_root + parent HOME so launch merges managed + adapter hosts
-    // before empty-backpack scrub (DIS / plan §3.6). Soft-skips if store/home missing.
+    // before empty-backpack scrub (DIS). Soft-skips if store/home missing.
     const parent_home = current_env.get("HOME") orelse "";
     try applyNetworkOverlayWithHostKey(
         allocator,
@@ -724,6 +724,8 @@ fn commandWithStdioAndEnv(io: std.Io, argv: []const []const u8, stdout: anytype,
         audit_context: *AuditContext,
         session_grade: SessionSandboxGrade,
         shim_audit_degraded: bool,
+        /// Exact host-launch handoff (`ryk grok`): skip SHIELD wall + audit=degraded line.
+        quiet_host_handoff: bool,
 
         pub fn print(context: *anyopaque, session: core.session.Session) !void {
             const self: *@This() = @ptrCast(@alignCast(context));
@@ -744,10 +746,14 @@ fn commandWithStdioAndEnv(io: std.Io, argv: []const []const u8, stdout: anytype,
                 self.apply_result.receipt,
                 self.session_grade,
                 self.shim_audit_degraded,
+                self.quiet_host_handoff,
             );
             // Flush before the shield dwell so the card is on-screen, not buffered.
             try flushIfSupported(self.writer);
-            holdShieldCardIfNeeded(self.io, self.writer, self.apply_result.receipt);
+            // One-click host handoff skips the SHIELD dwell (#221 feel).
+            if (!self.quiet_host_handoff) {
+                holdShieldCardIfNeeded(self.io, self.writer, self.apply_result.receipt);
+            }
         }
     };
 
@@ -771,6 +777,9 @@ fn commandWithStdioAndEnv(io: std.Io, argv: []const []const u8, stdout: anytype,
         }
     };
 
+    const quiet_host_handoff = options.command_argv.len > 0 and
+        host_launch.isExactHostLaunchArgv0(options.command_argv[0]) and
+        apply_result.requiresChildApply();
     var start_printer: StartPrinter = .{
         .io = io,
         .writer = stdout,
@@ -783,6 +792,7 @@ fn commandWithStdioAndEnv(io: std.Io, argv: []const []const u8, stdout: anytype,
         .audit_context = &audit_context,
         .session_grade = session_grade,
         .shim_audit_degraded = shim_audit_degraded,
+        .quiet_host_handoff = quiet_host_handoff,
     };
 
     var session_approvals = intercept.approvals.SessionApprovals.init(allocator);
@@ -1284,6 +1294,17 @@ fn commandWithStdioAndEnv(io: std.Io, argv: []const []const u8, stdout: anytype,
         plan.argv
     else
         options.command_argv;
+    var host_separator_stripped: ?[]const []const u8 = null;
+    defer if (host_separator_stripped) |a| allocator.free(a);
+    // `ryk <host> -- --help` must spawn the same agent argv as
+    // `ryk run -- <host> --help`. A leftover `--` is ryk punctuation.
+    const planned_argv_for_launch = blk: {
+        if (try host_launch.allocArgvWithoutHostSeparator(allocator, planned_argv)) |stripped| {
+            host_separator_stripped = stripped;
+            break :blk stripped;
+        }
+        break :blk planned_argv;
+    };
     var launch_argv_owned: ?[]const []const u8 = null;
     defer if (launch_argv_owned) |a| sandbox.apply.freeExpandedShellWrapperArgv(allocator, a);
     const expand_shell_wrapper = secret_boundary == .empty_backpack and codex_mcp_plan == null;
@@ -1291,7 +1312,7 @@ fn commandWithStdioAndEnv(io: std.Io, argv: []const []const u8, stdout: anytype,
         launch_argv_owned = sandbox.apply.rewriteOsAttachLaunchArgv(
             io,
             allocator,
-            planned_argv,
+            planned_argv_for_launch,
             &filtered_env.env_map,
             .{
                 .expand_shell_wrapper = expand_shell_wrapper,
@@ -1444,11 +1465,20 @@ fn commandWithStdioAndEnv(io: std.Io, argv: []const []const u8, stdout: anytype,
             }
             if (secret_boundary == .empty_backpack) {
                 const stdio_risk = sandbox.host_config_grants.parentStdioHasUngrantedHostTmpRisk(io);
-                // Agent stdio is usually inherited (not retained here). Path-walk residual
-                // is classified when agent_output is available; generic tip also names it.
+                // Inherit mode does not retain agent stdio; classify from flags + any
+                // captured output when present (tests / future capture paths).
+                const interactive_needs_tty = blk: {
+                    if (options.command_argv.len == 0) break :blk false;
+                    if (!host_launch.isExactHostLaunchArgv0(options.command_argv[0])) break :blk false;
+                    if (sandbox.host_config_grants.isAgentHelpOrVersionOnly(options.command_argv)) break :blk false;
+                    if (agentArgvLooksHeadless(options.command_argv)) break :blk false;
+                    const stdin_tty = std.Io.File.stdin().isTty(io) catch false;
+                    break :blk !stdin_tty;
+                };
                 try stderr.writeAll(sandbox.host_config_grants.selectEmptyBackpackAgentExitTip(.{
                     .stdio_host_tmp_risk = stdio_risk,
                     .agent_output = null,
+                    .interactive_needs_tty = interactive_needs_tty,
                 }));
             }
         }
@@ -1873,7 +1903,7 @@ fn hostKeyFromCommandArgv(options: RunOptions) ?[]const u8 {
     return base;
 }
 
-/// Launch-time discovery context for AINA P3 (plan §3.6 S4).
+/// Launch-time discovery context for AINA P3.
 /// When null, pack-only (P1) path. Product always supplies abs workspace_root + parent HOME.
 pub const DiscoveryLaunchContext = struct {
     io: std.Io,
@@ -2217,22 +2247,26 @@ fn printSessionStart(
     os_receipt: sandbox.posture.AttachReceipt,
     session_grade: SessionSandboxGrade,
     shim_audit_degraded: bool,
+    quiet_host_handoff: bool,
 ) !void {
     // Compact brand banner + Session / Workspace / Mode / Name grid. Celebration stays in printSessionEnd.
-    try tui.render.banner(io, stdout, build_options.version, "watching this session");
+    // Exact host-launch handoff (`ryk grok`) skips the banner/grid wall so the agent TUI is first (#221).
+    if (!quiet_host_handoff) {
+        try tui.render.banner(io, stdout, build_options.version, "watching this session");
 
-    var rows: [4]tui.render.KV = .{
-        .{ .label = "Session", .value = session.id.slice() },
-        .{ .label = "Workspace", .value = session.workspace_root },
-        .{ .label = "Mode", .value = session.mode.toString() },
-        .{ .label = "Name", .value = "" },
-    };
-    var count: usize = 3;
-    if (session.session_name) |name| {
-        rows[3].value = name;
-        count = 4;
+        var rows: [4]tui.render.KV = .{
+            .{ .label = "Session", .value = session.id.slice() },
+            .{ .label = "Workspace", .value = session.workspace_root },
+            .{ .label = "Mode", .value = session.mode.toString() },
+            .{ .label = "Name", .value = "" },
+        };
+        var count: usize = 3;
+        if (session.session_name) |name| {
+            rows[3].value = name;
+            count = 4;
+        }
+        try tui.render.keyValue(io, stdout, rows[0..count]);
     }
-    try tui.render.keyValue(io, stdout, rows[0..count]);
 
     // Mechanism-neutral OS sandbox line (S-GLO-03) — never "Seatbelt"/"Landlock" here.
     // Sized for longest production landlock route-forced banner (see posture.session_banner_buf_len).
@@ -2259,14 +2293,20 @@ fn printSessionStart(
         .{session_grade.toString()},
     );
     // E0: one greppable audit=degraded line per session when in-shim audit is known dead.
+    // Host-launch handoff suppresses this line on the success path (#221 feel).
     var audit_line_buf: [48]u8 = undefined;
-    const audit_line: ?[]const u8 = if (shim_audit_degraded)
+    const audit_line: ?[]const u8 = if (shim_audit_degraded and !quiet_host_handoff)
         try std.fmt.bufPrint(&audit_line_buf, "audit=degraded\n", .{})
     else
         null;
 
     const card_posture = tui.sandbox_card.PostureKind.parse(@tagName(os_receipt.posture));
-    if (card_posture.isDramatic()) {
+    // One-click host handoff: machine-readable posture only — no SHIELD UP wall.
+    if (quiet_host_handoff) {
+        try stdout.writeAll(posture_line);
+        try stdout.writeAll(os_line);
+        try stdout.writeAll("\n");
+    } else if (card_posture.isDramatic()) {
         const grade_str: ?[]const u8 = if (os_receipt.seatbelt_profile) |g| g.toString() else null;
         try tui.sandbox_card.render(io, stdout, .{
             .posture = card_posture,
@@ -2291,6 +2331,25 @@ fn printSessionStart(
         if (audit_line) |line| try stdout.writeAll(line);
         try stdout.writeAll("\n");
     }
+}
+
+/// True when agent argv looks headless (print/prompt/non-TUI), not bare interactive.
+fn agentArgvLooksHeadless(command_argv: []const []const u8) bool {
+    if (command_argv.len < 2) return false;
+    for (command_argv[1..]) |arg| {
+        if (std.mem.eql(u8, arg, "-p") or
+            std.mem.eql(u8, arg, "--print") or
+            std.mem.eql(u8, arg, "--prompt") or
+            std.mem.eql(u8, arg, "-q") or
+            std.mem.eql(u8, arg, "--quiet") or
+            std.mem.startsWith(u8, arg, "--output-format") or
+            std.mem.eql(u8, arg, "--json") or
+            std.mem.eql(u8, arg, "--no-interactive"))
+        {
+            return true;
+        }
+    }
+    return false;
 }
 
 fn printSessionEnd(
@@ -4130,7 +4189,7 @@ test "applyNetworkOverlayWithHostKey P3 managed hosts merge for pi with pack flo
 }
 
 test "applyNetworkOverlayWithHostKey P3 launch-time pi adapter discovers auth.x.ai from fixture home" {
-    // Launch-time discoverForHost(pi) must run even when managed file is missing (plan §3.6).
+    // Launch-time discoverForHost(pi) must run even when managed file is missing.
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -5632,7 +5691,7 @@ fn writeLastPointerNoMakePath(allocator: std.mem.Allocator, workspace_root: []co
 }
 
 // ---------------------------------------------------------------------------
-// TDD: first successful run celebration (written FIRST — RED, foundation work)
+// First successful run celebration tests.
 // These exercise isFirstSession + the celebration branch in printSessionEnd.
 // ---------------------------------------------------------------------------
 
@@ -5731,7 +5790,7 @@ test "session end prints final audit chain hash matching summary" {
 }
 
 // ---------------------------------------------------------------------------
-// TDD: Phase 1 — rich guardian block on deny (written FIRST → RED → GREEN).
+// Rich guardian block on deny tests.
 // These exercise renderDenyBlock via the real run.zig deny path. Fixed-buffer
 // writers + std.testing.io force theme.active() to .none, so assertions hold
 // against the plain-text degrade path (the colour path is covered by theme.zig).
@@ -6630,6 +6689,294 @@ test "empty backpack allows claude --help with expired credentials" {
     try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "usable host login material") == null);
 }
 
+// Issue #194 Linux: `ryk grok -- --help` must not fail closed before attach
+// when official ~/.grok/config.toml exists (alias keeps the `--` separator).
+test "empty backpack grok alias -- --help with official config.toml does not fail closed" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    try skipLinuxWorkspaceViewSelfExec();
+    try skipUnlessOsSandboxBackend();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+
+    var home_tmp = std.testing.tmpDir(.{});
+    defer home_tmp.cleanup();
+    try home_tmp.dir.createDirPath(std.testing.io, ".grok/bin");
+    try home_tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = ".grok/config.toml",
+        .data = "[cli]\nauto_update = false\n",
+    });
+    try home_tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = ".grok/bin/grok",
+        .data = "#!/bin/sh\necho grok-help-ok\n",
+    });
+    try home_tmp.dir.setFilePermissions(std.testing.io, ".grok/bin/grok", @enumFromInt(0o755), .{});
+    const fake_home = try home_tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(fake_home);
+    const grok_bin = try std.fs.path.join(std.testing.allocator, &.{ fake_home, ".grok/bin" });
+    defer std.testing.allocator.free(grok_bin);
+
+    var current = std.process.Environ.Map.init(std.testing.allocator);
+    defer current.deinit();
+    try current.put("PATH", grok_bin);
+    try current.put("HOME", fake_home);
+
+    var stdout_buf: [8192]u8 = undefined;
+    var stderr_buf: [4096]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+    // Alias shape after `ryk grok -- --help` → run sees grok + `--` + `--help`.
+    const code = try commandForTestWithEnvAndShellEvaluator(
+        &.{ "--workspace", root, "--mode", "observe", "--", "grok", "--", "--help" },
+        &stdout_writer,
+        &stderr_writer,
+        .ignore,
+        &current,
+        shell_eval.mockDaemonAllowEvaluator,
+    );
+    try std.testing.expectEqual(exit_codes.success, code);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "usable host login material") == null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "cannot read host agent login/config") == null);
+}
+
+// Issue #198: alias `ryk claude -- --help` must spawn the same argv as
+// `ryk run -- claude --help` (no leftover `--`). Claude's `--help` fast path
+// prints Usage; `-- --help` skips that path and hits the tmpdir lstat check.
+test "empty backpack claude alias -- --help session tmp passes Claude tmpdir check" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    try skipLinuxWorkspaceViewSelfExec();
+    try skipUnlessOsSandboxBackend();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+
+    var home_tmp = std.testing.tmpDir(.{});
+    defer home_tmp.cleanup();
+    const fake_home = try home_tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(fake_home);
+
+    var trust_tmp = std.testing.tmpDir(.{});
+    defer trust_tmp.cleanup();
+    {
+        const script = try trust_tmp.dir.createFile(std.testing.io, "claude", .{});
+        defer script.close(std.testing.io);
+        try script.writeStreamingAll(std.testing.io,
+            \\#!/bin/sh
+            \\base="${CLAUDE_CODE_TMPDIR:-${TMPDIR:-/tmp}}"
+            \\# Claude joins the tmp base with claude-{uid}; after userns that is claude-0
+            \\# (process.getuid?.() ?? 0). Check the exact QA leaf first.
+            \\leaf0="$base/claude-0"
+            \\leaf="$base/claude-$(id -u)"
+            \\if [ -L "$leaf0" ] || [ ! -d "$leaf0" ]; then
+            \\  echo "Temp directory $leaf0 is not a directory (may be an attacker-planted symlink)." >&2
+            \\  exit 1
+            \\fi
+            \\if [ "$leaf" != "$leaf0" ] && { [ -L "$leaf" ] || [ ! -d "$leaf" ]; }; then
+            \\  echo "Temp directory $leaf is not a directory (may be an attacker-planted symlink)." >&2
+            \\  exit 1
+            \\fi
+            \\echo "Usage: claude [options]"
+            \\exit 0
+            \\
+        );
+        try trust_tmp.dir.setFilePermissions(std.testing.io, "claude", @enumFromInt(0o755), .{});
+    }
+    const trust_root = try trust_tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(trust_root);
+
+    var current = std.process.Environ.Map.init(std.testing.allocator);
+    defer current.deinit();
+    try current.put("PATH", trust_root);
+    try current.put("HOME", fake_home);
+    try current.put("RYK_TRUSTED_HOST_PREFIXES", trust_root);
+
+    var stdout_buf: [8192]u8 = undefined;
+    var stderr_buf: [4096]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+    const code = try commandForTestWithEnvAndShellEvaluator(
+        &.{ "--workspace", root, "--mode", "observe", "--", "claude", "--help" },
+        &stdout_writer,
+        &stderr_writer,
+        .ignore,
+        &current,
+        shell_eval.mockDaemonAllowEvaluator,
+    );
+    try std.testing.expectEqual(exit_codes.success, code);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "Usage: claude") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "attacker-planted symlink") == null);
+
+    // Leftover `ryk claude -- --help` separator must strip to the same spawn argv.
+    var leftover_stdout: [8192]u8 = undefined;
+    var leftover_stderr: [4096]u8 = undefined;
+    var leftover_out: std.Io.Writer = .fixed(&leftover_stdout);
+    var leftover_err: std.Io.Writer = .fixed(&leftover_stderr);
+    const leftover_code = try commandForTestWithEnvAndShellEvaluator(
+        &.{ "--workspace", root, "--mode", "observe", "--", "claude", "--", "--help" },
+        &leftover_out,
+        &leftover_err,
+        .ignore,
+        &current,
+        shell_eval.mockDaemonAllowEvaluator,
+    );
+    try std.testing.expectEqual(exit_codes.success, leftover_code);
+    try std.testing.expect(std.mem.indexOf(u8, leftover_out.buffered(), "Usage: claude") != null);
+    try std.testing.expect(std.mem.indexOf(u8, leftover_err.buffered(), "attacker-planted symlink") == null);
+}
+
+test "planted cwd ./claude stays CommandDenied under strict" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    {
+        const policy_file = try tmp.dir.createFile(std.testing.io, "policy.yaml", .{});
+        defer policy_file.close(std.testing.io);
+        try policy_file.writeStreamingAll(std.testing.io,
+            \\version: 1
+            \\mode: strict
+            \\env:
+            \\  inherit: true
+            \\commands:
+            \\  default: deny
+            \\  allow:
+            \\    - "git status"
+            \\
+        );
+    }
+    const policy_path = try tmp.dir.realPathFileAlloc(std.testing.io, "policy.yaml", std.testing.allocator);
+    defer std.testing.allocator.free(policy_path);
+    {
+        const script = try tmp.dir.createFile(std.testing.io, "claude", .{});
+        defer script.close(std.testing.io);
+        try script.writeStreamingAll(std.testing.io,
+            \\#!/bin/sh
+            \\exit 0
+            \\
+        );
+        try tmp.dir.setFilePermissions(std.testing.io, "claude", @enumFromInt(0o755), .{});
+    }
+
+    var current = std.process.Environ.Map.init(std.testing.allocator);
+    defer current.deinit();
+    try current.put("PATH", "/usr/bin:/bin");
+    try current.put("HOME", root);
+
+    var stdout_buf: [4096]u8 = undefined;
+    var stderr_buf: [4096]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+    const code = try commandForTestWithEnvAndShellEvaluator(
+        &.{ "--workspace", root, "--policy", policy_path, "--mode", "strict", "--os-sandbox", "off", "--", "./claude", "--help" },
+        &stdout_writer,
+        &stderr_writer,
+        .ignore,
+        &current,
+        shell_eval.mockDaemonAllowEvaluator,
+    );
+    try std.testing.expectEqual(exit_codes.denial, code);
+}
+
+test "empty backpack grok interactive without config.toml still fail-closed" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    try skipUnlessOsSandboxBackend();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+
+    var home_tmp = std.testing.tmpDir(.{});
+    defer home_tmp.cleanup();
+    try home_tmp.dir.createDirPath(std.testing.io, ".grok/bin");
+    try home_tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = ".grok/bin/grok",
+        .data = "#!/bin/sh\nexit 0\n",
+    });
+    try home_tmp.dir.setFilePermissions(std.testing.io, ".grok/bin/grok", @enumFromInt(0o755), .{});
+    const fake_home = try home_tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(fake_home);
+    const grok_bin = try std.fs.path.join(std.testing.allocator, &.{ fake_home, ".grok/bin" });
+    defer std.testing.allocator.free(grok_bin);
+
+    var current = std.process.Environ.Map.init(std.testing.allocator);
+    defer current.deinit();
+    try current.put("PATH", grok_bin);
+    try current.put("HOME", fake_home);
+
+    var stdout_buf: [4096]u8 = undefined;
+    var stderr_buf: [4096]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+    const code = try commandForTestWithEnvAndShellEvaluator(
+        &.{ "--workspace", root, "--mode", "observe", "--", "grok" },
+        &stdout_writer,
+        &stderr_writer,
+        .ignore,
+        &current,
+        shell_eval.mockDaemonAllowEvaluator,
+    );
+    try std.testing.expectEqual(exit_codes.unsupported, code);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "usable host login material") != null or
+        std.mem.indexOf(u8, stderr_writer.buffered(), "cannot read host agent login/config") != null);
+}
+
+test "empty backpack grok --os-sandbox off still exit 2" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+
+    var home_tmp = std.testing.tmpDir(.{});
+    defer home_tmp.cleanup();
+    try home_tmp.dir.createDirPath(std.testing.io, ".grok/bin");
+    try home_tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = ".grok/config.toml",
+        .data = "[cli]\nauto_update = false\n",
+    });
+    try home_tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = ".grok/auth.json",
+        .data = "{\"accessToken\":\"synthetic\"}\n",
+    });
+    try home_tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = ".grok/bin/grok",
+        .data = "#!/bin/sh\nexit 0\n",
+    });
+    try home_tmp.dir.setFilePermissions(std.testing.io, ".grok/bin/grok", @enumFromInt(0o755), .{});
+    const fake_home = try home_tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(fake_home);
+    const grok_bin = try std.fs.path.join(std.testing.allocator, &.{ fake_home, ".grok/bin" });
+    defer std.testing.allocator.free(grok_bin);
+
+    var current = std.process.Environ.Map.init(std.testing.allocator);
+    defer current.deinit();
+    try current.put("PATH", grok_bin);
+    try current.put("HOME", fake_home);
+
+    var stdout_buf: [4096]u8 = undefined;
+    var stderr_buf: [4096]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+    const code = try commandForTestWithEnvAndShellEvaluator(
+        &.{ "--workspace", root, "--mode", "observe", "--os-sandbox", "off", "--", "grok", "--", "--help" },
+        &stdout_writer,
+        &stderr_writer,
+        .ignore,
+        &current,
+        shell_eval.mockDaemonAllowEvaluator,
+    );
+    try std.testing.expectEqual(exit_codes.usage, code);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "empty-backpack secret boundary requires an active OS sandbox") != null);
+}
+
 test "empty backpack allows claude --help with no credentials at all" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     try skipLinuxWorkspaceViewSelfExec();
@@ -6731,7 +7078,7 @@ test "session start banner is mechanism-neutral for disabled OS sandbox" {
         .mode = .observe,
         .platform = core.platform.detectOs(),
     };
-    try printSessionStart(std.testing.io, &writer, session, .ask, false, false, false, false, sandbox.posture.disabledReceipt(), .wrapper_only, false);
+    try printSessionStart(std.testing.io, &writer, session, .ask, false, false, false, false, sandbox.posture.disabledReceipt(), .wrapper_only, false, false);
     const out = writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, out, "OS sandbox: disabled") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "Session grade: wrapper-only") != null);
@@ -6757,6 +7104,7 @@ test "session start banner is mechanism-neutral for disabled OS sandbox" {
         ),
         .strong_mediated,
         true,
+        false,
     );
     const active_out = writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, active_out, "SHIELD UP") != null);
@@ -6768,6 +7116,33 @@ test "session start banner is mechanism-neutral for disabled OS sandbox" {
     try std.testing.expect(std.mem.indexOf(u8, active_out, "audit=degraded") != null);
     try std.testing.expect(std.mem.indexOf(u8, active_out, "Seatbelt") == null);
     try std.testing.expect(std.mem.indexOf(u8, active_out, "network: unrestricted") != null);
+
+    // #221: exact host-launch handoff skips SHIELD wall and audit=degraded line.
+    writer = .fixed(&buf);
+    try printSessionStart(
+        std.testing.io,
+        &writer,
+        session,
+        .allowlist,
+        true,
+        false,
+        false,
+        false,
+        try sandbox.posture.activeReceipt(
+            .seatbelt,
+            active_hash,
+            "workspace RW, system RO, platform tmp RW, no home",
+        ),
+        .strong_mediated,
+        true,
+        true,
+    );
+    const quiet_out = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, quiet_out, "SHIELD UP") == null);
+    try std.testing.expect(std.mem.indexOf(u8, quiet_out, "audit=degraded") == null);
+    try std.testing.expect(std.mem.indexOf(u8, quiet_out, "sandbox=active") != null);
+    try std.testing.expect(std.mem.indexOf(u8, quiet_out, "OS sandbox: active") != null);
+    try std.testing.expect(std.mem.indexOf(u8, quiet_out, "secret-boundary=on") != null);
 }
 
 test "computeSessionSandboxGrade: mediated attach vs open escape" {

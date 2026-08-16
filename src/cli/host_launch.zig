@@ -1,5 +1,6 @@
 const std = @import("std");
 const exit_codes = @import("exit_codes.zig");
+const host_ask_resume = @import("host_ask_resume.zig");
 
 /// Exact host names that rewrite to `ryk run -- <host> …`.
 /// Canonical allowlist for dispatch, help, and completions.
@@ -36,15 +37,41 @@ pub fn isExactHostLaunchArgv0(argv0: []const u8) bool {
     return isHostLaunchAlias(argv0);
 }
 
+/// `ryk <host> -- <agent-args>` uses `--` as ryk punctuation, not agent argv.
+/// A leftover `--` after the host makes Claude see `-- --help` instead of
+/// `--help`, skip its help fast path, and hit the tmpdir lstat check.
+pub fn agentRestAfterHostSeparator(rest: []const []const u8) []const []const u8 {
+    if (rest.len > 0 and std.mem.eql(u8, rest[0], "--")) return rest[1..];
+    return rest;
+}
+
+/// When `argv` is `[host, "--", …]` for an exact launch alias, return an owned
+/// `[host, …]` slice (caller frees). Null when there is no separator to drop.
+pub fn allocArgvWithoutHostSeparator(
+    allocator: std.mem.Allocator,
+    argv: []const []const u8,
+) error{OutOfMemory}!?[]const []const u8 {
+    if (argv.len < 2) return null;
+    if (!isExactHostLaunchArgv0(argv[0])) return null;
+    if (!std.mem.eql(u8, argv[1], "--")) return null;
+    const out = try allocator.alloc([]const u8, argv.len - 1);
+    out[0] = argv[0];
+    if (argv.len > 2) @memcpy(out[1..], argv[2..]);
+    return out;
+}
+
 /// Builds argv for `run_command.command`: `["--", host] ++ rest`.
+/// Drops a leading `--` from `rest` so `ryk claude -- --help` becomes
+/// `ryk run -- claude --help` (same agent argv as the working run form).
 /// Caller owns and must free the returned slice (not the pointed-to strings).
 /// Does not inject security flags: the run-level agent-primary default selects
 /// empty backpack after parsing, so flags after the host remain agent argv.
 pub fn buildRunArgv(allocator: std.mem.Allocator, host: []const u8, rest: []const []const u8) ![]const []const u8 {
-    const out = try allocator.alloc([]const u8, rest.len + 2);
+    const agent_rest = agentRestAfterHostSeparator(rest);
+    const out = try allocator.alloc([]const u8, agent_rest.len + 2);
     out[0] = "--";
     out[1] = host;
-    if (rest.len > 0) @memcpy(out[2..], rest);
+    if (agent_rest.len > 0) @memcpy(out[2..], agent_rest);
     return out;
 }
 
@@ -78,6 +105,10 @@ pub fn tryDispatch(
         , .{ command, command, command, command });
         return exit_codes.success;
     }
+    if (try host_ask_resume.formatWarn(allocator, &.{command})) |ask_warn| {
+        defer allocator.free(ask_warn);
+        try stderr.print("ryk: {s}\n", .{ask_warn});
+    }
     const run_argv = try buildRunArgv(allocator, command, rest);
     defer allocator.free(run_argv);
     return try runFn(io, environ_map, run_argv, stdout, stderr);
@@ -102,6 +133,47 @@ test "isHostLaunchAlias exact allowlist only" {
     try std.testing.expect(!isHostLaunchAlias("pi2"));
 }
 
+test "ryk claude -- --help rewrite matches ryk run -- claude --help" {
+    const host_config_grants = @import("../sandbox/host_config_grants.zig");
+    const argv = try buildRunArgv(std.testing.allocator, "claude", &.{ "--", "--help" });
+    defer std.testing.allocator.free(argv);
+    try std.testing.expectEqual(@as(usize, 3), argv.len);
+    try std.testing.expectEqualStrings("--", argv[0]);
+    try std.testing.expectEqualStrings("claude", argv[1]);
+    try std.testing.expectEqualStrings("--help", argv[2]);
+    try std.testing.expect(host_config_grants.isAgentHelpOrVersionOnly(argv[1..]));
+}
+
+test "ryk grok -- --help rewrite matches ryk run -- grok --help" {
+    const host_config_grants = @import("../sandbox/host_config_grants.zig");
+    const argv = try buildRunArgv(std.testing.allocator, "grok", &.{ "--", "--help" });
+    defer std.testing.allocator.free(argv);
+    try std.testing.expectEqual(@as(usize, 3), argv.len);
+    try std.testing.expectEqualStrings("--", argv[0]);
+    try std.testing.expectEqualStrings("grok", argv[1]);
+    try std.testing.expectEqualStrings("--help", argv[2]);
+    try std.testing.expect(host_config_grants.isAgentHelpOrVersionOnly(argv[1..]));
+}
+
+test "allocArgvWithoutHostSeparator drops leftover -- after exact host" {
+    const stripped = (try allocArgvWithoutHostSeparator(
+        std.testing.allocator,
+        &.{ "claude", "--", "--help" },
+    )) orelse return error.TestUnexpectedResult;
+    defer std.testing.allocator.free(stripped);
+    try std.testing.expectEqual(@as(usize, 2), stripped.len);
+    try std.testing.expectEqualStrings("claude", stripped[0]);
+    try std.testing.expectEqualStrings("--help", stripped[1]);
+    try std.testing.expect(try allocArgvWithoutHostSeparator(
+        std.testing.allocator,
+        &.{ "claude", "--help" },
+    ) == null);
+    try std.testing.expect(try allocArgvWithoutHostSeparator(
+        std.testing.allocator,
+        &.{ "./claude", "--", "--help" },
+    ) == null);
+}
+
 test "isExactHostLaunchArgv0 rejects basename paths" {
     for (host_launch_aliases) |host| {
         try std.testing.expect(isExactHostLaunchArgv0(host));
@@ -109,6 +181,8 @@ test "isExactHostLaunchArgv0 rejects basename paths" {
     try std.testing.expect(!isExactHostLaunchArgv0("./hermes"));
     try std.testing.expect(!isExactHostLaunchArgv0("/tmp/evil/hermes"));
     try std.testing.expect(!isExactHostLaunchArgv0("/workspace/planted/hermes"));
+    try std.testing.expect(!isExactHostLaunchArgv0("./grok"));
+    try std.testing.expect(!isExactHostLaunchArgv0("/tmp/evil/grok"));
     try std.testing.expect(!isExactHostLaunchArgv0("venv/bin/hermes"));
     try std.testing.expect(!isExactHostLaunchArgv0(""));
     try std.testing.expect(!isExactHostLaunchArgv0("sh"));
@@ -186,7 +260,7 @@ test "tryDispatch returns null for non-aliases and rewrites aliases" {
     // tryDispatch type-checks stdout.print on the help branch, so void `{}`
     // no longer instantiates (bare --help landed in #163).
     var stdout_buf: [64]u8 = undefined;
-    var stderr_buf: [64]u8 = undefined;
+    var stderr_buf: [512]u8 = undefined;
     var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
     var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
 
@@ -245,6 +319,44 @@ test "tryDispatch returns null for non-aliases and rewrites aliases" {
     try std.testing.expectEqualStrings("--", Capture.seen0);
     try std.testing.expectEqualStrings("pi", Capture.seen1);
     try std.testing.expectEqualStrings("exec", Capture.seen2);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "host-dependent") != null);
+}
+
+test "host_ask_resume tryDispatch warns when host hard-blocks ask with no resume" {
+    const allocator = std.testing.allocator;
+    var environ_map = std.process.Environ.Map.init(allocator);
+    defer environ_map.deinit();
+
+    var stdout_buf: [64]u8 = undefined;
+    var stderr_buf: [512]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+
+    const code = try tryDispatch(
+        allocator,
+        "opencode",
+        &.{},
+        struct {
+            fn run(
+                _: std.Io,
+                _: *const std.process.Environ.Map,
+                _: []const []const u8,
+                _: anytype,
+                _: anytype,
+            ) !u8 {
+                return 0;
+            }
+        }.run,
+        std.testing.io,
+        &environ_map,
+        &stdout_writer,
+        &stderr_writer,
+    );
+    try std.testing.expectEqual(@as(u8, 0), code.?);
+    const err = stderr_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, err, "opencode") != null);
+    try std.testing.expect(std.mem.indexOf(u8, err, "hard-blocks ask with no resume") != null);
+    try std.testing.expect(std.mem.indexOf(u8, err, "host-decision-mapping.md") != null);
 }
 
 test "tryDispatch intercepts bare --help before rewriting to run" {

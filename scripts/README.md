@@ -32,7 +32,7 @@ The release scripts write archives and generated metadata under ignored `dist/` 
 - `check-fixture-secrets.sh` rejects non-synthetic secret patterns.
 - `validate-docs.sh` checks documentation links, example policies, and the deterministic demo.
 - `os-sandbox-adversarial-e2e.sh` runs the OS sandbox fixture probes when the platform can attach the backend.
-- `host-live-e2e.sh` exercises every supported ryk veto envelope (`ryk hook` / `evaluate` / bare stdin). Host CLIs are optional. Cursor is bare stdin (W3 writer deferred).
+- `host-live-e2e.sh` exercises every supported ryk veto envelope (`ryk hook` / `evaluate` / bare stdin). Host CLIs are optional. Cursor uses bare stdin; there is no first-class launch alias.
 - `harness-stress.sh` prints allow/deny wire shapes for every ryk host envelope, including the blocked command.
 - `quick-install-dx-verify.sh` exercises the first-run CLI setup matrix.
 - `test-openclaw-release-assets.sh` proves committed OpenClaw `dist/` matches TypeScript. `agent-gate` runs it when `integrations/openclaw-plugin/**` is dirty (plugin gate); release packaging also runs it.
