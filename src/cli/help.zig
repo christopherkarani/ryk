@@ -265,20 +265,17 @@ pub const commands =
         },
         .{
             .name = "history",
-            .summary = "Review protected command history",
-            .usage = "ryk history [stats|check|analyze|interactive|export|prune|backup] [options] [--days N] [--strict] [--live] [--json|--robot|--format <value>]",
+            .summary = "Not available (hide-list stub)",
+            .usage = "ryk history  (not available)",
             .category = .diagnostics,
             .hidden = true, // use `replay` for history-like review
             .examples = &.{
-                "ryk history stats --days 7",
-                "ryk history check --strict",
-                "ryk history --live",
+                "ryk replay",
+                "ryk replay --tui",
             },
             .details = &.{
-                "Human stats are rendered by ryk from structured history data.",
-                "Use 'ryk history --help' for actions and examples.",
-                "--live opens a scrollable alt-screen view of the current stats snapshot (TTY only; not with --json).",
-                "Use --json, --robot, or --format for machine-readable daemon output.",
+                "Hide-list stub: command 'history' is not available.",
+                "The product review surface is ryk replay (optional --tui).",
             },
         },
         .{
@@ -1431,6 +1428,23 @@ test "P0 honesty: hide-list verbs are marked hidden; live P0 + shutdown are not"
     try std.testing.expect(!allow_info.hidden);
     const unallow_info = findCommand("unallow") orelse return error.TestUnexpectedResult;
     try std.testing.expect(!unallow_info.hidden);
+}
+
+test "history help catalog does not advertise --live as working" {
+    // Product dispatch is legacy_stub.unavailable("history"); catalog must stay
+    // hidden and must not teach `ryk history --live` as a working alt-screen.
+    const info = findCommand("history") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(info.hidden);
+
+    var buf: [4096]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try std.testing.expect(try writeCommand(std.testing.io, &writer, "history"));
+    const out = writer.buffered();
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "opens a scrollable alt-screen") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "ryk history --live") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "not available") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "replay") != null);
 }
 
 /// True when root help text teaches unfinished/hide-list verbs outside peer rows

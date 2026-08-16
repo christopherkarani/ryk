@@ -33,6 +33,13 @@ pub fn command(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: an
         else => return err,
     };
 
+    // Fail closed before --list / workspace load: --tui + --json is a
+    // machine-output conflict (same EXIT 2 as replaySession preflight).
+    if (options.tui_view and options.json) {
+        try stderr.writeAll("ryk replay: --tui cannot be combined with --json (machine output is frozen).\n");
+        return exit_codes.usage;
+    }
+
     var gpa_state: gpa_mod.State = .init;
     defer _ = gpa_state.deinit();
     const allocator = gpa_state.allocator();
@@ -1201,6 +1208,24 @@ test "replay --tui cannot combine with --json" {
     try std.testing.expect(std.mem.indexOf(u8, err, "--tui") != null);
     try std.testing.expect(std.mem.indexOf(u8, err, "--json") != null);
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "\x1b[?1049") == null);
+}
+
+test "replay --tui --json --list stays usage" {
+    // --list must not short-circuit past the --tui/--json machine conflict.
+    var stdout_buf: [512]u8 = undefined;
+    var stderr_buf: [256]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+
+    const code = try command(std.testing.io, &.{ "--tui", "--json", "--list" }, &stdout_writer, &stderr_writer);
+    try std.testing.expectEqual(exit_codes.usage, code);
+    const err = stderr_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, err, "--tui") != null);
+    try std.testing.expect(std.mem.indexOf(u8, err, "--json") != null);
+    const out = stdout_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "SESSION") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "No sessions yet") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[?1049") == null);
 }
 
 test "replay linear timeline is unchanged when --tui is absent" {
