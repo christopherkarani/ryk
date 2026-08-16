@@ -1284,6 +1284,17 @@ fn commandWithStdioAndEnv(io: std.Io, argv: []const []const u8, stdout: anytype,
         plan.argv
     else
         options.command_argv;
+    var host_separator_stripped: ?[]const []const u8 = null;
+    defer if (host_separator_stripped) |a| allocator.free(a);
+    // `ryk <host> -- --help` must spawn the same agent argv as
+    // `ryk run -- <host> --help`. A leftover `--` is ryk punctuation.
+    const planned_argv_for_launch = blk: {
+        if (try host_launch.allocArgvWithoutHostSeparator(allocator, planned_argv)) |stripped| {
+            host_separator_stripped = stripped;
+            break :blk stripped;
+        }
+        break :blk planned_argv;
+    };
     var launch_argv_owned: ?[]const []const u8 = null;
     defer if (launch_argv_owned) |a| sandbox.apply.freeExpandedShellWrapperArgv(allocator, a);
     const expand_shell_wrapper = secret_boundary == .empty_backpack and codex_mcp_plan == null;
@@ -1291,7 +1302,7 @@ fn commandWithStdioAndEnv(io: std.Io, argv: []const []const u8, stdout: anytype,
         launch_argv_owned = sandbox.apply.rewriteOsAttachLaunchArgv(
             io,
             allocator,
-            planned_argv,
+            planned_argv_for_launch,
             &filtered_env.env_map,
             .{
                 .expand_shell_wrapper = expand_shell_wrapper,
@@ -6680,6 +6691,148 @@ test "empty backpack grok alias -- --help with official config.toml does not fai
     try std.testing.expectEqual(exit_codes.success, code);
     try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "usable host login material") == null);
     try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "cannot read host agent login/config") == null);
+}
+
+// Issue #198: alias `ryk claude -- --help` must spawn the same argv as
+// `ryk run -- claude --help` (no leftover `--`). Claude's `--help` fast path
+// prints Usage; `-- --help` skips that path and hits the tmpdir lstat check.
+test "empty backpack claude alias -- --help session tmp passes Claude tmpdir check" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    try skipLinuxWorkspaceViewSelfExec();
+    try skipUnlessOsSandboxBackend();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+
+    var home_tmp = std.testing.tmpDir(.{});
+    defer home_tmp.cleanup();
+    const fake_home = try home_tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(fake_home);
+
+    var trust_tmp = std.testing.tmpDir(.{});
+    defer trust_tmp.cleanup();
+    {
+        const script = try trust_tmp.dir.createFile(std.testing.io, "claude", .{});
+        defer script.close(std.testing.io);
+        try script.writeStreamingAll(std.testing.io,
+            \\#!/bin/sh
+            \\base="${CLAUDE_CODE_TMPDIR:-${TMPDIR:-/tmp}}"
+            \\# Claude joins the tmp base with claude-{uid}; after userns that is claude-0
+            \\# (process.getuid?.() ?? 0). Check the exact QA leaf first.
+            \\leaf0="$base/claude-0"
+            \\leaf="$base/claude-$(id -u)"
+            \\if [ -L "$leaf0" ] || [ ! -d "$leaf0" ]; then
+            \\  echo "Temp directory $leaf0 is not a directory (may be an attacker-planted symlink)." >&2
+            \\  exit 1
+            \\fi
+            \\if [ "$leaf" != "$leaf0" ] && { [ -L "$leaf" ] || [ ! -d "$leaf" ]; }; then
+            \\  echo "Temp directory $leaf is not a directory (may be an attacker-planted symlink)." >&2
+            \\  exit 1
+            \\fi
+            \\echo "Usage: claude [options]"
+            \\exit 0
+            \\
+        );
+        try trust_tmp.dir.setFilePermissions(std.testing.io, "claude", @enumFromInt(0o755), .{});
+    }
+    const trust_root = try trust_tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(trust_root);
+
+    var current = std.process.Environ.Map.init(std.testing.allocator);
+    defer current.deinit();
+    try current.put("PATH", trust_root);
+    try current.put("HOME", fake_home);
+    try current.put("RYK_TRUSTED_HOST_PREFIXES", trust_root);
+
+    var stdout_buf: [8192]u8 = undefined;
+    var stderr_buf: [4096]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+    const code = try commandForTestWithEnvAndShellEvaluator(
+        &.{ "--workspace", root, "--mode", "observe", "--", "claude", "--help" },
+        &stdout_writer,
+        &stderr_writer,
+        .ignore,
+        &current,
+        shell_eval.mockDaemonAllowEvaluator,
+    );
+    try std.testing.expectEqual(exit_codes.success, code);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "Usage: claude") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "attacker-planted symlink") == null);
+
+    // Leftover `ryk claude -- --help` separator must strip to the same spawn argv.
+    var leftover_stdout: [8192]u8 = undefined;
+    var leftover_stderr: [4096]u8 = undefined;
+    var leftover_out: std.Io.Writer = .fixed(&leftover_stdout);
+    var leftover_err: std.Io.Writer = .fixed(&leftover_stderr);
+    const leftover_code = try commandForTestWithEnvAndShellEvaluator(
+        &.{ "--workspace", root, "--mode", "observe", "--", "claude", "--", "--help" },
+        &leftover_out,
+        &leftover_err,
+        .ignore,
+        &current,
+        shell_eval.mockDaemonAllowEvaluator,
+    );
+    try std.testing.expectEqual(exit_codes.success, leftover_code);
+    try std.testing.expect(std.mem.indexOf(u8, leftover_out.buffered(), "Usage: claude") != null);
+    try std.testing.expect(std.mem.indexOf(u8, leftover_err.buffered(), "attacker-planted symlink") == null);
+}
+
+test "planted cwd ./claude stays CommandDenied under strict" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    {
+        const policy_file = try tmp.dir.createFile(std.testing.io, "policy.yaml", .{});
+        defer policy_file.close(std.testing.io);
+        try policy_file.writeStreamingAll(std.testing.io,
+            \\version: 1
+            \\mode: strict
+            \\env:
+            \\  inherit: true
+            \\commands:
+            \\  default: deny
+            \\  allow:
+            \\    - "git status"
+            \\
+        );
+    }
+    const policy_path = try tmp.dir.realPathFileAlloc(std.testing.io, "policy.yaml", std.testing.allocator);
+    defer std.testing.allocator.free(policy_path);
+    {
+        const script = try tmp.dir.createFile(std.testing.io, "claude", .{});
+        defer script.close(std.testing.io);
+        try script.writeStreamingAll(std.testing.io,
+            \\#!/bin/sh
+            \\exit 0
+            \\
+        );
+        try tmp.dir.setFilePermissions(std.testing.io, "claude", @enumFromInt(0o755), .{});
+    }
+
+    var current = std.process.Environ.Map.init(std.testing.allocator);
+    defer current.deinit();
+    try current.put("PATH", "/usr/bin:/bin");
+    try current.put("HOME", root);
+
+    var stdout_buf: [4096]u8 = undefined;
+    var stderr_buf: [4096]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+    const code = try commandForTestWithEnvAndShellEvaluator(
+        &.{ "--workspace", root, "--policy", policy_path, "--mode", "strict", "--os-sandbox", "off", "--", "./claude", "--help" },
+        &stdout_writer,
+        &stderr_writer,
+        .ignore,
+        &current,
+        shell_eval.mockDaemonAllowEvaluator,
+    );
+    try std.testing.expectEqual(exit_codes.denial, code);
 }
 
 test "empty backpack grok interactive without config.toml still fail-closed" {
