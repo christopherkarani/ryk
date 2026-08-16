@@ -1048,13 +1048,13 @@ test "vendor tokens are redacted when embedded mid-string" {
         try expectSpanRedaction(case.value, case.expected);
     }
 
-    // `+` is not a classify tokenizer delimiter, so both alloc and bounded
-    // must use findStructuredSecret to keep the surrounding text.
+    // `@` is not a classify tokenizer delimiter and is outside the high-entropy
+    // alphabet, so both alloc and bounded must use findStructuredSecret.
     const glued = [_]struct { value: []const u8, expected: []const u8 }{
-        .{ .value = "note+xoxb-fakeSynthetic+here", .expected = "note+[REDACTED]+here" },
-        .{ .value = "charge+sk_live_fakeSynth+now", .expected = "charge+[REDACTED]+now" },
-        .{ .value = "model+hf_fakeSyntheticHuggingFaceTok+ready", .expected = "model+[REDACTED]+ready" },
-        .{ .value = "clone+glpat-fakeSynthetic+ok", .expected = "clone+[REDACTED]+ok" },
+        .{ .value = "note@xoxb-fakeSynthetic@here", .expected = "note@[REDACTED]@here" },
+        .{ .value = "charge@sk_live_fakeSynth@now", .expected = "charge@[REDACTED]@now" },
+        .{ .value = "model@hf_fakeSyntheticHuggingFaceTok@ready", .expected = "model@[REDACTED]@ready" },
+        .{ .value = "clone@glpat-fakeSynthetic@ok", .expected = "clone@[REDACTED]@ok" },
     };
     for (glued) |case| {
         try expectSpanRedaction(case.value, case.expected);
