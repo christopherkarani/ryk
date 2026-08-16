@@ -41,7 +41,16 @@ pub fn redactAlloc(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
 /// True when `value` contains a structured provider-token span (or a whole-value
 /// AWS access key). Does **not** treat high-entropy / JWT blobs as secrets.
 pub fn containsStructuredSecret(value: []const u8) bool {
-    if (findStructuredSecret(value, 0) != null) return true;
+    // Session ids are path keys. `findStructuredSecret` is a free-text scanner
+    // and matches `sk-` at every byte, so `task-<uuid>` / `ask-followup-1`
+    // would collapse onto `redacted`. Accept a hit only at an `isKeyStart`
+    // boundary (`-` / `.` count; alnum / `_` do not). Do not change the
+    // scanner itself — glued `blockedsk-…` in commands must still redact.
+    var from: usize = 0;
+    while (findStructuredSecret(value, from)) |span| {
+        if (isKeyStart(value, span.start)) return true;
+        from = span.start + 1;
+    }
     const trimmed = std.mem.trim(u8, value, " \t\r\n");
     return looksLikeAwsAccessKey(trimmed);
 }

@@ -860,6 +860,78 @@ test "feed loader keeps high-unique UUID session_id" {
     try std.testing.expect(std.mem.indexOf(u8, loaded[0].raw, "\"session_id\":\"redacted\"") == null);
 }
 
+test "feed loader keeps task- and ask- session ids that contain sk- trigraph" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+
+    const path = try feedPath(std.testing.allocator, root);
+    defer std.testing.allocator.free(path);
+    const parent = std.fs.path.dirname(path).?;
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, parent);
+
+    const keep = [_][]const u8{
+        "task-a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+        "ask-followup-1",
+    };
+    var jsonl: std.ArrayList(u8) = .empty;
+    defer jsonl.deinit(std.testing.allocator);
+    for (keep) |sid| {
+        const line = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "{{\"timestamp\":\"2026-07-13T00:00:00Z\",\"workspace_root\":\"{s}\",\"event_type\":\"command_denied\",\"decision\":\"deny\",\"decision_source\":\"rust-daemon\",\"event_source\":\"hook\",\"host\":\"codex\",\"daemon_status\":\"healthy\",\"pack_id\":\"core.shell\",\"severity\":\"high\",\"reason\":\"blocked\",\"remediation\":null,\"target_summary\":\"shell command (redacted)\",\"session_id\":\"{s}\",\"verified\":false}}\n",
+            .{ root, sid },
+        );
+        defer std.testing.allocator.free(line);
+        try jsonl.appendSlice(std.testing.allocator, line);
+    }
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = jsonl.items });
+
+    const loaded = try loadRecent(std.testing.io, std.testing.allocator, root, 4);
+    defer {
+        for (loaded) |*item| item.deinit(std.testing.allocator);
+        std.testing.allocator.free(loaded);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), loaded.len);
+    try std.testing.expectEqualStrings(keep[0], loaded[0].record.session_id.?);
+    try std.testing.expectEqualStrings(keep[1], loaded[1].record.session_id.?);
+    try std.testing.expect(std.mem.indexOf(u8, loaded[0].raw, keep[0]) != null);
+    try std.testing.expect(std.mem.indexOf(u8, loaded[1].raw, keep[1]) != null);
+}
+
+test "feed loader redacts session_id with sk- after a key boundary" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+
+    const path = try feedPath(std.testing.allocator, root);
+    defer std.testing.allocator.free(path);
+    const parent = std.fs.path.dirname(path).?;
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, parent);
+
+    const fake_session = "sess-sk-abcdefghijklmnop";
+    const line = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"timestamp\":\"2026-07-13T00:00:00Z\",\"workspace_root\":\"{s}\",\"event_type\":\"command_denied\",\"decision\":\"deny\",\"decision_source\":\"rust-daemon\",\"event_source\":\"hook\",\"host\":\"codex\",\"daemon_status\":\"healthy\",\"pack_id\":\"core.shell\",\"severity\":\"high\",\"reason\":\"blocked\",\"remediation\":null,\"target_summary\":\"shell command (redacted)\",\"session_id\":\"{s}\",\"verified\":false}}\n",
+        .{ root, fake_session },
+    );
+    defer std.testing.allocator.free(line);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = line });
+
+    const loaded = try loadRecent(std.testing.io, std.testing.allocator, root, 4);
+    defer {
+        for (loaded) |*item| item.deinit(std.testing.allocator);
+        std.testing.allocator.free(loaded);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), loaded.len);
+    try std.testing.expectEqualStrings("redacted", loaded[0].record.session_id.?);
+    try std.testing.expect(std.mem.indexOf(u8, loaded[0].raw, fake_session) == null);
+}
+
 test "feed loader redacts session_id that embeds a structured token" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
