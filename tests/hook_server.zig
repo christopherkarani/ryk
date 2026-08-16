@@ -676,8 +676,9 @@ test "one server permits leftover unused ask on coding hosts" {
     defer tmp.cleanup();
     const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir);
-    const sock = try std.fs.path.join(std.testing.allocator, &.{ dir, "leftover-ask.sock" });
-    defer std.testing.allocator.free(sock);
+    const short = try makeTestSock(std.testing.allocator, "leftover-ask");
+    defer short.deinit(std.testing.allocator);
+    const sock = short.sock;
     const ws = try std.fs.path.join(std.testing.allocator, &.{ dir, "ask-ws" });
     defer std.testing.allocator.free(ws);
     try std.Io.Dir.cwd().createDirPath(std.testing.io, ws);
