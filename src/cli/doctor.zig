@@ -3182,20 +3182,18 @@ fn testHostRows(allocator: std.mem.Allocator) ![]HostDoctorRow {
     }
     // Match production collectHostDoctorRows: fix strings from host_status.formatFix only
     // (no hand-authored Pi/hermes strings that green-paint message migration).
-    const smoke = host_status.HostSmokePair{};
     const hermes_fail_open = true;
     for (hosts) |h| {
-        const wired = "—";
-        const fix = try host_status.formatFix(allocator, h.name, wired, smoke, hermes_fail_open);
-        try list.append(allocator, .{
-            .host = try allocator.dupe(u8, h.name),
-            .wired = try allocator.dupe(u8, wired),
-            .shell_gate = try allocator.dupe(u8, h.gate),
-            .fail_stance = try allocator.dupe(u8, h.stance),
-            .smoke_allow = try allocator.dupe(u8, "not-run"),
-            .smoke_deny = try allocator.dupe(u8, "not-run"),
-            .fix = fix,
-        });
+        try appendHostDoctorRow(
+            allocator,
+            &list,
+            h.name,
+            "—",
+            h.gate,
+            h.stance,
+            .{},
+            hermes_fail_open,
+        );
     }
     return try list.toOwnedSlice(allocator);
 }
