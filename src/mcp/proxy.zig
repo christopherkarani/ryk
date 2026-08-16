@@ -2125,7 +2125,7 @@ test "proxy denies notify with structural to+body under effects.deny" {
     try std.testing.expect(std.mem.indexOf(u8, output_writer.buffered(), "\"error\"") != null);
 }
 
-test "upsertMetadataGate upgrade OOM GH347 keeps previous reason owned" {
+test "upsertMetadataGate upgrade OOM keeps previous reason owned" {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = std.math.maxInt(usize) });
     const allocator = failing.allocator();
 
@@ -2149,7 +2149,7 @@ test "upsertMetadataGate upgrade OOM GH347 keeps previous reason owned" {
     try std.testing.expectEqualStrings("name scan high", entry.reason);
 }
 
-test "upsertMetadataGate upgrade GH347 replaces reason only when risk increases" {
+test "upsertMetadataGate upgrade replaces reason only when risk increases" {
     const allocator = std.testing.allocator;
     var metadata_gates = std.StringHashMap(MetadataGate).init(allocator);
     defer deinitMetadataGates(allocator, &metadata_gates);
