@@ -16,7 +16,35 @@ pub fn feedPath(allocator: std.mem.Allocator, workspace_root: []const u8) ![]u8 
     return std.fs.path.join(allocator, &.{ workspace_root, ".ryk", feed_dir_name, feed_file_name });
 }
 
+pub const AppendOptions = struct {
+    sync: bool = true,
+    update_registry: bool = true,
+};
+
+/// Test-only: how many `file.sync` calls the feed writer issued.
+var test_sync_calls: usize = 0;
+
+fn maybeSync(io: std.Io, file: std.Io.File, do_sync: bool) !void {
+    if (!do_sync) return;
+    if (builtin.is_test) test_sync_calls += 1;
+    try file.sync(io);
+}
+
+fn isAllowDecision(decision: []const u8) bool {
+    return std.mem.eql(u8, decision, "allow") or std.mem.eql(u8, decision, "context_only");
+}
+
 pub fn appendRecord(io: std.Io, allocator: std.mem.Allocator, workspace_root: []const u8, record: rust_visibility.RustShellFeedRecord) !void {
+    return appendRecordWithOptions(io, allocator, workspace_root, record, .{});
+}
+
+pub fn appendRecordWithOptions(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    workspace_root: []const u8,
+    record: rust_visibility.RustShellFeedRecord,
+    opts: AppendOptions,
+) !void {
     const feed_dir = try std.fs.path.join(allocator, &.{ workspace_root, ".ryk", feed_dir_name });
     defer allocator.free(feed_dir);
     try std.Io.Dir.cwd().createDirPath(io, feed_dir);
@@ -24,10 +52,10 @@ pub fn appendRecord(io: std.Io, allocator: std.mem.Allocator, workspace_root: []
     const feed_path = try feedPath(allocator, workspace_root);
     defer allocator.free(feed_path);
 
-    try appendRecordAtPath(io, allocator, feed_path, record);
+    try appendRecordAtPath(io, allocator, feed_path, record, opts.sync);
 }
 
-fn appendRecordAtPath(io: std.Io, allocator: std.mem.Allocator, path: []const u8, record: rust_visibility.RustShellFeedRecord) !void {
+fn appendRecordAtPath(io: std.Io, allocator: std.mem.Allocator, path: []const u8, record: rust_visibility.RustShellFeedRecord, do_sync: bool) !void {
     var file = try std.Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = false, .lock = .exclusive });
     defer file.close(io);
     const end_offset = (try file.stat(io)).size;
@@ -43,7 +71,7 @@ fn appendRecordAtPath(io: std.Io, allocator: std.mem.Allocator, path: []const u8
     defer allocator.free(bytes);
     try file_writer.interface.writeAll(bytes);
     try file_writer.interface.flush();
-    try file.sync(io);
+    try maybeSync(io, file, do_sync);
 }
 
 pub fn appendGlobalRecord(
@@ -51,6 +79,16 @@ pub fn appendGlobalRecord(
     allocator: std.mem.Allocator,
     dashboard_root: []const u8,
     record: rust_visibility.RustShellFeedRecord,
+) !void {
+    return appendGlobalRecordWithOptions(io, allocator, dashboard_root, record, .{});
+}
+
+pub fn appendGlobalRecordWithOptions(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    dashboard_root: []const u8,
+    record: rust_visibility.RustShellFeedRecord,
+    opts: AppendOptions,
 ) !void {
     try std.Io.Dir.cwd().createDirPath(io, dashboard_root);
 
@@ -64,8 +102,10 @@ pub fn appendGlobalRecord(
     const events_path = try std.fs.path.join(allocator, &.{ dashboard_root, global_events_file_name });
     defer allocator.free(events_path);
     try rotateGlobalFeedIfNeeded(io, allocator, dashboard_root, events_path);
-    try appendRecordAtPath(io, allocator, events_path, record);
-    try updateWorkspaceRegistry(io, allocator, dashboard_root, record);
+    try appendRecordAtPath(io, allocator, events_path, record, opts.sync);
+    if (opts.update_registry) {
+        try updateWorkspaceRegistry(io, allocator, dashboard_root, record);
+    }
 }
 
 fn rotateGlobalFeedIfNeeded(io: std.Io, allocator: std.mem.Allocator, dashboard_root: []const u8, events_path: []const u8) !void {
@@ -88,12 +128,17 @@ fn rotateGlobalFeedIfNeeded(io: std.Io, allocator: std.mem.Allocator, dashboard_
 }
 
 /// Best-effort GUI feed write. Feed persistence must not affect hook/run fail-closed behavior.
+/// Hook/evaluate callers skip `file.sync` and do not rewrite `workspaces.json` on allow.
 pub fn appendRecordBestEffort(io: std.Io, allocator: std.mem.Allocator, workspace_root: []const u8, record: rust_visibility.RustShellFeedRecord) void {
-    appendRecord(io, allocator, workspace_root, record) catch {};
+    const opts = AppendOptions{
+        .sync = false,
+        .update_registry = !isAllowDecision(record.decision),
+    };
+    appendRecordWithOptions(io, allocator, workspace_root, record, opts) catch {};
     if (processGlobalWritesDisabled()) return;
     const dashboard_root = resolveGlobalDashboardRoot(allocator) catch return;
     defer allocator.free(dashboard_root);
-    appendGlobalRecord(io, allocator, dashboard_root, record) catch {};
+    appendGlobalRecordWithOptions(io, allocator, dashboard_root, record, opts) catch {};
 }
 
 pub fn processGlobalWritesDisabled() bool {
@@ -1082,4 +1127,73 @@ test "global feed append records workspace and updates registry" {
     defer std.testing.allocator.free(registry);
     try std.testing.expect(std.mem.indexOf(u8, registry, root) != null);
     try std.testing.expect(std.mem.indexOf(u8, registry, "\"last_host\":\"codex\"") != null);
+}
+
+test "hook-originated feed append skips file.sync" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+
+    var record = try rust_visibility.buildFeedRecordFromHookDecision(
+        std.testing.allocator,
+        std.testing.io,
+        root,
+        "grok",
+        "healthy",
+        "allow",
+        "allowed",
+        null,
+        null,
+        null,
+        null,
+        "req-hook-sync",
+    );
+    defer record.deinit(std.testing.allocator);
+
+    test_sync_calls = 0;
+    appendRecordBestEffort(std.testing.io, std.testing.allocator, root, record);
+    try std.testing.expectEqual(@as(usize, 0), test_sync_calls);
+
+    test_sync_calls = 0;
+    try appendRecord(std.testing.io, std.testing.allocator, root, record);
+    try std.testing.expect(test_sync_calls > 0);
+}
+
+test "hook allow does not rewrite workspace registry" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const dashboard_root = try std.fs.path.join(std.testing.allocator, &.{ root, "home", ".ryk", "dashboard" });
+    defer std.testing.allocator.free(dashboard_root);
+
+    var record = try rust_visibility.buildFeedRecordFromHookDecision(
+        std.testing.allocator,
+        std.testing.io,
+        root,
+        "grok",
+        "healthy",
+        "allow",
+        "allowed",
+        null,
+        null,
+        null,
+        null,
+        "req-hook-allow",
+    );
+    defer record.deinit(std.testing.allocator);
+
+    try appendGlobalRecordWithOptions(std.testing.io, std.testing.allocator, dashboard_root, record, .{
+        .sync = false,
+        .update_registry = false,
+    });
+
+    const registry_path = try std.fs.path.join(std.testing.allocator, &.{ dashboard_root, workspace_registry_file_name });
+    defer std.testing.allocator.free(registry_path);
+    std.Io.Dir.cwd().access(std.testing.io, registry_path, .{}) catch |err| {
+        try std.testing.expectEqual(error.FileNotFound, err);
+        return;
+    };
+    return error.TestUnexpectedResult;
 }
