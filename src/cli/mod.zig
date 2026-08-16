@@ -11,6 +11,7 @@ pub const run_command = @import("run.zig");
 pub const run_os_sandbox = @import("run_os_sandbox.zig");
 pub const env_schema_command = @import("env_schema.zig");
 pub const host_launch = @import("host_launch.zig");
+pub const host_ask_resume = @import("host_ask_resume.zig");
 pub const init = @import("init.zig");
 pub const doctor = @import("doctor.zig");
 pub const policy = @import("policy.zig");
@@ -161,6 +162,12 @@ test {
     _ = host_launch;
     // M-4: deny classifier / human DENY badge for non-command_denied events.
     _ = replay;
+}
+
+test "host_ask_resume matrix" {
+    _ = host_ask_resume;
+    _ = start;
+    _ = host_launch;
 }
 
 pub const version = build_options.version;

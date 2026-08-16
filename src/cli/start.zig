@@ -11,6 +11,7 @@ const onboarding = @import("onboarding.zig");
 const ensure = @import("ensure.zig");
 const pack_state = @import("pack_state.zig");
 const plugin = @import("plugin.zig");
+const host_ask_resume = @import("host_ask_resume.zig");
 const shell_eval = @import("shell_eval.zig");
 const build_options = @import("build_options");
 const env_util = @import("../env_util.zig");
@@ -690,6 +691,12 @@ fn writeSuccessEndCard(
         try stdout.writeAll("\n");
     }
 
+    if (try host_ask_resume.formatWarn(allocator, selected_hosts)) |ask_warn| {
+        defer allocator.free(ask_warn);
+        try tui.render.callout(io, stdout, .warn, "Ask resume", ask_warn);
+        try stdout.writeAll("\n");
+    }
+
     try stdout.writeAll("Next: ryk doctor\n");
 }
 
@@ -1092,7 +1099,7 @@ test "start verified firewall-only completion states mediated-session scope" {
     try std.testing.expect(std.mem.indexOf(u8, flat, "now protected") == null);
 }
 
-test "start OpenClaw completion is explicit about wrapper-required evidence" {
+test "host_ask_resume start OpenClaw completion warns about no ask resume" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
@@ -1134,6 +1141,9 @@ test "start OpenClaw completion is explicit about wrapper-required evidence" {
     try std.testing.expect(std.mem.indexOf(u8, written, "Verify passed") == null);
     try std.testing.expect(std.mem.indexOf(u8, written, "Setup complete") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "ryk run -- openclaw") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "Ask resume") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "hard-blocks ask with no resume") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "host-decision-mapping.md") != null);
 }
 
 test "start leave-alone empty-host card says policy unchanged after verify" {
