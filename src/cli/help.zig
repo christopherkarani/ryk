@@ -750,6 +750,8 @@ pub const commands =
             "One-click repair: `ryk doctor --fix`. Guided multi-select setup: `ryk start`.",
             "Bare install never mutates; mutation requires an explicit host or `all` plus --yes (confirm default No on TTY).",
             "Plugin doctor does not print secrets.",
+            "Grok is hook-managed (`ryk hook grok` / `ryk grok`); it is not a `plugin install` host.",
+            "Pi is extension-only (`ryk evaluate` / bundled extension); it is not a `plugin install` host.",
         } },
         .{ .name = "decide", .summary = "Ask ryk whether an action is allowed by policy", .usage = "ryk decide <command|file|prompt|tool> (--json <payload>|--stdin) [--ci] [--human]", .category = .advanced, .details = &.{
             "Evaluates a policy decision for host plugins (Codex, Claude Code, OpenCode, etc.).",
@@ -1219,6 +1221,40 @@ test "top help and per-host help surface claude and pi aliases" {
     writer = .fixed(&buf);
     try std.testing.expect(try writeCommand(std.testing.io, &writer, "pi"));
     try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "ryk pi") != null);
+}
+
+test "plugin help mentions grok and pi as non-install hosts" {
+    var buf: [4096]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try std.testing.expect(try writeCommand(std.testing.io, &writer, "plugin"));
+    const printed = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, printed, "grok") != null);
+    try std.testing.expect(std.mem.indexOf(u8, printed, "Pi") != null);
+
+    const info = findCommand("plugin") orelse return error.TestUnexpectedResult;
+    var found_grok_note = false;
+    var found_pi_note = false;
+    for (info.details) |line| {
+        const not_install_host = std.mem.indexOf(u8, line, "not a `plugin install` host") != null;
+        const mentions_grok = std.mem.indexOf(u8, line, "Grok") != null or std.mem.indexOf(u8, line, "grok") != null;
+        const mentions_hook = std.mem.indexOf(u8, line, "hook") != null;
+        if (mentions_grok and mentions_hook and not_install_host) found_grok_note = true;
+
+        const mentions_pi = std.mem.indexOf(u8, line, "Pi") != null;
+        const mentions_extension = std.mem.indexOf(u8, line, "extension") != null;
+        if (mentions_pi and mentions_extension and not_install_host) found_pi_note = true;
+
+        if (std.mem.indexOf(u8, line, "plugin install <") != null) {
+            try std.testing.expect(std.mem.indexOf(u8, line, "grok") == null);
+            try std.testing.expect(std.mem.indexOf(u8, line, "pi") == null);
+        }
+        if (std.mem.indexOf(u8, line, "ryk plugin <") != null) {
+            try std.testing.expect(std.mem.indexOf(u8, line, "grok") == null);
+            try std.testing.expect(std.mem.indexOf(u8, line, "pi") == null);
+        }
+    }
+    try std.testing.expect(found_grok_note);
+    try std.testing.expect(found_pi_note);
 }
 
 /// True when root help lists `name` as a left-column peer command (not Common tasks / prose).
