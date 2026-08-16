@@ -73,7 +73,7 @@ Pi uses the same socket via `ryk evaluate`. Cursor uses it via bare `ryk` stdin.
 
 ### Protocol (v1)
 
-NDJSON, one request line, one response line. Max line 1 MiB (same as today’s hook payload cap).
+NDJSON, one request line, one response line. Max line 1 MiB (same as today’s hook payload cap). The client writes `payload` as a single-line JSON value so pretty-printed host stdin cannot split the request.
 
 Request:
 
