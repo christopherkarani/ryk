@@ -194,7 +194,8 @@ def map_pre_tool_call(
 
     - allow → None (proceed)
     - block → {"action": "block", ...}
-    - ask → None (proceed) or block under CI / unattended marker
+    - leftover unused ask → None (proceed) or block under CI / unattended marker
+    - stage → block (hold/deny; never proceed)
     - warn → log advisory + None (not collapsed to block)
     - other → fail-closed block
     """
@@ -206,7 +207,7 @@ def map_pre_tool_call(
         if log_warn is not None:
             log_warn(f"WARN (advisory, not blocked): {message}")
         return None
-    if decision == "block":
+    if decision == "block" or decision == "stage":
         return {
             "action": "block",
             "message": format_tool_message(response, default="blocked by ryk"),
@@ -239,6 +240,7 @@ def tool_action_mode(decision: str) -> str:
         "allow": "proceed",
         "block": "hard_block",
         "ask": "proceed",
+        "stage": "hard_block",
         "warn": "advisory_log",
         "error": "fail_closed_block",
     }.get(decision, "fail_closed_block")

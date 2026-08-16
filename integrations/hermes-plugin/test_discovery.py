@@ -582,6 +582,16 @@ class HermesPluginDiscoveryTests(unittest.TestCase):
                 result = handler(tool_name="terminal", args={"command": "rm -rf /tmp/x"})
         self.assertIsNone(result)
 
+    def test_pre_tool_call_stage_never_permits(self) -> None:
+        """Staged writes are hold/deny, not leftover unused ask."""
+        blocked = _PLUGIN._mapping.map_pre_tool_call(
+            {"decision": "stage", "message": "staged write pending review"},
+            "write",
+            {"path": "src/main.ts"},
+            environ={},
+        )
+        self.assertEqual(blocked["action"], "block")
+
     def test_pre_tool_call_ask_hardens_to_block_in_ci(self) -> None:
         ctx = mock.Mock()
         _PLUGIN._register(ctx, "pre_tool_call")
@@ -767,6 +777,14 @@ class HermesPluginDiscoveryTests(unittest.TestCase):
             environ={},
         )
         self.assertIsNone(permitted)
+        staged = _PLUGIN._mapping.map_pre_tool_call(
+            {"decision": "stage", "message": "staged write"},
+            "terminal",
+            {"path": "src/main.ts"},
+            environ={},
+        )
+        self.assertEqual(staged["action"], "block")
+        self.assertEqual(_PLUGIN._mapping.tool_action_mode("stage"), "hard_block")
 
     def test_pre_tool_call_block_message_is_short_without_remediation(self) -> None:
         """Host block message is one short line: no Next/remediation wall, rule once."""

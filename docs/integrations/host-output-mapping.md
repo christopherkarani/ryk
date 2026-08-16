@@ -73,10 +73,10 @@ Claude only. Informational allow.
 |---|---|---|
 | `allow` | `allow` | Policy allows |
 | `deny` | `block` | Policy denies |
-| `ask` | `allow` on Claude/Codex/OpenCode/Cursor/Pi; `block` when unattended | Residual ask is permit so agents can work. Explicit deny is unchanged. |
+| `ask` | `allow` on Claude/Codex/OpenCode/Cursor/Pi; `block` when unattended | Leftover unused policy ask is permit so agents can work. Stage, FM steward ask, and SoftBlock never ride this wire. Explicit deny is unchanged. |
 | `observe` | `context_only` | Log only |
 | `redact` | `warn` | Secrets detected |
-| `stage` | `ask` | Staged write pending review |
+| `stage` | hold (`ask` on Claude `permissionDecision`) or `stage`/`block` on generic hook JSON; never `allow` | Staged write pending review. Unattended/`--ci` hardens to `block`. |
 | `broker` | `error` | Evaluation failure |
 
 ## Risk Level Reference

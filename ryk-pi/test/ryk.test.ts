@@ -563,7 +563,14 @@ function decideAllowJson(category = "file.write"): string {
 }
 
 function decideJson(
-	decision: "allow" | "block" | "ask" | "warn" | "context_only" | "error",
+	decision:
+		| "allow"
+		| "block"
+		| "ask"
+		| "stage"
+		| "warn"
+		| "context_only"
+		| "error",
 	category = "file.write",
 ): string {
 	return JSON.stringify({
@@ -1059,6 +1066,30 @@ test("file-policy residual ask is permit without a prompt", async () => {
 		{ path: "src/main.ts", content: "x" },
 	);
 	assert.equal(result, undefined);
+	assert.equal(offered.length, 0);
+});
+
+test("staged file write is not permit on attended Pi", async () => {
+	const { pi, handlers } = makePi();
+	const { spawn } = makeSpawn([
+		{ code: 7, stdout: decideJson("stage", "file.write") },
+	]);
+	installRykExtension(pi, { spawn, rykBin: "ryk" });
+	const { ctx } = makeCtx();
+	let offered: string[] = [];
+	(ctx.ui as any).select = async (_title: string, options: string[]) => {
+		offered = options;
+		return "Block";
+	};
+
+	const result = await fireToolCall(
+		handlers.get("tool_call")![0],
+		ctx,
+		"",
+		"write",
+		{ path: "src/main.ts", content: "x" },
+	);
+	assert.equal(result?.block, true);
 	assert.equal(offered.length, 0);
 });
 

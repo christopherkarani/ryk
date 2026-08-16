@@ -584,6 +584,7 @@ const DECIDE_EXIT_CODE = {
 	context_only: 0,
 	block: 3,
 	ask: 7,
+	stage: 7,
 	warn: 8,
 	error: 1,
 } as const;
@@ -885,7 +886,7 @@ async function runRykDecideOnce(
 	if (decision === "allow" || decision === "context_only") {
 		return { kind: "allow", response: parsed };
 	}
-	if (decision === "block") {
+	if (decision === "block" || decision === "stage") {
 		const normalized = normalizeDecideToEvaluateShape(parsed);
 		return {
 			kind: "deny",
@@ -968,7 +969,10 @@ function normalizeDecideToEvaluateShape(response: unknown): unknown {
 	const obj = response as Record<string, unknown>;
 	return {
 		...obj,
-		decision: obj.decision === "block" ? "deny" : obj.decision,
+		decision:
+			obj.decision === "block" || obj.decision === "stage"
+				? "deny"
+				: obj.decision,
 		rule_id: typeof obj.rule === "string" ? obj.rule : obj.rule_id,
 	};
 }
@@ -1861,10 +1865,10 @@ async function applyToolDecision(
 }
 
 /**
- * Single entry for policy ask:
+ * Single entry for leftover unused policy ask:
  * - unattended / CI → auto-deny
- * - otherwise residual ask is permit so coding agents can work
- * Explicit deny still blocks before this function runs.
+ * - otherwise leftover unused policy ask is permit so coding agents can work
+ * Staged writes, FM steward ask, SoftBlock, and explicit deny never reach here.
  */
 async function resolvePolicyAsk(
 	reason: string,

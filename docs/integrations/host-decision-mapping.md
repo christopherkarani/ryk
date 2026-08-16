@@ -12,7 +12,8 @@ ryk decisions are host-agnostic:
 |---|---|
 | `allow` | Proceed |
 | `block` | Hard deny |
-| `ask` | Residual leftover. Coding hosts permit it so agents can work. Unattended/CI hardens to deny. Not a host approval UI. |
+| `ask` | Leftover unused policy ask only. Coding hosts permit that leftover so agents can work. Unattended/CI hardens to deny. Not a host approval UI. Not stage, FM steward ask, or SoftBlock. |
+| `stage` | Hold-for-review or deny. Never allow. Default `write_mode: staged` file writes. Unattended/`--ci` hardens to block. |
 | `warn` | Advisory; do not silently treat as hard deny unless documented |
 | `context_only` | Observe / inject context only |
 | `error` | Evaluation failure; fail closed on enforcement surfaces |
@@ -21,9 +22,10 @@ Adapters **must not** claim stronger enforcement than the host provides. Passive
 
 ## CI / unattended rule
 
-Coding hosts (Claude, Codex, OpenCode, Cursor, Pi, Hermes) permit residual
-`ask` so agents can work. There is no host ask UI for leftover `ask`. ryk
-only hard-stops explicit deny/block.
+Coding hosts (Claude, Codex, OpenCode, Cursor, Pi, Hermes) permit leftover
+unused policy `ask` so agents can work. There is no host ask UI for that
+leftover. Stage, FM steward soft→ask, SoftBlock, and explicit deny never
+become allow. ryk still hard-stops explicit deny/block.
 
 When unattended (`CI`, `RYK_CI`, `RYK_NONINTERACTIVE`, `RYK_UNATTENDED`, or
 host `--ci`):
@@ -110,7 +112,8 @@ Blocked-actions counters classify by **decision**, not host event-type strings:
 | decision | Counts as blocked/attention? |
 |---|---|
 | `deny` / `block` / `error` | Yes (hard deny or failure) |
-| `ask` | No on coding-host wire (permitted). Yes if unattended hardens it to deny. |
+| `ask` | No on coding-host wire for leftover unused policy ask (permitted). Yes if unattended hardens it to deny. Stage / FM / SoftBlock are not this leftover. |
+| `stage` | Yes (hold or deny; never a permitted leftover ask) |
 | `warn` | **No** (advisory; tool may proceed) |
 | `allow` / `context_only` | No |
 

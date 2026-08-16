@@ -22,7 +22,7 @@ There is **no host ask** on `pre_tool_call` today. ryk only hard-stops explicit 
 
 ### CI / noninteractive
 
-When `CI`, `RYK_CI`, `RYK_NONINTERACTIVE`, `RYK_UNATTENDED`, or `RYK_HERMES_UNATTENDED` is set truthily, **or** the install-time `.ryk_unattended` marker is present, ryk `ask` is hardened to Hermes `block` (no permit). The live hook also passes `ryk hook hermes … --ci` so residual CLI-side ask (FM soft / stage) hardens inside ryk, not only in the host mapping layer. These unattended signals also override `RYK_HERMES_FAIL_OPEN=1`; a missing ryk binary remains blocked.
+When `CI`, `RYK_CI`, `RYK_NONINTERACTIVE`, `RYK_UNATTENDED`, or `RYK_HERMES_UNATTENDED` is set truthily, **or** the install-time `.ryk_unattended` marker is present, leftover unused ryk `ask` is hardened to Hermes `block` (no permit). The live hook also passes `ryk hook hermes … --ci` so leftover unused CLI-side ask hardens inside ryk, not only in the host mapping layer. Stage, FM steward ask, and SoftBlock never become allow. These unattended signals also override `RYK_HERMES_FAIL_OPEN=1`; a missing ryk binary remains blocked.
 
 ## Failure modes
 

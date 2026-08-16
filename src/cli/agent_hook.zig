@@ -236,8 +236,10 @@ pub fn evaluatePayloadWithModeOpts(
     // `fm_client` on evaluatePayloadWithModeOpts to exercise the seatbelt.
     // Bare agent-hook has no policy YAML, so permit is empty (matrix + sticky
     // only); sticky is process-session store.
-    // Residual ask is permit on Cursor / Claude-compatible agent_hook so
-    // coding agents can work. Unattended / mode=.ci hardens ask → deny.
+    // Leftover unused policy ask is permit on Cursor / Claude-compatible
+    // agent_hook so coding agents can work. SoftBlock, FM steward ask, and
+    // staged writes never become allow. Unattended / mode=.ci hardens leftover
+    // ask → deny.
     const decision = try shell_eval.decisionFromDaemonResultWithPolicy(
         allocator,
         daemon_response.value.result,
@@ -272,7 +274,14 @@ pub fn evaluatePayloadWithModeOpts(
         },
         .ask => {
             const unattended = opts.unattended orelse env_util.getenvUnattended() or mode == .ci;
-            if (unattended) {
+            const leftover = decision.ask_origin.mayPermitOnCodingHost();
+            if (!leftover) {
+                // SoftBlock / FM: hold on Claude-compatible agent_hook; Cursor
+                // has no ask channel so writeAsk denies.
+                const reason = try core_api.redactAlloc(allocator, decision.owned_reason);
+                defer allocator.free(reason);
+                try writeAsk(stdout, format, reason);
+            } else if (unattended) {
                 const reason = try core_api.redactAlloc(allocator, decision.owned_reason);
                 defer allocator.free(reason);
                 try writeDeny(stdout, format, reason);
@@ -379,6 +388,15 @@ fn writeAllow(stdout: anytype, format: InputFormat) !void {
         .cursor_shell => try stdout.writeAll(
             \\{"permission":"allow","continue":true,"userMessage":"","agentMessage":"","user_message":"","agent_message":""}
         ),
+    }
+}
+
+fn writeAsk(stdout: anytype, format: InputFormat, reason: []const u8) !void {
+    switch (format) {
+        // Claude-compatible PreToolUse supports permissionDecision "ask".
+        .agent_hook => try writeAgentPermission(stdout, "ask", reason),
+        // Cursor beforeShellExecution has no ask; deny so approval is not skipped.
+        .cursor_shell => try writeCursorDenial(stdout, reason),
     }
 }
 
@@ -729,7 +747,7 @@ test "observe mode high-severity deny is warn-allow (empty agent / allow cursor)
     try std.testing.expect(std.mem.indexOf(u8, cursor_stdout.buffered(), "\"permission\":\"allow\"") != null);
 }
 
-test "SoftBlock residual ask is permit on agent_hook; deny still deny" {
+test "SoftBlock ask is not permit on agent_hook" {
     const allocator = std.testing.allocator;
     var stdout_buf: [1024]u8 = undefined;
     var stdout: std.Io.Writer = .fixed(&stdout_buf);
@@ -738,7 +756,7 @@ test "SoftBlock residual ask is permit on agent_hook; deny still deny" {
         .disable_fm = true,
         .unattended = false,
     });
-    try std.testing.expectEqual(@as(usize, 0), stdout.buffered().len);
+    try std.testing.expect(std.mem.indexOf(u8, stdout.buffered(), "\"permissionDecision\":\"ask\"") != null);
 }
 
 test "critical deny stays deny even in observe mode" {
@@ -906,5 +924,6 @@ test "agent_hook product path FM ask upgrades soft allow" {
     const out = stdout.buffered();
     try std.testing.expectEqual(@as(u32, 1), fm_state.call_count);
     try std.testing.expect(fm_state.saw_expected_session);
-    try std.testing.expectEqual(@as(usize, 0), out.len);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"permissionDecision\":\"ask\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "curl pipe needs confirmation") != null);
 }
