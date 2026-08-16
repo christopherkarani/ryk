@@ -640,7 +640,10 @@ fn walkCollect(
     suffix: ?[]const u8,
     exact_name: ?[]const u8,
 ) !void {
-    if (record.inWindowCount(options.window) >= types.max_sessions_per_host) return;
+    if (record.inWindowCount(options.window) >= types.max_sessions_per_host) {
+        record.cacheable = false;
+        return;
+    }
     const full = if (rel.len == 0) root else try std.fs.path.join(allocator, &.{ root, rel });
     defer if (rel.len != 0) allocator.free(full);
 
@@ -660,7 +663,10 @@ fn walkCollect(
     var it = dir.iterate();
     while (true) {
         const entry = it.next(io) catch break orelse break;
-        if (record.inWindowCount(options.window) >= types.max_sessions_per_host) return;
+        if (record.inWindowCount(options.window) >= types.max_sessions_per_host) {
+            record.cacheable = false;
+            return;
+        }
 
         if (entry.kind == .file) {
             const match = blk: {
@@ -1189,4 +1195,57 @@ test "discover symlink leaf and dir still skipped with cache" {
     try std.testing.expectEqual(@as(usize, 1), second[0].files.items.len);
     try std.testing.expectEqualStrings("real-session", second[0].files.items[0].session_id);
     try std.testing.expectEqual(@as(u32, 1), walk_cache_misses);
+}
+
+test "discover 80-cap truncated walk is not cached" {
+    const io = std.testing.io;
+    const now: i64 = std.Io.Timestamp.now(io, .real).toSeconds();
+    const home = try std.fmt.allocPrint(std.testing.allocator, "zig-cache/tmp-scan-claude-cache-80cap-{d}", .{now});
+    defer std.testing.allocator.free(home);
+    defer std.Io.Dir.cwd().deleteTree(io, home) catch {};
+
+    const dir_a = try std.fs.path.join(std.testing.allocator, &.{ home, ".claude", "projects", "a" });
+    defer std.testing.allocator.free(dir_a);
+    try std.Io.Dir.cwd().createDirPath(io, dir_a);
+    const dir_z = try std.fs.path.join(std.testing.allocator, &.{ home, ".claude", "projects", "z" });
+    defer std.testing.allocator.free(dir_z);
+    try std.Io.Dir.cwd().createDirPath(io, dir_z);
+
+    const cutoff_mtime = now - 30 * 86_400;
+    var i: usize = 0;
+    while (i < types.max_sessions_per_host) : (i += 1) {
+        const sess = try std.fmt.allocPrint(std.testing.allocator, "{s}/sess-{d:0>3}.jsonl", .{ dir_a, i });
+        defer std.testing.allocator.free(sess);
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = sess, .data = claudeJsonlBody() });
+        try setFileMtimeSecs(io, sess, if (i == 0) cutoff_mtime else now);
+    }
+
+    const late = try std.fs.path.join(std.testing.allocator, &.{ dir_z, "late-session.jsonl" });
+    defer std.testing.allocator.free(late);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = late, .data = claudeJsonlBody() });
+    try setFileMtimeSecs(io, late, now);
+
+    walk_cache_misses = 0;
+    {
+        const first = try discoverAll(io, std.testing.allocator, .{
+            .home = home,
+            .window = time_window.resolveWindow(now, 30, false),
+            .only_host = .claude,
+        });
+        defer freeDiscoveries(std.testing.allocator, first);
+        try std.testing.expectEqual(@as(u32, 1), walk_cache_misses);
+    }
+
+    const second = try discoverAll(io, std.testing.allocator, .{
+        .home = home,
+        .window = time_window.resolveWindow(now + 1, 30, false),
+        .only_host = .claude,
+    });
+    defer freeDiscoveries(std.testing.allocator, second);
+    try std.testing.expectEqual(@as(u32, 2), walk_cache_misses);
+    var saw_late = false;
+    for (second[0].files.items) |f| {
+        if (std.mem.eql(u8, f.session_id, "late-session")) saw_late = true;
+    }
+    try std.testing.expect(saw_late);
 }
