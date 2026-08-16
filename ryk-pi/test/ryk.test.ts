@@ -230,6 +230,31 @@ function makeCtx(overrides: Record<string, unknown> = {}) {
 	return { ctx, notifications, statuses, widgets, selections };
 }
 
+const UNATTENDED_ENV_KEYS = [
+	"CI",
+	"RYK_CI",
+	"RYK_NONINTERACTIVE",
+	"RYK_UNATTENDED",
+] as const;
+
+/** Residual-ask permit tests must not inherit GitHub Actions CI=true. */
+async function withClearedUnattendedEnv<T>(
+	run: () => Promise<T> | T,
+): Promise<T> {
+	const saved = Object.fromEntries(
+		UNATTENDED_ENV_KEYS.map((key) => [key, process.env[key]]),
+	);
+	for (const key of UNATTENDED_ENV_KEYS) delete process.env[key];
+	try {
+		return await run();
+	} finally {
+		for (const key of UNATTENDED_ENV_KEYS) {
+			if (saved[key] === undefined) delete process.env[key];
+			else process.env[key] = saved[key];
+		}
+	}
+}
+
 function allowJson(): string {
 	return JSON.stringify({
 		decision: "allow",
@@ -1046,27 +1071,29 @@ test("ls tool denies sensitive directory via decide file read", async () => {
 });
 
 test("file-policy residual ask is permit without a prompt", async () => {
-	const { pi, handlers } = makePi();
-	const { spawn } = makeSpawn([
-		{ code: 7, stdout: decideJson("ask", "file.write") },
-	]);
-	installRykExtension(pi, { spawn, rykBin: "ryk" });
-	const { ctx } = makeCtx();
-	let offered: string[] = [];
-	(ctx.ui as any).select = async (_title: string, options: string[]) => {
-		offered = options;
-		return "Block";
-	};
+	await withClearedUnattendedEnv(async () => {
+		const { pi, handlers } = makePi();
+		const { spawn } = makeSpawn([
+			{ code: 7, stdout: decideJson("ask", "file.write") },
+		]);
+		installRykExtension(pi, { spawn, rykBin: "ryk" });
+		const { ctx } = makeCtx();
+		let offered: string[] = [];
+		(ctx.ui as any).select = async (_title: string, options: string[]) => {
+			offered = options;
+			return "Block";
+		};
 
-	const result = await fireToolCall(
-		handlers.get("tool_call")![0],
-		ctx,
-		"",
-		"write",
-		{ path: "src/main.ts", content: "x" },
-	);
-	assert.equal(result, undefined);
-	assert.equal(offered.length, 0);
+		const result = await fireToolCall(
+			handlers.get("tool_call")![0],
+			ctx,
+			"",
+			"write",
+			{ path: "src/main.ts", content: "x" },
+		);
+		assert.equal(result, undefined);
+		assert.equal(offered.length, 0);
+	});
 });
 
 test("staged file write is not permit on attended Pi", async () => {
@@ -1134,77 +1161,83 @@ test("allowOnceBypassEnabled honors env and strict mode", () => {
 });
 
 test("strict mode residual ask is permit without a prompt", async () => {
-	const { pi, handlers, commands } = makePi();
-	const { spawn } = makeSpawn([
-		{ code: 7, stdout: decideJson("ask", "file.write") },
-	]);
-	installRykExtension(pi, { spawn, rykBin: "ryk" });
-	const { ctx } = makeCtx();
-	await commands.get("ryk-mode")!.handler("strict", ctx);
-	let offered: string[] = [];
-	(ctx.ui as any).select = async (_title: string, options: string[]) => {
-		offered = options;
-		return "Block";
-	};
+	await withClearedUnattendedEnv(async () => {
+		const { pi, handlers, commands } = makePi();
+		const { spawn } = makeSpawn([
+			{ code: 7, stdout: decideJson("ask", "file.write") },
+		]);
+		installRykExtension(pi, { spawn, rykBin: "ryk" });
+		const { ctx } = makeCtx();
+		await commands.get("ryk-mode")!.handler("strict", ctx);
+		let offered: string[] = [];
+		(ctx.ui as any).select = async (_title: string, options: string[]) => {
+			offered = options;
+			return "Block";
+		};
 
-	const result = await fireToolCall(
-		handlers.get("tool_call")![0],
-		ctx,
-		"",
-		"write",
-		{ path: "src/main.ts", content: "x" },
-	);
-	assert.equal(result, undefined);
-	assert.equal(offered.length, 0);
+		const result = await fireToolCall(
+			handlers.get("tool_call")![0],
+			ctx,
+			"",
+			"write",
+			{ path: "src/main.ts", content: "x" },
+		);
+		assert.equal(result, undefined);
+		assert.equal(offered.length, 0);
+	});
 });
 
 test("residual ask does not open once-bypass UI", async () => {
-	const { pi, handlers, messages } = makePi();
-	const { spawn } = makeSpawn([
-		{ code: 7, stdout: decideJson("ask", "file.write") },
-	]);
-	installRykExtension(pi, { spawn, rykBin: "ryk" });
-	const syntheticSecret = "AKIASYNTHETICONLY1234";
-	const encodedSecret = "dG9rZW49c3ludGhldGljLW9ubHktc2VjcmV0";
-	const { ctx, notifications } = makeCtx({
-		cwd: `/tmp/${syntheticSecret}/${encodedSecret}`,
-		sessionManager: { getSessionId: () => `session-${syntheticSecret}-${encodedSecret}` },
-	});
-	(ctx.ui as any).select = async () => "Allow once";
+	await withClearedUnattendedEnv(async () => {
+		const { pi, handlers, messages } = makePi();
+		const { spawn } = makeSpawn([
+			{ code: 7, stdout: decideJson("ask", "file.write") },
+		]);
+		installRykExtension(pi, { spawn, rykBin: "ryk" });
+		const syntheticSecret = "AKIASYNTHETICONLY1234";
+		const encodedSecret = "dG9rZW49c3ludGhldGljLW9ubHktc2VjcmV0";
+		const { ctx, notifications } = makeCtx({
+			cwd: `/tmp/${syntheticSecret}/${encodedSecret}`,
+			sessionManager: { getSessionId: () => `session-${syntheticSecret}-${encodedSecret}` },
+		});
+		(ctx.ui as any).select = async () => "Allow once";
 
-	const result = await fireToolCall(
-		handlers.get("tool_call")![0],
-		ctx,
-		"",
-		"write",
-		{ path: "src/main.ts", content: "x" },
-	);
-	assert.equal(result, undefined);
-	assert.equal(
-		messages.find((m) => m.message.customType === "ryk.audit"),
-		undefined,
-	);
+		const result = await fireToolCall(
+			handlers.get("tool_call")![0],
+			ctx,
+			"",
+			"write",
+			{ path: "src/main.ts", content: "x" },
+		);
+		assert.equal(result, undefined);
+		assert.equal(
+			messages.find((m) => m.message.customType === "ryk.audit"),
+			undefined,
+		);
+	});
 });
 
 test("residual ask still permits when transcript auditing is unavailable", async () => {
-	const { pi, handlers, messages } = makePi();
-	delete (pi as { sendMessage?: unknown }).sendMessage;
-	const { spawn } = makeSpawn([
-		{ code: 7, stdout: decideJson("ask", "file.write") },
-	]);
-	installRykExtension(pi, { spawn, rykBin: "ryk" });
-	const { ctx, notifications } = makeCtx();
-	(ctx.ui as any).select = async () => "Allow once";
+	await withClearedUnattendedEnv(async () => {
+		const { pi, handlers, messages } = makePi();
+		delete (pi as { sendMessage?: unknown }).sendMessage;
+		const { spawn } = makeSpawn([
+			{ code: 7, stdout: decideJson("ask", "file.write") },
+		]);
+		installRykExtension(pi, { spawn, rykBin: "ryk" });
+		const { ctx, notifications } = makeCtx();
+		(ctx.ui as any).select = async () => "Allow once";
 
-	const result = await fireToolCall(
-		handlers.get("tool_call")![0],
-		ctx,
-		"",
-		"write",
-		{ path: "src/main.ts", content: "x" },
-	);
-	assert.equal(result, undefined);
-	assert.equal(messages.length, 0);
+		const result = await fireToolCall(
+			handlers.get("tool_call")![0],
+			ctx,
+			"",
+			"write",
+			{ path: "src/main.ts", content: "x" },
+		);
+		assert.equal(result, undefined);
+		assert.equal(messages.length, 0);
+	});
 });
 
 test("isSubagentSession and shouldAutoDenyPolicyAsk helpers", () => {
@@ -1304,34 +1337,37 @@ test("askOptionsFor policy includes session grant option", () => {
 });
 
 test("policy ask permits noninteractive sessions so agents can work", async () => {
-	const { pi, handlers, messages } = makePi();
-	const { spawn } = makeSpawn([
-		{ code: 7, stdout: decideJson("ask", "file.write") },
-	]);
-	installRykExtension(pi, { spawn, rykBin: "ryk" });
-	const { ctx } = makeCtx({ hasUI: false, mode: "print" });
-	let selectCalled = false;
-	(ctx.ui as any).select = async () => {
-		selectCalled = true;
-		return "Allow once";
-	};
+	await withClearedUnattendedEnv(async () => {
+		const { pi, handlers, messages } = makePi();
+		const { spawn } = makeSpawn([
+			{ code: 7, stdout: decideJson("ask", "file.write") },
+		]);
+		installRykExtension(pi, { spawn, rykBin: "ryk" });
+		const { ctx } = makeCtx({ hasUI: false, mode: "print" });
+		let selectCalled = false;
+		(ctx.ui as any).select = async () => {
+			selectCalled = true;
+			return "Allow once";
+		};
 
-	const result = await fireToolCall(
-		handlers.get("tool_call")![0],
-		ctx,
-		"",
-		"write",
-		{ path: "src/main.ts", content: "x" },
-	);
-	assert.equal(result, undefined);
-	assert.equal(selectCalled, false, "select must not be called for residual ask");
-	assert.equal(
-		messages.find((m) => m.message.customType === "ryk.audit"),
-		undefined,
-	);
+		const result = await fireToolCall(
+			handlers.get("tool_call")![0],
+			ctx,
+			"",
+			"write",
+			{ path: "src/main.ts", content: "x" },
+		);
+		assert.equal(result, undefined);
+		assert.equal(selectCalled, false, "select must not be called for residual ask");
+		assert.equal(
+			messages.find((m) => m.message.customType === "ryk.audit"),
+			undefined,
+		);
+	});
 });
 
 test("policy ask auto-denies when RYK_UNATTENDED is set", async () => {
+	await withClearedUnattendedEnv(async () => {
 	const previous = process.env.RYK_UNATTENDED;
 	process.env.RYK_UNATTENDED = "1";
 	try {
@@ -1359,33 +1395,37 @@ test("policy ask auto-denies when RYK_UNATTENDED is set", async () => {
 		if (previous === undefined) delete process.env.RYK_UNATTENDED;
 		else process.env.RYK_UNATTENDED = previous;
 	}
+	});
 });
 
 test("policy ask permits print mode even when hasUI is true", async () => {
-	const { pi, handlers } = makePi();
-	const { spawn } = makeSpawn([
-		{ code: 7, stdout: decideJson("ask", "file.write") },
-	]);
-	installRykExtension(pi, { spawn, rykBin: "ryk" });
-	const { ctx } = makeCtx({ hasUI: true, mode: "print" });
-	let selectCalled = false;
-	(ctx.ui as any).select = async () => {
-		selectCalled = true;
-		return "Allow once";
-	};
+	await withClearedUnattendedEnv(async () => {
+		const { pi, handlers } = makePi();
+		const { spawn } = makeSpawn([
+			{ code: 7, stdout: decideJson("ask", "file.write") },
+		]);
+		installRykExtension(pi, { spawn, rykBin: "ryk" });
+		const { ctx } = makeCtx({ hasUI: true, mode: "print" });
+		let selectCalled = false;
+		(ctx.ui as any).select = async () => {
+			selectCalled = true;
+			return "Allow once";
+		};
 
-	const result = await fireToolCall(
-		handlers.get("tool_call")![0],
-		ctx,
-		"",
-		"write",
-		{ path: "src/main.ts", content: "x" },
-	);
-	assert.equal(result, undefined);
-	assert.equal(selectCalled, false);
+		const result = await fireToolCall(
+			handlers.get("tool_call")![0],
+			ctx,
+			"",
+			"write",
+			{ path: "src/main.ts", content: "x" },
+		);
+		assert.equal(result, undefined);
+		assert.equal(selectCalled, false);
+	});
 });
 
 test("policy ask subagent permits residual ask without parent wait", async () => {
+	await withClearedUnattendedEnv(async () => {
 	const previous = process.env.PI_SUBAGENT_PARENT_SESSION;
 	const previousTimeout = process.env.RYK_PI_PARENT_ASK_TIMEOUT_MS;
 	const previousRoot = process.env.RYK_PI_ASK_ROOT;
@@ -1440,9 +1480,11 @@ test("policy ask subagent permits residual ask without parent wait", async () =>
 		else process.env.RYK_PI_ASK_ROOT = previousRoot;
 		rmSync(askRoot, { recursive: true, force: true });
 	}
+	});
 });
 
 test("policy ask subagent permits residual ask without parent IPC", async () => {
+	await withClearedUnattendedEnv(async () => {
 	const previous = process.env.PI_SUBAGENT_PARENT_SESSION;
 	const previousTimeout = process.env.RYK_PI_PARENT_ASK_TIMEOUT_MS;
 	const previousRoot = process.env.RYK_PI_ASK_ROOT;
@@ -1501,9 +1543,11 @@ test("policy ask subagent permits residual ask without parent IPC", async () => 
 		else process.env.RYK_PI_ASK_ROOT = previousRoot;
 		rmSync(askRoot, { recursive: true, force: true });
 	}
+	});
 });
 
 test("policy ask subagent does not wait for a parent block", async () => {
+	await withClearedUnattendedEnv(async () => {
 	const previous = process.env.PI_SUBAGENT_PARENT_SESSION;
 	const previousTimeout = process.env.RYK_PI_PARENT_ASK_TIMEOUT_MS;
 	const previousRoot = process.env.RYK_PI_ASK_ROOT;
@@ -1557,6 +1601,7 @@ test("policy ask subagent does not wait for a parent block", async () => {
 		else process.env.RYK_PI_ASK_ROOT = previousRoot;
 		rmSync(askRoot, { recursive: true, force: true });
 	}
+	});
 });
 
 test("session grant short-circuits decide for granted tool name", async () => {
@@ -1677,37 +1722,40 @@ test("parent main session answers pending child ask via select", async () => {
 });
 
 test("policy ask permits residual ask in interactive parent TUI", async () => {
-	const previous = process.env.PI_SUBAGENT_PARENT_SESSION;
-	delete process.env.PI_SUBAGENT_PARENT_SESSION;
-	try {
-		const { pi, handlers } = makePi();
-		const { spawn } = makeSpawn([
-			{ code: 7, stdout: decideJson("ask", "file.write") },
-		]);
-		installRykExtension(pi, { spawn, rykBin: "ryk" });
-		const { ctx } = makeCtx({ hasUI: true, mode: "tui" });
-		let selectCalled = false;
-		(ctx.ui as any).select = async () => {
-			selectCalled = true;
-			return "Block";
-		};
+	await withClearedUnattendedEnv(async () => {
+		const previous = process.env.PI_SUBAGENT_PARENT_SESSION;
+		delete process.env.PI_SUBAGENT_PARENT_SESSION;
+		try {
+			const { pi, handlers } = makePi();
+			const { spawn } = makeSpawn([
+				{ code: 7, stdout: decideJson("ask", "file.write") },
+			]);
+			installRykExtension(pi, { spawn, rykBin: "ryk" });
+			const { ctx } = makeCtx({ hasUI: true, mode: "tui" });
+			let selectCalled = false;
+			(ctx.ui as any).select = async () => {
+				selectCalled = true;
+				return "Block";
+			};
 
-		const result = await fireToolCall(
-			handlers.get("tool_call")![0],
-			ctx,
-			"",
-			"write",
-			{ path: "src/main.ts", content: "x" },
-		);
-		assert.equal(result, undefined);
-		assert.equal(selectCalled, false, "residual ask must not prompt");
-	} finally {
-		if (previous === undefined) delete process.env.PI_SUBAGENT_PARENT_SESSION;
-		else process.env.PI_SUBAGENT_PARENT_SESSION = previous;
-	}
+			const result = await fireToolCall(
+				handlers.get("tool_call")![0],
+				ctx,
+				"",
+				"write",
+				{ path: "src/main.ts", content: "x" },
+			);
+			assert.equal(result, undefined);
+			assert.equal(selectCalled, false, "residual ask must not prompt");
+		} finally {
+			if (previous === undefined) delete process.env.PI_SUBAGENT_PARENT_SESSION;
+			else process.env.PI_SUBAGENT_PARENT_SESSION = previous;
+		}
+	});
 });
 
 test("policy ask auto-deny still blocks when audit is unavailable", async () => {
+	await withClearedUnattendedEnv(async () => {
 	const previous = process.env.RYK_UNATTENDED;
 	process.env.RYK_UNATTENDED = "1";
 	try {
@@ -1739,52 +1787,57 @@ test("policy ask auto-deny still blocks when audit is unavailable", async () => 
 		if (previous === undefined) delete process.env.RYK_UNATTENDED;
 		else process.env.RYK_UNATTENDED = previous;
 	}
+	});
 });
 
 test("bash policy ask permits noninteractive sessions", async () => {
-	const { pi, handlers } = makePi();
-	const { spawn } = makeSpawn([{ code: 0, stdout: askJson() }]);
-	installRykExtension(pi, { spawn, rykBin: "ryk" });
-	const { ctx } = makeCtx({ hasUI: false, mode: "print" });
-	let selectCalled = false;
-	(ctx.ui as any).select = async () => {
-		selectCalled = true;
-		return "Allow once";
-	};
-
-	const result = await fireToolCall(
-		handlers.get("tool_call")![0],
-		ctx,
-		"git push --force",
-	);
-	assert.equal(result, undefined);
-	assert.equal(selectCalled, false);
-});
-
-test("interactive policy ask permits residual ask without select", async () => {
-	const previous = process.env.PI_SUBAGENT_PARENT_SESSION;
-	delete process.env.PI_SUBAGENT_PARENT_SESSION;
-	try {
+	await withClearedUnattendedEnv(async () => {
 		const { pi, handlers } = makePi();
-		const { spawn } = makeSpawn([
-			{ code: 7, stdout: decideJson("ask", "file.write") },
-		]);
+		const { spawn } = makeSpawn([{ code: 0, stdout: askJson() }]);
 		installRykExtension(pi, { spawn, rykBin: "ryk" });
-		const { ctx } = makeCtx({ hasUI: true, mode: "tui" });
-		(ctx.ui as any).select = async () => undefined;
+		const { ctx } = makeCtx({ hasUI: false, mode: "print" });
+		let selectCalled = false;
+		(ctx.ui as any).select = async () => {
+			selectCalled = true;
+			return "Allow once";
+		};
 
 		const result = await fireToolCall(
 			handlers.get("tool_call")![0],
 			ctx,
-			"",
-			"write",
-			{ path: "src/main.ts", content: "x" },
+			"git push --force",
 		);
 		assert.equal(result, undefined);
-	} finally {
-		if (previous === undefined) delete process.env.PI_SUBAGENT_PARENT_SESSION;
-		else process.env.PI_SUBAGENT_PARENT_SESSION = previous;
-	}
+		assert.equal(selectCalled, false);
+	});
+});
+
+test("interactive policy ask permits residual ask without select", async () => {
+	await withClearedUnattendedEnv(async () => {
+		const previous = process.env.PI_SUBAGENT_PARENT_SESSION;
+		delete process.env.PI_SUBAGENT_PARENT_SESSION;
+		try {
+			const { pi, handlers } = makePi();
+			const { spawn } = makeSpawn([
+				{ code: 7, stdout: decideJson("ask", "file.write") },
+			]);
+			installRykExtension(pi, { spawn, rykBin: "ryk" });
+			const { ctx } = makeCtx({ hasUI: true, mode: "tui" });
+			(ctx.ui as any).select = async () => undefined;
+
+			const result = await fireToolCall(
+				handlers.get("tool_call")![0],
+				ctx,
+				"",
+				"write",
+				{ path: "src/main.ts", content: "x" },
+			);
+			assert.equal(result, undefined);
+		} finally {
+			if (previous === undefined) delete process.env.PI_SUBAGENT_PARENT_SESSION;
+			else process.env.PI_SUBAGENT_PARENT_SESSION = previous;
+		}
+	});
 });
 
 test("malformed read tool call fails closed", async () => {
@@ -3133,6 +3186,7 @@ test("tool_call survives parent-ask mkdir EPERM", async () => {
 });
 
 test("subagent residual ask permits when parent-ask FS is EPERM", async () => {
+	await withClearedUnattendedEnv(async () => {
 	const previous = process.env.PI_SUBAGENT_PARENT_SESSION;
 	process.env.PI_SUBAGENT_PARENT_SESSION = "parent-eperm";
 	try {
@@ -3169,4 +3223,5 @@ test("subagent residual ask permits when parent-ask FS is EPERM", async () => {
 		if (previous === undefined) delete process.env.PI_SUBAGENT_PARENT_SESSION;
 		else process.env.PI_SUBAGENT_PARENT_SESSION = previous;
 	}
+	});
 });

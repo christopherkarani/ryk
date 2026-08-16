@@ -91,15 +91,6 @@ fn isSoftMode(mode: policy.schema.Mode) bool {
     };
 }
 
-fn envFlagTruthy(name: [*:0]const u8) bool {
-    const raw_c = std.c.getenv(name) orelse return false;
-    const raw = std.mem.span(raw_c);
-    return std.mem.eql(u8, raw, "1") or
-        std.ascii.eqlIgnoreCase(raw, "true") or
-        std.ascii.eqlIgnoreCase(raw, "yes") or
-        std.ascii.eqlIgnoreCase(raw, "on");
-}
-
 /// Resolve mode for bare agent-hook (no loaded policy YAML).
 ///
 /// Floor is **strict**. `RYK_MODE` may only *raise* strictness (strict →
@@ -897,7 +888,8 @@ fn agentHookFakeFmClient(state: *AgentHookFmFakeState) fm_steward_client.Client 
 }
 
 test "agent_hook product path FM ask upgrades soft allow" {
-    // Daemon Allow + FM ask via injectable client → agent_hook ask JSON.
+    // Daemon Allow + FM ask stays ask (not leftover unused-policy permit).
+    // Pin unattended so live CI=true cannot flip this path to deny.
     const allocator = std.testing.allocator;
     var fm_state = AgentHookFmFakeState{
         .verdict = .ask,
@@ -919,6 +911,7 @@ test "agent_hook product path FM ask upgrades soft allow" {
         .{
             .fm_client = agentHookFakeFmClient(&fm_state),
             .session_id = "agent-hook-fm-sess",
+            .unattended = false,
         },
     );
     const out = stdout.buffered();
@@ -926,4 +919,26 @@ test "agent_hook product path FM ask upgrades soft allow" {
     try std.testing.expect(fm_state.saw_expected_session);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"permissionDecision\":\"ask\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "curl pipe needs confirmation") != null);
+
+    var unattended_state = AgentHookFmFakeState{
+        .verdict = .ask,
+        .why = "hard danger residual",
+        .explain = "curl pipe needs confirmation",
+    };
+    var unattended_buf: [2048]u8 = undefined;
+    var unattended_stdout: std.Io.Writer = .fixed(&unattended_buf);
+    _ = try evaluatePayloadWithModeOpts(
+        allocator,
+        payload,
+        &unattended_stdout,
+        shell_eval.mockDaemonAllowEvaluator,
+        .ask,
+        .{
+            .fm_client = agentHookFakeFmClient(&unattended_state),
+            .session_id = "agent-hook-fm-sess",
+            .unattended = true,
+        },
+    );
+    try std.testing.expectEqual(@as(u32, 1), unattended_state.call_count);
+    try std.testing.expect(std.mem.indexOf(u8, unattended_stdout.buffered(), "\"permissionDecision\":\"deny\"") != null);
 }
