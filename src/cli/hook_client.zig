@@ -78,7 +78,7 @@ pub fn tryServe(io: std.Io, allocator: std.mem.Allocator, request: hook_ipc.Requ
     if (parsed.response.mismatch) {
         parsed.deinit();
         allocator.free(raw);
-        requestShutdown(io, allocator, socket_path, request);
+        _ = requestShutdown(io, allocator, socket_path, request);
         return error.Unavailable;
     }
     return .{ .parsed = parsed, .raw = raw };
