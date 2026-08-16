@@ -63,9 +63,9 @@ function Write-StepActive([string]$Label) {
     Write-Ui ("  > " + $Label) Green
 }
 
-function Write-Activation {
-    # Always printed (including quiet) so automation can hand off to ryk env.
-    Write-Host "    ryk env   # then evaluate the set commands (or copy them for cmd.exe)"
+function Write-HostHint {
+    # Optional one-line next step. Not leftover homework.
+    Write-Host "    ryk claude"
 }
 
 function Fail($Message, $Remediation = $null) {
@@ -235,12 +235,10 @@ function Invoke-InstallEnsure($Destination) {
 
 function Write-SuccessReceipt {
     param(
-        [string]$PreviousVersion,
-        [string]$Destination
+        [string]$PreviousVersion
     )
 
     if ($Quiet) {
-        Write-Activation
         return
     }
 
@@ -252,21 +250,8 @@ function Write-SuccessReceipt {
     } else {
         Write-Ui ("  +  ryk v" + $Version + " installed") Green
     }
-    Write-Ui "  CLI + runtime ready (shell_engine in-process)" DarkGray
     Write-Host ""
-    Write-Ui "  Activate this session" White
-    Write-Ui "  (InstallDir may not be on PATH yet)" DarkGray
-    Write-Host ""
-    Write-Activation
-    Write-Host ""
-    Write-Ui "  Profile exports were also written for future sessions." DarkGray
-    Write-Host ""
-    Write-Ui "  Protection setup completed via doctor --fix --from-install." DarkGray
-
-    Write-Host ""
-    Write-Ui "  Details" DarkGray
-    Write-Ui ("    binary   " + $Destination) DarkGray
-    Write-Ui ("    assets   " + $CurrentLink + " -> " + $ResourceRoot) DarkGray
+    Write-HostHint
     Write-Host ""
 }
 
@@ -371,7 +356,7 @@ try {
     Invoke-InstallEnsure $destination
     Write-StepDone "Set up protection" "doctor --fix --from-install"
 
-    Write-SuccessReceipt -PreviousVersion $previousVersion -Destination $destination
+    Write-SuccessReceipt -PreviousVersion $previousVersion
 } finally {
     Remove-Item -LiteralPath $tempDir -Recurse -Force -ErrorAction SilentlyContinue
 }

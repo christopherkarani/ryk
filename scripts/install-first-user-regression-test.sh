@@ -239,10 +239,7 @@ sh "${INSTALL_SH}" >/dev/null ||
 [[ "$(readlink "${old_runtime}/current")" == "${resource_root}" ]] ||
   fail "reinstall modified a previous runtime's nested selector"
 
-activation="$(printf '%s\n' "${output}" | awk '/^    eval / { sub(/^    /, ""); print; exit }')"
-[[ -n "${activation}" ]] || fail "installer did not print an activation command"
-[[ "${activation}" == *"${install_dir}/ryk"* ]] || fail "activation command does not use the absolute installed binary"
-# UX receipt: brand + success + hierarchy (presentation may use ANSI; strip for asserts).
+# UX receipt: brand + success + optional host hint (presentation may use ANSI; strip for asserts).
 plain_output="$(printf '%s\n' "${output}" | sed $'s/\x1b\\[[0-9;]*m//g')"
 printf '%s\n' "${plain_output}" | grep -Eq 'Rykan V|ryk' || fail "installer did not print brand header"
 printf '%s\n' "${plain_output}" | grep -Eqi 'Rykan V' || fail "installer did not print Rykan V brand"
@@ -262,7 +259,15 @@ if printf '%s\n' "${plain_output}" | grep -Fqi 'start --auto'; then
   fail "installer still surfaces start --auto in user-facing copy"
 fi
 assert_no_d06_full_protection "${plain_output}" "success receipt"
-printf '%s\n' "${plain_output}" | grep -Eq '^[[:space:]]*eval ' || fail "installer did not print activation eval line"
+# Curl-and-done: no leftover eval / doctor --fix homework; optional host hint only.
+if printf '%s\n' "${plain_output}" | grep -Eq '^[[:space:]]*eval '; then
+  fail "installer printed leftover eval homework on success"
+fi
+if printf '%s\n' "${plain_output}" | grep -Fq 'ryk doctor --fix --from-install'; then
+  fail "installer printed leftover doctor --fix homework on success"
+fi
+printf '%s\n' "${plain_output}" | grep -Eq '^[[:space:]]*ryk claude[[:space:]]*$' ||
+  fail "installer missing optional one-line host hint (ryk claude)"
 if printf '%s\n' "${plain_output}" | grep -Eq 'Activate this terminal|Activate this session|Profile exports|INSTALL_DIR is not on PATH'; then
   fail "installer still prints removed success chrome (Activate/profile noise)"
 fi
@@ -274,11 +279,8 @@ printf '%s\n' "${plain_output}" | grep -Eqi 'dashboard' || fail "installer did n
 if printf '%s\n' "${plain_output}" | grep -Eiq '(^|[^[:alnum:]_])orca([^[:alnum:]_]|$)'; then
   fail "installer exposed retired ryk branding"
 fi
-unset RYK_FIRST_USER_ACTIVATED
-eval "${activation}"
-[[ "${RYK_FIRST_USER_ACTIVATED:-}" == 1 ]] || fail "printed activation command did not activate the current shell"
 
-# Quiet mode: only the activation line on stdout (no banner / steps / details).
+# Quiet mode: no leftover homework (no banner / steps / eval / doctor next-steps).
 # Quiet call site must still invoke doctor --fix under HOME + resource roots.
 : > "${onboard_log}"
 quiet_output="$(
@@ -303,14 +305,12 @@ grep -qF "resource=${share_dir}/current" "${onboard_log}" ||
   fail "quiet onboarding missing RYK_RESOURCE_ROOT"
 grep -qF "ryk_resource=${share_dir}/current" "${onboard_log}" ||
   fail "quiet onboarding missing RYK_RESOURCE_ROOT"
-quiet_activation="$(printf '%s\n' "${quiet_output}" | awk '/^    eval / { sub(/^    /, ""); print; exit }')"
-[[ -n "${quiet_activation}" ]] || fail "quiet mode did not print an activation command"
-if printf '%s\n' "${quiet_output}" | grep -Eq 'Platform|Details|Resolve release|Activate this terminal|Rykan V'; then
-  fail "quiet mode leaked non-activation UI"
+if printf '%s\n' "${quiet_output}" | grep -Eq 'Platform|Details|Resolve release|Activate this terminal|Rykan V|eval |doctor --fix'; then
+  fail "quiet mode leaked leftover homework or non-error UI"
 fi
-# Only the activation line should be non-empty content (allow blank lines).
+# Quiet is curl-and-done: no leftover homework lines (allow blank lines).
 nonempty_quiet="$(printf '%s\n' "${quiet_output}" | sed '/^[[:space:]]*$/d')"
-[[ "$(printf '%s\n' "${nonempty_quiet}" | wc -l | tr -d ' ')" == "1" ]] || fail "quiet mode printed more than the activation line"
+[[ -z "${nonempty_quiet}" ]] || fail "quiet mode printed leftover stdout: ${nonempty_quiet}"
 
 # Core / hard onboarding failure must fail the install receipt instead of claiming
 # success and requiring the user to notice a dim warning.
@@ -367,18 +367,30 @@ if printf '%s\n' "${partial_plain}" | grep -Fq "You're now protected by ryk"; th
 fi
 
 # SKIP_ONBOARD must suppress the ensure door entirely (both RYK_ and RYK_ names).
+# Success copy still must not assign leftover doctor --fix homework.
 : > "${onboard_log}"
-HOME="${home}" \
-SHELL=/bin/sh \
-RYK_VERSION="${VERSION}" \
-RYK_ARTIFACT_DIR="${artifact_dir}" \
-RYK_INSTALL_DIR="${install_dir}" \
-RYK_SHARE_DIR="${share_dir}" \
-RYK_INSTALL_SKIP_ONBOARD=1 \
-RYK_TEST_ONBOARD_LOG="${onboard_log}" \
-sh "${INSTALL_SH}" >/dev/null
+skip_onboard_output="$(
+  HOME="${home}" \
+  SHELL=/bin/sh \
+  RYK_VERSION="${VERSION}" \
+  RYK_ARTIFACT_DIR="${artifact_dir}" \
+  RYK_INSTALL_DIR="${install_dir}" \
+  RYK_SHARE_DIR="${share_dir}" \
+  RYK_INSTALL_SKIP_ONBOARD=1 \
+  RYK_TEST_ONBOARD_LOG="${onboard_log}" \
+  sh "${INSTALL_SH}"
+)"
 [[ ! -s "${onboard_log}" ]] ||
   fail "RYK_INSTALL_SKIP_ONBOARD=1 still invoked doctor/start (log not empty)"
+skip_plain="$(printf '%s\n' "${skip_onboard_output}" | sed $'s/\x1b\\[[0-9;]*m//g')"
+if printf '%s\n' "${skip_plain}" | grep -Eq '^[[:space:]]*eval '; then
+  fail "skip-onboard success printed leftover eval homework"
+fi
+if printf '%s\n' "${skip_plain}" | grep -Fq 'ryk doctor --fix --from-install'; then
+  fail "skip-onboard success printed leftover doctor --fix homework"
+fi
+printf '%s\n' "${skip_plain}" | grep -Eq '^[[:space:]]*ryk claude[[:space:]]*$' ||
+  fail "skip-onboard success missing optional one-line host hint"
 
 : > "${onboard_log}"
 HOME="${home}" \
@@ -688,6 +700,10 @@ fi
 # Interactive guided start must not be the taught hard-cut install door.
 if grep -nE '(^|[^$])ryk start' "${INSTALL_SH}" >/dev/null 2>&1; then
   fail "scripts/install.sh still teaches bare ryk start (use doctor --fix --from-install)"
+fi
+# Success card must not print leftover eval homework (fail-path remediations stay).
+if grep -nE 'print_activation|eval "\$\(' "${INSTALL_SH}" >/dev/null 2>&1; then
+  fail "scripts/install.sh still prints leftover eval activation homework"
 fi
 # Harness self-check (D84): the capable-binary path must require doctor --fix.
 if ! grep -nF "grep -c '^doctor --fix$'" "${BASH_SOURCE[0]}" >/dev/null 2>&1; then

@@ -72,7 +72,7 @@ Do not use an install-only path without verification. Download the archive, veri
 1. Download or build the archive for your OS and CPU.
 2. Verify its SHA-256 digest against `dist/checksums.txt`.
 3. Extract the archive, or run `scripts/install.sh` / `scripts/install.ps1` to install the binary and runtime assets together.
-4. Paste the activation command printed by the installer (the highlighted `eval "$(… env …)"` block on Unix). It invokes the absolute installed binary, so it also works in the shell that launched a first-time install before `ryk` is on `PATH`. The installer runs `ryk doctor --fix --from-install` to configure protection.
+4. Open a new shell so `PATH` includes the install dir, then run `ryk claude` (or the host you use). The installer writes the profile `PATH` entry and runs `ryk doctor --fix --from-install` to configure protection.
 
 ### Updating
 
@@ -93,12 +93,12 @@ ryk update --yes    # non-interactive
 
 `ryk update` reuses the official curl installer (checksums + atomic replace). Use `ryk update --force` only when you intentionally want to override the normal release check. After the binary is replaced, the installer runs `ryk doctor --fix --from-install`, which refreshes managed host plugins (for example OpenCode `ryk.ts`, Codex/Claude marketplace plugins, and ryk-owned Hermes trees) so stale plugin files are upgraded in place without a manual delete.
 
-The installers print a step-based receipt (brand header, phases, activation hero). They honor `NO_COLOR` and `RYK_INSTALL_QUIET=1` (non-error silence; activation line still printed) and run the canonical `doctor --fix --from-install` setup door.
+The installers print a step-based receipt (brand header, phases, optional one-line host hint). They honor `NO_COLOR` and `RYK_INSTALL_QUIET=1` (non-error silence) and run the canonical `doctor --fix --from-install` setup door.
 
 Windows (`scripts/install.ps1`) is **checksum-only (unsigned)**: it verifies
 SHA-256 against `checksums.txt` and does not consume `checksums.txt.minisig`.
 It shares the other core contracts (binary + runtime install, structured
-failures, quiet mode, activation handoff) with a smaller surface: it does not
+failures, quiet mode, optional host hint) with a smaller surface: it does not
 manage `PATH` (use your profile / user PATH) and does not soft-warn on a missing
 dashboard UI bundle.
 
@@ -144,7 +144,7 @@ curl -fsSL https://rykanv.com/install | sh
 ```
 
 It downloads the matching GitHub Release archive, verifies `checksums.txt`,
-installs the CLI and runtime assets, and prints the activation command. The
+and installs the CLI and runtime assets. The
 installer runs `ryk doctor --fix --from-install`, which creates a coding
 default policy under `$HOME/.ryk/policy.yaml` and seeds the runtime user
 fallback at `~/.config/ryk/policy.yaml` (create-only; never overwrites). That
