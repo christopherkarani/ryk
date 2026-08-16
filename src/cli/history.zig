@@ -79,10 +79,12 @@ fn renderLiveStats(comptime execute_cli: anytype, io: std.Io, argv: []const []co
             return exit_codes.usage;
         }
     }
-    // Colour-only gate (library/test surface). Do not treat leftover `--plain`
-    // / `--format json` as TUI escapes — those tokens are not history-stats
-    // machine conflicts. `--json`/`--robot` stay rejected above.
-    const enter_tui = (comptime enable_tui) and tui.theme.active(io, stdout).capability.hasColor();
+    // Colour TTY plus no presentation escape. Honour `--plain` / `--no-rich`
+    // as linear (issue #217). Do not treat leftover `--format json` as a TUI
+    // escape — that reopens a human/machine mash. `--json`/`--robot` stay
+    // rejected above.
+    const enter_tui = (comptime enable_tui) and tui.theme.active(io, stdout).capability.hasColor() and
+        !argvHasPresentationEscape(argv);
 
     const allocator = std.heap.smp_allocator;
     const live_args = try buildLiveStatsArgv(allocator, argv);
@@ -164,6 +166,13 @@ fn isLiveRequest(argv: []const []const u8) bool {
     for (argv) |arg| {
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) return false;
         if (std.mem.eql(u8, arg, "--live")) return true;
+    }
+    return false;
+}
+
+fn argvHasPresentationEscape(argv: []const []const u8) bool {
+    for (argv) |arg| {
+        if (std.mem.eql(u8, arg, "--plain") or std.mem.eql(u8, arg, "--no-rich")) return true;
     }
     return false;
 }
@@ -454,6 +463,21 @@ test "history --live falls back to linear on non-interactive output" {
 
 test "history --live --plain does not forward --plain to daemon" {
     // Leftover --plain is a presentation escape, not a history-stats flag.
+    var out: [8192]u8 = undefined;
+    var err: [512]u8 = undefined;
+    var stdout: std.Io.Writer = .fixed(&out);
+    var stderr: std.Io.Writer = .fixed(&err);
+    const code = try commandWithExecutor(fakeStats, std.testing.io, &.{ "--live", "--plain", "--days", "7" }, &stdout, &stderr);
+    try std.testing.expectEqual(exit_codes.success, code);
+    try std.testing.expect(std.mem.indexOf(u8, stderr.buffered(), "using linear") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout.buffered(), "PATTERN") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout.buffered(), "\x1b[?1049") == null);
+}
+
+test "history --live --plain on a colour TTY stays linear" {
+    tui.theme.setTestActive(.{ .capability = .truecolor, .background = .dark });
+    defer tui.theme.setTestActive(null);
+
     var out: [8192]u8 = undefined;
     var err: [512]u8 = undefined;
     var stdout: std.Io.Writer = .fixed(&out);
