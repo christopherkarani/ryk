@@ -163,7 +163,8 @@ fn explain(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: anytyp
             }
             policy_path = argv[start_index];
         } else {
-            break;
+            try suggestions.writeUnknownOption(stderr, "ryk policy explain", argv[start_index], &.{ "--policy", "--help", "-h" }, "policy");
+            return exit_codes.usage;
         }
     }
     const positional = argv[start_index..];
@@ -672,6 +673,19 @@ test "policy explain unsupported type still fails closed" {
     const code = try command(std.testing.io, &.{ "explain", "not-a-kind", "/tmp" }, &stdout_writer, &stderr_writer);
     try std.testing.expectEqual(exit_codes.usage, code);
     try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "unsupported type") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "Usage") == null);
+}
+
+test "policy explain unknown leading flag fails closed" {
+    var stdout_buf: [1024]u8 = undefined;
+    var stderr_buf: [512]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+
+    const code = try command(std.testing.io, &.{ "explain", "--foo" }, &stdout_writer, &stderr_writer);
+    try std.testing.expectEqual(exit_codes.usage, code);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "unknown option") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "--foo") != null);
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "Usage") == null);
 }
 
