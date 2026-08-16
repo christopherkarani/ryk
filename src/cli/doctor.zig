@@ -597,6 +597,66 @@ fn freeHostDoctorRow(allocator: std.mem.Allocator, row: HostDoctorRow) void {
     allocator.free(row.fix);
 }
 
+fn buildHostDoctorRow(
+    allocator: std.mem.Allocator,
+    host: []const u8,
+    wired: []const u8,
+    shell_gate: []const u8,
+    fail_stance: []const u8,
+    smoke_allow: []const u8,
+    smoke_deny: []const u8,
+    fix: []const u8,
+) !HostDoctorRow {
+    const owned_host = try allocator.dupe(u8, host);
+    errdefer allocator.free(owned_host);
+    const owned_wired = try allocator.dupe(u8, wired);
+    errdefer allocator.free(owned_wired);
+    const owned_shell_gate = try allocator.dupe(u8, shell_gate);
+    errdefer allocator.free(owned_shell_gate);
+    const owned_fail_stance = try allocator.dupe(u8, fail_stance);
+    errdefer allocator.free(owned_fail_stance);
+    const owned_smoke_allow = try allocator.dupe(u8, smoke_allow);
+    errdefer allocator.free(owned_smoke_allow);
+    const owned_smoke_deny = try allocator.dupe(u8, smoke_deny);
+    errdefer allocator.free(owned_smoke_deny);
+    const owned_fix = try allocator.dupe(u8, fix);
+    return .{
+        .host = owned_host,
+        .wired = owned_wired,
+        .shell_gate = owned_shell_gate,
+        .fail_stance = owned_fail_stance,
+        .smoke_allow = owned_smoke_allow,
+        .smoke_deny = owned_smoke_deny,
+        .fix = owned_fix,
+    };
+}
+
+fn appendHostDoctorRow(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayList(HostDoctorRow),
+    host: []const u8,
+    wired: []const u8,
+    shell_gate: []const u8,
+    fail_stance: []const u8,
+    smoke: host_status.HostSmokePair,
+    hermes_fail_open: bool,
+) !void {
+    const fix = try host_status.formatFix(allocator, host, wired, smoke, hermes_fail_open);
+    defer allocator.free(fix);
+    const row = try buildHostDoctorRow(
+        allocator,
+        host,
+        wired,
+        shell_gate,
+        fail_stance,
+        smoke.allow.toString(),
+        smoke.deny.toString(),
+        fix,
+    );
+    errdefer freeHostDoctorRow(allocator, row);
+    try list.append(allocator, row);
+}
+
 fn redactHostRow(allocator: std.mem.Allocator, row: HostDoctorRow) !HostDoctorRow {
     const host = try redactDisplayAlloc(allocator, row.host);
     errdefer allocator.free(host);
@@ -1416,54 +1476,48 @@ fn collectHostDoctorRows(io: std.Io, allocator: std.mem.Allocator) !HostDoctorSn
         if (std.mem.eql(u8, host_name, "hermes") and installed) hermes_installed = true;
 
         const wired: []const u8 = if (installed) "yes" else if (detected) "no" else "—";
-        const shell_gate = host_status.shellGate(host_name);
-        const fail_stance = host_status.failStance(host_name, hermes_fail_open, wired);
-        const smoke = host_status.HostSmokePair{};
-        const fix = try host_status.formatFix(allocator, host_name, wired, smoke, hermes_fail_open);
-
-        try list.append(allocator, .{
-            .host = try allocator.dupe(u8, host_name),
-            .wired = try allocator.dupe(u8, wired),
-            .shell_gate = try allocator.dupe(u8, shell_gate),
-            .fail_stance = try allocator.dupe(u8, fail_stance),
-            .smoke_allow = try allocator.dupe(u8, smoke.allow.toString()),
-            .smoke_deny = try allocator.dupe(u8, smoke.deny.toString()),
-            .fix = fix,
-        });
+        try appendHostDoctorRow(
+            allocator,
+            &list,
+            host_name,
+            wired,
+            host_status.shellGate(host_name),
+            host_status.failStance(host_name, hermes_fail_open, wired),
+            .{},
+            hermes_fail_open,
+        );
     }
 
     // Pi: first-class status line (honest coverage / install path; not plugin-managed).
     {
         const pi_status = host_status.inspectPi(io, allocator);
         const wired = pi_status.wiredLabel();
-        const smoke = host_status.HostSmokePair{};
-        const fix = try host_status.formatFix(allocator, "pi", wired, smoke, hermes_fail_open);
-        try list.append(allocator, .{
-            .host = try allocator.dupe(u8, "pi"),
-            .wired = try allocator.dupe(u8, wired),
-            .shell_gate = try allocator.dupe(u8, host_status.shellGate("pi")),
-            .fail_stance = try allocator.dupe(u8, host_status.failStance("pi", hermes_fail_open, wired)),
-            .smoke_allow = try allocator.dupe(u8, smoke.allow.toString()),
-            .smoke_deny = try allocator.dupe(u8, smoke.deny.toString()),
-            .fix = fix,
-        });
+        try appendHostDoctorRow(
+            allocator,
+            &list,
+            "pi",
+            wired,
+            host_status.shellGate("pi"),
+            host_status.failStance("pi", hermes_fail_open, wired),
+            .{},
+            hermes_fail_open,
+        );
     }
 
     // Grok: native PreToolUse Command Guard (not marketplace-plugin-managed).
     {
         const grok_status = host_status.inspectGrok(io, allocator);
         const wired = grok_status.wiredLabel();
-        const smoke = host_status.HostSmokePair{};
-        const fix = try host_status.formatFix(allocator, "grok", wired, smoke, hermes_fail_open);
-        try list.append(allocator, .{
-            .host = try allocator.dupe(u8, "grok"),
-            .wired = try allocator.dupe(u8, wired),
-            .shell_gate = try allocator.dupe(u8, host_status.shellGate("grok")),
-            .fail_stance = try allocator.dupe(u8, host_status.failStance("grok", hermes_fail_open, wired)),
-            .smoke_allow = try allocator.dupe(u8, smoke.allow.toString()),
-            .smoke_deny = try allocator.dupe(u8, smoke.deny.toString()),
-            .fix = fix,
-        });
+        try appendHostDoctorRow(
+            allocator,
+            &list,
+            "grok",
+            wired,
+            host_status.shellGate("grok"),
+            host_status.failStance("grok", hermes_fail_open, wired),
+            .{},
+            hermes_fail_open,
+        );
     }
 
     return .{
@@ -3173,4 +3227,22 @@ test "lastSessionAuditDegraded detects audit_degraded in the pointed-at session"
         .data = "{\"type\":\"session_start\"}\n{\"type\":\"command_allowed\"}\n",
     });
     try std.testing.expect(!lastSessionAuditDegraded(io, allocator, root));
+}
+
+fn buildHostDoctorRowOomProbe(allocator: std.mem.Allocator) !void {
+    const row = try buildHostDoctorRow(
+        allocator,
+        "codex",
+        "—",
+        "PreToolUse",
+        "fail-closed shell",
+        "not-run",
+        "not-run",
+        "ryk doctor --fix",
+    );
+    freeHostDoctorRow(allocator, row);
+}
+
+test "buildHostDoctorRow OOM does not leak partial fields" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, buildHostDoctorRowOomProbe, .{});
 }
