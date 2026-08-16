@@ -6,6 +6,8 @@
 
 **Wave 2 (2026-08-16):** PERF/MEM/security `needs-triage` review — 20 confirmed → ready-for-eng, 7 rejected. See [wave-2-ready-for-eng.md](wave-2-ready-for-eng.md).
 
+**Grouped-issue campaign (2026-08-16):** walk all open issues by pack. See [grouped-issue-campaign.md](grouped-issue-campaign.md). Wave 0 apply: [wave-0-campaign-apply.json](wave-0-campaign-apply.json) / [apply-wave-0-campaign.sh](apply-wave-0-campaign.sh). Do not use PR-0..PR-8 as the live queue. Do not run [apply-wave-2-triage.sh](apply-wave-2-triage.sh).
+
 ## Verdict summary
 
 | Issue | Verdict | Action |

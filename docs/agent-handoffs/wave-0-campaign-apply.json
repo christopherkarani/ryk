@@ -1,0 +1,140 @@
+{
+  "repo": "christopherkarani/ryk",
+  "pin": "430c13e6",
+  "date": "2026-08-16",
+  "note": "Filtered Wave 0 for the grouped-issue campaign. Do not use wave-2-apply-plan.json (it still lists closed hook parents and would add factory:auto to #371/#373). Requires issues:write. Skip any number that is already closed.",
+  "promote": [
+    {
+      "number": 362,
+      "labels": ["bug", "triage:confirmed", "ready-for-eng", "factory:auto", "agent-filed", "area:zig", "priority:p2"],
+      "comment": "**Triage: confirmed → ready-for-eng + factory:auto (P2)**\n\n`getSelectedLabels` dupe-then-append with no errdefer (`src/cli/interactive.zig`). Test-only caller; ownership still broken.\n\nPack: MEM-ERRDEFER."
+    },
+    {
+      "number": 364,
+      "labels": ["bug", "triage:confirmed", "ready-for-eng", "factory:auto", "agent-filed", "area:zig", "priority:p2"],
+      "comment": "**Triage: confirmed → ready-for-eng + factory:auto (P2)**\n\nPrompt-secret redaction dual-dupe, no errdefer (`src/cli/hook.zig`). Pair with #365.\n\nPack: MEM-ERRDEFER."
+    },
+    {
+      "number": 365,
+      "labels": ["bug", "triage:confirmed", "ready-for-eng", "factory:auto", "agent-filed", "area:zig", "priority:p2"],
+      "comment": "**Triage: confirmed → ready-for-eng + factory:auto (P2)**\n\n`recordDaemonMetadataRedaction` dual-dupe, no errdefer (`src/cli/hook.zig`). Pair with #364.\n\nPack: MEM-ERRDEFER."
+    },
+    {
+      "number": 366,
+      "labels": ["bug", "triage:confirmed", "ready-for-eng", "factory:auto", "agent-filed", "area:zig", "priority:p2"],
+      "comment": "**Triage: confirmed → ready-for-eng + factory:auto (P2)**\n\nDecide redaction dual-dupe on secret text (`src/cli/decide.zig`). Same mechanical errdefer class as #364/#365.\n\nPack: MEM-ERRDEFER."
+    },
+    {
+      "number": 367,
+      "labels": ["bug", "triage:confirmed", "ready-for-eng", "factory:auto", "agent-filed", "area:zig", "priority:p2"],
+      "comment": "**Triage: confirmed → ready-for-eng + factory:auto (P2)**\n\n`collectHostDoctorRows` multi-field dupe without per-field errdefer (`src/cli/doctor.zig`).\n\nPack: MEM-ERRDEFER. Merge before DOCTOR-PR3 (G1)."
+    },
+    {
+      "number": 368,
+      "labels": ["bug", "triage:confirmed", "ready-for-eng", "factory:auto", "agent-filed", "area:zig", "priority:p3"],
+      "comment": "**Triage: confirmed → ready-for-eng + factory:auto (P3)**\n\nDoctor test host-row helper multi-dupe partial leak (`src/cli/doctor.zig`). Pair with #367.\n\nPack: MEM-ERRDEFER."
+    },
+    {
+      "number": 371,
+      "labels": ["bug", "triage:confirmed", "ready-for-eng", "agent-filed", "area:zig", "priority:p2"],
+      "comment": "**Triage: confirmed → ready-for-eng (P2). No factory:auto.**\n\n`provider_gateway` `audit_events` unbounded list. Cap/ring — not mechanical errdefer.\n\n**No factory:auto.** Caps are forbidden new-yes.\n\nPack: MEM-REST (Wave 3, triage remaining scope on pin)."
+    },
+    {
+      "number": 373,
+      "labels": ["bug", "triage:confirmed", "ready-for-eng", "agent-filed", "area:zig", "priority:p2"],
+      "comment": "**Triage: confirmed → ready-for-eng (P2). No factory:auto.**\n\n`SessionApprovals` entries list has no max cap. Cap/ring — not mechanical errdefer. M001 dual-dupe already errdefer-fixed.\n\n**No factory:auto.** Caps are forbidden new-yes.\n\nPack: MEM-REST (Wave 3)."
+    }
+  ],
+  "close": [
+    {
+      "number": 197,
+      "state": "closed",
+      "state_reason": "completed",
+      "comment": "**Triage: already-fixed / CPO.** Do not expand `policy check --preset` to accept `generic-agent`. Docs already use path form. Not a reopen of #203–#212."
+    },
+    {
+      "number": 203,
+      "state": "closed",
+      "state_reason": "completed",
+      "comment": "**Triage: already-fixed.** Default `ryk explain` uses `writePretty`. Box tree only behind `--verbose`. Close-as-completed is allowed; this is not a reopen."
+    },
+    {
+      "number": 204,
+      "state": "closed",
+      "state_reason": "completed",
+      "comment": "**Triage: already-fixed.** Telemetry handles `--help`/`-h` and returns success."
+    },
+    {
+      "number": 224,
+      "state": "closed",
+      "state_reason": "completed",
+      "comment": "**Triage: already-fixed (CLOSE-D).** Unknown command returns `exit_codes.usage` (`src/cli/mod.zig`; test `unknown command returns non-zero with useful message`). `audit`/`sandbox` are not registered commands."
+    },
+    {
+      "number": 225,
+      "state": "closed",
+      "state_reason": "completed",
+      "comment": "**Triage: already-fixed (CLOSE-D).** `evaluate --json --stdin` parse failure returns `exit_invalid_input` (64) (`src/cli/evaluate.zig`)."
+    },
+    {
+      "number": 226,
+      "state": "closed",
+      "state_reason": "completed",
+      "comment": "**Triage: already-fixed (CLOSE-D).** Bare `ryk evaluate` without `--json --stdin` returns `exit_codes.usage` (`src/cli/evaluate.zig`)."
+    },
+    {
+      "number": 242,
+      "state": "closed",
+      "state_reason": "completed",
+      "comment": "**Triage: already-fixed (CLOSE-D).** `invalid_input` is already fail-closed at the process boundary (`exit_invalid_input` 64). Same path as #225."
+    },
+    {
+      "number": 280,
+      "state": "closed",
+      "state_reason": "completed",
+      "comment": "**Triage: not-real.** `init` already exits 1 on `PathAlreadyExists`."
+    },
+    {
+      "number": 287,
+      "state": "closed",
+      "state_reason": "not_planned",
+      "comment": "**Triage: overstated.** `--json` exit 0 is by design. Gate is `doctor --check`."
+    },
+    {
+      "number": 294,
+      "state": "closed",
+      "state_reason": "not_planned",
+      "comment": "**Triage: not-real.** FM never softens `.block`."
+    },
+    {
+      "number": 298,
+      "state": "closed",
+      "state_reason": "completed",
+      "comment": "**Triage: already-fixed.** Feed uses `redact_bridge`."
+    },
+    {
+      "number": 299,
+      "state": "closed",
+      "state_reason": "not_planned",
+      "comment": "**Triage: not-real.** No current secret-print path. Remaining ask is test-hardening, not a leak fix."
+    },
+    {
+      "number": 302,
+      "state": "closed",
+      "state_reason": "completed",
+      "comment": "**Triage: already-fixed.** Seatbelt / `--os-sandbox on` fail closed."
+    },
+    {
+      "number": 311,
+      "state": "closed",
+      "state_reason": "not_planned",
+      "comment": "**Triage: overstated.** Documented host matrix + `doctor --deadlock-check`, not a missing gate. Does **not** close HOST pack #258–#259 / #261–#263 / #306–#310."
+    },
+    {
+      "number": 324,
+      "state": "closed",
+      "state_reason": "not_planned",
+      "comment": "**Triage: temp probe.** Title asks to close. Closing as not_planned."
+    }
+  ]
+}

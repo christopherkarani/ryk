@@ -60,3 +60,4 @@ Started from open `needs-triage`. Preferred P0/P1, then filled with independentl
 - Do not weaken fail-closed / lock / fsync without an explicit durability tradeoff.
 - Do not change ask≠allow or CI ask→deny.
 - Do not expand `policy check --preset` to accept `generic-agent`.
+- Campaign plan supersedes this table's `factory:auto` on #400 (GitHub has no such label; do not add it). Wave 0 apply is `wave-0-campaign-apply.json`, not this file's promote list.
