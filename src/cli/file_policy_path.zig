@@ -37,22 +37,61 @@ pub fn normalizeFilePolicyPathForRead(
                 return err;
             defer allocator.free(resolved);
             if (!host_runtime_reads.isHostRuntimeReadPath(resolved)) return err;
-            return sealResolvedHostRuntimePath(io, allocator, try allocator.dupe(u8, resolved));
+            return sealResolvedHostRuntimePath(io, allocator, workspace_root_raw, try allocator.dupe(u8, resolved));
         },
     };
-    return sealResolvedHostRuntimePath(io, allocator, initial);
+    return sealResolvedHostRuntimePath(io, allocator, workspace_root_raw, initial);
 }
 
 fn sealResolvedHostRuntimePath(
     io: std.Io,
     allocator: std.mem.Allocator,
+    workspace_root_raw: []const u8,
     initial: []u8,
 ) ![]u8 {
-    const resolved_z = std.Io.Dir.cwd().realPathFileAlloc(io, initial, allocator) catch return initial;
+    const inspect = absoluteInspectPath(io, allocator, workspace_root_raw, initial) catch |err| {
+        allocator.free(initial);
+        return err;
+    };
+    defer allocator.free(inspect);
+
+    const link_target = readLinkAbsoluteTarget(io, allocator, inspect) catch |err| {
+        allocator.free(initial);
+        return err;
+    };
+    if (link_target) |target_abs| {
+        defer allocator.free(target_abs);
+        const in_catalog = host_runtime_reads.classify(target_abs) != .none;
+        if (!in_catalog and !pathIsUnder(workspace_root_raw, target_abs)) {
+            allocator.free(initial);
+            return error.SymlinkEscapesWorkspace;
+        }
+        const resolved_z = std.Io.Dir.cwd().realPathFileAlloc(io, inspect, allocator) catch {
+            if (!in_catalog) return initial;
+            if (std.mem.eql(u8, target_abs, initial)) return initial;
+            const owned = allocator.dupe(u8, target_abs) catch |err| {
+                allocator.free(initial);
+                return err;
+            };
+            allocator.free(initial);
+            return owned;
+        };
+        defer allocator.free(resolved_z);
+        return finishSealFromResolved(allocator, initial, resolved_z);
+    }
+
+    const resolved_z = std.Io.Dir.cwd().realPathFileAlloc(io, inspect, allocator) catch return initial;
     defer allocator.free(resolved_z);
+    return finishSealFromResolved(allocator, initial, resolved_z);
+}
+
+fn finishSealFromResolved(allocator: std.mem.Allocator, initial: []u8, resolved_z: []const u8) ![]u8 {
     if (host_runtime_reads.classify(resolved_z) != .none) {
         if (std.mem.eql(u8, resolved_z, initial)) return initial;
-        const owned = try allocator.dupe(u8, resolved_z);
+        const owned = allocator.dupe(u8, resolved_z) catch |err| {
+            allocator.free(initial);
+            return err;
+        };
         allocator.free(initial);
         return owned;
     }
@@ -61,6 +100,49 @@ fn sealResolvedHostRuntimePath(
         return error.SymlinkEscapesWorkspace;
     }
     return initial;
+}
+
+fn absoluteInspectPath(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    workspace_root_raw: []const u8,
+    initial: []const u8,
+) ![]u8 {
+    if (std.fs.path.isAbsolute(initial)) return allocator.dupe(u8, initial);
+    if (!std.mem.startsWith(u8, initial, "./")) return allocator.dupe(u8, initial);
+
+    if (std.fs.path.isAbsolute(workspace_root_raw)) {
+        return std.fs.path.resolve(allocator, &.{ workspace_root_raw, initial });
+    }
+    const workspace = std.Io.Dir.cwd().realPathFileAlloc(io, workspace_root_raw, allocator) catch
+        return error.SymlinkEscapesWorkspace;
+    defer allocator.free(workspace);
+    return std.fs.path.resolve(allocator, &.{ workspace, initial });
+}
+
+fn readLinkAbsoluteTarget(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !?[]u8 {
+    if (!std.fs.path.isAbsolute(path)) return null;
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = std.Io.Dir.readLinkAbsolute(io, path, &buf) catch |err| switch (err) {
+        error.NotLink, error.FileNotFound, error.NotDir => return null,
+        else => return error.SymlinkEscapesWorkspace,
+    };
+    return try resolveSymlinkTarget(allocator, path, buf[0..n]);
+}
+
+fn resolveSymlinkTarget(allocator: std.mem.Allocator, link_abs: []const u8, raw: []const u8) ![]u8 {
+    if (std.fs.path.isAbsolute(raw)) return std.fs.path.resolve(allocator, &.{raw});
+    const dir = std.fs.path.dirname(link_abs) orelse return std.fs.path.resolve(allocator, &.{raw});
+    return std.fs.path.resolve(allocator, &.{ dir, raw });
+}
+
+fn pathIsUnder(root: []const u8, path: []const u8) bool {
+    if (!std.fs.path.isAbsolute(root) or !std.fs.path.isAbsolute(path)) return false;
+    if (std.mem.eql(u8, root, path)) return true;
+    if (path.len <= root.len) return false;
+    if (!std.mem.startsWith(u8, path, root)) return false;
+    const sep = path[root.len];
+    return sep == '/' or sep == '\\';
 }
 
 fn tryResolveExistingPath(
@@ -215,27 +297,41 @@ extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 
 test "read normalize still rejects workspace symlink to ssh" {
     const io = std.testing.io;
-    const home_c = std.c.getenv("HOME") orelse return error.SkipZigTest;
-    const home = std.mem.sliceTo(home_c, 0);
-
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "outside/.ssh");
     try tmp.dir.createDirPath(io, "workspace");
+    try tmp.dir.writeFile(io, .{ .sub_path = "outside/.ssh/id_ed25519", .data = "synthetic\n" });
 
-    const root = try tmp.dir.realPathFileAlloc(io, "workspace", std.testing.allocator);
-    defer std.testing.allocator.free(root);
-    const target = try std.fmt.allocPrint(std.testing.allocator, "{s}/.ssh/id_ed25519", .{home});
-    defer std.testing.allocator.free(target);
+    const workspace = try tmp.dir.realPathFileAlloc(io, "workspace", std.testing.allocator);
+    defer std.testing.allocator.free(workspace);
+    const outside = try tmp.dir.realPathFileAlloc(io, "outside", std.testing.allocator);
+    defer std.testing.allocator.free(outside);
+    const existing_target = try std.fs.path.join(std.testing.allocator, &.{ outside, ".ssh/id_ed25519" });
+    defer std.testing.allocator.free(existing_target);
+    const dangling_target = try std.fs.path.join(std.testing.allocator, &.{ outside, ".ssh/id_ed25519-missing" });
+    defer std.testing.allocator.free(dangling_target);
 
-    const alias = try std.fs.path.join(std.testing.allocator, &.{ root, "ssh-link" });
-    defer std.testing.allocator.free(alias);
-    std.Io.Dir.cwd().symLink(io, target, alias, .{}) catch |err| switch (err) {
+    const existing_alias = try std.fs.path.join(std.testing.allocator, &.{ workspace, "ssh-link" });
+    defer std.testing.allocator.free(existing_alias);
+    const dangling_alias = try std.fs.path.join(std.testing.allocator, &.{ workspace, "ssh-dangling" });
+    defer std.testing.allocator.free(dangling_alias);
+
+    std.Io.Dir.cwd().symLink(io, existing_target, existing_alias, .{}) catch |err| switch (err) {
+        error.PermissionDenied => return error.SkipZigTest,
+        else => return err,
+    };
+    std.Io.Dir.cwd().symLink(io, dangling_target, dangling_alias, .{}) catch |err| switch (err) {
         error.PermissionDenied => return error.SkipZigTest,
         else => return err,
     };
 
     try std.testing.expectError(
         error.SymlinkEscapesWorkspace,
-        normalizeFilePolicyPathForRead(io, std.testing.allocator, root, alias),
+        normalizeFilePolicyPathForRead(io, std.testing.allocator, workspace, existing_alias),
+    );
+    try std.testing.expectError(
+        error.SymlinkEscapesWorkspace,
+        normalizeFilePolicyPathForRead(io, std.testing.allocator, workspace, dangling_alias),
     );
 }

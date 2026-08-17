@@ -131,6 +131,7 @@ pub fn classifyWithEnv(path: []const u8, env: []const EnvPair) MatchKind {
 
 /// Lexical classify, then if the path exists follow one realpath hop.
 /// A catalog path whose target leaves the catalog is `.none`.
+/// An unresolved catalog symlink is `.none` (fail closed), not lexical allow.
 pub fn classifyExisting(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -138,7 +139,18 @@ pub fn classifyExisting(
 ) error{OutOfMemory}!MatchKind {
     const lexical = classify(path);
     if (lexical == .none) return .none;
-    const resolved_z = std.Io.Dir.cwd().realPathFileAlloc(io, path, allocator) catch return lexical;
+    const resolved_z = std.Io.Dir.cwd().realPathFileAlloc(io, path, allocator) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            var buf: [std.fs.max_path_bytes]u8 = undefined;
+            if (std.fs.path.isAbsolute(path)) {
+                _ = std.Io.Dir.readLinkAbsolute(io, path, &buf) catch return lexical;
+                return .none;
+            }
+            _ = std.Io.Dir.cwd().readLink(io, path, &buf) catch return lexical;
+            return .none;
+        },
+    };
     defer allocator.free(resolved_z);
     return classify(resolved_z);
 }
@@ -370,3 +382,43 @@ test "skill tree wins over instruction basename inside a skill dir" {
         classifyWithEnv(test_home ++ "/.claude/skills/AGENTS.md", env[0..1]),
     );
 }
+
+test "classifyExisting fails closed on unresolved catalog symlink" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "home/.grok/skills/pwn");
+
+    const home = try tmp.dir.realPathFileAlloc(io, "home", std.testing.allocator);
+    defer std.testing.allocator.free(home);
+    const alias = try std.fs.path.join(std.testing.allocator, &.{ home, ".grok/skills/pwn/SKILL.md" });
+    defer std.testing.allocator.free(alias);
+    const missing = try std.fs.path.join(std.testing.allocator, &.{ home, ".grok/skills/pwn/missing-target" });
+    defer std.testing.allocator.free(missing);
+    std.Io.Dir.cwd().symLink(io, missing, alias, .{}) catch |err| switch (err) {
+        error.PermissionDenied => return error.SkipZigTest,
+        else => return err,
+    };
+
+    const prev_home = blk: {
+        if (std.c.getenv("HOME")) |value| break :blk try std.testing.allocator.dupeZ(u8, std.mem.span(value));
+        break :blk null;
+    };
+    defer if (prev_home) |value| std.testing.allocator.free(value);
+    const home_z = try std.testing.allocator.dupeZ(u8, home);
+    defer std.testing.allocator.free(home_z);
+    try std.testing.expectEqual(@as(c_int, 0), setenv("HOME", home_z, 1));
+    defer {
+        if (prev_home) |value| {
+            _ = setenv("HOME", value, 1);
+        } else {
+            _ = unsetenv("HOME");
+        }
+    }
+
+    try std.testing.expectEqual(MatchKind.skill, classify(alias));
+    try std.testing.expectEqual(MatchKind.none, try classifyExisting(io, std.testing.allocator, alias));
+}
+
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
