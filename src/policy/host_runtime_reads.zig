@@ -90,7 +90,7 @@ const skill_roots = [_]SkillRoot{
     },
 };
 
-const instruction_basenames = [_][]const u8{
+pub const instruction_basenames = [_][]const u8{
     "AGENTS.md",
     "AGENTS.MD",
     "CLAUDE.md",
@@ -130,6 +130,68 @@ pub fn classifyWithEnv(path: []const u8, env: []const EnvPair) MatchKind {
     return .none;
 }
 
+/// Result of one shortcut hop. The catalog itself stays path-text only.
+pub const FollowedPath = struct {
+    written: MatchKind,
+    /// Set when the path exists and realpath succeeded. `.none` means the
+    /// target left the catalog, or the path is an unresolved symlink.
+    followed: ?MatchKind = null,
+    /// Owned real path when the hop stayed in the catalog. Caller frees via `deinit`.
+    real_path: ?[]u8 = null,
+
+    pub fn deinit(self: FollowedPath, allocator: std.mem.Allocator) void {
+        if (self.real_path) |path| allocator.free(path);
+    }
+
+    /// Evaluate ignores a hop when the written path is not catalog.
+    pub fn policyKind(self: FollowedPath) MatchKind {
+        if (self.written == .none) return .none;
+        return self.followed orelse self.written;
+    }
+
+    pub fn leftCatalog(self: FollowedPath) bool {
+        const followed = self.followed orelse return false;
+        return self.written != .none and followed == .none;
+    }
+};
+
+/// Follow one realpath hop and classify both the written path and the target.
+/// Missing paths leave `followed` null. An unresolved symlink is `.none`.
+pub fn followShortcut(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+) error{OutOfMemory}!FollowedPath {
+    const written = classify(path);
+    const expanded = try expandHomePrefix(allocator, path);
+    defer allocator.free(expanded);
+    const resolved_z = std.Io.Dir.cwd().realPathFileAlloc(io, expanded, allocator) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            var buf: [std.fs.max_path_bytes]u8 = undefined;
+            const is_link = if (std.fs.path.isAbsolute(expanded))
+                std.Io.Dir.readLinkAbsolute(io, expanded, &buf)
+            else
+                std.Io.Dir.cwd().readLink(io, expanded, &buf);
+            if (is_link) |_| {
+                return .{ .written = written, .followed = .none, .real_path = null };
+            } else |_| {
+                return .{ .written = written };
+            }
+        },
+    };
+    defer allocator.free(resolved_z);
+    const followed = classify(resolved_z);
+    if (followed == .none) {
+        return .{ .written = written, .followed = .none, .real_path = null };
+    }
+    return .{
+        .written = written,
+        .followed = followed,
+        .real_path = try allocator.dupe(u8, resolved_z),
+    };
+}
+
 /// Lexical classify, then if the path exists follow one realpath hop.
 /// A catalog path whose target leaves the catalog is `.none`.
 /// An unresolved catalog symlink is `.none` (fail closed), not lexical allow.
@@ -138,24 +200,9 @@ pub fn classifyExisting(
     allocator: std.mem.Allocator,
     path: []const u8,
 ) error{OutOfMemory}!MatchKind {
-    const lexical = classify(path);
-    if (lexical == .none) return .none;
-    const expanded = try expandHomePrefix(allocator, path);
-    defer allocator.free(expanded);
-    const resolved_z = std.Io.Dir.cwd().realPathFileAlloc(io, expanded, allocator) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => {
-            var buf: [std.fs.max_path_bytes]u8 = undefined;
-            if (std.fs.path.isAbsolute(expanded)) {
-                _ = std.Io.Dir.readLinkAbsolute(io, expanded, &buf) catch return lexical;
-                return .none;
-            }
-            _ = std.Io.Dir.cwd().readLink(io, expanded, &buf) catch return lexical;
-            return .none;
-        },
-    };
-    defer allocator.free(resolved_z);
-    return classify(resolved_z);
+    const followed = try followShortcut(io, allocator, path);
+    defer followed.deinit(allocator);
+    return followed.policyKind();
 }
 
 pub fn isHostRuntimeReadPathWithEnv(path: []const u8, env: []const EnvPair) bool {
@@ -497,6 +544,85 @@ test "classifyExisting fails closed on unresolved catalog symlink" {
 
     try std.testing.expectEqual(MatchKind.skill, classify(alias));
     try std.testing.expectEqual(MatchKind.none, try classifyExisting(io, std.testing.allocator, alias));
+
+    const followed = try followShortcut(io, std.testing.allocator, alias);
+    defer followed.deinit(std.testing.allocator);
+    try std.testing.expectEqual(MatchKind.skill, followed.written);
+    try std.testing.expectEqual(MatchKind.none, followed.followed.?);
+    try std.testing.expect(followed.leftCatalog());
+}
+
+test "followShortcut keeps written kind when the path is missing" {
+    const io = std.testing.io;
+    const path = test_home ++ "/CodingProjects/AGENTS.md";
+    const prev_home = blk: {
+        if (std.c.getenv("HOME")) |value| break :blk try std.testing.allocator.dupeZ(u8, std.mem.span(value));
+        break :blk null;
+    };
+    defer if (prev_home) |value| std.testing.allocator.free(value);
+    try std.testing.expectEqual(@as(c_int, 0), setenv("HOME", test_home, 1));
+    defer {
+        if (prev_home) |value| {
+            _ = setenv("HOME", value, 1);
+        } else {
+            _ = unsetenv("HOME");
+        }
+    }
+
+    const followed = try followShortcut(io, std.testing.allocator, path);
+    defer followed.deinit(std.testing.allocator);
+    try std.testing.expectEqual(MatchKind.instruction, followed.written);
+    try std.testing.expect(followed.followed == null);
+    try std.testing.expectEqual(MatchKind.instruction, followed.policyKind());
+    try std.testing.expect(!followed.leftCatalog());
+}
+
+test "followShortcut hop into the catalog does not change evaluate kind" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "home/.grok/skills/task-observer");
+    try tmp.dir.createDirPath(io, "workspace");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "home/.grok/skills/task-observer/SKILL.md",
+        .data = "# skill\n",
+    });
+
+    const home = try tmp.dir.realPathFileAlloc(io, "home", std.testing.allocator);
+    defer std.testing.allocator.free(home);
+    const workspace = try tmp.dir.realPathFileAlloc(io, "workspace", std.testing.allocator);
+    defer std.testing.allocator.free(workspace);
+    const target = try std.fs.path.join(std.testing.allocator, &.{ home, ".grok/skills/task-observer/SKILL.md" });
+    defer std.testing.allocator.free(target);
+    const alias = try std.fs.path.join(std.testing.allocator, &.{ workspace, "note.md" });
+    defer std.testing.allocator.free(alias);
+    std.Io.Dir.cwd().symLink(io, target, alias, .{}) catch |err| switch (err) {
+        error.PermissionDenied => return error.SkipZigTest,
+        else => return err,
+    };
+
+    const prev_home = blk: {
+        if (std.c.getenv("HOME")) |value| break :blk try std.testing.allocator.dupeZ(u8, std.mem.span(value));
+        break :blk null;
+    };
+    defer if (prev_home) |value| std.testing.allocator.free(value);
+    const home_z = try std.testing.allocator.dupeZ(u8, home);
+    defer std.testing.allocator.free(home_z);
+    try std.testing.expectEqual(@as(c_int, 0), setenv("HOME", home_z, 1));
+    defer {
+        if (prev_home) |value| {
+            _ = setenv("HOME", value, 1);
+        } else {
+            _ = unsetenv("HOME");
+        }
+    }
+
+    const followed = try followShortcut(io, std.testing.allocator, alias);
+    defer followed.deinit(std.testing.allocator);
+    try std.testing.expectEqual(MatchKind.none, followed.written);
+    try std.testing.expectEqual(MatchKind.skill, followed.followed.?);
+    try std.testing.expectEqual(MatchKind.none, followed.policyKind());
+    try std.testing.expect(followed.real_path != null);
 }
 
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;

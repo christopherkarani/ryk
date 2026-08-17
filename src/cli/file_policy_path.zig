@@ -77,27 +77,32 @@ fn sealResolvedHostRuntimePath(
             return owned;
         };
         defer allocator.free(resolved_z);
-        return finishSealFromResolved(allocator, initial, resolved_z);
+        return finishSealFromFollowed(io, allocator, initial, inspect);
     }
 
-    const resolved_z = std.Io.Dir.cwd().realPathFileAlloc(io, inspect, allocator) catch return initial;
-    defer allocator.free(resolved_z);
-    return finishSealFromResolved(allocator, initial, resolved_z);
+    return finishSealFromFollowed(io, allocator, initial, inspect);
 }
 
-fn finishSealFromResolved(allocator: std.mem.Allocator, initial: []u8, resolved_z: []const u8) ![]u8 {
-    if (host_runtime_reads.classify(resolved_z) != .none) {
-        if (std.mem.eql(u8, resolved_z, initial)) return initial;
-        const owned = allocator.dupe(u8, resolved_z) catch |err| {
+fn finishSealFromFollowed(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    initial: []u8,
+    inspect: []const u8,
+) ![]u8 {
+    const followed = try host_runtime_reads.followShortcut(io, allocator, inspect);
+    defer followed.deinit(allocator);
+    if (followed.leftCatalog()) {
+        allocator.free(initial);
+        return error.SymlinkEscapesWorkspace;
+    }
+    if (followed.real_path) |real| {
+        if (std.mem.eql(u8, real, initial)) return initial;
+        const owned = allocator.dupe(u8, real) catch |err| {
             allocator.free(initial);
             return err;
         };
         allocator.free(initial);
         return owned;
-    }
-    if (host_runtime_reads.classify(initial) != .none) {
-        allocator.free(initial);
-        return error.SymlinkEscapesWorkspace;
     }
     return initial;
 }

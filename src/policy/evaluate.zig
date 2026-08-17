@@ -632,7 +632,9 @@ fn evaluateRuleSet(
 fn builtinHostRuntimeReadAllow(allocator: std.mem.Allocator, surface: Surface, value: []const u8) !?schema.Evaluation {
     if (surface != .file_read) return null;
     var threaded: std.Io.Threaded = .init_single_threaded;
-    const kind = try host_runtime_reads.classifyExisting(threaded.io(), allocator, value);
+    const followed = try host_runtime_reads.followShortcut(threaded.io(), allocator, value);
+    defer followed.deinit(allocator);
+    const kind = followed.policyKind();
     const meta: struct { id: []const u8, reason: []const u8, pattern: []const u8 } = switch (kind) {
         .none => return null,
         .skill => .{

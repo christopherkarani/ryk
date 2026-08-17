@@ -14,9 +14,10 @@
 //!   roots — still never bare `$HOME`, bare `~/Library`, or `~/.ssh`.
 //! - Optional **system RO** trees (e.g. `/etc/codex`) are host-scoped, never bare
 //!   `/etc`, and may be granted even when missing so open fails as ENOENT not EPERM.
-//! - Optional **ancestor instruction RO** files (`AGENTS.md` / `CLAUDE.md` name
-//!   spellings) on parents of the workspace up through `$HOME` — file paths only,
-//!   never parent directory trees or bare `$HOME`.
+//! - Optional **ancestor instruction RO** files the host-runtime catalog calls
+//!   instruction (`AGENTS.md` / `CLAUDE.md` name spellings) on parents of the
+//!   workspace up through `$HOME` — file paths only, never parent directory
+//!   trees, bare `$HOME`, or skill-tree matches.
 //! - **Authority write-deny** paths (MCP/config.toml/settings.json templates in
 //!   `HostConfigSpec`) collected cross-platform for Seatbelt literal write-deny
 //!   and Landlock control-root expand (RO leaf under host RW trees).
@@ -25,6 +26,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const profile = @import("profile.zig");
+const host_runtime_reads = @import("ryk_core").policy.host_runtime_reads;
 
 /// Env-relative authority write-deny path template.
 ///
@@ -620,17 +622,6 @@ fn containsAuthorityPath(paths: []const []const u8, candidate: []const u8) bool 
     return false;
 }
 
-/// Basenames coding agents walk up for project/user instruction files.
-/// Matches pi (`AGENTS.md` / `AGENTS.MD` / `CLAUDE.md` / `CLAUDE.MD`) and common
-/// Claude Code / Codex discovery. Both case spellings are listed so case-sensitive
-/// Seatbelt literals cover case-insensitive volumes where agents stat both names.
-pub const ancestor_instruction_basenames = [_][]const u8{
-    "AGENTS.md",
-    "AGENTS.MD",
-    "CLAUDE.md",
-    "CLAUDE.MD",
-};
-
 /// Cap ancestor walk depth (workspace parent → home). Defends runaway paths.
 pub const max_ancestor_instruction_depth: usize = 48;
 
@@ -648,7 +639,9 @@ pub const max_ancestor_instruction_paths: usize = 32;
 /// - Starts at `dirname(workspace_root)` (workspace itself is already RW).
 /// - Walks toward `/`, stopping after processing `$HOME` when home is absolute
 ///   and an ancestor of the workspace; otherwise stops at FS root / depth cap.
-/// - Grants **regular files only** for `ancestor_instruction_basenames`.
+/// - Grants **regular files only** whose catalog kind is instruction (shared
+///   `instruction_basenames`, then `classifyWithEnv` == instruction).
+/// - Skill-tree matches and paths the catalog rejects are not granted.
 /// - Never returns bare `$HOME`, parent directories, or secret trees.
 /// - Missing files are skipped (no invent). Symlinks that retarget outside the
 ///   approved ancestor directory are skipped.
@@ -688,6 +681,10 @@ pub fn collectAncestorInstructionRoPaths(
         null;
     defer if (canonical_home) |path| allocator.free(path);
 
+    const catalog_env = [_]host_runtime_reads.EnvPair{
+        .{ .key = "HOME", .value = if (home_abs.len > 0) home_abs else "" },
+    };
+
     var current = std.fs.path.dirname(ws) orelse return try list.toOwnedSlice(allocator);
     var depth: usize = 0;
     while (depth < max_ancestor_instruction_depth) : (depth += 1) {
@@ -707,10 +704,13 @@ pub fn collectAncestorInstructionRoPaths(
         };
         defer allocator.free(canonical_current);
 
-        for (ancestor_instruction_basenames) |base| {
+        for (host_runtime_reads.instruction_basenames) |base| {
             if (list.items.len >= max_ancestor_instruction_paths) break;
             const candidate = try std.fs.path.join(allocator, &.{ current, base });
             defer allocator.free(candidate);
+            // Catalog kind first: policy may allow a skill or a sibling
+            // instruction; OS grant is catalog instruction ∩ this walk.
+            if (host_runtime_reads.classifyWithEnv(candidate, &catalog_env) != .instruction) continue;
             // Fast lexical rejection only. The canonical target check below is
             // the security boundary and handles symlinks and macOS path aliases.
             if (home_abs.len > 0 and isForbiddenHostConfigPath(candidate, home_abs)) continue;
@@ -722,6 +722,10 @@ pub fn collectAncestorInstructionRoPaths(
                 continue;
             };
             if (!std.mem.eql(u8, canonical_parent, canonical_current)) {
+                allocator.free(canonical);
+                continue;
+            }
+            if (host_runtime_reads.classifyWithEnv(canonical, &catalog_env) != .instruction) {
                 allocator.free(canonical);
                 continue;
             }
@@ -2991,6 +2995,151 @@ test "collectAncestorInstructionRoPaths skips workspace itself and missing paren
         try std.testing.expect(!std.mem.endsWith(u8, p, "/proj/AGENTS.md"));
     }
 }
+
+test "sibling instruction is policy-allowed and not an OS grant" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const evaluate = @import("ryk_core").policy.evaluate;
+    const load = @import("ryk_core").policy.load;
+    const presets = @import("ryk_core").policy.presets;
+
+    var home_tmp = std.testing.tmpDir(.{});
+    defer home_tmp.cleanup();
+    const home = try home_tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(home);
+
+    try home_tmp.dir.createDirPath(io, "CodingProjects/ryk");
+    try home_tmp.dir.createDirPath(io, "other-project");
+    try home_tmp.dir.writeFile(io, .{
+        .sub_path = "CodingProjects/AGENTS.md",
+        .data = "# ancestor\n",
+    });
+    try home_tmp.dir.writeFile(io, .{
+        .sub_path = "other-project/AGENTS.md",
+        .data = "# sibling\n",
+    });
+
+    const workspace = try std.fs.path.join(allocator, &.{ home, "CodingProjects", "ryk" });
+    defer allocator.free(workspace);
+    const sibling = try std.fs.path.join(allocator, &.{ home, "other-project", "AGENTS.md" });
+    defer allocator.free(sibling);
+    const ancestor = try std.fs.path.join(allocator, &.{ home, "CodingProjects", "AGENTS.md" });
+    defer allocator.free(ancestor);
+
+    const prev_home = blk: {
+        if (std.c.getenv("HOME")) |value| break :blk try allocator.dupeZ(u8, std.mem.span(value));
+        break :blk null;
+    };
+    defer if (prev_home) |value| allocator.free(value);
+    const home_z = try allocator.dupeZ(u8, home);
+    defer allocator.free(home_z);
+    try std.testing.expectEqual(@as(c_int, 0), setenv("HOME", home_z, 1));
+    defer {
+        if (prev_home) |value| {
+            _ = setenv("HOME", value, 1);
+        } else {
+            _ = unsetenv("HOME");
+        }
+    }
+
+    var policy = try load.parseFromSlice(allocator, presets.agentPresetText(.generic_agent), "generic-agent.yaml");
+    defer policy.deinit();
+    var allowed = try evaluate.fileRead(&policy, sibling, allocator);
+    defer allowed.deinit(allocator);
+    try std.testing.expectEqual(@import("ryk_core").core.decision.DecisionResult.allow, allowed.decision.result);
+    try std.testing.expectEqualStrings("builtin.files.read.allow[host_instruction]", allowed.matched_rule.?.id);
+
+    const paths = try collectAncestorInstructionRoPaths(io, allocator, workspace, home);
+    defer freeHostSystemRoPaths(allocator, paths);
+
+    var saw_sibling = false;
+    var saw_ancestor = false;
+    for (paths) |p| {
+        if (std.mem.eql(u8, p, sibling)) saw_sibling = true;
+        if (std.mem.eql(u8, p, ancestor)) saw_ancestor = true;
+    }
+    try std.testing.expect(!saw_sibling);
+    try std.testing.expect(saw_ancestor);
+}
+
+test "collectAncestorInstructionRoPaths does not grant instruction files outside HOME" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var home_tmp = std.testing.tmpDir(.{});
+    defer home_tmp.cleanup();
+    const home = try home_tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(home);
+
+    var outside_tmp = std.testing.tmpDir(.{});
+    defer outside_tmp.cleanup();
+    try outside_tmp.dir.createDirPath(io, "project");
+    try outside_tmp.dir.writeFile(io, .{
+        .sub_path = "AGENTS.md",
+        .data = "# outside home\n",
+    });
+    try home_tmp.dir.writeFile(io, .{
+        .sub_path = "AGENTS.md",
+        .data = "# home\n",
+    });
+
+    const workspace = try outside_tmp.dir.realPathFileAlloc(io, "project", allocator);
+    defer allocator.free(workspace);
+    const outside_parent = try outside_tmp.dir.realPathFileAlloc(io, "AGENTS.md", allocator);
+    defer allocator.free(outside_parent);
+    const home_agents = try std.fs.path.join(allocator, &.{ home, "AGENTS.md" });
+    defer allocator.free(home_agents);
+
+    const paths = try collectAncestorInstructionRoPaths(io, allocator, workspace, home);
+    defer freeHostSystemRoPaths(allocator, paths);
+
+    for (paths) |p| {
+        try std.testing.expect(!std.mem.eql(u8, p, outside_parent));
+        try std.testing.expect(!std.mem.eql(u8, p, home_agents));
+    }
+}
+
+test "collectAncestorInstructionRoPaths does not grant skill-tree AGENTS.md on the ancestor walk" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var home_tmp = std.testing.tmpDir(.{});
+    defer home_tmp.cleanup();
+    const home = try home_tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(home);
+
+    try home_tmp.dir.createDirPath(io, ".claude/skills/foo");
+    try home_tmp.dir.writeFile(io, .{
+        .sub_path = ".claude/skills/AGENTS.md",
+        .data = "# skill tree\n",
+    });
+    try home_tmp.dir.writeFile(io, .{
+        .sub_path = "AGENTS.md",
+        .data = "# home instruction\n",
+    });
+
+    const workspace = try std.fs.path.join(allocator, &.{ home, ".claude", "skills", "foo" });
+    defer allocator.free(workspace);
+    const skill_agents = try std.fs.path.join(allocator, &.{ home, ".claude", "skills", "AGENTS.md" });
+    defer allocator.free(skill_agents);
+    const home_agents = try std.fs.path.join(allocator, &.{ home, "AGENTS.md" });
+    defer allocator.free(home_agents);
+
+    const paths = try collectAncestorInstructionRoPaths(io, allocator, workspace, home);
+    defer freeHostSystemRoPaths(allocator, paths);
+
+    var saw_skill = false;
+    var saw_home = false;
+    for (paths) |p| {
+        if (std.mem.eql(u8, p, skill_agents)) saw_skill = true;
+        if (std.mem.eql(u8, p, home_agents)) saw_home = true;
+    }
+    try std.testing.expect(!saw_skill);
+    try std.testing.expect(saw_home);
+}
+
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 
 test "selectEmptyBackpackAgentExitTip prefers system-ro residual for etc/codex EPERM" {
     const stack =
