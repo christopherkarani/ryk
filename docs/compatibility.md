@@ -32,8 +32,14 @@ Doctor / platform reports are **not** a second taxonomy. Map them to grades:
 | `ryk start` default (**generic-agent / DCG strict**) | multi-grade aspirational (`hook` + `wrapper` when available) | Public path has no `--protection` flag; wires host hooks + policy; not `OS-enforced` from doctor probes alone |
 | Host hooks that fire and honor veto | primarily `hook` (+ daemon for shell eval) | Depends on host install path; hooks alone are not process wrap. The per-user Zig hook server is best-effort speed, not a new enforcement grade. |
 | Host aliases / advanced run engine / PATH shims | primarily `wrapper` | Not kernel firewall; absolute paths may bypass |
+| session `strong-mediated` (`RYK_SESSION_SANDBOX_GRADE`) | `OS-enforced` (FS + network route-force, that session) | Banner `Session grade:` / env. Not a doctor capability. See [commands.md](commands.md#session-sandbox-grade). |
+| session `fs-attached` | `OS-enforced` (FS only, that session) | Attach without route-force. Not a doctor capability. |
+| session `wrapper-only` | `wrapper` | No OS attach this session. Distinct from doctor capability `wrapper-only` (PATH shims / command guard). |
+| session `unrestricted-escape` | no `OS-enforced` claim | `--network open` or `RYK_AGENT_NETWORK_DEFAULT=legacy`. Do not market as mediated. |
 
 Reserve marketing “firewall” / “maximum protection” for a **verified** multi-grade or **`OS-enforced`** posture. See also [threat-model.md](threat-model.md).
+
+Session tokens (`RYK_SESSION_SANDBOX_GRADE`: `strong-mediated`, `fs-attached`, `wrapper-only`, `unrestricted-escape`) are **this-run residuals**, not doctor capability labels. Doctor probes never mint these tokens. The authoritative table is [commands.md — Session sandbox grade](commands.md#session-sandbox-grade). Doctor capability vocab stays `active|partial|wrapper-only|observe-only|limited|unavailable|unsupported`.
 
 ---
 
