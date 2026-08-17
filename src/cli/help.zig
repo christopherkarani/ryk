@@ -280,17 +280,16 @@ pub const commands =
         },
         .{
             .name = "precommit",
-            .summary = "Run the Rust pre-commit safety scan",
-            .usage = "ryk precommit [options]",
+            .summary = "Not available (hide-list stub)",
+            .usage = "ryk precommit  (not available)",
             .category = .core_workflow,
             .hidden = true,
             .examples = &.{
-                "ryk precommit",
-                "ryk precommit --format json",
+                "ryk scan",
             },
             .details = &.{
-                "Proxies to the Rust daemon and runs the staged-file pre-commit scan path.",
-                "This is the Phase 1 user-facing alias for the Rust scan pre-commit workflow.",
+                "Hide-list stub: command 'precommit' is not available.",
+                "The product scan surface is ryk scan (session forensics).",
             },
         },
         .{
@@ -315,17 +314,17 @@ pub const commands =
         },
         .{
             .name = "classify",
-            .summary = "Classify a shell command's risk without blocking",
-            .usage = "ryk classify <command> [options]",
+            .summary = "Not available (hide-list stub)",
+            .usage = "ryk classify  (not available)",
             .category = .diagnostics,
             .hidden = true,
             .examples = &.{
-                "ryk classify \"git status\"",
-                "ryk classify \"rm -rf /\" --format json",
+                "ryk explain \"git status\"",
+                "ryk tools classify send_email",
             },
             .details = &.{
-                "Proxies to the Rust daemon risk classifier (read-only; does not block).",
-                "Use 'ryk classify --help' for the full Rust-backed option set.",
+                "Hide-list stub: command 'classify' is not available.",
+                "Use ryk explain for shell risk; ryk tools classify for effect-class tools.",
             },
         },
         .{
@@ -403,70 +402,60 @@ pub const commands =
         },
         .{
             .name = "suggest-allowlist",
-            .summary = "Suggest allowlist entries from protected history",
-            .usage = "ryk suggest-allowlist [options]",
+            .summary = "Not available (hide-list stub)",
+            .usage = "ryk suggest-allowlist  (not available)",
             .category = .diagnostics,
             .hidden = true,
             .examples = &.{
-                "ryk suggest-allowlist",
-                "ryk suggest-allowlist --confidence high",
-                "ryk suggest-allowlist --format json",
-                "ryk history suggest",
+                "ryk replay",
+                "ryk allowlist",
             },
-            .additional_completion_flags = &.{"--apply"},
             .details = &.{
-                "Day-2 policy loop: denials → suggestions → allowlist.",
-                "Proxies to the Rust daemon; requires history to be enabled.",
-                "Human output includes copy-pasteable next commands (`suggest-allowlist --apply N` / `allowlist add-command`) for high-confidence items.",
-                "Alias: `ryk history suggest` (same as suggest-allowlist).",
-                "Use 'ryk suggest-allowlist --help' for filters and confidence options.",
+                "Hide-list stub: command 'suggest-allowlist' is not available.",
+                "Use ryk replay and ryk allowlist instead.",
             },
         },
         .{
             .name = "simulate",
-            .summary = "Dry-run policy / packs against a command file or history dump",
-            .usage = "ryk simulate [--file <path>] [options]",
+            .summary = "Not available (hide-list stub)",
+            .usage = "ryk simulate  (not available)",
             .category = .diagnostics,
             .hidden = true,
             .examples = &.{
-                "ryk simulate --file commands.txt",
-                "ryk simulate -f denials.jsonl --format pretty",
-                "ryk simulate --help",
+                "ryk explain \"git status\"",
+                "ryk policy check",
             },
             .details = &.{
-                "What-if dry-run for pack rollout and false-positive review before tightening modes.",
-                "Proxies to the Rust daemon simulate engine (does not execute shell commands).",
-                "Input is a file of commands or hook JSONL (use -f / --file; default stdin).",
-                "Prints allow/deny counts and top denials. Use before enabling packs or switching to strict/ci.",
+                "Hide-list stub: command 'simulate' is not available.",
+                "Use ryk explain or ryk policy check instead.",
             },
         },
         .{
             .name = "rebase-recover",
-            .summary = "Issue a short-lived permit for git rebase recovery",
-            .usage = "ryk rebase-recover [--ttl <seconds>]",
+            .summary = "Not available (hide-list stub)",
+            .usage = "ryk rebase-recover  (not available)",
             .category = .core_workflow,
             .hidden = true,
             .examples = &.{
-                "ryk rebase-recover",
-                "ryk rebase-recover --ttl 120",
+                "ryk allow-once",
             },
             .details = &.{
-                "Proxies to the Rust daemon. Unblocks the next git checkout -- / restore",
-                "step after a messy rebase recovery within a short TTL.",
+                "Hide-list stub: command 'rebase-recover' is not available.",
+                "Use ryk allow-once for a single-use grant.",
             },
         },
         .{
             .name = "config",
-            .summary = "Show ryk daemon configuration",
-            .usage = "ryk config",
+            .summary = "Not available (hide-list stub)",
+            .usage = "ryk config  (not available)",
             .category = .diagnostics,
             .hidden = true,
             .examples = &.{
-                "ryk config",
+                "ryk doctor",
             },
             .details = &.{
-                "Proxies to the Rust daemon config show path (read-only).",
-                "Use 'ryk config --help' for daemon-backed details.",
+                "Hide-list stub: command 'config' is not available.",
+                "Use ryk doctor instead.",
             },
         },
         .{
@@ -558,13 +547,12 @@ pub const commands =
         .{ .name = "ci", .summary = "Run local CI readiness checks", .usage = "ryk ci check [--format markdown|json] [--github-summary <path>]", .category = .advanced, .details = &.{
             "Validates .ryk/policy.yaml, rejects dangerous obvious defaults, runs a focused CI-safe redteam fixture, and emits GitHub Actions-friendly output.",
         } },
-        .{ .name = "shutdown", .summary = "Stop the background ryk daemon", .usage = "ryk shutdown [--daemon]", .category = .advanced, .examples = &.{
+        .{ .name = "shutdown", .summary = "Stop leftover local daemon sockets and the hook server", .usage = "ryk shutdown [--daemon]", .category = .advanced, .examples = &.{
             "ryk shutdown",
             "ryk shutdown --daemon",
         }, .details = &.{
-            "Sends a graceful Shutdown request to the Rust daemon over UDS.",
-            "Removes $HOME/.ryk/daemon.sock and daemon.pid when shutdown succeeds.",
-            "When the daemon is not running, stale artifacts are cleaned when safe.",
+            "Stops leftover local daemon socket artifacts ($HOME/.ryk/daemon.sock, daemon.pid) when safe.",
+            "Best-effort stops the local ryk hook server. This is local process cleanup, not a hosted service.",
         } },
         .{ .name = "stop", .summary = "Stop ryk protection for host agents", .usage = "ryk stop [codex|claude|cursor|opencode|openclaw|hermes|all] [--yes|--no]", .category = .integrations, .public = true, .examples = &.{
             "ryk stop",
@@ -1548,6 +1536,56 @@ test "P0 honesty: default help and help --all omit hide-list and unfinished P0; 
     try std.testing.expect(helpListsPeerCommand(all, "test"));
     try std.testing.expect(helpListsPeerCommand(all, "explain"));
     try std.testing.expect(helpListsPeerCommand(all, "start"));
+}
+
+test "P0 honesty: help catalog does not claim Rust daemon" {
+    const banned = [_][]const u8{
+        "Rust daemon",
+        "Rust pre-commit",
+        "Rust scan",
+        "Rust-backed",
+    };
+    const hide_list = [_][]const u8{
+        "precommit",
+        "classify",
+        "suggest-allowlist",
+        "simulate",
+        "rebase-recover",
+        "config",
+    };
+
+    var buf: [32768]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try write(std.testing.io, &writer);
+    const top = writer.buffered();
+    for (banned) |phrase| {
+        try std.testing.expect(std.mem.indexOf(u8, top, phrase) == null);
+    }
+
+    writer = .fixed(&buf);
+    try writeAll(std.testing.io, &writer);
+    const all = writer.buffered();
+    for (banned) |phrase| {
+        try std.testing.expect(std.mem.indexOf(u8, all, phrase) == null);
+    }
+
+    writer = .fixed(&buf);
+    try std.testing.expect(try writeCommand(std.testing.io, &writer, "shutdown"));
+    const shutdown_out = writer.buffered();
+    for (banned) |phrase| {
+        try std.testing.expect(std.mem.indexOf(u8, shutdown_out, phrase) == null);
+    }
+
+    // Do not render hook-serve: its honest "not the removed Rust daemon" line is allowed.
+    for (hide_list) |name| {
+        writer = .fixed(&buf);
+        try std.testing.expect(try writeCommand(std.testing.io, &writer, name));
+        const out = writer.buffered();
+        for (banned) |phrase| {
+            try std.testing.expect(std.mem.indexOf(u8, out, phrase) == null);
+        }
+        try std.testing.expect(std.mem.indexOf(u8, out, "not available") != null);
+    }
 }
 
 test "public Safe Launch: packs and allowlist help details mention TTY browse and --plain" {
