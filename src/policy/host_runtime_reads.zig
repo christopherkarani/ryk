@@ -124,6 +124,7 @@ pub fn isHostRuntimeReadPath(path: []const u8) bool {
 pub fn classifyWithEnv(path: []const u8, env: []const EnvPair) MatchKind {
     if (pathHasDotDotSegment(path)) return .none;
     if (isSecretBasename(std.fs.path.basename(path))) return .none;
+    if (pathHasSecretSegment(path)) return .none;
     if (isSkillRead(path, env)) return .skill;
     if (isInstructionRead(path, envGet(env, "HOME") orelse "")) return .instruction;
     return .none;
@@ -139,15 +140,17 @@ pub fn classifyExisting(
 ) error{OutOfMemory}!MatchKind {
     const lexical = classify(path);
     if (lexical == .none) return .none;
-    const resolved_z = std.Io.Dir.cwd().realPathFileAlloc(io, path, allocator) catch |err| switch (err) {
+    const expanded = try expandHomePrefix(allocator, path);
+    defer allocator.free(expanded);
+    const resolved_z = std.Io.Dir.cwd().realPathFileAlloc(io, expanded, allocator) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
             var buf: [std.fs.max_path_bytes]u8 = undefined;
-            if (std.fs.path.isAbsolute(path)) {
-                _ = std.Io.Dir.readLinkAbsolute(io, path, &buf) catch return lexical;
+            if (std.fs.path.isAbsolute(expanded)) {
+                _ = std.Io.Dir.readLinkAbsolute(io, expanded, &buf) catch return lexical;
                 return .none;
             }
-            _ = std.Io.Dir.cwd().readLink(io, path, &buf) catch return lexical;
+            _ = std.Io.Dir.cwd().readLink(io, expanded, &buf) catch return lexical;
             return .none;
         },
     };
@@ -181,6 +184,7 @@ fn isSkillRead(path: []const u8, env: []const EnvPair) bool {
         if (root.env_key) |key| {
             const configured = envGet(env, key) orelse continue;
             if (!std.fs.path.isAbsolute(configured)) continue;
+            if (envSkillRootForbidden(configured, home)) continue;
             if (matchRootSuffixes(path, configured, "", root.suffixes)) return true;
         }
     }
@@ -228,11 +232,12 @@ fn isInstructionRead(path: []const u8, home: []const u8) bool {
 }
 
 fn isSecretBasename(name: []const u8) bool {
-    if (std.mem.eql(u8, name, ".env")) return true;
-    if (std.mem.startsWith(u8, name, ".env.")) return true;
-    if (std.mem.eql(u8, name, "auth.json")) return true;
-    if (std.mem.eql(u8, name, ".credentials.json")) return true;
-    if (std.mem.eql(u8, name, "credentials.json")) return true;
+    if (std.ascii.eqlIgnoreCase(name, ".env")) return true;
+    if (std.ascii.startsWithIgnoreCase(name, ".env.")) return true;
+    if (std.ascii.eqlIgnoreCase(name, "auth.json")) return true;
+    if (std.ascii.eqlIgnoreCase(name, ".credentials.json")) return true;
+    if (std.ascii.eqlIgnoreCase(name, "credentials.json")) return true;
+    if (std.ascii.eqlIgnoreCase(name, "id_ed25519")) return true;
     return false;
 }
 
@@ -277,9 +282,32 @@ fn pathHasSecretSegment(path: []const u8) bool {
 
 fn isSecretSegment(seg: []const u8) bool {
     for (secret_segments) |banned| {
-        if (std.mem.eql(u8, seg, banned)) return true;
+        if (std.ascii.eqlIgnoreCase(seg, banned)) return true;
     }
     return false;
+}
+
+fn pathEqualsOrTrailingSlash(path: []const u8, root: []const u8) bool {
+    if (std.mem.eql(u8, path, root)) return true;
+    return path.len == root.len + 1 and
+        std.mem.startsWith(u8, path, root) and
+        (path[root.len] == '/' or path[root.len] == '\\');
+}
+
+fn envSkillRootForbidden(configured: []const u8, home: []const u8) bool {
+    const forbidden = [_][]const u8{ "/", "/tmp", "/var/tmp", "/private/tmp", "/private/var/tmp" };
+    for (forbidden) |root| {
+        if (pathEqualsOrTrailingSlash(configured, root)) return true;
+    }
+    if (home.len == 0) return false;
+    return pathEqualsOrTrailingSlash(configured, home);
+}
+
+fn expandHomePrefix(allocator: std.mem.Allocator, path: []const u8) error{OutOfMemory}![]u8 {
+    if (!std.mem.startsWith(u8, path, "~/")) return allocator.dupe(u8, path);
+    const home = osGet("HOME") orelse return allocator.dupe(u8, path);
+    if (home.len == 0) return allocator.dupe(u8, path);
+    return std.fs.path.join(allocator, &.{ home, path[2..] });
 }
 
 const test_home = "/tmp/ryk-host-runtime-home";
@@ -338,6 +366,38 @@ test "host skill catalog honors env-rooted homes and accumulates defaults" {
     try std.testing.expectEqual(MatchKind.none, classifyWithEnv("/custom/codex/auth.json", env[0..5]));
 }
 
+test "host skill catalog rejects forbidden env-rooted homes" {
+    const tmp_extra = [_]EnvPair{
+        .{ .key = "CLAUDE_CONFIG_DIR", .value = "/tmp" },
+    };
+    const tmp_env = testEnv(&tmp_extra);
+    try std.testing.expectEqual(MatchKind.none, classifyWithEnv("/tmp/skills/x/SKILL.md", tmp_env[0..2]));
+    try std.testing.expectEqual(MatchKind.skill, classifyWithEnv(test_home ++ "/.claude/skills/x/SKILL.md", tmp_env[0..2]));
+
+    const home_extra = [_]EnvPair{
+        .{ .key = "CLAUDE_CONFIG_DIR", .value = test_home },
+    };
+    const home_env = testEnv(&home_extra);
+    try std.testing.expectEqual(MatchKind.none, classifyWithEnv(test_home ++ "/skills/x/SKILL.md", home_env[0..2]));
+    try std.testing.expectEqual(MatchKind.skill, classifyWithEnv(test_home ++ "/.claude/skills/x/SKILL.md", home_env[0..2]));
+
+    const slash_extra = [_]EnvPair{
+        .{ .key = "CLAUDE_CONFIG_DIR", .value = "/" },
+        .{ .key = "CODEX_HOME", .value = "/var/tmp" },
+        .{ .key = "HERMES_HOME", .value = "/private/tmp" },
+        .{ .key = "PI_CODING_AGENT_DIR", .value = "/private/var/tmp" },
+    };
+    const slash_env = testEnv(&slash_extra);
+    try std.testing.expectEqual(MatchKind.none, classifyWithEnv("/skills/x/SKILL.md", slash_env[0..5]));
+    try std.testing.expectEqual(MatchKind.none, classifyWithEnv("/var/tmp/skills/x/SKILL.md", slash_env[0..5]));
+    try std.testing.expectEqual(MatchKind.none, classifyWithEnv("/private/tmp/skills/x/SKILL.md", slash_env[0..5]));
+    try std.testing.expectEqual(MatchKind.none, classifyWithEnv("/private/var/tmp/skills/x/SKILL.md", slash_env[0..5]));
+
+    const custom_extra = [_]EnvPair{.{ .key = "CLAUDE_CONFIG_DIR", .value = "/custom/claude" }};
+    const custom_env = testEnv(&custom_extra);
+    try std.testing.expectEqual(MatchKind.skill, classifyWithEnv("/custom/claude/skills/x/SKILL.md", custom_env[0..2]));
+}
+
 test "host instruction catalog allows AGENTS.md and CLAUDE.md under HOME" {
     const env = testEnv(&.{});
     try std.testing.expectEqual(MatchKind.instruction, classifyWithEnv(test_home ++ "/AGENTS.md", env[0..1]));
@@ -360,11 +420,19 @@ test "host runtime catalog rejects secrets traversal and non-catalog paths" {
         test_home ++ "/.ssh/id_ed25519",
         test_home ++ "/.grok/skills/../auth.json",
         test_home ++ "/.grok/skills/x/.env",
+        test_home ++ "/.grok/skills/x/.ENV",
+        test_home ++ "/.grok/skills/x/AUTH.json",
+        test_home ++ "/.grok/skills/x/.ENV.local",
+        test_home ++ "/.grok/skills/x/ID_ED25519",
         test_home ++ "/.grok/third-party/pkg/.env.local",
+        test_home ++ "/.grok/third-party/pkg/.ssh/config",
         test_home ++ "/.claude/skills/x/auth.json",
         test_home ++ "/.grok/installed-plugins/evil/skills/auth.json",
         test_home ++ "/.claude/skills/x/.credentials.json",
         test_home ++ "/.ssh/AGENTS.md",
+        test_home ++ "/.SSH/AGENTS.md",
+        test_home ++ "/.SSH/ID_ED25519",
+        "~/.SSH/AGENTS.md",
         test_home ++ "/AGENTS.md/../.ssh/id",
         "/etc/passwd",
         test_home ++ "/Notes/todo.md",
@@ -373,6 +441,17 @@ test "host runtime catalog rejects secrets traversal and non-catalog paths" {
     for (blocked) |path| {
         try std.testing.expectEqual(MatchKind.none, classifyWithEnv(path, env[0..1]));
     }
+}
+
+test "host skill catalog rejects case-folded secrets and ssh segments" {
+    const env = testEnv(&.{});
+    try std.testing.expectEqual(MatchKind.none, classifyWithEnv(test_home ++ "/.grok/skills/x/.ENV", env[0..1]));
+    try std.testing.expectEqual(MatchKind.none, classifyWithEnv(test_home ++ "/.grok/skills/x/AUTH.json", env[0..1]));
+    try std.testing.expectEqual(MatchKind.none, classifyWithEnv(test_home ++ "/.grok/skills/x/.ENV.local", env[0..1]));
+    try std.testing.expectEqual(MatchKind.none, classifyWithEnv(test_home ++ "/.grok/skills/x/ID_ED25519", env[0..1]));
+    try std.testing.expectEqual(MatchKind.none, classifyWithEnv(test_home ++ "/.grok/third-party/pkg/.ssh/config", env[0..1]));
+    try std.testing.expectEqual(MatchKind.none, classifyWithEnv("~/.SSH/AGENTS.md", env[0..1]));
+    try std.testing.expectEqual(MatchKind.skill, classifyWithEnv(test_home ++ "/.grok/third-party/hallmark/SKILL.md", env[0..1]));
 }
 
 test "skill tree wins over instruction basename inside a skill dir" {
