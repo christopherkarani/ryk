@@ -21,8 +21,10 @@ for runtime_asset in dist/index.js dist/index.d.ts dist/index.d.ts.map; do
 done
 
 [ -x "${TSC}" ] || {
-  if [ "${RYK_RELEASE_LIVE:-0}" = "1" ]; then
-    echo "openclaw release assets: install plugin dev dependencies before a live release" >&2
+  # Live release and GitHub Actions must not skip freshness. Local agent-gate
+  # / verify-pre-merge still skip when plugin deps are not installed.
+  if [ "${RYK_RELEASE_LIVE:-0}" = "1" ] || [ -n "${GITHUB_ACTIONS:-}" ]; then
+    echo "openclaw release assets: install plugin dev dependencies before a live release or CI check" >&2
     exit 1
   fi
   echo "openclaw release assets: committed dist present; skip tsc freshness (plugin deps not installed)"

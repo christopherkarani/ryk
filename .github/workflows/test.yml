@@ -111,3 +111,34 @@ jobs:
       - name: Skip notice
         if: steps.filter.outputs.dashboard != 'true'
         run: echo "No ryk-dashboard-ui or src/dashboard changes; skipping dashboard job work."
+
+  # OpenClaw ships committed dist/; fail if a TypeScript rebuild disagrees.
+  # Job always runs so a required-check stays green when the filter skips.
+  openclaw-release-assets:
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.filter.outputs.openclaw }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            openclaw:
+              - 'integrations/openclaw-plugin/**'
+              - 'scripts/test-openclaw-release-assets.sh'
+      - name: Setup Node.js
+        if: steps.filter.outputs.openclaw == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.6.0
+          cache: npm
+          cache-dependency-path: integrations/openclaw-plugin/package-lock.json
+      - name: OpenClaw committed dist freshness
+        if: steps.filter.outputs.openclaw == 'true'
+        run: |
+          (cd integrations/openclaw-plugin && npm ci)
+          RYK_RELEASE_LIVE=1 ./scripts/test-openclaw-release-assets.sh
+      - name: Skip notice
+        if: steps.filter.outputs.openclaw != 'true'
+        run: echo "No OpenClaw plugin or release-assets script changes; skipping freshness check."
