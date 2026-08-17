@@ -3147,63 +3147,49 @@ test "expandShellWrapperLaunch rewrites hermes-style exec to realpath python" {
     try std.testing.expect(std.mem.indexOf(u8, pp, "site-packages") != null);
 }
 
-// CAAF probes for launch argv builders. Fixtures (tmpDir/argv/PATH bytes) live
-// outside the failing allocator; success frees via freeExpandedShellWrapperArgv.
-// OOM must surface as error.OutOfMemory — never as null.
-fn launchArgvOomExpandShellWrapperProbe(
-    allocator: std.mem.Allocator,
-    wrapper: []const u8,
-    interp: []const u8,
-) !void {
-    const io = std.testing.io;
-    const argv_in = [_][]const u8{ wrapper, "--version" };
-    const owned = (try expandShellWrapperLaunch(io, allocator, &argv_in, null)) orelse
-        return error.TestUnexpectedResult;
-    defer freeExpandedShellWrapperArgv(allocator, owned);
-    try std.testing.expect(owned.len >= 2);
-    var real_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const want = realpathInto(io, interp, &real_buf) orelse interp;
-    try std.testing.expectEqualStrings(want, owned[0]);
-    try std.testing.expectEqualStrings("--version", owned[owned.len - 1]);
+/// Fail remaps so ArrayList append is an alloc (cited dupe-then-append hole).
+const launch_argv_oom_resize_fail: std.testing.FailingAllocator.Config = .{
+    .fail_index = std.math.maxInt(usize),
+    .resize_fail_index = 0,
+};
+
+fn launchArgvOomExpectBalancedOom(failing: *const std.testing.FailingAllocator, err: anyerror) !void {
+    try std.testing.expectEqual(error.OutOfMemory, err);
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
 }
 
-fn launchArgvOomExpandEnvShebangProbe(
+fn expandShellWrapperLaunchOomOnce(
     allocator: std.mem.Allocator,
+    io: std.Io,
+    wrapper: []const u8,
+) error{OutOfMemory}!?[]const []const u8 {
+    const argv_in = [_][]const u8{ wrapper, "--version" };
+    return expandShellWrapperLaunch(io, allocator, &argv_in, null);
+}
+
+fn expandEnvShebangLaunchOomOnce(
+    allocator: std.mem.Allocator,
+    io: std.Io,
     script_abs: []const u8,
     runtime_bin: []const u8,
-    node_abs: []const u8,
-) !void {
-    const io = std.testing.io;
+) error{OutOfMemory}!?[]const []const u8 {
     var env_map = std.process.Environ.Map.init(allocator);
     defer env_map.deinit();
     try env_map.put("PATH", runtime_bin);
-    const argv_in = [_][]const u8{ script_abs, "mcp", "list", "--json" };
-    const owned = (try expandEnvShebangLaunch(io, allocator, &argv_in, &env_map)) orelse
-        return error.TestUnexpectedResult;
-    defer freeExpandedShellWrapperArgv(allocator, owned);
-    try std.testing.expectEqual(@as(usize, 5), owned.len);
-    var real_buf_a: [std.fs.max_path_bytes]u8 = undefined;
-    var real_buf_b: [std.fs.max_path_bytes]u8 = undefined;
-    const want_node = realpathInto(io, node_abs, &real_buf_a) orelse node_abs;
-    const want_script = realpathInto(io, script_abs, &real_buf_b) orelse script_abs;
-    try std.testing.expectEqualStrings(want_node, owned[0]);
-    try std.testing.expectEqualStrings(want_script, owned[1]);
-    try std.testing.expectEqualStrings("mcp", owned[2]);
-    try std.testing.expectEqualStrings("list", owned[3]);
-    try std.testing.expectEqualStrings("--json", owned[4]);
+    const argv_in = [_][]const u8{ script_abs, "--version" };
+    return expandEnvShebangLaunch(io, allocator, &argv_in, &env_map);
 }
 
-fn launchArgvOomAbsoluteizeProbe(
+fn absoluteizeLaunchArgvOomOnce(
     allocator: std.mem.Allocator,
-    env_map: *const std.process.Environ.Map,
-) !void {
+    io: std.Io,
+) error{OutOfMemory}!?[]const []const u8 {
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("PATH", "/bin:/usr/bin");
     const argv_in = [_][]const u8{ "sh", "--version" };
-    const owned = (try absoluteizeLaunchArgv(std.testing.io, allocator, &argv_in, env_map)) orelse
-        return error.TestUnexpectedResult;
-    defer freeExpandedShellWrapperArgv(allocator, owned);
-    try std.testing.expectEqual(@as(usize, 2), owned.len);
-    try std.testing.expect(std.fs.path.isAbsolute(owned[0]));
-    try std.testing.expectEqualStrings("--version", owned[1]);
+    return absoluteizeLaunchArgv(io, allocator, &argv_in, &env_map);
 }
 
 test "LaunchArgvOom expandShellWrapperLaunch OOM ownership" {
@@ -3213,35 +3199,79 @@ test "LaunchArgvOom expandShellWrapperLaunch OOM ownership" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const home = try tmp.dir.realPathFileAlloc(io, ".", allocator);
-    defer allocator.free(home);
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
 
     try tmp.dir.writeFile(io, .{
-        .sub_path = "interp",
-        .data = "#!/bin/sh\necho fake\n",
+        .sub_path = "target.bin",
+        .data = "#!/bin/sh\necho target\n",
     });
-    try tmp.dir.setFilePermissions(io, "interp", std.Io.File.Permissions.fromMode(0o755), .{});
-    try tmp.dir.writeFile(io, .{ .sub_path = "main.py", .data = "print(1)\n" });
-    const interp = try std.fs.path.join(allocator, &.{ home, "interp" });
-    defer allocator.free(interp);
-    const main_py = try std.fs.path.join(allocator, &.{ home, "main.py" });
-    defer allocator.free(main_py);
-    const body = try std.fmt.allocPrint(allocator,
-        \\#!/bin/sh
-        \\exec "{s}" "{s}" "$@"
-        \\
-    , .{ interp, main_py });
+    try tmp.dir.setFilePermissions(io, "target.bin", std.Io.File.Permissions.fromMode(0o755), .{});
+    const target = try std.fs.path.join(allocator, &.{ root, "target.bin" });
+    defer allocator.free(target);
+
+    const body = try std.fmt.allocPrint(allocator, "#!/bin/sh\nexec \"{s}\" \"$@\"\n", .{target});
     defer allocator.free(body);
     try tmp.dir.writeFile(io, .{ .sub_path = "wrap.sh", .data = body });
     try tmp.dir.setFilePermissions(io, "wrap.sh", std.Io.File.Permissions.fromMode(0o755), .{});
-    const wrapper = try std.fs.path.join(allocator, &.{ home, "wrap.sh" });
+    const wrapper = try std.fs.path.join(allocator, &.{ root, "wrap.sh" });
     defer allocator.free(wrapper);
 
-    try std.testing.checkAllAllocationFailures(
-        allocator,
-        launchArgvOomExpandShellWrapperProbe,
-        .{ wrapper, interp },
-    );
+    const argv_in = [_][]const u8{ wrapper, "--version" };
+    const expanded = (try expandShellWrapperLaunch(io, allocator, &argv_in, null)) orelse {
+        return error.TestUnexpectedResult;
+    };
+    defer freeExpandedShellWrapperArgv(allocator, expanded);
+    try std.testing.expectEqual(@as(usize, 2), expanded.len);
+    var real_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const want_target = realpathInto(io, target, &real_buf) orelse target;
+    try std.testing.expectEqualStrings(want_target, expanded[0]);
+    try std.testing.expectEqualStrings("--version", expanded[1]);
+
+    var counter = std.testing.FailingAllocator.init(allocator, launch_argv_oom_resize_fail);
+    const counted = (try expandShellWrapperLaunchOomOnce(counter.allocator(), io, wrapper)) orelse {
+        return error.TestUnexpectedResult;
+    };
+    freeExpandedShellWrapperArgv(counter.allocator(), counted);
+    const alloc_count = counter.alloc_index;
+    try std.testing.expect(alloc_count >= 2);
+
+    last_alloc: {
+        var failing = std.testing.FailingAllocator.init(allocator, .{
+            .fail_index = alloc_count - 1,
+            .resize_fail_index = 0,
+        });
+        const result = expandShellWrapperLaunchOomOnce(failing.allocator(), io, wrapper);
+        if (result) |maybe| {
+            if (maybe) |owned| freeExpandedShellWrapperArgv(failing.allocator(), owned);
+            return error.TestUnexpectedResult;
+        } else |err| {
+            try launchArgvOomExpectBalancedOom(&failing, err);
+            break :last_alloc;
+        }
+    }
+
+    var saw_oom = false;
+    var fail_at: usize = 0;
+    while (fail_at < alloc_count) : (fail_at += 1) {
+        var failing = std.testing.FailingAllocator.init(allocator, .{
+            .fail_index = fail_at,
+            .resize_fail_index = 0,
+        });
+        const result = expandShellWrapperLaunchOomOnce(failing.allocator(), io, wrapper);
+        if (result) |maybe| {
+            if (maybe) |owned| {
+                freeExpandedShellWrapperArgv(failing.allocator(), owned);
+                if (failing.has_induced_failure) return error.TestUnexpectedResult;
+                return error.NondeterministicMemoryUsage;
+            }
+            continue;
+        } else |err| {
+            try launchArgvOomExpectBalancedOom(&failing, err);
+            saw_oom = true;
+        }
+    }
+    try std.testing.expect(saw_oom);
 }
 
 test "LaunchArgvOom expandEnvShebangLaunch OOM ownership" {
@@ -3274,26 +3304,147 @@ test "LaunchArgvOom expandEnvShebangLaunch OOM ownership" {
     const runtime_bin = try std.fs.path.join(allocator, &.{ root, "runtime/bin" });
     defer allocator.free(runtime_bin);
 
-    try std.testing.checkAllAllocationFailures(
-        allocator,
-        launchArgvOomExpandEnvShebangProbe,
-        .{ script_abs, runtime_bin, node_abs },
-    );
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "pkg/bin/missing.js",
+        .data = "#!/usr/bin/env ryk-oom-missing-interp\n",
+    });
+    try tmp.dir.setFilePermissions(io, "pkg/bin/missing.js", std.Io.File.Permissions.fromMode(0o755), .{});
+    const missing_script = try std.fs.path.join(allocator, &.{ root, "pkg/bin/missing.js" });
+    defer allocator.free(missing_script);
+    const missing_argv = [_][]const u8{missing_script};
+    try std.testing.expect((try expandEnvShebangLaunch(io, allocator, &missing_argv, null)) == null);
+
+    const argv_in = [_][]const u8{ script_abs, "--version" };
+
+    var happy_env = std.process.Environ.Map.init(allocator);
+    defer happy_env.deinit();
+    try happy_env.put("PATH", runtime_bin);
+    const expanded = (try expandEnvShebangLaunch(io, allocator, &argv_in, &happy_env)) orelse {
+        return error.TestUnexpectedResult;
+    };
+    defer freeExpandedShellWrapperArgv(allocator, expanded);
+    try std.testing.expectEqual(@as(usize, 3), expanded.len);
+    var real_buf_a: [std.fs.max_path_bytes]u8 = undefined;
+    var real_buf_b: [std.fs.max_path_bytes]u8 = undefined;
+    const want_node = realpathInto(io, node_abs, &real_buf_a) orelse node_abs;
+    const want_script = realpathInto(io, script_abs, &real_buf_b) orelse script_abs;
+    try std.testing.expectEqualStrings(want_node, expanded[0]);
+    try std.testing.expectEqualStrings(want_script, expanded[1]);
+    try std.testing.expectEqualStrings("--version", expanded[2]);
+
+    var counter = std.testing.FailingAllocator.init(allocator, launch_argv_oom_resize_fail);
+    const counted = (try expandEnvShebangLaunchOomOnce(counter.allocator(), io, script_abs, runtime_bin)) orelse {
+        return error.TestUnexpectedResult;
+    };
+    freeExpandedShellWrapperArgv(counter.allocator(), counted);
+    const alloc_count = counter.alloc_index;
+    try std.testing.expect(alloc_count >= 2);
+
+    last_alloc: {
+        var failing = std.testing.FailingAllocator.init(allocator, .{
+            .fail_index = alloc_count - 1,
+            .resize_fail_index = 0,
+        });
+        const result = expandEnvShebangLaunchOomOnce(failing.allocator(), io, script_abs, runtime_bin);
+        if (result) |maybe| {
+            if (maybe) |owned| freeExpandedShellWrapperArgv(failing.allocator(), owned);
+            return error.TestUnexpectedResult;
+        } else |err| {
+            try launchArgvOomExpectBalancedOom(&failing, err);
+            break :last_alloc;
+        }
+    }
+
+    var saw_oom = false;
+    var fail_at: usize = 0;
+    while (fail_at < alloc_count) : (fail_at += 1) {
+        var failing = std.testing.FailingAllocator.init(allocator, .{
+            .fail_index = fail_at,
+            .resize_fail_index = 0,
+        });
+        const result = expandEnvShebangLaunchOomOnce(failing.allocator(), io, script_abs, runtime_bin);
+        if (result) |maybe| {
+            if (maybe) |owned| {
+                freeExpandedShellWrapperArgv(failing.allocator(), owned);
+                if (failing.has_induced_failure) return error.TestUnexpectedResult;
+                return error.NondeterministicMemoryUsage;
+            }
+            continue;
+        } else |err| {
+            try launchArgvOomExpectBalancedOom(&failing, err);
+            saw_oom = true;
+        }
+    }
+    try std.testing.expect(saw_oom);
 }
 
 test "LaunchArgvOom absoluteizeLaunchArgv OOM ownership" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     const allocator = std.testing.allocator;
+    const io = std.testing.io;
 
     var env_map = std.process.Environ.Map.init(allocator);
     defer env_map.deinit();
     try env_map.put("PATH", "/bin:/usr/bin");
 
-    try std.testing.checkAllAllocationFailures(
-        allocator,
-        launchArgvOomAbsoluteizeProbe,
-        .{&env_map},
-    );
+    const abs_in = [_][]const u8{"/bin/sh"};
+    try std.testing.expect((try absoluteizeLaunchArgv(io, allocator, &abs_in, &env_map)) == null);
+    const missing = [_][]const u8{"ryk-no-such-host-alias-bin"};
+    try std.testing.expect((try absoluteizeLaunchArgv(io, allocator, &missing, &env_map)) == null);
+
+    const argv_in = [_][]const u8{ "sh", "--version" };
+    const expanded = (try absoluteizeLaunchArgv(io, allocator, &argv_in, &env_map)) orelse {
+        return error.TestUnexpectedResult;
+    };
+    defer freeExpandedShellWrapperArgv(allocator, expanded);
+    try std.testing.expectEqual(@as(usize, 2), expanded.len);
+    try std.testing.expect(std.fs.path.isAbsolute(expanded[0]));
+    try std.testing.expectEqualStrings("--version", expanded[1]);
+
+    var counter = std.testing.FailingAllocator.init(allocator, launch_argv_oom_resize_fail);
+    const counted = (try absoluteizeLaunchArgvOomOnce(counter.allocator(), io)) orelse {
+        return error.TestUnexpectedResult;
+    };
+    freeExpandedShellWrapperArgv(counter.allocator(), counted);
+    const alloc_count = counter.alloc_index;
+    try std.testing.expect(alloc_count >= 2);
+
+    last_alloc: {
+        var failing = std.testing.FailingAllocator.init(allocator, .{
+            .fail_index = alloc_count - 1,
+            .resize_fail_index = 0,
+        });
+        const result = absoluteizeLaunchArgvOomOnce(failing.allocator(), io);
+        if (result) |maybe| {
+            if (maybe) |owned| freeExpandedShellWrapperArgv(failing.allocator(), owned);
+            return error.TestUnexpectedResult;
+        } else |err| {
+            try launchArgvOomExpectBalancedOom(&failing, err);
+            break :last_alloc;
+        }
+    }
+
+    var saw_oom = false;
+    var fail_at: usize = 0;
+    while (fail_at < alloc_count) : (fail_at += 1) {
+        var failing = std.testing.FailingAllocator.init(allocator, .{
+            .fail_index = fail_at,
+            .resize_fail_index = 0,
+        });
+        const result = absoluteizeLaunchArgvOomOnce(failing.allocator(), io);
+        if (result) |maybe| {
+            if (maybe) |owned| {
+                freeExpandedShellWrapperArgv(failing.allocator(), owned);
+                if (failing.has_induced_failure) return error.TestUnexpectedResult;
+                return error.NondeterministicMemoryUsage;
+            }
+            continue;
+        } else |err| {
+            try launchArgvOomExpectBalancedOom(&failing, err);
+            saw_oom = true;
+        }
+    }
+    try std.testing.expect(saw_oom);
 }
 
 test "collectLaunchInstallRoPaths real host hermes grants uv cpython when present" {
