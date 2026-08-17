@@ -153,8 +153,10 @@ pub fn normalizePathAlloc(allocator: std.mem.Allocator, raw_path: []const u8, ro
             continue;
         }
         const owned = try allocator.dupe(u8, component);
-        errdefer allocator.free(owned);
-        try components.append(allocator, owned);
+        components.append(allocator, owned) catch |err| {
+            allocator.free(owned);
+            return err;
+        };
     }
 
     var out: std.ArrayList(u8) = .empty;
