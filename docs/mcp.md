@@ -29,6 +29,20 @@ The proxy reads client JSON-RPC from stdin and writes protocol responses to stdo
 
 ## Manifest Support
 
+`ryk doctor` and `ryk mcp list` count YAML files under the workspace `.ryk/mcp/` directory (`<name>.yaml` or `<name>.yml`). The example fixture `examples/mcp/demo-manifest.yaml` is for local inspect/proxy demos; it is not the path doctor scans. Manifests are launch and inventory metadata, not OS grants. ryk mediates MCP only through `ryk mcp proxy`.
+
+Create a workspace manifest, then check it:
+
+```sh
+mkdir -p .ryk/mcp
+./zig-out/bin/ryk mcp manifest generate --server demo > .ryk/mcp/demo.yaml
+./zig-out/bin/ryk mcp manifest check .ryk/mcp/demo.yaml
+```
+
+You can copy the example fixture into `.ryk/mcp/` instead of generating. Doctor then reports `manifests under .ryk/mcp: 1 found` instead of `none`. Doctor does not write this directory or rewrite policy. `generate` prints YAML on stdout; redirect it yourself.
+
+If `.ryk/policy.yaml` has no `mcp.default`, doctor prints MCP policy default `ask`. That report is diagnose-only; `ask` is never treated as allow.
+
 ```sh
 ./zig-out/bin/ryk mcp manifest check examples/mcp/demo-manifest.yaml
 ./zig-out/bin/ryk mcp proxy --name demo --manifest examples/mcp/demo-manifest.yaml --command python3 -- fixtures/mcp/fake_server.py
