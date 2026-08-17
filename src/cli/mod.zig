@@ -197,9 +197,8 @@ const self_banner_commands = [_][]const u8{ "version", "--version", "help", "run
 const always_machine_commands = [_][]const u8{
     "evaluate", "hook", "hook-serve", "shim", "completions", "env", "dashboard", "cloud", "telemetry", "--print-install-env",
     // Zig-native shell tools (formerly daemon-proxied): keep machine/banner-free.
-    // `explain` is human pretty by default (DCG-class colors); machine only via
-    // `--format json` (isMachineArgv). Own header is `RYK EXPLAIN` (no brand banner).
-    "test",
+    // `explain` / `test` are human pretty by default; machine only via
+    // `--format json` (isMachineArgv). Banner stays off in shouldShowBanner.
 };
 
 fn isAlwaysMachineCommand(command: []const u8) bool {
@@ -262,8 +261,9 @@ fn shouldShowBanner(command: []const u8, argv: []const []const u8) bool {
     for (self_banner_commands) |s| {
         if (std.mem.eql(u8, command, s)) return false;
     }
-    // `ryk explain` owns its DCG-style header; never double-print brand banner.
-    if (std.mem.eql(u8, command, "explain")) return false;
+    // `ryk explain` owns its DCG-style header; `ryk test` is a glanceable
+    // receipt (DENY Decision color only). Never double-print brand banner.
+    if (std.mem.eql(u8, command, "explain") or std.mem.eql(u8, command, "test")) return false;
     if (host_launch.isHostLaunchAlias(command)) return false;
     // `decide` is a frozen machine API by default. Only its explicit human
     // output mode participates in shared presentation, even though JSON/stdin
