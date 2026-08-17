@@ -1810,11 +1810,12 @@ test "proxy tunnel survives mid-stream quiet gap of 5s (CONNECT shares fn tunnel
     const head_len = try readHttpResponse(io, client, &head_buf);
     try std.testing.expect(std.mem.indexOf(u8, head_buf[0..head_len], "200 Connection Established") != null);
 
-    // Read tunnel body until both chunks arrive (or 10s deadline).
+    // Read tunnel body until both chunks arrive. The upstream pause is 5s;
+    // give 20s so a loaded monopath run cannot miss chunk-b on the deadline.
     var body_buf: [64]u8 = undefined;
     var total: usize = 0;
     const started = std.Io.Clock.Timestamp.now(io, .awake);
-    const deadline_ns: i96 = 10 * std.time.ns_per_s;
+    const deadline_ns: i96 = 20 * std.time.ns_per_s;
     while (total < body_buf.len and started.durationFromNow(io).raw.nanoseconds < deadline_ns) {
         if (std.mem.indexOf(u8, body_buf[0..total], "chunk-a") != null and
             std.mem.indexOf(u8, body_buf[0..total], "chunk-b") != null) break;
