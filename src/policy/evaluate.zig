@@ -2,6 +2,7 @@ const std = @import("std");
 
 const core = @import("../core/public.zig");
 const effects = @import("effects/mod.zig");
+const host_runtime_reads = @import("host_runtime_reads.zig");
 const matchers = @import("matchers.zig");
 const schema = @import("schema.zig");
 
@@ -615,6 +616,7 @@ fn evaluateRuleSet(
     if (findMatch(surface, rules.deny, value)) |match| return explicit(allocator, mode, .deny, try std.fmt.allocPrint(allocator, "{s}.deny", .{label}), match.index, match.pattern);
     if (try builtinHardDeny(allocator, surface, value)) |evaluation| return evaluation;
     if (findMatch(surface, rules.allow, value)) |match| return explicit(allocator, mode, .allow, try std.fmt.allocPrint(allocator, "{s}.allow", .{label}), match.index, match.pattern);
+    if (try builtinHostRuntimeReadAllow(allocator, surface, value)) |evaluation| return evaluation;
     if (findMatch(surface, rules.ask, value)) |match| return explicit(allocator, mode, .ask, try std.fmt.allocPrint(allocator, "{s}.ask", .{label}), match.index, match.pattern);
     if (riskHeuristic(surface, value)) |risk| return riskDecision(allocator, mode, risk);
     if (rules.default) |default| {
@@ -623,6 +625,43 @@ fn evaluateRuleSet(
         return defaultDecision(allocator, mode, default, default_label);
     }
     return defaultDecision(allocator, mode, null, "mode default");
+}
+
+/// Host skill trees and home/ancestor AGENTS.md / CLAUDE.md. Explicit deny
+/// still wins. `..` segments never qualify (explain/raw paths are not resolved).
+fn builtinHostRuntimeReadAllow(allocator: std.mem.Allocator, surface: Surface, value: []const u8) !?schema.Evaluation {
+    if (surface != .file_read) return null;
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const kind = try host_runtime_reads.classifyExisting(threaded.io(), allocator, value);
+    const meta: struct { id: []const u8, reason: []const u8, pattern: []const u8 } = switch (kind) {
+        .none => return null,
+        .skill => .{
+            .id = host_runtime_reads.host_skill_read_allow_id,
+            .reason = "built-in allow: host skill tree",
+            .pattern = "host skill tree",
+        },
+        .instruction => .{
+            .id = host_runtime_reads.host_instruction_read_allow_id,
+            .reason = "built-in allow: host instruction file",
+            .pattern = "host instruction file",
+        },
+    };
+
+    const rule_id = try allocator.dupe(u8, meta.id);
+    errdefer allocator.free(rule_id);
+    const explanation = try allocator.dupe(u8, meta.reason);
+    return .{
+        .decision = .{
+            .result = .allow,
+            .rule_id = rule_id,
+            .reason = explanation,
+            .requires_user = false,
+            .ci_may_proceed = true,
+        },
+        .matched_rule = .{ .id = rule_id, .pattern = meta.pattern },
+        .explanation = explanation,
+        .owned_rule_id = rule_id,
+    };
 }
 
 fn builtinHardDeny(allocator: std.mem.Allocator, surface: Surface, value: []const u8) !?schema.Evaluation {
@@ -946,6 +985,133 @@ fn networkDestinationText(allocator: std.mem.Allocator, network_action: core.typ
     }
     if (network_action.port) |port| return std.fmt.allocPrint(allocator, "{s}:{d}", .{ host_for_port, port });
     return allocator.dupe(u8, host);
+}
+
+test "generic-agent allows host skill reads outside workspace" {
+    const load = @import("load.zig");
+    const presets = @import("presets.zig");
+    var policy = try load.parseFromSlice(std.testing.allocator, presets.agentPresetText(.generic_agent), "generic-agent.yaml");
+    defer policy.deinit();
+
+    const home_c = std.c.getenv("HOME") orelse return error.SkipZigTest;
+    const home = std.mem.sliceTo(home_c, 0);
+
+    const allowed_rels = [_][]const u8{
+        ".grok/skills/task-observer/SKILL.md",
+        ".grok/skills/diagnosing-bugs/SKILL.md",
+        ".grok/skills",
+        ".grok/bundled/skills/imagine/SKILL.md",
+        ".grok/installed-plugins/cursor-team-kit-af7a1e23/skills/check-compiler-errors/SKILL.md",
+        ".grok/third-party/hallmark/SKILL.md",
+        ".agents/skills/zig/SKILL.md",
+        ".claude/skills/doctor/SKILL.md",
+        ".claude/plugins/cache/foo/skills/bar/SKILL.md",
+        ".codex/skills/ryk-doctor/SKILL.md",
+        ".cursor/skills-cursor/review/SKILL.md",
+        ".pi/agent/skills/tdd/SKILL.md",
+        ".hermes/skills/wiki/SKILL.md",
+        ".openclaw/skills/handoff/SKILL.md",
+    };
+    for (allowed_rels) |rel| {
+        const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/{s}", .{ home, rel });
+        defer std.testing.allocator.free(path);
+        var result = try fileRead(&policy, path, std.testing.allocator);
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqual(core.decision.DecisionResult.allow, result.decision.result);
+        try std.testing.expectEqualStrings("builtin.files.read.allow[host_skill]", result.matched_rule.?.id);
+    }
+}
+
+test "generic-agent allows home AGENTS.md and CLAUDE.md reads" {
+    const load = @import("load.zig");
+    const presets = @import("presets.zig");
+    var policy = try load.parseFromSlice(std.testing.allocator, presets.agentPresetText(.generic_agent), "generic-agent.yaml");
+    defer policy.deinit();
+
+    const home_c = std.c.getenv("HOME") orelse return error.SkipZigTest;
+    const home = std.mem.sliceTo(home_c, 0);
+
+    const allowed_rels = [_][]const u8{
+        "AGENTS.md",
+        "CLAUDE.md",
+        "CodingProjects/AGENTS.md",
+        ".claude/CLAUDE.md",
+    };
+    for (allowed_rels) |rel| {
+        const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/{s}", .{ home, rel });
+        defer std.testing.allocator.free(path);
+        var result = try fileRead(&policy, path, std.testing.allocator);
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqual(core.decision.DecisionResult.allow, result.decision.result);
+        try std.testing.expectEqualStrings("builtin.files.read.allow[host_instruction]", result.matched_rule.?.id);
+    }
+
+    const ssh_agents = try std.fmt.allocPrint(std.testing.allocator, "{s}/.ssh/AGENTS.md", .{home});
+    defer std.testing.allocator.free(ssh_agents);
+    var blocked = try fileRead(&policy, ssh_agents, std.testing.allocator);
+    defer blocked.deinit(std.testing.allocator);
+    try std.testing.expect(blocked.decision.result != .allow);
+    if (blocked.matched_rule) |rule| {
+        try std.testing.expect(!std.mem.eql(u8, rule.id, "builtin.files.read.allow[host_instruction]"));
+        try std.testing.expect(!std.mem.eql(u8, rule.id, "builtin.files.read.allow[host_skill]"));
+    }
+}
+
+test "host skill read allow does not unlock secrets or grok auth" {
+    const load = @import("load.zig");
+    const presets = @import("presets.zig");
+    var policy = try load.parseFromSlice(std.testing.allocator, presets.agentPresetText(.generic_agent), "generic-agent.yaml");
+    defer policy.deinit();
+
+    const home_c = std.c.getenv("HOME") orelse return error.SkipZigTest;
+    const home = std.mem.sliceTo(home_c, 0);
+
+    const blocked_rels = [_][]const u8{
+        ".grok/auth.json",
+        ".grok/config.toml",
+        ".ssh/id_ed25519",
+        ".grok/skills/../auth.json",
+        ".grok/skills/my-secret/SKILL.md",
+    };
+    for (blocked_rels) |rel| {
+        const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/{s}", .{ home, rel });
+        defer std.testing.allocator.free(path);
+        var result = try fileRead(&policy, path, std.testing.allocator);
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expect(result.decision.result != .allow);
+        if (result.matched_rule) |rule| {
+            try std.testing.expect(!std.mem.eql(u8, rule.id, "builtin.files.read.allow[host_skill]"));
+            try std.testing.expect(!std.mem.eql(u8, rule.id, "builtin.files.read.allow[host_instruction]"));
+        }
+    }
+
+    var passwd = try fileRead(&policy, "/etc/passwd", std.testing.allocator);
+    defer passwd.deinit(std.testing.allocator);
+    try std.testing.expectEqual(core.decision.DecisionResult.deny, passwd.decision.result);
+
+    var workspace = try fileRead(&policy, "./README.md", std.testing.allocator);
+    defer workspace.deinit(std.testing.allocator);
+    try std.testing.expectEqual(core.decision.DecisionResult.allow, workspace.decision.result);
+    try std.testing.expect(std.mem.startsWith(u8, workspace.matched_rule.?.id, "files.read.allow"));
+
+    const skill_write = try std.fmt.allocPrint(std.testing.allocator, "{s}/.grok/skills/task-observer/SKILL.md", .{home});
+    defer std.testing.allocator.free(skill_write);
+    var write_result = try fileWrite(&policy, skill_write, std.testing.allocator);
+    defer write_result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(core.decision.DecisionResult.deny, write_result.decision.result);
+    if (write_result.matched_rule) |rule| {
+        try std.testing.expect(!std.mem.eql(u8, rule.id, "builtin.files.read.allow[host_skill]"));
+        try std.testing.expect(!std.mem.eql(u8, rule.id, "builtin.files.read.allow[host_instruction]"));
+    }
+
+    const skill_env = try std.fmt.allocPrint(std.testing.allocator, "{s}/.grok/skills/x/.env", .{home});
+    defer std.testing.allocator.free(skill_env);
+    var env_result = try fileRead(&policy, skill_env, std.testing.allocator);
+    defer env_result.deinit(std.testing.allocator);
+    try std.testing.expect(env_result.decision.result != .allow);
+    if (env_result.matched_rule) |rule| {
+        try std.testing.expect(!std.mem.eql(u8, rule.id, "builtin.files.read.allow[host_skill]"));
+    }
 }
 
 test "deny priority beats allow for file paths" {

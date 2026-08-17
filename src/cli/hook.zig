@@ -1623,7 +1623,10 @@ fn evaluateHook(
             const explain_target = blk: {
                 if (explain_kind != .file_write and explain_kind != .file_read) break :blk target;
                 const rule_category: []const u8 = if (explain_kind == .file_write) "file.write" else "file.read";
-                break :blk file_policy_path.normalizeFilePolicyPath(io, allocator, workspace_root, target) catch |err| switch (err) {
+                break :blk (if (explain_kind == .file_read)
+                    file_policy_path.normalizeFilePolicyPathForRead(io, allocator, workspace_root, target)
+                else
+                    file_policy_path.normalizeFilePolicyPath(io, allocator, workspace_root, target)) catch |err| switch (err) {
                     error.OutOfMemory => return err,
                     else => return try makeFileNormalizationBlockResponse(
                         allocator,
@@ -2623,7 +2626,10 @@ fn evaluateFilePolicyPreToolUse(
 ) !HookResponse {
     const path = extractFilePath(payload) orelse return error.MissingRequiredField;
     const cat = kind.category();
-    const policy_path = file_policy_path.normalizeFilePolicyPath(io, allocator, workspace_root, path) catch |err| switch (err) {
+    const policy_path = (if (kind == .read)
+        file_policy_path.normalizeFilePolicyPathForRead(io, allocator, workspace_root, path)
+    else
+        file_policy_path.normalizeFilePolicyPath(io, allocator, workspace_root, path)) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return try makeFileNormalizationBlockResponse(allocator, cat, cat, redactions, limitations),
     };
@@ -3601,6 +3607,154 @@ test "hook PreToolUse file_read allows README.md" {
 
     try std.testing.expectEqual(PluginDecision.allow, result.decision);
     try std.testing.expectEqualStrings("file.read", result.category);
+}
+
+test "hook PreToolUse file_read allows Grok host skill path" {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const allocator = gpa_state.allocator();
+
+    const home_c = std.c.getenv("HOME") orelse return error.SkipZigTest;
+    const home = std.mem.sliceTo(home_c, 0);
+    const skill_path = try std.fmt.allocPrint(allocator, "{s}/.grok/skills/task-observer/SKILL.md", .{home});
+    defer allocator.free(skill_path);
+    const payload_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"toolName\":\"Read\",\"toolInput\":{{\"target_file\":\"{s}\"}}}}",
+        .{skill_path},
+    );
+    defer allocator.free(payload_json);
+
+    var policy_obj = try core_api.loadPolicyPreset(allocator, .strict);
+    defer policy_obj.deinit();
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload_json, .{});
+    defer parsed.deinit();
+
+    var result = try evaluateHookForTest(allocator, @ptrCast(@alignCast(policy_obj)), .grok, .PreToolUse, parsed.value, false);
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqual(PluginDecision.allow, result.decision);
+    try std.testing.expectEqualStrings("file.read", result.category);
+    try std.testing.expect(result.rule != null);
+    try std.testing.expectEqualStrings("builtin.files.read.allow[host_skill]", result.rule.?);
+}
+
+test "hook PreToolUse file_read allows Claude host skill path" {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const allocator = gpa_state.allocator();
+
+    const home_c = std.c.getenv("HOME") orelse return error.SkipZigTest;
+    const home = std.mem.sliceTo(home_c, 0);
+    const skill_path = try std.fmt.allocPrint(allocator, "{s}/.claude/skills/doctor/SKILL.md", .{home});
+    defer allocator.free(skill_path);
+    const payload_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"toolName\":\"Read\",\"toolInput\":{{\"target_file\":\"{s}\"}}}}",
+        .{skill_path},
+    );
+    defer allocator.free(payload_json);
+
+    var policy_obj = try core_api.loadPolicyPreset(allocator, .strict);
+    defer policy_obj.deinit();
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload_json, .{});
+    defer parsed.deinit();
+
+    var result = try evaluateHookForTest(allocator, @ptrCast(@alignCast(policy_obj)), .claude, .PreToolUse, parsed.value, false);
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqual(PluginDecision.allow, result.decision);
+    try std.testing.expectEqualStrings("file.read", result.category);
+    try std.testing.expect(result.rule != null);
+    try std.testing.expectEqualStrings("builtin.files.read.allow[host_skill]", result.rule.?);
+}
+
+test "hook PreToolUse file_read allows home AGENTS.md" {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const allocator = gpa_state.allocator();
+
+    const home_c = std.c.getenv("HOME") orelse return error.SkipZigTest;
+    const home = std.mem.sliceTo(home_c, 0);
+    const instruction_path = try std.fmt.allocPrint(allocator, "{s}/AGENTS.md", .{home});
+    defer allocator.free(instruction_path);
+    const payload_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"toolName\":\"Read\",\"toolInput\":{{\"target_file\":\"{s}\"}}}}",
+        .{instruction_path},
+    );
+    defer allocator.free(payload_json);
+
+    var policy_obj = try core_api.loadPolicyPreset(allocator, .strict);
+    defer policy_obj.deinit();
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload_json, .{});
+    defer parsed.deinit();
+
+    var result = try evaluateHookForTest(allocator, @ptrCast(@alignCast(policy_obj)), .grok, .PreToolUse, parsed.value, false);
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqual(PluginDecision.allow, result.decision);
+    try std.testing.expectEqualStrings("file.read", result.category);
+    try std.testing.expect(result.rule != null);
+    try std.testing.expectEqualStrings("builtin.files.read.allow[host_instruction]", result.rule.?);
+}
+
+test "hook PreToolUse file_read allows workspace symlink to host skill" {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const allocator = gpa_state.allocator();
+    const io = std.testing.io;
+
+    const home_c = std.c.getenv("HOME") orelse return error.SkipZigTest;
+    const home = std.mem.sliceTo(home_c, 0);
+    const target = try std.fmt.allocPrint(allocator, "{s}/.grok/skills/task-observer/SKILL.md", .{home});
+    defer allocator.free(target);
+    std.Io.Dir.cwd().access(io, target, .{}) catch return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "workspace/.grok/skills");
+    const root = try tmp.dir.realPathFileAlloc(io, "workspace", allocator);
+    defer allocator.free(root);
+    const alias = try std.fs.path.join(allocator, &.{ root, ".grok/skills/task-observer" });
+    defer allocator.free(alias);
+    std.Io.Dir.cwd().symLink(io, target, alias, .{}) catch |err| switch (err) {
+        error.PermissionDenied => return error.SkipZigTest,
+        else => return err,
+    };
+
+    const payload_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"toolName\":\"Read\",\"toolInput\":{{\"target_file\":\"{s}\"}}}}",
+        .{alias},
+    );
+    defer allocator.free(payload_json);
+
+    var policy_obj = try core_api.loadPolicyPreset(allocator, .strict);
+    defer policy_obj.deinit();
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload_json, .{});
+    defer parsed.deinit();
+
+    var result = try evaluateHookForTestWithOptions(
+        allocator,
+        root,
+        @ptrCast(@alignCast(policy_obj)),
+        .grok,
+        .PreToolUse,
+        parsed.value,
+        false,
+        null,
+    );
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqual(PluginDecision.allow, result.decision);
+    try std.testing.expectEqualStrings("file.read", result.category);
+    try std.testing.expect(result.rule != null);
+    try std.testing.expectEqualStrings("builtin.files.read.allow[host_skill]", result.rule.?);
 }
 
 test "hook PreToolUse Read alias blocks .env via files.read.deny" {
@@ -5896,6 +6050,7 @@ test {
     _ = @import("allow_once.zig");
     // Nested module: Zig 0.16 monopath does not auto-attach transitive import tests.
     _ = grok_deny_reason;
+    _ = file_policy_path;
 }
 
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;

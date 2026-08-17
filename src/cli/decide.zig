@@ -390,7 +390,10 @@ fn evaluateDecision(
 
             const explain_kind: policy.explain.ExplainKind = if (std.mem.eql(u8, operation, "write")) .file_write else .file_read;
             const category_text = if (std.mem.eql(u8, operation, "write")) "file.write" else "file.read";
-            const policy_path = file_policy_path.normalizeFilePolicyPath(io, allocator, workspace_root, path) catch |err| switch (err) {
+            const policy_path = (if (std.mem.eql(u8, operation, "read"))
+                file_policy_path.normalizeFilePolicyPathForRead(io, allocator, workspace_root, path)
+            else
+                file_policy_path.normalizeFilePolicyPath(io, allocator, workspace_root, path)) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => return buildFileNormalizationBlock(allocator, category_text),
             };
