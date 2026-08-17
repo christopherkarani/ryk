@@ -817,6 +817,8 @@ test "help output is grouped, complete, and excludes hidden commands" {
     // from the top-level help (global-options surface).
     try std.testing.expect(std.mem.indexOf(u8, output, "Global options") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "--no-rich") != null);
+    // --json is per-command, not a working `ryk --json <cmd>` prefix.
+    try std.testing.expect(std.mem.indexOf(u8, output, "    --json") == null);
     // Hidden internal command absent
     try std.testing.expect(std.mem.indexOf(u8, output, "shim") == null);
     try std.testing.expectEqualStrings("", stderr_writer.buffered());
