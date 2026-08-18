@@ -74,7 +74,7 @@ Claude only. Informational allow.
 |---|---|---|
 | `allow` | `allow` | Policy allows |
 | `deny` | `block` | Policy denies |
-| `ask` | `allow` on coding hosts (Claude, Codex, OpenCode, Cursor, Pi, Hermes, Grok, OpenClaw); `block` when unattended | Leftover unused policy ask is permit so agents can work. Stage, FM steward ask, and SoftBlock never ride this wire. Explicit deny is unchanged. |
+| leftover unused policy `ask` | `allow` when attended; `block` when unattended | Rewritten on the coding-host enforcement wire. Never emitted as `decision: ask`. Stage, FM steward ask, and SoftBlock never become allow. Explicit deny is unchanged. |
 | `observe` | `context_only` | Log only |
 | `redact` | `warn` | Secrets detected |
 | `stage` | hold (`ask` on Claude `permissionDecision`) or `stage`/`block` on generic hook JSON; never `allow` | Staged write pending review. Unattended/`--ci` hardens to `block`. |
@@ -113,7 +113,7 @@ Most hosts and Claude informational events (`SessionStart`, `UserPromptSubmit`, 
 | Field | Required | Notes |
 |---|---|---|
 | `version` | yes | Always `1` |
-| `decision` | yes | `allow`, `block`, `warn`, `ask`, `context_only`, `error` |
+| `decision` | yes | `allow`, `block`, `warn`, `stage`, `context_only`, `error`. Leftover unused policy ask is rewritten to `allow`/`block` and is not a host-wire `decision`. |
 | `risk` | yes | `low`, `medium`, `high`, `critical`, `unknown` |
 | `category` | yes | `command`, `file`, `prompt`, `tool`, `network`, `mcp`, `unknown` before normalization |
 | `reason` | yes | Machine-readable string |
@@ -149,7 +149,7 @@ Claude Code expects native host JSON so blocks surface as real permission denial
 | ryk hook decision | Claude `permissionDecision` | Notes |
 |---|---|---|
 | `block` / `error` | `deny` | Hard veto |
-| `ask` | `allow` | Residual ask is permit on Claude/Codex so agents can work; `--ci` / unattended → `deny` |
+| leftover unused policy `ask` | `allow` | Rewritten by `ryk hook`. Attended leftover is permit; `--ci` / unattended → `deny`. Never emitted as `decision: ask`. |
 | `allow` / `context_only` | `allow` | Proceed |
 | `warn` | `allow` | Warn is not a hard veto on this surface (documented proceed; not a silent silent-allow of blocked tools) |
 
@@ -218,12 +218,12 @@ This is still **hook-grade** enforcement: strongest boundary remains `ryk claude
 }
 ```
 
-### ask
+### stage
 
 ```json
 {
   "version": 1,
-  "decision": "ask",
+  "decision": "stage",
   "risk": "medium",
   "category": "file.write",
   "reason": "file.staged_review_required",
@@ -287,7 +287,7 @@ For headless runs, ryk should report the CI limitation directly instead of prete
 
 ## Cross-host decision mapping
 
-The living multi-host matrix (residual unused ask is permit on coding hosts including Grok and OpenClaw; unattended leftover ask still denies; prompt-path honesty) lives in:
+The living multi-host matrix (leftover unused policy ask is rewritten by the coding-host enforcement wire; a leaked `ask` is fail-closed deny; prompt-path honesty) lives in:
 
 - `docs/integrations/host-decision-mapping.md`
 - `integrations/common/schemas/host-decision-mapping-v1.json`

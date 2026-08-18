@@ -119,6 +119,7 @@ test {
     _ = daemon.errors;
     _ = shutdown;
     _ = shell_eval;
+    _ = @import("host_wire_rewrite.zig");
     _ = scan_command;
     // Pull hook.zig tests (daemon evaluate → HookResponse, strict refuse, redaction).
     _ = hook;

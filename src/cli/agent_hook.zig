@@ -25,6 +25,7 @@ const core_api = @import("ryk_core").api;
 const policy = @import("ryk_core").policy;
 const hook_client = @import("hook_client.zig");
 const hook_ipc = @import("hook_ipc.zig");
+const host_wire_rewrite = @import("host_wire_rewrite.zig");
 
 const max_payload_len = 256 * 1024;
 
@@ -313,12 +314,18 @@ pub fn evaluatePayloadWithModeOpts(
     );
     defer decision.deinit(allocator);
 
-    switch (decision.decision.result) {
-        .deny, .redact, .stage, .broker => {
-            // Keep host JSON contracts valid; enrich the human-readable reason
-            // string with a short tip when present (no new required fields).
-            // Re-redact the final presentation string so tips cannot leak secrets
-            // even if a future path skips remediation sanitization.
+    const unattended = opts.unattended orelse host_wire_rewrite.unattendedFromEnv(mode == .ci);
+    const wire_policy: host_wire_rewrite.PolicyDecisionForWire = switch (decision.decision.result) {
+        .allow => .allow,
+        .observe => .observe,
+        .ask => .{ .ask = host_wire_rewrite.fromAskOrigin(decision.ask_origin) },
+        .stage => .stage,
+        .deny, .redact, .broker => .deny,
+    };
+    const wire_outcome = host_wire_rewrite.rewrite(wire_policy, unattended);
+    switch (wire_outcome) {
+        .allow, .observe => try writeAllow(stdout, format),
+        .deny, .stage => {
             const combined = if (decision.owned_remediation) |tip| blk: {
                 break :blk try std.fmt.allocPrint(allocator, "{s}. Tip: {s}", .{ decision.owned_reason, tip });
             } else try allocator.dupe(u8, decision.owned_reason);
@@ -327,26 +334,6 @@ pub fn evaluatePayloadWithModeOpts(
             defer allocator.free(reason);
             try writeDeny(stdout, format, reason);
         },
-        .ask => {
-            const unattended = opts.unattended orelse env_util.getenvUnattended() or mode == .ci;
-            const leftover = decision.ask_origin.mayPermitOnCodingHost();
-            if (unattended) {
-                // Unattended / CI hardens leftover ask *and* SoftBlock/FM hold to deny.
-                const reason = try core_api.redactAlloc(allocator, decision.owned_reason);
-                defer allocator.free(reason);
-                try writeDeny(stdout, format, reason);
-            } else if (leftover) {
-                try writeAllow(stdout, format);
-            } else {
-                // SoftBlock / FM: hold on Claude-compatible agent_hook; Cursor
-                // has no ask channel so writeAsk denies.
-                const reason = try core_api.redactAlloc(allocator, decision.owned_reason);
-                defer allocator.free(reason);
-                try writeAsk(stdout, format, reason);
-            }
-        },
-        // observe is intentional warn-allow (proceed while recording risk).
-        .allow, .observe => try writeAllow(stdout, format),
     }
 
     return exit_codes.success;
@@ -812,7 +799,7 @@ test "SoftBlock ask is not permit on agent_hook" {
         .disable_fm = true,
         .unattended = false,
     });
-    try std.testing.expect(std.mem.indexOf(u8, stdout.buffered(), "\"permissionDecision\":\"ask\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout.buffered(), "\"permissionDecision\":\"deny\"") != null);
 }
 
 test "critical deny stays deny even in observe mode" {
@@ -990,7 +977,7 @@ test "agent_hook product path FM ask upgrades soft allow" {
     const out = stdout.buffered();
     try std.testing.expectEqual(@as(u32, 1), fm_state.call_count);
     try std.testing.expect(fm_state.saw_expected_session);
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"permissionDecision\":\"ask\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"permissionDecision\":\"deny\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "curl pipe needs confirmation") != null);
 
     var unattended_state = AgentHookFmFakeState{

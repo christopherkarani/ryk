@@ -12,17 +12,17 @@ On `pre_tool_call`, ryk decisions map to Hermes native directives:
 |---|---|---|
 | `allow` | `None` | Tool proceeds |
 | `block` | `{"action":"block","message":...}` | Hard deny; tool does not run |
-| `ask` | `None` | Residual ask is **permit** so agents can work. Unattended / CI hardens to `block` |
+| `ask` | `{"action":"block",...}` | Unexpected `ask` after `ryk hook` rewrite is fail-closed deny |
 | `warn` | log + `None` | Advisory warning only; tool proceeds (not collapsed to block) |
 | other / malformed | `{"action":"block",...}` | Fail-closed |
 
 Host-facing `message` on block is a **short single line** (reason and/or rule id). Operator tips (`Recourse` / `Next` / `remediation_commands`) are **not** stuffed into the Hermes UI string — use `ryk explain` / stderr from the CLI for those.
 
-There is **no host ask** on `pre_tool_call` today. ryk only hard-stops explicit deny/block. Residual policy `ask` proceeds so coding agents are not stopped for leftover `ask` that is not a deny.
+There is **no host ask** on `pre_tool_call` today. Leftover unused policy ask is rewritten by `ryk hook` (attended → permit, unattended → deny). A leaked `ask` is fail-closed deny. Stage, FM steward ask, and SoftBlock never become allow.
 
 ### CI / noninteractive
 
-When `CI`, `RYK_CI`, `RYK_NONINTERACTIVE`, `RYK_UNATTENDED`, or `RYK_HERMES_UNATTENDED` is set truthily, **or** the install-time `.ryk_unattended` marker is present, leftover unused ryk `ask` is hardened to Hermes `block` (no permit). The live hook also passes `ryk hook hermes … --ci` so leftover unused CLI-side ask hardens inside ryk, not only in the host mapping layer. Stage, FM steward ask, and SoftBlock never become allow. These unattended signals also override `RYK_HERMES_FAIL_OPEN=1`; a missing ryk binary remains blocked.
+When `CI`, `RYK_CI`, `RYK_NONINTERACTIVE`, `RYK_UNATTENDED`, or `RYK_HERMES_UNATTENDED` is set truthily, **or** the install-time `.ryk_unattended` marker is present, the live hook passes `ryk hook hermes … --ci` so leftover unused policy ask hardens inside ryk. The plugin does not remap leftover unused policy ask. Stage, FM steward ask, and SoftBlock never become allow. These unattended signals also override `RYK_HERMES_FAIL_OPEN=1`; a missing ryk binary remains blocked.
 
 ## Failure modes
 

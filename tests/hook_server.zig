@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const hook_serve = @import("ryk").cli.hook_serve;
+const hook = @import("ryk").cli.hook;
 const hook_ipc = @import("ryk").cli.hook_ipc;
 const hook_client = @import("ryk").cli.hook_client;
 const daemon_uds = @import("ryk").cli.daemon_uds;
@@ -672,6 +673,10 @@ test "one server serves evaluate allow" {
 
 test "one server permits leftover unused ask on coding hosts" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    hook.test_unattended_override = false;
+    defer {
+        hook.test_unattended_override = null;
+    }
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);

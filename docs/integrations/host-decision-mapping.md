@@ -12,7 +12,7 @@ ryk decisions are host-agnostic:
 |---|---|
 | `allow` | Proceed |
 | `block` | Hard deny |
-| `ask` | Leftover unused policy ask only. Coding hosts permit that leftover so agents can work. Unattended/CI hardens to deny. Not a host approval UI. Not stage, FM steward ask, or SoftBlock. |
+| `ask` | Policy leftover unused policy ask only. The coding-host enforcement wire rewrites it to allow (attended) or deny (unattended). It is not a host-wire `decision`. Not a host approval UI. Not stage, FM steward ask, or SoftBlock. |
 | `stage` | Hold-for-review or deny. Never allow. Default `write_mode: staged` file writes. Unattended/`--ci` hardens to block. |
 | `warn` | Advisory; do not silently treat as hard deny unless documented |
 | `context_only` | Observe / inject context only |
@@ -23,9 +23,12 @@ Adapters **must not** claim stronger enforcement than the host provides. Passive
 ## CI / unattended rule
 
 Coding hosts (Claude, Codex, OpenCode, Cursor, Pi, Hermes, Grok, OpenClaw)
-permit leftover unused policy `ask` so agents can work. There is no host
-ask UI for that leftover. Stage, FM steward soft→ask, SoftBlock, and
-explicit deny never become allow. ryk still hard-stops explicit deny/block.
+rewrite leftover unused policy `ask` on the coding-host enforcement wire
+(`ryk hook`, Cursor agent_hook, `ryk evaluate`, machine-JSON `ryk decide`).
+Attended leftover is permit; unattended leftover is deny. Plugins do not
+reimplement leftover unused policy ask: a leaked `decision: ask` is
+fail-closed deny. Stage, FM steward soft→ask, SoftBlock, and explicit deny
+never become allow. ryk still hard-stops explicit deny/block.
 
 When unattended (`CI`, `RYK_CI`, `RYK_NONINTERACTIVE`, `RYK_UNATTENDED`, or
 host `--ci`):
@@ -35,24 +38,24 @@ host `--ci`):
 
 ## Tool-path matrix (primary enforcement)
 
-| Host | Event | `allow` | `block` | `ask` | `warn` | Resume? | Notes |
+| Host | Event | `allow` | `block` | leaked `ask` | `warn` | Resume? | Notes |
 |---|---|---|---|---|---|---|---|
-| **Hermes** | `pre_tool_call` | proceed | `action: block` | **allow** (unattended → block) | log + proceed | No | Residual ask is permit. No Hermes approve UI. CI / unattended hardens `ask`→`block`. |
-| **OpenClaw** | `tool.before` | proceed | block | **allow** (unattended → block) | log + allow | **No** | Residual unused ask is permit. Unknown/legacy/metadata registration is unprotected; use the wrapper for the hard boundary. |
-| **OpenCode** | `tool.execute.before` | proceed | throw/block | **allow** (unattended → block) | log + allow | No | Residual ask is permit so agents can work. |
-| **OpenCode** | `command.execute.before` | proceed | throw/block | **allow** (unattended → block) | log + allow | No | Slash/custom commands; payload uses command name as tool. |
-| **OpenCode** | `permission.ask` | allow | deny | **allow** (unattended → deny) | log | No | Residual ask is permit; only hard-deny on `block`. |
-| **Claude Code** | `PreToolUse` / `PermissionRequest` | `permissionDecision: allow` | `permissionDecision: deny` | **allow** (unattended/`--ci` → deny) | proceed as allow | No | Host-shaped stdout JSON via `hookSpecificOutput` (hook grade; exit 0). Residual ask is permit so agents can work. |
-| **Codex** | `PreToolUse` / `PermissionRequest` | allow | deny | **allow** (unattended/`--ci` → deny) | warn | No | Residual ask is permit; unattended wires ask to block. |
-| **Pi** | tool hooks | allow | deny | **allow** (unattended → auto-deny) | warn | No | Residual ask is permit. `RYK_UNATTENDED` / `CI` auto-denies. |
-| **Grok** | `PreToolUse` (Bash / Read) | exit 0 | `{"decision":"deny","reason":…}` + exit 2 | **allow** (unattended → deny JSON + exit 2) | exit 0 | **No** | Residual unused ask is permit. Stage / SoftBlock / FM / explicit deny stay deny JSON + exit 2. **hook** + `ryk grok` **wrapper**. Missing/non-executable `ryk` emits deny JSON + exit 2. See below. |
-| **Cursor** | `beforeShellExecution` (bare `ryk` stdin hook) | `permission: allow` JSON, exit 0 | `permission: deny` JSON, exit 0 | **allow** (unattended → deny) | log + allow | No | Residual ask is permit. Malformed/oversized/unknown payloads: dual-contract deny JSON + exit 2. |
+| **Hermes** | `pre_tool_call` | proceed | `action: block` | fail-closed block | log + proceed | No | Leftover unused policy ask is rewritten by `ryk hook`. A leaked `ask` is deny. No Hermes approve UI. Host extras fold into `--ci`. |
+| **OpenClaw** | `tool.before` | proceed | block | fail-closed block | log + allow | **No** | Leftover unused policy ask is rewritten by `ryk hook`. A leaked `ask` is deny. Unknown/legacy/metadata registration is unprotected; use the wrapper for the hard boundary. |
+| **OpenCode** | `tool.execute.before` | proceed | throw/block | fail-closed deny | log + allow | No | Leftover unused policy ask is rewritten by `ryk hook`. A leaked `ask` is deny. |
+| **OpenCode** | `command.execute.before` | proceed | throw/block | fail-closed deny | log + allow | No | Slash/custom commands; payload uses command name as tool. |
+| **OpenCode** | `permission.ask` | allow | deny | fail-closed deny | log | No | Leftover unused policy ask is rewritten by `ryk hook`. A leaked `ask` is deny. |
+| **Claude Code** | `PreToolUse` / `PermissionRequest` | `permissionDecision: allow` | `permissionDecision: deny` | fail-closed deny | proceed as allow | No | Host-shaped stdout JSON via `hookSpecificOutput` (hook grade; exit 0). Leftover unused policy ask is rewritten by `ryk hook`. |
+| **Codex** | `PreToolUse` / `PermissionRequest` | allow | deny | fail-closed deny | warn | No | Leftover unused policy ask is rewritten by `ryk hook`. Unattended leftover is block. |
+| **Pi** | tool hooks | allow | deny | fail-closed deny | warn | No | Leftover unused policy ask is rewritten by `ryk evaluate` / `ryk decide`. A leaked `ask` is deny. |
+| **Grok** | `PreToolUse` (Bash / Read) | exit 0 | `{"decision":"deny","reason":…}` + exit 2 | fail-closed deny JSON + exit 2 | exit 0 | **No** | Leftover unused policy ask is rewritten by `ryk hook`. Stage / SoftBlock / FM / explicit deny stay deny JSON + exit 2. **hook** + `ryk grok` **wrapper**. Missing/non-executable `ryk` emits deny JSON + exit 2. See below. |
+| **Cursor** | `beforeShellExecution` (bare `ryk` stdin hook) | `permission: allow` JSON, exit 0 | `permission: deny` JSON, exit 0 | fail-closed deny | log + allow | No | Leftover unused policy ask is rewritten by agent_hook. Malformed/oversized/unknown payloads: dual-contract deny JSON + exit 2. |
 
 ### Grok hook fail-closed contract
 
 Official Grok Build treats hook stdout + exit as:
 
-- allow / warn / leftover unused ask → exit 0 (generic hook JSON from `ryk hook grok`)
+- allow / warn / leftover unused policy ask (rewritten to allow) → exit 0 (generic hook JSON from `ryk hook grok`)
 - block / stage / SoftBlock / FM ask / error → `{"decision":"deny","reason":…}` + exit 2 (no resume)
 - unattended / `--ci` leftover `ask` → deny JSON + exit 2
 
@@ -125,7 +128,7 @@ Blocked-actions counters classify by **decision**, not host event-type strings:
 | decision | Counts as blocked/attention? |
 |---|---|
 | `deny` / `block` / `error` | Yes (hard deny or failure) |
-| `ask` | No on coding-host wire for leftover unused policy ask (permitted). Yes if unattended hardens it to deny. Stage / FM / SoftBlock are not this leftover. |
+| leftover unused policy `ask` | No on the coding-host wire when attended (rewritten to allow). Yes when unattended hardens it to deny. A leaked `decision: ask` after rewrite is fail-closed deny. Stage / FM / SoftBlock are not this leftover. |
 | `stage` | Yes (hold or deny; never a permitted leftover ask) |
 | `warn` | **No** (advisory; tool may proceed) |
 | `allow` / `context_only` | No |
