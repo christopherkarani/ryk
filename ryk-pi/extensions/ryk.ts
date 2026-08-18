@@ -1865,10 +1865,10 @@ async function applyToolDecision(
 }
 
 /**
- * Single entry for leftover unused policy ask:
- * - unattended / CI → auto-deny
- * - otherwise leftover unused policy ask is permit so coding agents can work
- * Staged writes, FM steward ask, SoftBlock, and explicit deny never reach here.
+ * Unexpected `ask` after the coding-host enforcement wire rewrite.
+ * Leftover unused policy ask is rewritten by `ryk evaluate` / `ryk decide`
+ * before emit. A leaked `ask` is fail-closed deny.
+ * Staged writes, FM steward ask, SoftBlock, and explicit deny never become allow.
  */
 async function resolvePolicyAsk(
 	reason: string,
@@ -1880,10 +1880,7 @@ async function resolvePolicyAsk(
 	env: NodeJS.ProcessEnv = process.env,
 	_askIpc?: AskIpcContext,
 ): Promise<ToolCallResult> {
-	if (isUnattendedEnv(env)) {
-		return handlePolicyAskAutoDeny(reason, pi, ctx, toolLabel, env);
-	}
-	return undefined;
+	return handlePolicyAskAutoDeny(reason, pi, ctx, toolLabel, env);
 }
 
 function recordOnceBypass(

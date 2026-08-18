@@ -12,6 +12,11 @@ const tui = @import("../tui/render.zig");
 const terminal_text = @import("../tui/terminal_text.zig");
 const suggestions = @import("suggestions.zig");
 const file_policy_path = @import("file_policy_path.zig");
+const host_wire_rewrite = @import("host_wire_rewrite.zig");
+
+/// Test inject. Null → `--ci` OR process unattended keys.
+/// Leftover-allow tests must pin `false` so live `CI` cannot flip them.
+pub var test_unattended_override: ?bool = null;
 
 // Maximum JSON payload size to prevent memory exhaustion from hostile hosts.
 const max_payload_len = 256 * 1024; // 256 KiB
@@ -199,8 +204,12 @@ pub fn decideCommandWithPolicy(
     if (human) {
         try writeDecisionHuman(io, allocator, stdout, loaded.mode().toString(), result);
     } else {
-        // Frozen machine contract: default output remains byte-identical JSON.
-        // On encode failure emit a minimal typed error object (never partial garbage).
+        // Coding-host enforcement wire: leftover unused policy ask from decide
+        // is policy leftover (explicit). Operator TTY above is not this wire.
+        result.decision = applyDecideHostWire(
+            result.decision,
+            test_unattended_override orelse host_wire_rewrite.unattendedFromEnv(ci_mode),
+        );
         writeDecisionJson(stdout, result) catch {
             try writeFailClosedJson(stdout, "encode_failed", "ryk decide: failed to encode decision JSON.");
             return exit_codes.general;
@@ -252,6 +261,27 @@ pub const PluginDecision = enum {
         };
     }
 };
+
+/// Machine-JSON coding-host enforcement wire. Policy `ask` from decide is leftover
+/// unused policy ask (explicit). `warn` / `err` stay adapter-local.
+fn applyDecideHostWire(decision: PluginDecision, unattended: bool) PluginDecision {
+    const origin: ?host_wire_rewrite.AskOrigin = if (decision == .ask) .leftover else null;
+    const for_wire: host_wire_rewrite.PolicyDecisionForWire = switch (decision) {
+        .allow => .allow,
+        .ask => .{ .ask = host_wire_rewrite.fromAskOrigin(origin) },
+        .block => .deny,
+        .warn => return decision,
+        .context_only => .observe,
+        .stage => .stage,
+        .err => return decision,
+    };
+    return switch (host_wire_rewrite.rewrite(for_wire, unattended)) {
+        .allow => .allow,
+        .deny => .block,
+        .observe => .context_only,
+        .stage => .stage,
+    };
+}
 
 const RiskLevel = enum {
     low,
@@ -390,7 +420,10 @@ fn evaluateDecision(
 
             const explain_kind: policy.explain.ExplainKind = if (std.mem.eql(u8, operation, "write")) .file_write else .file_read;
             const category_text = if (std.mem.eql(u8, operation, "write")) "file.write" else "file.read";
-            const policy_path = file_policy_path.normalizeFilePolicyPath(io, allocator, workspace_root, path) catch |err| switch (err) {
+            const policy_path = (if (std.mem.eql(u8, operation, "read"))
+                file_policy_path.normalizeFilePolicyPathForRead(io, allocator, workspace_root, path)
+            else
+                file_policy_path.normalizeFilePolicyPath(io, allocator, workspace_root, path)) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => return buildFileNormalizationBlock(allocator, category_text),
             };
@@ -1096,6 +1129,10 @@ test "decide command pack fence: git branch -D under commands.allow is ask (CI b
         var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
         var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
 
+        test_unattended_override = false;
+        defer {
+            test_unattended_override = null;
+        }
         const code = try decideCommandWithPolicy(
             std.testing.io,
             .command,
@@ -1104,11 +1141,11 @@ test "decide command pack fence: git branch -D under commands.allow is ask (CI b
             &stderr_writer,
             policy_path,
         );
-        try std.testing.expectEqual(exit_codes.ask, code);
+        try std.testing.expectEqual(exit_codes.success, code);
 
         const output = stdout_writer.buffered();
-        try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"ask\"") != null);
-        try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"allow\"") == null);
+        try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"allow\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"ask\"") == null);
         try std.testing.expect(std.mem.indexOf(u8, output, "core.git:branch-force-delete") != null);
     }
 
@@ -1663,9 +1700,9 @@ test "decide tool applies effect-class denials" {
     try std.testing.expect(std.mem.indexOf(u8, reason, "effect") != null);
 }
 
-test "decide non-ci mode returns ask exit code for unknown command" {
+test "decide non-ci leftover unused policy ask is allow" {
     // Coding DCG defaults allow unmatched shell; use an explicit ask-default
-    // policy so this still exercises PluginDecision ask → exit 7.
+    // policy so this still exercises leftover unused policy ask → allow / exit 0.
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{
@@ -1688,6 +1725,10 @@ test "decide non-ci mode returns ask exit code for unknown command" {
     var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
     var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
 
+    test_unattended_override = false;
+    defer {
+        test_unattended_override = null;
+    }
     const code = try decideCommandWithPolicy(
         std.testing.io,
         .command,
@@ -1696,10 +1737,11 @@ test "decide non-ci mode returns ask exit code for unknown command" {
         &stderr_writer,
         policy_path,
     );
-    try std.testing.expectEqual(exit_codes.ask, code);
+    try std.testing.expectEqual(exit_codes.success, code);
 
     const output = stdout_writer.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"ask\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"allow\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"ask\"") == null);
 }
 
 test "decide ci mode turns ask into block" {

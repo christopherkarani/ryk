@@ -1070,7 +1070,7 @@ test("ls tool denies sensitive directory via decide file read", async () => {
 	assert.equal(payload.operation, "read");
 });
 
-test("file-policy residual ask is permit without a prompt", async () => {
+test("file-policy unexpected ask is deny without a prompt", async () => {
 	await withClearedUnattendedEnv(async () => {
 		const { pi, handlers } = makePi();
 		const { spawn } = makeSpawn([
@@ -1091,7 +1091,8 @@ test("file-policy residual ask is permit without a prompt", async () => {
 			"write",
 			{ path: "src/main.ts", content: "x" },
 		);
-		assert.equal(result, undefined);
+		assert.equal(result?.block, true);
+		assert.match(result?.reason ?? "", /auto-denied/i);
 		assert.equal(offered.length, 0);
 	});
 });
@@ -1160,7 +1161,7 @@ test("allowOnceBypassEnabled honors env and strict mode", () => {
 	);
 });
 
-test("strict mode residual ask is permit without a prompt", async () => {
+test("strict mode unexpected ask is deny without a prompt", async () => {
 	await withClearedUnattendedEnv(async () => {
 		const { pi, handlers, commands } = makePi();
 		const { spawn } = makeSpawn([
@@ -1182,12 +1183,13 @@ test("strict mode residual ask is permit without a prompt", async () => {
 			"write",
 			{ path: "src/main.ts", content: "x" },
 		);
-		assert.equal(result, undefined);
+		assert.equal(result?.block, true);
+		assert.match(result?.reason ?? "", /auto-denied/i);
 		assert.equal(offered.length, 0);
 	});
 });
 
-test("residual ask does not open once-bypass UI", async () => {
+test("unexpected ask does not open once-bypass UI", async () => {
 	await withClearedUnattendedEnv(async () => {
 		const { pi, handlers, messages } = makePi();
 		const { spawn } = makeSpawn([
@@ -1209,15 +1211,16 @@ test("residual ask does not open once-bypass UI", async () => {
 			"write",
 			{ path: "src/main.ts", content: "x" },
 		);
-		assert.equal(result, undefined);
-		assert.equal(
+		assert.equal(result?.block, true);
+		assert.match(result?.reason ?? "", /auto-denied/i);
+		assert.ok(
 			messages.find((m) => m.message.customType === "ryk.audit"),
-			undefined,
+			"unexpected ask records auto-deny audit",
 		);
 	});
 });
 
-test("residual ask still permits when transcript auditing is unavailable", async () => {
+test("unexpected ask still denies when transcript auditing is unavailable", async () => {
 	await withClearedUnattendedEnv(async () => {
 		const { pi, handlers, messages } = makePi();
 		delete (pi as { sendMessage?: unknown }).sendMessage;
@@ -1235,7 +1238,8 @@ test("residual ask still permits when transcript auditing is unavailable", async
 			"write",
 			{ path: "src/main.ts", content: "x" },
 		);
-		assert.equal(result, undefined);
+		assert.equal(result?.block, true);
+		assert.match(result?.reason ?? "", /auto-denied/i);
 		assert.equal(messages.length, 0);
 	});
 });
@@ -1336,7 +1340,7 @@ test("askOptionsFor policy includes session grant option", () => {
 	assert.ok(noOnce.includes(SESSION_GRANT_OPTION));
 });
 
-test("policy ask permits noninteractive sessions so agents can work", async () => {
+test("policy unexpected ask denies noninteractive sessions", async () => {
 	await withClearedUnattendedEnv(async () => {
 		const { pi, handlers, messages } = makePi();
 		const { spawn } = makeSpawn([
@@ -1357,11 +1361,12 @@ test("policy ask permits noninteractive sessions so agents can work", async () =
 			"write",
 			{ path: "src/main.ts", content: "x" },
 		);
-		assert.equal(result, undefined);
-		assert.equal(selectCalled, false, "select must not be called for residual ask");
-		assert.equal(
+		assert.equal(result?.block, true);
+		assert.match(result?.reason ?? "", /auto-denied/i);
+		assert.equal(selectCalled, false, "select must not be called for unexpected ask");
+		assert.ok(
 			messages.find((m) => m.message.customType === "ryk.audit"),
-			undefined,
+			"unexpected ask records auto-deny audit",
 		);
 	});
 });
@@ -1398,7 +1403,7 @@ test("policy ask auto-denies when RYK_UNATTENDED is set", async () => {
 	});
 });
 
-test("policy ask permits print mode even when hasUI is true", async () => {
+test("policy unexpected ask denies print mode even when hasUI is true", async () => {
 	await withClearedUnattendedEnv(async () => {
 		const { pi, handlers } = makePi();
 		const { spawn } = makeSpawn([
@@ -1419,12 +1424,13 @@ test("policy ask permits print mode even when hasUI is true", async () => {
 			"write",
 			{ path: "src/main.ts", content: "x" },
 		);
-		assert.equal(result, undefined);
+		assert.equal(result?.block, true);
+		assert.match(result?.reason ?? "", /auto-denied/i);
 		assert.equal(selectCalled, false);
 	});
 });
 
-test("policy ask subagent permits residual ask without parent wait", async () => {
+test("policy ask subagent denies unexpected ask without parent wait", async () => {
 	await withClearedUnattendedEnv(async () => {
 	const previous = process.env.PI_SUBAGENT_PARENT_SESSION;
 	const previousTimeout = process.env.RYK_PI_PARENT_ASK_TIMEOUT_MS;
@@ -1464,7 +1470,8 @@ test("policy ask subagent permits residual ask without parent wait", async () =>
 			"write",
 			{ path: "src/main.ts", content: "x" },
 		);
-		assert.equal(result, undefined);
+		assert.equal(result?.block, true);
+		assert.match(result?.reason ?? "", /auto-denied/i);
 		assert.equal(
 			selectCalled,
 			false,
@@ -1483,7 +1490,7 @@ test("policy ask subagent permits residual ask without parent wait", async () =>
 	});
 });
 
-test("policy ask subagent permits residual ask without parent IPC", async () => {
+test("policy ask subagent denies unexpected ask without parent IPC", async () => {
 	await withClearedUnattendedEnv(async () => {
 	const previous = process.env.PI_SUBAGENT_PARENT_SESSION;
 	const previousTimeout = process.env.RYK_PI_PARENT_ASK_TIMEOUT_MS;
@@ -1532,7 +1539,8 @@ test("policy ask subagent permits residual ask without parent IPC", async () => 
 			"write",
 			{ path: "src/main.ts", content: "x" },
 		);
-		assert.equal(result, undefined, "residual ask is permit");
+		assert.equal(result?.block, true, "unexpected ask is deny");
+		assert.match(result?.reason ?? "", /auto-denied/i);
 	} finally {
 		if (previous === undefined) delete process.env.PI_SUBAGENT_PARENT_SESSION;
 		else process.env.PI_SUBAGENT_PARENT_SESSION = previous;
@@ -1590,7 +1598,8 @@ test("policy ask subagent does not wait for a parent block", async () => {
 			"write",
 			{ path: "src/main.ts", content: "x" },
 		);
-		assert.equal(result, undefined);
+		assert.equal(result?.block, true);
+		assert.match(result?.reason ?? "", /auto-denied/i);
 	} finally {
 		if (previous === undefined) delete process.env.PI_SUBAGENT_PARENT_SESSION;
 		else process.env.PI_SUBAGENT_PARENT_SESSION = previous;
@@ -1721,7 +1730,7 @@ test("parent main session answers pending child ask via select", async () => {
 	}
 });
 
-test("policy ask permits residual ask in interactive parent TUI", async () => {
+test("policy unexpected ask is deny in interactive parent TUI", async () => {
 	await withClearedUnattendedEnv(async () => {
 		const previous = process.env.PI_SUBAGENT_PARENT_SESSION;
 		delete process.env.PI_SUBAGENT_PARENT_SESSION;
@@ -1745,8 +1754,9 @@ test("policy ask permits residual ask in interactive parent TUI", async () => {
 				"write",
 				{ path: "src/main.ts", content: "x" },
 			);
-			assert.equal(result, undefined);
-			assert.equal(selectCalled, false, "residual ask must not prompt");
+			assert.equal(result?.block, true);
+			assert.match(result?.reason ?? "", /auto-denied/i);
+			assert.equal(selectCalled, false, "unexpected ask must not prompt");
 		} finally {
 			if (previous === undefined) delete process.env.PI_SUBAGENT_PARENT_SESSION;
 			else process.env.PI_SUBAGENT_PARENT_SESSION = previous;
@@ -1790,7 +1800,7 @@ test("policy ask auto-deny still blocks when audit is unavailable", async () => 
 	});
 });
 
-test("bash policy ask permits noninteractive sessions", async () => {
+test("bash policy unexpected ask denies noninteractive sessions", async () => {
 	await withClearedUnattendedEnv(async () => {
 		const { pi, handlers } = makePi();
 		const { spawn } = makeSpawn([{ code: 0, stdout: askJson() }]);
@@ -1807,12 +1817,13 @@ test("bash policy ask permits noninteractive sessions", async () => {
 			ctx,
 			"git push --force",
 		);
-		assert.equal(result, undefined);
+		assert.equal(result?.block, true);
+		assert.match(result?.reason ?? "", /auto-denied/i);
 		assert.equal(selectCalled, false);
 	});
 });
 
-test("interactive policy ask permits residual ask without select", async () => {
+test("interactive policy unexpected ask is deny without select", async () => {
 	await withClearedUnattendedEnv(async () => {
 		const previous = process.env.PI_SUBAGENT_PARENT_SESSION;
 		delete process.env.PI_SUBAGENT_PARENT_SESSION;
@@ -1832,7 +1843,8 @@ test("interactive policy ask permits residual ask without select", async () => {
 				"write",
 				{ path: "src/main.ts", content: "x" },
 			);
-			assert.equal(result, undefined);
+			assert.equal(result?.block, true);
+			assert.match(result?.reason ?? "", /auto-denied/i);
 		} finally {
 			if (previous === undefined) delete process.env.PI_SUBAGENT_PARENT_SESSION;
 			else process.env.PI_SUBAGENT_PARENT_SESSION = previous;
@@ -3185,7 +3197,7 @@ test("tool_call survives parent-ask mkdir EPERM", async () => {
 	);
 });
 
-test("subagent residual ask permits when parent-ask FS is EPERM", async () => {
+test("subagent unexpected ask denies when parent-ask FS is EPERM", async () => {
 	await withClearedUnattendedEnv(async () => {
 	const previous = process.env.PI_SUBAGENT_PARENT_SESSION;
 	process.env.PI_SUBAGENT_PARENT_SESSION = "parent-eperm";
@@ -3218,7 +3230,8 @@ test("subagent residual ask permits when parent-ask FS is EPERM", async () => {
 			"write",
 			{ path: "src/main.ts", content: "x" },
 		);
-		assert.equal(result, undefined);
+		assert.equal(result?.block, true);
+		assert.match(result?.reason ?? "", /auto-denied/i);
 	} finally {
 		if (previous === undefined) delete process.env.PI_SUBAGENT_PARENT_SESSION;
 		else process.env.PI_SUBAGENT_PARENT_SESSION = previous;
