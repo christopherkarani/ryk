@@ -1901,7 +1901,7 @@ test "doctor output has no ANSI codes in non-TTY mode" {
     try std.testing.expect(std.mem.indexOf(u8, written, "\x1b[") == null);
 }
 
-test "doctor default renders compact health and capability panels" {
+test "doctor default renders a short linear summary without panels" {
     var stdout_buf: [32768]u8 = undefined;
     var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
     const report = sandbox.backend.detect(.linux);
