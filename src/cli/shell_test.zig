@@ -4,7 +4,6 @@ const shell_engine = @import("../shell_engine/mod.zig");
 const shell_eval = @import("shell_eval.zig");
 const pack_config = @import("pack_config.zig");
 const core = @import("ryk_core").core;
-const reasons = @import("../tui/reasons.zig");
 const explain_render = @import("explain_render.zig");
 const theme = @import("../tui/theme.zig");
 
@@ -101,20 +100,7 @@ pub fn command(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: an
         try stdout.writeAll(json);
         try stdout.writeAll("\n");
     } else {
-        try explain_render.writeDecisionLine(io, stdout, eval.decision);
-        if (eval.decision == .deny) {
-            if (eval.rule_id) |rid| try stdout.print("Rule: {s}\n", .{rid});
-            try stdout.print("Why: {s}\n", .{eval.reason});
-            const alts = try reasons.safeAlternatives(std.heap.smp_allocator, command_text);
-            defer {
-                for (alts) |a| std.heap.smp_allocator.free(a.command);
-                std.heap.smp_allocator.free(alts);
-            }
-            if (alts.len > 0) try stdout.print("Safer: {s}\n", .{alts[0].command});
-            try stdout.print("Next: ryk explain \"{s}\"\n", .{command_text});
-        } else {
-            try stdout.print("Why: {s}\n", .{eval.reason});
-        }
+        try explain_render.writePretty(io, stdout, command_text, eval);
     }
 
     return switch (eval.decision) {
@@ -273,6 +259,9 @@ test "test rm -rf / is deny not an unknown-option error" {
     try std.testing.expect(std.mem.indexOf(u8, out, "rm -rf ./build") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "Always") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "always") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Next: ryk explain") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Next: ryk test") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Next:") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[") == null);
     try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "unknown option") == null);
 }
@@ -301,6 +290,7 @@ test "test human output is a decision panel" {
     try std.testing.expect(std.mem.indexOf(u8, out, "always") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "allowlist") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "Safer:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Next:") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[") == null);
 }
 
@@ -348,7 +338,9 @@ test "shell_test colors DENY Decision only" {
     try std.testing.expect(std.mem.indexOf(u8, out, "Why:") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "Rule:") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "Safer:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "Next:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Next: ryk explain") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Next: ryk test") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Next:") == null);
     try expectCsiOnlyOnDecisionLine(out);
 }
 

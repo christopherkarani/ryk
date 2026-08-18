@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+* `ryk test` and default `ryk explain` DENY no longer ping-pong Next between the other inspect verb. Safer is the one action when a safer command exists.
 * Dashboard feed load redacts historical JSONL user fields and rewrites a token-shaped `session_id` to the path-safe literal `redacted` (not `[REDACTED]`) so Session stays a valid path key.
 * Leftover unused policy ask is rewritten on every coding-host enforcement wire (`ryk hook`, Cursor agent_hook, `ryk evaluate`, machine-JSON `ryk decide`). Attended leftover is permit; unattended leftover is deny. Plugins treat a leaked `decision: ask` as fail-closed deny and no longer remap leftover unused policy ask themselves.
 

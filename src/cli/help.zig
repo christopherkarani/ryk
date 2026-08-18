@@ -305,7 +305,7 @@ pub const commands =
             },
             .additional_completion_flags = &.{ "--verbose", "-v", "--format" },
             .details = &.{
-                "Runs the in-process Zig shell_engine. Default output is decision, why, and one next command. Nothing is executed.",
+                "Runs the in-process Zig shell_engine. Default output is decision, why, and a safer command when one exists. Nothing is executed.",
                 "Use --verbose for the match tree, pipeline steps, and safer-workflow suggestions.",
                 "Use --format json for machine-readable output (regex, span, latency, tips).",
                 "Different from 'ryk policy explain', which explains .ryk/policy.yaml file/network/tool rules.",

@@ -17,7 +17,8 @@ pub fn writeDecisionLine(io: std.Io, writer: anytype, decision: shell_engine.Dec
 }
 
 /// Glanceable human receipt: decision + why. Deny names the rule and a safer
-/// command. Allow stays quiet (no Always / allowlist / Safer chrome).
+/// command (that Safer line is the one action). Allow stays quiet (no Always /
+/// allowlist / Safer / Next chrome). Inspect verbs do not ping-pong Next.
 pub fn writePretty(io: std.Io, writer: anytype, command_text: []const u8, eval: shell_engine.Evaluation) !void {
     try writeDecisionLine(io, writer, eval.decision);
     try writer.print("Why: {s}\n", .{eval.reason});
@@ -29,9 +30,6 @@ pub fn writePretty(io: std.Io, writer: anytype, command_text: []const u8, eval: 
             std.heap.smp_allocator.free(alts);
         }
         if (alts.len > 0) try writer.print("Safer: {s}\n", .{alts[0].command});
-        try writer.writeAll("Next: ryk test \"");
-        try terminal_text.write(writer, command_text, .single_line);
-        try writer.writeAll("\"\n");
     }
 }
 
@@ -261,7 +259,9 @@ test "writePretty is a glanceable decision receipt" {
     try std.testing.expect(std.mem.indexOf(u8, out, "rm -rf ./build") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "Always") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "always") == null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "Next: ryk test \"rm -rf /\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Next: ryk test") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Next: ryk explain") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Next:") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "Pipeline Trace") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "full_evaluation") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "Regex") == null);
@@ -339,8 +339,31 @@ test "writePretty colors DENY Decision only" {
     try std.testing.expect(std.mem.indexOf(u8, out, "Why: destructive") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "Rule: core.filesystem:rm-rf-general") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "Safer:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "Next:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Next: ryk test") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Next: ryk explain") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Next:") == null);
     try expectCsiOnlyOnDecisionLine(out);
+}
+
+test "writePretty deny without safer has no inspect Next" {
+    theme.setTestActive(.{ .capability = .none, .background = .dark });
+    defer theme.setTestActive(null);
+    var buf: [2048]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    const eval = shell_engine.Evaluation{
+        .decision = .deny,
+        .rule_id = "core.git:reset-hard",
+        .severity = .high,
+        .reason = "destructive",
+        .owned = false,
+    };
+    try writePretty(std.testing.io, &w, "git reset --hard", eval);
+    const out = w.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "Decision: DENY") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Safer:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Next: ryk test") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Next: ryk explain") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Next:") == null);
 }
 
 test "writePretty ALLOW stays uncolored" {
