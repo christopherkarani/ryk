@@ -83,6 +83,7 @@ pub const StartFlags = struct {
 
 pub const DaemonHealthStatus = enum {
     compatible,
+    in_process,
     unavailable,
     incompatible,
     degraded,
@@ -90,12 +91,21 @@ pub const DaemonHealthStatus = enum {
     pub fn label(self: DaemonHealthStatus) []const u8 {
         return switch (self) {
             .compatible => "healthy",
+            .in_process => "in-process",
             .unavailable => "unavailable",
             .incompatible => "incompatible",
             .degraded => "degraded",
         };
     }
+
+    /// Companion healthy, or CLI-only in-process Zig shell_engine (no companion required).
+    pub fn evaluationReady(self: DaemonHealthStatus) bool {
+        return self == .compatible or self == .in_process;
+    }
 };
+
+/// Doctor / start copy when command evaluation is the in-process engine.
+pub const in_process_engine_detail = "Command evaluation uses the in-process Zig shell_engine; companion is not required.";
 
 pub const DaemonCheck = struct {
     status: DaemonHealthStatus,
@@ -341,6 +351,7 @@ pub fn deinitHostList(allocator: std.mem.Allocator, hosts: [][]const u8) void {
 pub fn daemonRemediation(status: DaemonHealthStatus) []const u8 {
     return switch (status) {
         .compatible => "Daemon is ready.",
+        .in_process => "Shell evaluation uses the CLI binary (no companion daemon).",
         .unavailable => "Install the ryk background service, then run: ryk doctor",
         .incompatible => "Upgrade ryk and its background service together, then run: ryk doctor",
         .degraded => "Restart the background service: ryk shutdown --daemon && ryk doctor",
@@ -747,6 +758,14 @@ test "onboarding host evidence distinguishes installed chain from native proof" 
     try std.testing.expectEqual(HostEvidence.wrapper_required, classifyHostEvidence(&.{ "codex", "openclaw" }));
     try std.testing.expectEqual(HostEvidence.not_applicable, classifyHostEvidence(&.{"cursor"}));
     try std.testing.expectEqual(HostEvidence.installed_fail_closed, classifyHostEvidence(&.{ "cursor", "codex" }));
+}
+
+test "onboarding in-process engine is evaluation-ready without a companion" {
+    try std.testing.expectEqualStrings("in-process", DaemonHealthStatus.in_process.label());
+    try std.testing.expect(DaemonHealthStatus.in_process.evaluationReady());
+    try std.testing.expect(DaemonHealthStatus.compatible.evaluationReady());
+    try std.testing.expect(!DaemonHealthStatus.unavailable.evaluationReady());
+    try std.testing.expect(std.mem.indexOf(u8, daemonRemediation(.in_process), "no companion daemon") != null);
 }
 
 test "onboarding checkDaemonHealth reports unavailable from mock checker" {

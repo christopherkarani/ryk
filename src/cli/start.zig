@@ -157,9 +157,9 @@ pub fn runStart(
         // CLI-only product: shell mediation is in-process Zig shell_engine.
         // Do not require the removed ryk-daemon binary for start/onboarding.
         daemon_check = .{
-            .status = .compatible,
+            .status = .in_process,
             .detail = "in-process Zig shell_engine",
-            .remediation = "Shell evaluation uses the CLI binary (no companion daemon).",
+            .remediation = onboarding.daemonRemediation(.in_process),
         };
         protection_active = true;
         try tui.render.stepLine(io, stdout, .done, "Command guard", "Zig shell_engine ready (in-process)", 80);
@@ -198,7 +198,7 @@ pub fn runStart(
 
     var verification: ?onboarding.VerificationOutcome = null;
     if (!flags.skip_verify and failures == 0) {
-        if (protection.needsCommandGuard() and daemon_check.status != .compatible) {
+        if (protection.needsCommandGuard() and !daemon_check.status.evaluationReady()) {
             try tui.render.stepLine(io, stdout, .failed, "Verify", "Skipped shell verification because command guard is unavailable", 80);
             failures += 1;
         } else {
@@ -623,8 +623,6 @@ fn writeSuccessEndCard(
     defer allocator.free(policy_path);
     const policy_line = try std.fmt.allocPrint(allocator, "{s}  (preset {s})", .{ policy_path, preset });
     defer allocator.free(policy_line);
-    const daemon_line = try std.fmt.allocPrint(allocator, "{s}", .{daemon_check.status.label()});
-    defer allocator.free(daemon_line);
     const verify_line: []const u8 = if (verification) |v|
         if (!v.passed())
             "failed"
@@ -637,8 +635,13 @@ fn writeSuccessEndCard(
     else
         "skipped";
 
-    const daemon_status_line = try std.fmt.allocPrint(allocator, "Daemon       {s}", .{daemon_line});
-    defer allocator.free(daemon_status_line);
+    // Command-guard evaluation is in-process Zig shell_engine. Do not print
+    // "Daemon healthy" — that reads as a companion service that was never probed.
+    const engine_status_line = if (protection.needsCommandGuard())
+        try allocator.dupe(u8, "Engine       in-process")
+    else
+        try std.fmt.allocPrint(allocator, "Daemon       {s}", .{daemon_check.status.label()});
+    defer allocator.free(engine_status_line);
     const policy_status_line = try std.fmt.allocPrint(allocator, "Policy       {s}", .{policy_line});
     defer allocator.free(policy_status_line);
     // Honesty: name the written YAML posture. Ask stays Ask; deny/strict stays strict.
@@ -651,7 +654,7 @@ fn writeSuccessEndCard(
     defer allocator.free(protection_status_line);
     const verify_status_line = try std.fmt.allocPrint(allocator, "Verify       {s}", .{verify_line});
     defer allocator.free(verify_status_line);
-    try stdout.writeAll(daemon_status_line);
+    try stdout.writeAll(engine_status_line);
     try stdout.writeAll("\n");
     try stdout.writeAll(policy_status_line);
     try stdout.writeAll("\n");
@@ -709,7 +712,7 @@ fn writeSuccessEndCard(
         try stdout.writeAll("\n");
     }
 
-    try stdout.writeAll("Next: ryk doctor\n");
+    try stdout.writeAll("Next: ryk <agent>\n");
 }
 
 fn protectionClaimReady(
@@ -923,7 +926,10 @@ test "start first-run create copy names what happened without leftover jargon" {
     try std.testing.expect(std.mem.indexOf(u8, output, "Policy written. Policy check passed.") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Verify       policy check") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Setup complete") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "Next: ryk doctor") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Engine       in-process") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Daemon       healthy") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Next: ryk <agent>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Reinstall the complete ryk release") == null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Verify passed") == null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Existing policy files are kept") == null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Existing policy is preserved") == null);
@@ -972,7 +978,7 @@ test "start auto mode with mock daemon completes in temp workspace" {
     try std.testing.expect(std.mem.indexOf(u8, output, "Daemon") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Policy") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Hosts") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "Next: ryk doctor") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Next: ryk <agent>") != null);
     // No interactive grade menu on the Safe Launch path.
     try std.testing.expect(std.mem.indexOf(u8, output, "Choose your protection mode") == null);
     try std.testing.expect(std.mem.indexOf(u8, output, "command-guard") == null);
@@ -1408,7 +1414,53 @@ test "start command-guard succeeds without companion daemon" {
     try std.testing.expectEqual(exit_codes.success, code);
     const output = stdout_writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, output, "Zig shell_engine ready") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Engine       in-process") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Daemon       healthy") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Next: ryk <agent>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Reinstall the complete ryk release") == null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Setup incomplete") == null);
+}
+
+test "start command-guard success card is honest about in-process engine" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+
+    const verification = onboarding.VerificationOutcome{
+        .safe_allowed = true,
+        .dangerous_denied = true,
+        .host_evidence = .not_applicable,
+        .detail = "ok",
+    };
+    const daemon_check = onboarding.DaemonCheck{
+        .status = .in_process,
+        .detail = "in-process Zig shell_engine",
+        .remediation = onboarding.daemonRemediation(.in_process),
+    };
+    var output_buffer: [16 * 1024]u8 = undefined;
+    var output: std.Io.Writer = .fixed(&output_buffer);
+    try writeSuccessEndCard(
+        std.testing.io,
+        std.testing.allocator,
+        &output,
+        root,
+        "generic-agent",
+        .command_guard,
+        &.{},
+        &.{},
+        daemon_check,
+        verification,
+        "strict",
+        true,
+    );
+
+    const written = output.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "Engine       in-process") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "Daemon       healthy") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "Next: ryk <agent>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "Reinstall the complete ryk release") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "The ryk companion service was not found.") == null);
 }
 
 test "start cursor-only selection is deferred not incomplete" {
