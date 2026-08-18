@@ -104,7 +104,7 @@ pub const commands =
         },
         .{
             .name = "start",
-            .summary = "Guided setup: policy, hosts, and verification",
+            .summary = "Repair setup or wire optional host integrations",
             .usage = "ryk start [--auto|--yes|--no-interact] [--hosts <list>] [--preset <name>] [--skip-verify]",
             .category = .getting_started,
             .public = true,
@@ -114,15 +114,14 @@ pub const commands =
                 "ryk start --auto --hosts codex,claude",
             },
             .details = &.{
-                "Primary first-run onboarding — the only Safe Launch door.",
-                "Creates a policy if missing (coding DCG defaults via generic-agent: matrix-only strict, no ask main loop).",
+                "Repair an existing install or optionally wire hosts. Curl install already leaves ryk ready.",
+                "Creates a policy if missing.",
                 "Wires detected host integrations and verifies daemon/hook paths when available.",
-                "No protection-grade menu; the banner names the posture from the written policy YAML.",
                 "On interactive terminals, prompts only for host selection when hosts are detected.",
                 "On non-TTY terminals, auto-selects safe defaults (no --auto required).",
                 "Use --auto to force non-interactive mode on a TTY; optional --hosts and --preset.",
                 "Compatibility flags --yes and --no-interact also select non-interactive mode.",
-                "Next steps after start: ryk <agent> · ryk doctor · ryk replay.",
+                "After repair: ryk <agent> · ryk doctor · ryk replay.",
                 "Re-run safely to repair or update an existing setup.",
             },
         },
@@ -892,8 +891,8 @@ pub fn writeWithMode(io: std.Io, writer: anytype, mode: WriteMode) !void {
     try writer.writeAll("\n");
     const Task = struct { label: []const u8, cmd: []const u8 };
     const public_tasks = [_]Task{
-        .{ .label = "Get protected", .cmd = "ryk doctor --fix" },
-        .{ .label = "Guided setup", .cmd = "ryk start" },
+        .{ .label = "Get protected", .cmd = "ryk claude" },
+        .{ .label = "Repair / wire hosts", .cmd = "ryk start" },
         .{ .label = "Always-on setup", .cmd = "ryk agents setup" },
         .{ .label = "Run an agent", .cmd = "ryk claude  (or: codex | pi | opencode | openclaw | hermes | grok)" },
         .{ .label = "Diagnose", .cmd = "ryk doctor" },
@@ -903,8 +902,8 @@ pub fn writeWithMode(io: std.Io, writer: anytype, mode: WriteMode) !void {
         .{ .label = "Stop protection", .cmd = "ryk stop" },
     };
     const all_tasks = [_]Task{
-        .{ .label = "Get protected", .cmd = "ryk doctor --fix" },
-        .{ .label = "Guided setup", .cmd = "ryk start" },
+        .{ .label = "Get protected", .cmd = "ryk claude" },
+        .{ .label = "Repair / wire hosts", .cmd = "ryk start" },
         .{ .label = "Always-on setup", .cmd = "ryk agents setup" },
         .{ .label = "Diagnose", .cmd = "ryk doctor" },
         .{ .label = "Why blocked?", .cmd = "ryk explain \"…\"" },
@@ -1018,19 +1017,13 @@ pub fn writeWithMode(io: std.Io, writer: anytype, mode: WriteMode) !void {
     try writer.writeAll("\n");
     try writer.writeAll("\n");
 
-    // Try-next hint.
+    // Try-next hint: one agent launch. Power features stay on the public
+    // "ryk help --all" disclosure line, not as a second Next.
     try writer.writeAll("  ");
     try tui.theme.paint(io, writer, .muted, "Next:");
     try writer.writeAll(" run ");
-    try tui.theme.paint(io, writer, .text_bright, "ryk start");
-    try writer.writeAll(" to get protected, or ");
-    if (mode == .public) {
-        try tui.theme.paint(io, writer, .text_bright, "ryk help --all");
-        try writer.writeAll(" for the full surface.\n");
-    } else {
-        try tui.theme.paint(io, writer, .text_bright, "ryk help <command>");
-        try writer.writeAll(" for details.\n");
-    }
+    try tui.theme.paint(io, writer, .text_bright, "ryk claude");
+    try writer.writeAll("\n");
 }
 
 fn categoryTitle(cat: Category) []const u8 {
@@ -1666,6 +1659,82 @@ test "hook-serve is hidden and has --help text" {
     var writer: std.Io.Writer = .fixed(&buf);
     try std.testing.expect(try writeCommand(std.testing.io, &writer, "hook-serve"));
     try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "ryk hook-serve") != null);
+}
+
+fn helpLineContaining(text: []const u8, needle: []const u8) ?[]const u8 {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.indexOf(u8, line, needle) != null) return line;
+    }
+    return null;
+}
+
+test "public help Next is a single agent launch" {
+    var buf: [24576]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try write(std.testing.io, &writer);
+    const top = writer.buffered();
+
+    const next = helpLineContaining(top, "Next:") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, next, "ryk claude") != null);
+    try std.testing.expect(std.mem.indexOf(u8, next, "ryk start") == null);
+    try std.testing.expect(std.mem.indexOf(u8, next, " or ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, next, "help --all") == null);
+    // Power features stay on public help as disclosure, not as a second Next.
+    try std.testing.expect(std.mem.indexOf(u8, top, "help --all") != null);
+
+    var all_buf: [32768]u8 = undefined;
+    var all_writer: std.Io.Writer = .fixed(&all_buf);
+    try writeAll(std.testing.io, &all_writer);
+    const all = all_writer.buffered();
+    const all_next = helpLineContaining(all, "Next:") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, all_next, "ryk claude") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all_next, "ryk start") == null);
+    try std.testing.expect(std.mem.indexOf(u8, all_next, " or ") == null);
+}
+
+test "common tasks Get protected is not doctor --fix" {
+    var buf: [24576]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try write(std.testing.io, &writer);
+    const top = writer.buffered();
+
+    const row = helpLineContaining(top, "Get protected") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, row, "ryk doctor --fix") == null);
+    try std.testing.expect(std.mem.indexOf(u8, row, "doctor --fix") == null);
+    try std.testing.expect(std.mem.indexOf(u8, row, "ryk claude") != null);
+    try std.testing.expect(std.mem.indexOf(u8, top, "ryk doctor") != null);
+
+    writer = .fixed(&buf);
+    try writeAll(std.testing.io, &writer);
+    const all = writer.buffered();
+    const all_row = helpLineContaining(all, "Get protected") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, all_row, "doctor --fix") == null);
+    try std.testing.expect(std.mem.indexOf(u8, all_row, "ryk claude") != null);
+}
+
+test "help start has no Ask/DCG or first-run-onboarding jargon" {
+    const info = findCommand("start") orelse return error.TestUnexpectedResult;
+    var details: [4096]u8 = undefined;
+    var details_w: std.Io.Writer = .fixed(&details);
+    for (info.details) |line| {
+        try details_w.writeAll(line);
+        try details_w.writeAll("\n");
+    }
+    const details_text = details_w.buffered();
+
+    var printed_buf: [8192]u8 = undefined;
+    var printed_w: std.Io.Writer = .fixed(&printed_buf);
+    try std.testing.expect(try writeCommand(std.testing.io, &printed_w, "start"));
+    const printed = printed_w.buffered();
+
+    for ([_][]const u8{ details_text, printed }) |text| {
+        try std.testing.expect(std.mem.indexOf(u8, text, "DCG") == null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "Ask posture") == null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "ask main loop") == null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "first-run onboarding") == null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "Repair") != null or std.mem.indexOf(u8, text, "repair") != null);
+    }
 }
 
 fn expectStopFamilyDoesNotAdvertiseCursor(printed: []const u8, verb: []const u8) !void {
