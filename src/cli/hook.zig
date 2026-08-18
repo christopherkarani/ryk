@@ -1647,7 +1647,10 @@ fn evaluateHook(
             const explain_target = blk: {
                 if (explain_kind != .file_write and explain_kind != .file_read) break :blk target;
                 const rule_category: []const u8 = if (explain_kind == .file_write) "file.write" else "file.read";
-                break :blk file_policy_path.normalizeFilePolicyPath(io, allocator, workspace_root, target) catch |err| switch (err) {
+                break :blk (if (explain_kind == .file_read)
+                    file_policy_path.normalizeFilePolicyPathForRead(io, allocator, workspace_root, target)
+                else
+                    file_policy_path.normalizeFilePolicyPath(io, allocator, workspace_root, target)) catch |err| switch (err) {
                     error.OutOfMemory => return err,
                     else => return try makeFileNormalizationBlockResponse(
                         allocator,
@@ -2647,7 +2650,10 @@ fn evaluateFilePolicyPreToolUse(
 ) !HookResponse {
     const path = extractFilePath(payload) orelse return error.MissingRequiredField;
     const cat = kind.category();
-    const policy_path = file_policy_path.normalizeFilePolicyPath(io, allocator, workspace_root, path) catch |err| switch (err) {
+    const policy_path = (if (kind == .read)
+        file_policy_path.normalizeFilePolicyPathForRead(io, allocator, workspace_root, path)
+    else
+        file_policy_path.normalizeFilePolicyPath(io, allocator, workspace_root, path)) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return try makeFileNormalizationBlockResponse(allocator, cat, cat, redactions, limitations),
     };
@@ -3765,15 +3771,36 @@ test "hook PreToolUse file_read allows workspace symlink to host skill" {
     const allocator = gpa_state.allocator();
     const io = std.testing.io;
 
-    const home_c = std.c.getenv("HOME") orelse return error.SkipZigTest;
-    const home = std.mem.sliceTo(home_c, 0);
-    const target = try std.fmt.allocPrint(allocator, "{s}/.grok/skills/task-observer/SKILL.md", .{home});
-    defer allocator.free(target);
-    std.Io.Dir.cwd().access(io, target, .{}) catch return error.SkipZigTest;
-
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "home/.grok/skills/task-observer");
     try tmp.dir.createDirPath(io, "workspace/.grok/skills");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "home/.grok/skills/task-observer/SKILL.md",
+        .data = "# test skill\n",
+    });
+
+    const home = try tmp.dir.realPathFileAlloc(io, "home", allocator);
+    defer allocator.free(home);
+    const target = try std.fmt.allocPrint(allocator, "{s}/.grok/skills/task-observer/SKILL.md", .{home});
+    defer allocator.free(target);
+
+    const prev_home = blk: {
+        if (std.c.getenv("HOME")) |value| break :blk try allocator.dupeZ(u8, std.mem.span(value));
+        break :blk null;
+    };
+    defer if (prev_home) |value| allocator.free(value);
+    const home_z = try allocator.dupeZ(u8, home);
+    defer allocator.free(home_z);
+    try std.testing.expectEqual(@as(c_int, 0), setenv("HOME", home_z, 1));
+    defer {
+        if (prev_home) |value| {
+            _ = setenv("HOME", value, 1);
+        } else {
+            _ = unsetenv("HOME");
+        }
+    }
+
     const root = try tmp.dir.realPathFileAlloc(io, "workspace", allocator);
     defer allocator.free(root);
     const alias = try std.fs.path.join(allocator, &.{ root, ".grok/skills/task-observer" });
