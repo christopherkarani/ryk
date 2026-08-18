@@ -207,9 +207,9 @@ pub const commands =
             },
             .additional_completion_flags = &.{ "--verbose", "-v", "--check", "--json", "--tui", "--fix", "--from-install", "--preset", "--deadlock-check" },
             .details = &.{
-                "Default output is a one-line summary plus recommended next steps (linear; fast glance).",
-                "Includes a Packs section (baseline always-on + opt-in enabled) when the daemon is reachable.",
-                "Use --verbose for the full platform, integration, and capability report.",
+                "Default output is a short linear summary plus one recommended next step.",
+                "Doctor reports host capability only (probe ≠ live session).",
+                "Use --verbose for host integrations, packs, MCP setup, and the full capability report.",
                 "Use --check for automation: exit non-zero when core readiness fails (daemon not compatible, or policy missing/invalid).",
                 "Use --json for a minimal readiness report (ready, state, policy.valid).",
                 "Use --tui for a four-pane deep-dive (Summary · Hosts · Capabilities · Next steps) on an interactive TTY; non-TTY / --json / --plain falls back to linear.",
@@ -1691,6 +1691,22 @@ test "public help Next is a single agent launch" {
     try std.testing.expect(std.mem.indexOf(u8, all_next, "ryk claude") != null);
     try std.testing.expect(std.mem.indexOf(u8, all_next, "ryk start") == null);
     try std.testing.expect(std.mem.indexOf(u8, all_next, " or ") == null);
+}
+
+test "doctor help describes short linear summary plus one next step" {
+    const info = findCommand("doctor") orelse return error.TestUnexpectedResult;
+    var details: [4096]u8 = undefined;
+    var details_w: std.Io.Writer = .fixed(&details);
+    for (info.details) |line| {
+        try details_w.writeAll(line);
+        try details_w.writeAll("\n");
+    }
+    const details_text = details_w.buffered();
+
+    try std.testing.expect(std.mem.indexOf(u8, details_text, "one-line summary") == null);
+    try std.testing.expect(std.mem.indexOf(u8, details_text, "short linear summary") != null);
+    try std.testing.expect(std.mem.indexOf(u8, details_text, "one recommended next step") != null);
+    try std.testing.expect(std.mem.indexOf(u8, details_text, "recommended next steps") == null);
 }
 
 test "common tasks Get protected is not doctor --fix" {

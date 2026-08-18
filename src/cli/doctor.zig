@@ -718,15 +718,11 @@ fn writeReportRaw(io: std.Io, stdout: anytype, os: core.platform.Os, backend_rep
     }
 
     try writeHookServerLine(io, context.allocator, stdout);
+    try writeCapabilityHonestyNote(stdout);
 
     if (!verbose) {
-        try writeDefaultPanels(io, stdout, os, backend_report, context, policy_status, counts);
-        try writeMcpSetupReport(io, stdout, context);
-        try writeHostStatusTable(io, stdout, context);
-        try writePacksSection(io, stdout, context);
         try writeHermesFailOpenWarning(io, stdout, context);
         try writeBrokenEvaluatorWarning(io, stdout, context);
-        try writePiNote(stdout);
         try writePolicyFreshnessNotices(stdout, context);
         try writeRecommendations(stdout, context);
         return;
@@ -877,68 +873,8 @@ fn writeHookServerLine(io: std.Io, allocator: std.mem.Allocator, stdout: anytype
     try stdout.print("hook server: {s}\n  socket: {s}\n\n", .{ status, path });
 }
 
-fn writeDefaultPanels(
-    io: std.Io,
-    stdout: anytype,
-    os: core.platform.Os,
-    backend_report: sandbox.backend.ReportSet,
-    context: IntegrationContext,
-    policy_status: []const u8,
-    counts: anytype,
-) !void {
-    var health_storage: [6][128]u8 = undefined;
-    const health_lines = [_][]const u8{
-        try std.fmt.bufPrint(&health_storage[0], "Platform       {s}", .{os.toString()}),
-        try std.fmt.bufPrint(&health_storage[1], "Policy         {s}", .{policy_status}),
-        if (context.daemon_health == .in_process)
-            try std.fmt.bufPrint(&health_storage[2], "Engine         in-process", .{})
-        else
-            try std.fmt.bufPrint(&health_storage[2], "Daemon         {s}", .{daemonStatusSummary(context.daemon_health)}),
-        try std.fmt.bufPrint(&health_storage[3], "Capabilities   {d} active · {d} limited", .{ counts.active, counts.limited }),
-        try std.fmt.bufPrint(&health_storage[4], "Unavailable    {d}", .{counts.unavailable}),
-        try std.fmt.bufPrint(&health_storage[5], "Secret boundary {s}", .{secretBoundaryCapability(backend_report)}),
-    };
-    try tui.render.panel(io, stdout, "System health", &health_lines);
-    try stdout.writeByte('\n');
-
-    var capability_storage: [doctor_capabilities.len][160]u8 = undefined;
-    var detail_storage: [doctor_capabilities.len][96]u8 = undefined;
-    var capability_lines: [doctor_capabilities.len][]const u8 = undefined;
-    for (doctor_capabilities, 0..) |item, index| {
-        if (item.feature) |feature| {
-            const report = backend_report.get(feature);
-            const display_level = doctorDisplayLevel(feature, report.level);
-            capability_lines[index] = if (featureProbeDetail(backend_report, feature, &detail_storage[index])) |detail|
-                try std.fmt.bufPrint(&capability_storage[index], "{s}  {s}: {s} ({s})", .{
-                    levelColorAndGlyph(display_level).glyph,
-                    item.label,
-                    display_level.toString(),
-                    detail,
-                })
-            else
-                try std.fmt.bufPrint(&capability_storage[index], "{s}  {s}: {s}", .{
-                    levelColorAndGlyph(display_level).glyph,
-                    item.label,
-                    display_level.toString(),
-                });
-        } else if (item.capability) |capability| {
-            const report = core.platform.reportCapability(os, capability);
-            capability_lines[index] = try std.fmt.bufPrint(&capability_storage[index], "{s}  {s}: {s}", .{
-                stateColorAndGlyph(report.state).glyph,
-                item.label,
-                report.state.toString(),
-            });
-        }
-    }
-    try tui.render.panel(io, stdout, "Capabilities", &capability_lines);
-    try stdout.writeAll(
-        \\
-        \\  Note: Doctor = host capability (probe ≠ live session).
-        \\  Session grade = this run's env RYK_SESSION_SANDBOX_GRADE
-        \\  (strong-mediated | fs-attached | wrapper-only | unrestricted-escape).
-        \\  Labels: network route-force, RYK_TOOL_PACK, RYK_PATH_FILTER, control roots (.ryk + .git).
-        \\
-    );
+fn writeCapabilityHonestyNote(stdout: anytype) !void {
+    try stdout.writeAll("Note: Doctor = host capability (probe ≠ live session).\n");
 }
 
 fn writeMcpSetupReport(io: std.Io, stdout: anytype, context: IntegrationContext) !void {
@@ -1307,18 +1243,18 @@ fn companionNeedsRemediation(context: IntegrationContext) bool {
 fn writeRecommendations(stdout: anytype, context: IntegrationContext) !void {
     try stdout.writeAll("\nRecommended next step:\n");
     if (companionNeedsRemediation(context)) {
-        try writeDynamicLine(context.allocator, stdout, "  Daemon health issue: ", context.daemon_detail, "\n");
         if (context.daemon_binary_untrusted) {
             try stdout.writeAll("  Remove the untrusted legacy companion override, then re-run `ryk doctor`.\n");
         } else if (!context.daemon_binary_executable) {
             try stdout.writeAll("  Restore companion-service execute permission or reinstall ryk, then re-run `ryk doctor`.\n");
         } else {
-            try stdout.writeAll("  Reinstall ryk or rebuild with `./scripts/build-all.sh`, then re-run `ryk doctor`.\n");
-        }
-        if (!context.policy_present) {
-            try stdout.writeAll("  Then run `ryk doctor --fix` and review .ryk/policy.yaml.\n");
-        } else if (!context.policy_valid) {
-            try stdout.writeAll("  After the daemon is healthy, fix `.ryk/policy.yaml`, then run `ryk policy check .ryk/policy.yaml`.\n");
+            try writeDynamicLine(
+                context.allocator,
+                stdout,
+                "  Daemon health issue: ",
+                context.daemon_detail,
+                " Rebuild with `./scripts/build-all.sh`, then re-run `ryk doctor`.\n",
+            );
         }
     } else if (!context.policy_present) {
         try stdout.writeAll("  Run `ryk doctor --fix` and review .ryk/policy.yaml.\n");
@@ -1327,12 +1263,7 @@ fn writeRecommendations(stdout: anytype, context: IntegrationContext) !void {
     } else if (context.mcp_manifest_invalid_count > 0) {
         try stdout.writeAll("  Fix invalid MCP manifests with `ryk mcp manifest check <path>`.\n");
     } else if (!context.redteam_fixtures_present) {
-        try stdout.writeAll("  Runtime assets (fixtures, integrations) not found.\n");
-        try stdout.writeAll("  This is common after a fresh packaged install (curl|sh, Homebrew, npm).\n\n");
-        try stdout.writeAll("  Paste these two lines in your current terminal (then re-run `ryk doctor`):\n\n");
-        try stdout.writeAll("      export PATH=\"$HOME/.local/bin:$PATH\"\n");
-        try stdout.writeAll("      export RYK_RESOURCE_ROOT=\"$HOME/.local/share/ryk/current\"\n\n");
-        try stdout.writeAll("  (Use the exact paths printed by your installer if they differ.)\n");
+        try stdout.writeAll("  Export PATH and RYK_RESOURCE_ROOT from the installer receipt, then re-run `ryk doctor`.\n");
     } else {
         try stdout.writeAll("  Run `ryk run -- <command>` or `ryk redteam --ci` for a local smoke test.\n");
     }
@@ -1700,7 +1631,7 @@ test "doctor writeReport includes MCP setup table" {
     var context = try testContext(std.testing.allocator, .{});
     defer context.deinit();
 
-    try writeReport(std.testing.io, &stdout_writer, os, report, context, false);
+    try writeReport(std.testing.io, &stdout_writer, os, report, context, true);
     const written = stdout_writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "MCP policy (.ryk/policy.yaml):") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "Host MCP inventory") != null);
@@ -1980,10 +1911,90 @@ test "doctor default renders compact health and capability panels" {
     try writeReport(std.testing.io, &stdout_writer, .linux, report, context, false);
 
     const written = stdout_writer.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, written, "System health") != null);
-    try std.testing.expect(std.mem.indexOf(u8, written, "Capabilities") != null);
-    try std.testing.expect(std.mem.indexOf(u8, written, "process supervision") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "Summary:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "Doctor = host capability (probe ≠ live session)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "Recommended next step:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "System health") == null);
     try std.testing.expect(std.mem.indexOf(u8, written, "fallback mode:") == null);
+    try std.testing.expect(!doctorLinearHasBoxWalls(written));
+}
+
+fn doctorLinearHasBoxWalls(text: []const u8) bool {
+    if (std.mem.indexOf(u8, text, "+---") != null) return true;
+    if (std.mem.indexOf(u8, text, "+---+") != null) return true;
+    if (std.mem.indexOf(u8, text, "┌") != null) return true;
+    if (std.mem.indexOf(u8, text, "└") != null) return true;
+    if (std.mem.indexOf(u8, text, "├") != null) return true;
+    if (std.mem.indexOf(u8, text, "│") != null) return true;
+    return false;
+}
+
+fn countDoctorNextStepActionLines(text: []const u8) usize {
+    const header = "Recommended next step:\n";
+    const start = std.mem.indexOf(u8, text, header) orelse return 0;
+    var rest = text[start + header.len ..];
+    var count: usize = 0;
+    while (rest.len > 0) {
+        const line_end = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
+        const line = rest[0..line_end];
+        if (line.len == 0) break;
+        if (std.mem.startsWith(u8, line, "  ")) count += 1;
+        if (line_end == rest.len) break;
+        rest = rest[line_end + 1 ..];
+    }
+    return count;
+}
+
+fn countDoctorOutputLines(text: []const u8) usize {
+    if (text.len == 0) return 0;
+    var count: usize = 0;
+    var rest = text;
+    while (rest.len > 0) {
+        const line_end = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
+        if (line_end > 0) count += 1;
+        if (line_end == rest.len) break;
+        rest = rest[line_end + 1 ..];
+    }
+    return count;
+}
+
+test "doctor default linear has no box walls, honesty note, and one next step" {
+    var stdout_buf: [32768]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    const report = sandbox.backend.detect(.linux);
+    var context = try testContext(std.testing.allocator, .{});
+    defer context.deinit();
+
+    try writeReport(std.testing.io, &stdout_writer, .linux, report, context, false);
+    const written = stdout_writer.buffered();
+
+    try std.testing.expect(!doctorLinearHasBoxWalls(written));
+    try std.testing.expect(std.mem.indexOf(u8, written, "Doctor = host capability (probe ≠ live session)") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, written, "Recommended next step:"));
+    try std.testing.expectEqual(@as(usize, 1), countDoctorNextStepActionLines(written));
+    try std.testing.expect(std.mem.indexOf(u8, written, "Reinstall the complete ryk release") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "Then run `ryk doctor --fix`") == null);
+    try std.testing.expect(countDoctorOutputLines(written) < 25);
+}
+
+test "doctor default linear daemon+policy case is one next step not a trio" {
+    var stdout_buf: [32768]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    const report = sandbox.backend.detect(.linux);
+    var context = try testContext(std.testing.allocator, .{
+        .policy_present = false,
+        .daemon_health = .unavailable,
+        .daemon_detail = "no running daemon answered on the expected socket.",
+    });
+    defer context.deinit();
+
+    try writeReport(std.testing.io, &stdout_writer, .linux, report, context, false);
+    const written = stdout_writer.buffered();
+
+    try std.testing.expect(!doctorLinearHasBoxWalls(written));
+    try std.testing.expectEqual(@as(usize, 1), countDoctorNextStepActionLines(written));
+    try std.testing.expect(std.mem.indexOf(u8, written, "Then run `ryk doctor --fix`") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "Reinstall the complete ryk release") == null);
 }
 
 test "doctor sanitizes hostile dynamic diagnostic text" {
@@ -2070,7 +2081,6 @@ test "doctor summary names in-process engine when companion is not required" {
     try writeReport(std.testing.io, &stdout_writer, .linux, report, context, false);
     const written = stdout_writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "engine in-process") != null);
-    try std.testing.expect(std.mem.indexOf(u8, written, "Engine         in-process") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "daemon unavailable") == null);
 }
 
@@ -2142,8 +2152,8 @@ test "doctor recommendations prioritize daemon remediation over missing policy" 
     const written = stdout_writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "Daemon health issue: no running daemon answered on the expected socket.") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "./scripts/build-all.sh") != null);
-    // After daemon remediation, missing policy teaches sole repair door doctor --fix.
-    try std.testing.expect(std.mem.indexOf(u8, written, "ryk doctor --fix") != null);
+    try std.testing.expectEqual(@as(usize, 1), countDoctorNextStepActionLines(written));
+    try std.testing.expect(std.mem.indexOf(u8, written, "Then run `ryk doctor --fix`") == null);
     try std.testing.expect(std.mem.indexOf(u8, written, "ryk init --preset") == null);
 }
 
@@ -2158,7 +2168,7 @@ test "doctor packs section stays known when daemon is unavailable" {
     });
     defer context.deinit();
 
-    try writeReport(std.testing.io, &stdout_writer, .linux, report, context, false);
+    try writeReport(std.testing.io, &stdout_writer, .linux, report, context, true);
     const written = stdout_writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "\nPacks\n") != null);
     // Must not claim unknown solely because daemon is down.
@@ -2199,7 +2209,7 @@ test "doctor host table lists managed hosts and shell gates" {
     var context = try testContext(std.testing.allocator, .{});
     defer context.deinit();
 
-    try writeReport(std.testing.io, &stdout_writer, .linux, report, context, false);
+    try writeReport(std.testing.io, &stdout_writer, .linux, report, context, true);
     const written = stdout_writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "Host integrations") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "codex") != null);
@@ -3177,7 +3187,7 @@ test "MessageMigrate rendered doctor host table teaches doctor --fix not start" 
     var context = try testContext(std.testing.allocator, .{});
     defer context.deinit();
 
-    try writeReport(std.testing.io, &stdout_writer, .linux, report, context, false);
+    try writeReport(std.testing.io, &stdout_writer, .linux, report, context, true);
     const written = stdout_writer.buffered();
 
     try std.testing.expect(std.mem.indexOf(u8, written, "Host integrations") != null);
