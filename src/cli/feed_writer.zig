@@ -525,7 +525,10 @@ fn loadOwnedFeedLine(
     // can collapse high-entropy JSONL to `[REDACTED]` and break parsers.
     var raw_line: std.Io.Writer.Allocating = .init(allocator);
     defer raw_line.deinit();
-    try rust_visibility.writeFeedRecordJson(&raw_line.writer, record);
+    rust_visibility.writeFeedRecordJson(&raw_line.writer, record) catch |err| switch (err) {
+        // AllocatingWriter intentionally erases allocator failures to WriteFailed.
+        error.WriteFailed => return error.OutOfMemory,
+    };
     return .{ .raw = try raw_line.toOwnedSlice(), .record = record };
 }
 
@@ -1149,6 +1152,18 @@ test "feed loader reconstructs parseable JSON raw for high-entropy fields" {
     try std.testing.expect(loaded[0].raw.len > 0);
     try std.testing.expectEqual(@as(u8, '{'), loaded[0].raw[0]);
     try std.testing.expect(std.mem.indexOf(u8, loaded[0].raw, high_entropy) == null);
+}
+
+test "feed loadOwnedFeedLine remaps allocating-writer OOM" {
+    const line =
+        \\{"timestamp":"2026-07-13T00:00:00Z","workspace_root":"/tmp/legacy","event_type":"command_denied","decision":"deny","decision_source":"rust-daemon","event_source":"hook","host":"codex","daemon_status":"healthy","pack_id":"core.shell","severity":"high","reason":"blocked","remediation":null,"target_summary":"shell command (redacted)","session_id":null,"verified":false}
+    ;
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, loadOwnedFeedLineAllocationFailureProbe, .{line});
+}
+
+fn loadOwnedFeedLineAllocationFailureProbe(allocator: std.mem.Allocator, line: []const u8) !void {
+    var loaded = try loadOwnedFeedLine(allocator, line, null);
+    defer loaded.deinit(allocator);
 }
 
 test "feed loader accepts legacy records without rule" {
