@@ -2,7 +2,78 @@
 
 ## [Unreleased]
 
-* **OpenClaw leftover unused policy `ask` is permit.** Attended `ryk hook openclaw` and the OpenClaw plugin rewrite residual unused `ask` to allow. Unattended / `--ci` still hardens leftover `ask` to block. Explicit deny, stage, SoftBlock, and FM steward ask never become allow. Grok leftover unused `ask` is permit on the same wire.
+* Leftover unused policy ask is rewritten on every coding-host enforcement wire (`ryk hook`, Cursor agent_hook, `ryk evaluate`, machine-JSON `ryk decide`). Attended leftover is permit; unattended leftover is deny. Plugins treat a leaked `decision: ask` as fail-closed deny and no longer remap leftover unused policy ask themselves.
+
+## [0.2.20] - 2026-08-16
+
+## What's Changed
+* fix(sandbox): grant grok ~/.grok/config.toml after Seatbelt attach by @christopherkarani in https://github.com/christopherkarani/ryk/pull/195
+* fix(sandbox): grant grok ~/.grok/auth.json after Seatbelt attach by @christopherkarani in https://github.com/christopherkarani/ryk/pull/196
+* fix(hook): document that pi is not a hook host by @christopherkarani in https://github.com/christopherkarani/ryk/pull/200
+* fix(sandbox): pass Claude --help, not leftover -- --help by @christopherkarani in https://github.com/christopherkarani/ryk/pull/202
+* fix(cli): one-click ryk grok reaches agent by @christopherkarani in https://github.com/christopherkarani/ryk/pull/348
+* fix(cli): stop suggesting hook for unknown commands by @christopherkarani in https://github.com/christopherkarani/ryk/pull/350
+* fix(install): drop leftover homework after curl / ryk update by @christopherkarani in https://github.com/christopherkarani/ryk/pull/351
+* fix(cli): drop leftover first-run jargon from ryk start by @christopherkarani in https://github.com/christopherkarani/ryk/pull/358
+* fix(cli): mention grok and pi honestly in plugin --help by @christopherkarani in https://github.com/christopherkarani/ryk/pull/353
+* fix(cli): env --help exits 0 and names eval verbs by @christopherkarani in https://github.com/christopherkarani/ryk/pull/356
+* fix(cli): policy explain with no args prints usage by @christopherkarani in https://github.com/christopherkarani/ryk/pull/355
+* fix(intercept): transfer staging buffers before upsert by @christopherkarani in https://github.com/christopherkarani/ryk/pull/382
+* fix(cli): init --quiet is silent and next is ryk doctor by @christopherkarani in https://github.com/christopherkarani/ryk/pull/352
+* fix(cli): replay --tui on a pipe falls back to linear by @christopherkarani in https://github.com/christopherkarani/ryk/pull/354
+* perf(p0): cold-hook allow-once single-pass, policy mtime cache, lazy packs by @christopherkarani in https://github.com/christopherkarani/ryk/pull/449
+* docs: Wave 2 AI-slop hygiene for changelog, CLI reference, and locale READMEs by @christopherkarani in https://github.com/christopherkarani/ryk/pull/349
+* docs: adversarial triage handoffs + agent kickoff packs for open UX issues by @christopherkarani in https://github.com/christopherkarani/ryk/pull/223
+* fix(mem): P1 ownership leaks and unbounded session growth by @christopherkarani in https://github.com/christopherkarani/ryk/pull/450
+* fix(install): treat a valid ryk binary as overwrite-safe by @christopherkarani in https://github.com/christopherkarani/ryk/pull/357
+* fix(sandbox): grant grok ~/.grok/active_sessions.lock after Seatbelt attach by @christopherkarani in https://github.com/christopherkarani/ryk/pull/222
+* perf(dashboard): single-pass session enrich + retain helper by @christopherkarani in https://github.com/christopherkarani/ryk/pull/452
+* fix(mcp): deinit ParsedMessage once after sampling handle by @christopherkarani in https://github.com/christopherkarani/ryk/pull/454
+* fix(mcp): errdefer addFinding dual-dupe on OOM by @christopherkarani in https://github.com/christopherkarani/ryk/pull/468
+* fix(mcp): errdefer inspectTool name/description dual-dupe by @christopherkarani in https://github.com/christopherkarani/ryk/pull/469
+* chore: scrub AI-slop chat docs and dangling plan cites by @christopherkarani in https://github.com/christopherkarani/ryk/pull/344
+* fix(cli): empty-host start must not say Verify passed by @christopherkarani in https://github.com/christopherkarani/ryk/pull/478
+* fix(mcp): dupe metadata-gate reason before freeing the old one by @christopherkarani in https://github.com/christopherkarani/ryk/pull/467
+* fix(feed): skip global events.jsonl fsync on the hook path (#395) by @christopherkarani in https://github.com/christopherkarani/ryk/pull/464
+* fix(cli): warn when hosts hard-block ask with no resume (#311) by @christopherkarani in https://github.com/christopherkarani/ryk/pull/455
+* fix(shell): skip duplicate pack-scan candidates (#396) by @christopherkarani in https://github.com/christopherkarani/ryk/pull/457
+* fix(feed): parse dashboard JSONL with a typed record (#402) by @christopherkarani in https://github.com/christopherkarani/ryk/pull/458
+* fix(cli): cache pack enablement by config mtime (#392) by @christopherkarani in https://github.com/christopherkarani/ryk/pull/459
+* fix(hook): skip workspace walk on informational Hermes events (#398) by @christopherkarani in https://github.com/christopherkarani/ryk/pull/461
+* fix(shell): cache merged allowlists by file stamp (#391) by @christopherkarani in https://github.com/christopherkarani/ryk/pull/460
+* test(shell): lock P001 single-pass allow-once consume (#404) by @christopherkarani in https://github.com/christopherkarani/ryk/pull/462
+* fix(shell): embed default-pack gzip for hook inflate (#397) by @christopherkarani in https://github.com/christopherkarani/ryk/pull/463
+* fix(audit): fdatasync events.jsonl without dropping durability (#394) by @christopherkarani in https://github.com/christopherkarani/ryk/pull/465
+* fix(cli): doctor --fix rebinds Pi/Grok test-binary hooks by @christopherkarani in https://github.com/christopherkarani/ryk/pull/475
+* fix: fail-closed evaluate on bad policy; wrap missing Grok ryk by @christopherkarani in https://github.com/christopherkarani/ryk/pull/456
+* perf(eval): allow-once one-load + store mtime caches by @christopherkarani in https://github.com/christopherkarani/ryk/pull/477
+* perf(hook): discover stat + informational walk + plugin sticky attest by @christopherkarani in https://github.com/christopherkarani/ryk/pull/476
+* fix(hosts): permit residual ask so coding agents can work by @christopherkarani in https://github.com/christopherkarani/ryk/pull/479
+* test(hosts): isolate residual-ask tests from live CI env by @christopherkarani in https://github.com/christopherkarani/ryk/pull/482
+* fix(hook): errdefer prompt redaction field/reason dupes (#364) by @christopherkarani in https://github.com/christopherkarani/ryk/pull/474
+* fix(mem): close remaining OOM and error-path ownership holes by @christopherkarani in https://github.com/christopherkarani/ryk/pull/481
+* refactor: HookResponse.take after #481 OOM ownership by @christopherkarani in https://github.com/christopherkarani/ryk/pull/485
+* refactor(cli): drop leftover start picker index after #481 by @christopherkarani in https://github.com/christopherkarani/ryk/pull/487
+* fix(cli): remove Codex/Claude plugin dirs on stop (#345) by @christopherkarani in https://github.com/christopherkarani/ryk/pull/486
+* fix(mem): OOM ownership on network deny, license, structural, redteam by @christopherkarani in https://github.com/christopherkarani/ryk/pull/488
+* fix(intercept): staged-entry ownership on delete/write paths by @christopherkarani in https://github.com/christopherkarani/ryk/pull/490
+* fix(hosts): leftover unused ask is permit on Grok and OpenClaw by @christopherkarani in https://github.com/christopherkarani/ryk/pull/489
+* fix(hosts): permit leftover unused ask on Grok and OpenClaw by @christopherkarani in https://github.com/christopherkarani/ryk/pull/491
+* fix(mem): doctor row ownership, tui alts free, gateway audit cap by @christopherkarani in https://github.com/christopherkarani/ryk/pull/497
+* fix(decide): errdefer prompt redaction field/reason dupes (#366) by @christopherkarani in https://github.com/christopherkarani/ryk/pull/473
+* fix(cli): clearer run/history/mcp trust messages by @christopherkarani in https://github.com/christopherkarani/ryk/pull/499
+* fix(intercept): deep-copy provider gateway audit snapshots (#386) by @christopherkarani in https://github.com/christopherkarani/ryk/pull/494
+* fix(cli): Grok doctor health requires the fail-closed wrapper by @christopherkarani in https://github.com/christopherkarani/ryk/pull/484
+* perf(scripts): collapse sibling zig build process re-entries by @christopherkarani in https://github.com/christopherkarani/ryk/pull/483
+* fix(audit): detect Slack/Stripe/HF/GitLab/SAS token shapes (#330) by @christopherkarani in https://github.com/christopherkarani/ryk/pull/470
+* feat(hook): per-user Zig hook-serve for warm multi-host decisions by @christopherkarani in https://github.com/christopherkarani/ryk/pull/480
+
+
+**Full Changelog**: https://github.com/christopherkarani/ryk/compare/v0.2.19...v0.2.20
+
+## [Unreleased]
+
+* **OpenClaw leftover unused policy `ask` is permit.** Attended `ryk hook openclaw` and the OpenClaw plugin rewrite residual unused `ask` to allow. Unattended / `--ci` still hardens leftover `ask` to block. Explicit deny, stage, SoftBlock, and FM steward ask never become allow. Grok leftover unused `ask` is permit on the same wire. The OpenClaw start card now says ask resume is partial (hook-grade), not hard-block.
 
 ## [0.2.19] - 2026-08-16
 
@@ -410,4 +481,3 @@ The product was previously named Orca.
 
 - Prepared Orca production release metadata and artifact contract.
 - Added checksum, release-manifest, SBOM inventory hook, optional signing hook status, install guidance, GitHub release draft, tagging instructions, release checklist, and production-readiness report.
-

@@ -1,4 +1,5 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const core = @import("ryk_core").core;
 const supervisor = core.supervisor;
 const core_api = @import("ryk_core").api;
@@ -16,7 +17,14 @@ const telemetry = @import("../telemetry.zig");
 const file_policy_path = @import("file_policy_path.zig");
 const fm_steward_client = @import("fm_steward_client.zig");
 const grok_deny_reason = @import("grok_deny_reason.zig");
+const hook_client = @import("hook_client.zig");
+const hook_ipc = @import("hook_ipc.zig");
 const env_util = @import("../env_util.zig");
+const host_wire_rewrite = @import("host_wire_rewrite.zig");
+
+/// Test inject. Null → `--ci` OR process unattended keys.
+/// Leftover-allow tests must pin `false` so live `CI` cannot flip them.
+pub var test_unattended_override: ?bool = null;
 
 // Maximum JSON payload size to prevent memory exhaustion from hostile hosts.
 const max_payload_len = 256 * 1024; // 256 KiB
@@ -381,6 +389,149 @@ fn hookCommand(io: std.Io, host: Host, event: Event, original_event_name: []cons
     };
     defer allocator.free(payload_text);
 
+    if (try tryHookServer(io, allocator, host, event, original_event_name, payload_text, ci_mode, hook_probe_mode, stdout, stderr)) |code| {
+        return code;
+    }
+
+    return evaluateFromPayload(io, allocator, host, event, original_event_name, payload_text, ci_mode, null, null, stdout, stderr);
+}
+
+fn tryHookServer(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    host: Host,
+    event: Event,
+    event_name: []const u8,
+    payload_text: []const u8,
+    ci: bool,
+    probe: bool,
+    stdout: anytype,
+    stderr: anytype,
+) !?u8 {
+    if (!hook_client.shouldTry()) return null;
+    const bin = std.process.executablePathAlloc(io, allocator) catch "";
+    defer if (bin.len > 0) allocator.free(bin);
+    const cwd_z = hook_client.resolveClientWorkspace(io, allocator) orelse return null;
+    defer allocator.free(cwd_z);
+
+    var owned = hook_client.tryServe(io, allocator, .{
+        .id = 1,
+        .method = "hook",
+        .bin = bin,
+        .version = build_options.version,
+        .host = @tagName(host),
+        .event = event_name,
+        // Client folds `--ci` with process unattended keys; hook-serve must not getenvUnattended.
+        .ci = hook_client.clientUnattendedCi(ci),
+        .probe = probe,
+        .workspace = cwd_z,
+        .cwd = cwd_z,
+        .payload_json = payload_text,
+    }) catch |err| switch (err) {
+        error.Unavailable => return null,
+        error.BrokenSession, error.OutOfMemory => return try emitPreEvalFailClosed(
+            allocator,
+            host,
+            event,
+            stdout,
+            stderr,
+            "hook",
+            if (err == error.OutOfMemory) "hook server allocation failed" else "hook server session broken",
+            if (err == error.OutOfMemory)
+                "ryk hook: hook server ran out of memory; ryk blocked it."
+            else
+                "ryk hook: hook server session ended before a decision; ryk blocked it.",
+        ),
+    };
+    defer owned.deinit(allocator);
+    try stdout.writeAll(owned.response().stdout);
+    try stderr.writeAll(owned.response().stderr);
+    return owned.response().exit;
+}
+
+pub fn evaluateForServer(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    host_name: []const u8,
+    event_name: []const u8,
+    payload_text: []const u8,
+    ci: bool,
+    probe: bool,
+    workspace_override: ?[]const u8,
+    cached_policy: ?*const core_api.LoadedPolicy,
+) !hook_ipc.HostEmit {
+    const host = Host.parse(host_name) orelse return failClosedEmit(allocator, "unknown host");
+    const event = resolveEvent(host, event_name) orelse return failClosedEmit(allocator, "unknown event");
+
+    const saved_probe = hook_probe_mode;
+    hook_probe_mode = probe;
+    defer hook_probe_mode = saved_probe;
+
+    var stdout_buf: std.Io.Writer.Allocating = .init(allocator);
+    errdefer stdout_buf.deinit();
+    var stderr_buf: std.Io.Writer.Allocating = .init(allocator);
+    errdefer stderr_buf.deinit();
+
+    const code = try evaluateFromPayload(
+        io,
+        allocator,
+        host,
+        event,
+        event_name,
+        payload_text,
+        ci,
+        workspace_override,
+        cached_policy,
+        &stdout_buf.writer,
+        &stderr_buf.writer,
+    );
+    return .{
+        .exit = code,
+        .stdout = try stdout_buf.toOwnedSlice(),
+        .stderr = try stderr_buf.toOwnedSlice(),
+    };
+}
+
+fn failClosedEmit(allocator: std.mem.Allocator, reason: []const u8) !hook_ipc.HostEmit {
+    _ = reason;
+    const stdout = try allocator.dupe(u8, "{\"decision\":\"deny\",\"reason\":\"ryk hook-serve: invalid host or event\"}\n");
+    errdefer allocator.free(stdout);
+    const stderr = try allocator.dupe(u8, "ryk hook-serve: invalid host or event\n");
+    return .{ .exit = 2, .stdout = stdout, .stderr = stderr };
+}
+
+fn resolveEvent(host: Host, event_name: []const u8) ?Event {
+    if (host == .opencode) {
+        if (mapOpenCodeEvent(event_name)) |event| return event;
+        if (isOpenCodeInformationalEvent(event_name)) return .SessionStart;
+        return null;
+    }
+    if (host == .openclaw) {
+        if (mapOpenClawEvent(event_name)) |event| return event;
+        if (isOpenClawInformationalEvent(event_name)) return .SessionStart;
+        return null;
+    }
+    if (host == .hermes) {
+        if (mapHermesEvent(event_name)) |event| return event;
+        if (isHermesInformationalEvent(event_name)) return .SessionStart;
+        return null;
+    }
+    return Event.parse(event_name);
+}
+
+fn evaluateFromPayload(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    host: Host,
+    event: Event,
+    original_event_name: []const u8,
+    payload_text: []const u8,
+    ci_mode: bool,
+    workspace_override: ?[]const u8,
+    cached_policy: ?*const core_api.LoadedPolicy,
+    stdout: anytype,
+    stderr: anytype,
+) !u8 {
     if (payload_text.len == 0) {
         if (shouldFailClosedOnPreEval(host, event)) {
             return try emitPreEvalFailClosed(
@@ -539,10 +690,11 @@ fn hookCommand(io: std.Io, host: Host, event: Event, original_event_name: []cons
     const needs_policy = eventNeedsPolicy(event);
     const fail_closed_pre_eval = shouldFailClosedOnPreEval(host, event);
     const needs_workspace = hookNeedsWorkspaceRoot(host, event, request_event);
+    const start_dir = workspace_override orelse ".";
     const root = if (needs_workspace)
-        supervisor.resolveWorkspaceRoot(io, allocator, null, ".") catch try allocator.dupe(u8, ".")
+        supervisor.resolveWorkspaceRoot(io, allocator, null, start_dir) catch try allocator.dupe(u8, start_dir)
     else
-        try allocator.dupe(u8, ".");
+        try allocator.dupe(u8, start_dir);
     defer allocator.free(root);
 
     if (host == .hermes and isHermesInformationalEvent(request_event)) {
@@ -563,19 +715,21 @@ fn hookCommand(io: std.Io, host: Host, event: Event, original_event_name: []cons
         if (fail_closed_pre_eval) {
             // Codex informational events used to fail-closed on discover failure.
             // Do not turn a broken workspace policy into allow.
-            var loaded = core_api.discoverPolicy(io, allocator, null, root) catch {
-                return try emitPreEvalFailClosed(
-                    allocator,
-                    host,
-                    event,
-                    stdout,
-                    stderr,
-                    "hook",
-                    "policy load failed",
-                    "ryk hook: failed to load policy; ryk blocked it before evaluation.",
-                );
-            };
-            loaded.deinit();
+            if (cached_policy == null) {
+                var loaded = core_api.discoverPolicy(io, allocator, null, root) catch {
+                    return try emitPreEvalFailClosed(
+                        allocator,
+                        host,
+                        event,
+                        stdout,
+                        stderr,
+                        "hook",
+                        "policy load failed",
+                        "ryk hook: failed to load policy; ryk blocked it before evaluation.",
+                    );
+                };
+                loaded.deinit();
+            }
         }
         var redactions: std.ArrayList(RedactionEntry) = .empty;
         var limitations: std.ArrayList([]const u8) = .empty;
@@ -600,27 +754,31 @@ fn hookCommand(io: std.Io, host: Host, event: Event, original_event_name: []cons
         return hookExitCode(host, result.decision, ci_mode);
     }
 
-    // Load policy
-    var loaded = core_api.discoverPolicy(io, allocator, null, root) catch |err| {
-        if (shouldFailClosedOnPreEval(host, event)) {
-            return try emitPreEvalFailClosed(
-                allocator,
-                host,
-                event,
-                stdout,
-                stderr,
-                "hook",
-                "policy load failed",
-                "ryk hook: failed to load policy; ryk blocked it before evaluation.",
-            );
-        }
-        try stderr.print("ryk hook: failed to load policy: {s}\n", .{@errorName(err)});
-        return exit_codes.general;
+    // Load policy. A server cache hit skips rediscovery; do not deinit cached policy.
+    var discovered: ?core_api.LoadedPolicy = null;
+    defer if (discovered) |*item| item.deinit();
+    const loaded_ptr: *const core_api.LoadedPolicy = cached_policy orelse blk: {
+        discovered = core_api.discoverPolicy(io, allocator, null, root) catch |err| {
+            if (shouldFailClosedOnPreEval(host, event)) {
+                return try emitPreEvalFailClosed(
+                    allocator,
+                    host,
+                    event,
+                    stdout,
+                    stderr,
+                    "hook",
+                    "policy load failed",
+                    "ryk hook: failed to load policy; ryk blocked it before evaluation.",
+                );
+            }
+            try stderr.print("ryk hook: failed to load policy: {s}\n", .{@errorName(err)});
+            return exit_codes.general;
+        };
+        break :blk &(discovered.?);
     };
-    defer loaded.deinit();
 
     // Evaluate via host adapter
-    var result = evaluateHook(io, allocator, root, @tagName(host), loaded.innerPtr(), host, event, hook_payload, ci_mode, null) catch |err| {
+    var result = evaluateHook(io, allocator, root, @tagName(host), loaded_ptr.innerPtr(), host, event, hook_payload, ci_mode, null) catch |err| {
         if (shouldFailClosedOnPreEval(host, event)) {
             return try emitPreEvalFailClosed(
                 allocator,
@@ -638,19 +796,13 @@ fn hookCommand(io: std.Io, host: Host, event: Event, original_event_name: []cons
     };
     defer result.deinit(allocator);
 
-    // Leftover unused policy ask is permit on attended coding hosts. Stage,
-    // SoftBlock, and FM steward ask never become allow. Unattended / --ci
-    // still hardens leftover ask (and hold outcomes) to block.
-    const unattended = ci_mode or env_util.getenvUnattended();
-    if (result.decision == .stage and unattended) {
-        result.decision = .block;
-    } else if (result.ask_origin.mayPermitOnCodingHost()) {
-        result.decision = wireCodingHostAsk(result.decision, unattended);
-    } else if (result.decision == .ask) {
-        // SoftBlock / FM: OpenCode and Hermes treat leftover ask as proceed,
-        // so the hook wire denies instead of emitting ask.
-        result.decision = .block;
-    }
+    // Host-wire rewrite: leftover unused policy ask, never-permit ask,
+    // missing origin, unattended stage. Emit adapters only format.
+    result.decision = applyHostWireRewrite(
+        result.decision,
+        result.ask_origin,
+        test_unattended_override orelse host_wire_rewrite.unattendedFromEnv(ci_mode),
+    );
 
     telemetry.recordEnforcement(
         "hook",
@@ -658,7 +810,7 @@ fn hookCommand(io: std.Io, host: Host, event: Event, original_event_name: []cons
         result.decision.toString(),
         @tagName(result.risk),
         result.category,
-        loaded.mode().toString(),
+        loaded_ptr.mode().toString(),
     );
     telemetry.recordSession(
         @tagName(host),
@@ -808,20 +960,31 @@ fn isCodexDenyOutput(host: Host, decision: PluginDecision) bool {
     return host == .codex and decision == .block;
 }
 
-/// Wire leftover unused policy `ask` only. `.stage`, `.block`, and `.allow`
-/// are unchanged. Unattended / CI: leftover ask → block. Attended hook hosts
-/// (every `Host` value) permit leftover unused ask so agents can work.
-/// Stage, SoftBlock, and FM steward ask never enter this helper.
-fn wireCodingHostAsk(decision: PluginDecision, unattended: bool) PluginDecision {
-    if (decision != .ask) return decision;
-    return if (unattended) .block else .allow;
+/// Map hook plugin vocab through the host-wire rewrite.
+/// `warn` / `err` stay adapter-local (not a policy decision on this seam).
+fn applyHostWireRewrite(decision: PluginDecision, origin: ?shell_eval.AskOrigin, unattended: bool) PluginDecision {
+    const for_wire: host_wire_rewrite.PolicyDecisionForWire = switch (decision) {
+        .allow => .allow,
+        .ask => .{ .ask = host_wire_rewrite.fromAskOrigin(origin) },
+        .block => .deny,
+        .warn => return decision,
+        .context_only => .observe,
+        .stage => .stage,
+        .err => return decision,
+    };
+    return switch (host_wire_rewrite.rewrite(for_wire, unattended)) {
+        .allow => .allow,
+        .deny => .block,
+        .observe => .context_only,
+        .stage => .stage,
+    };
 }
 
 fn usesExitTwoDenyOutput(host: Host, decision: PluginDecision) bool {
     if (host == .codex) return decision == .block;
-    // Grok has no native approval UI for an `ask`/`stage` result. Its only
-    // enforceable non-allow contract is exit 2, so escalation and evaluator
-    // errors must block just like an explicit deny.
+    // Leftover unused ask is remapped to `.allow` before emit. A leaked
+    // `.ask`, plus stage / evaluator error, still has no Grok approval UI —
+    // the only enforceable non-allow contract is exit 2.
     if (host == .grok) {
         // Leftover unused ask is remapped to allow before emit. A raw `.ask`
         // here is the fail-closed residual (must not reach attended leftover-ask).
@@ -1115,7 +1278,8 @@ const HookResponse = struct {
     suggestions: [][]const u8 = &.{},
     remediation_commands: [][]const u8 = &.{},
     /// SoftBlock / FM ask must not ride the leftover-unused-ask permit wire.
-    ask_origin: shell_eval.AskOrigin = .leftover,
+    /// Null is missing origin (never-permit).
+    ask_origin: ?shell_eval.AskOrigin = null,
 
     fn deinit(self: *HookResponse, allocator: std.mem.Allocator) void {
         allocator.free(self.reason);
@@ -1142,7 +1306,7 @@ const HookResponse = struct {
             reason: []const u8,
             rule: ?[]const u8 = null,
             message: []const u8,
-            ask_origin: shell_eval.AskOrigin = .leftover,
+            ask_origin: ?shell_eval.AskOrigin = null,
         },
         redactions: *std.ArrayList(RedactionEntry),
         limitations: *std.ArrayList([]const u8),
@@ -1165,7 +1329,13 @@ const HookResponse = struct {
             .message = message,
             .redactions = lists.redactions,
             .host_limitations = lists.host_limitations,
-            .ask_origin = fields.ask_origin,
+            // Policy ask with no tagged origin is leftover unused policy ask.
+            // SoftBlock / FM must set origin at the producer. Missing origin
+            // is never-permit only when the caller passes ask + null after tagging.
+            .ask_origin = if (fields.decision == .ask)
+                fields.ask_origin orelse .leftover
+            else
+                fields.ask_origin,
         };
     }
 };
@@ -1941,7 +2111,7 @@ fn buildAgentVisibleDaemonDeny(
     message: []const u8,
     suggestions: [][]const u8,
     remediation_commands: [][]const u8,
-    ask_origin: shell_eval.AskOrigin = .leftover,
+    ask_origin: ?shell_eval.AskOrigin = null,
 } {
     if (daemon.responseStringField(result, "matched_text_preview")) |_| {
         try appendOwnedRedaction(
@@ -1968,7 +2138,7 @@ fn buildAgentVisibleDaemonDeny(
             shell_risk,
             cmd,
             permit,
-            shell_eval.getSessionStickyStore(),
+            shell_eval.getSessionStickyStoreFor(fm_opts.session_id),
             null,
         );
         // CI hardens ask/warn → block before FM (same order as decisionFromDaemonResultWithPolicy).
@@ -2298,7 +2468,7 @@ fn hookResponseFromDaemonEvaluate(
                     .low,
                     cmd,
                     permit,
-                    shell_eval.getSessionStickyStore(),
+                    shell_eval.getSessionStickyStoreFor(fm_opts.session_id),
                     null,
                 );
                 if (policy_out.decision == .block) {
@@ -2334,7 +2504,7 @@ fn hookResponseFromDaemonEvaluate(
             var after_fm: shell_eval.ShellWithPolicyDecision = .{
                 .decision = shell_plugin,
                 .reason = null,
-                .ask_origin = if (shell_plugin == .ask) .soft_block else .leftover,
+                .ask_origin = if (shell_plugin == .ask) .soft_block else null,
             };
             if (shell_command) |cmd| {
                 after_fm = try shell_eval.applyFmSoftSeatbelt(
@@ -3234,7 +3404,7 @@ test "hook recognizes Grok as a PreToolUse host with exit-two deny semantics" {
     try std.testing.expectEqual(Host.grok, Host.parse("grok").?);
     try std.testing.expect(shouldFailClosedOnPreEval(.grok, .PreToolUse));
     try std.testing.expectEqual(codex_deny_exit_code, hookExitCode(.grok, .block, false));
-    // Raw leftover `.ask` must not reach emit: wireCodingHostAsk remaps it first.
+    // Raw leftover `.ask` must not reach emit: applyHostWireRewrite remaps it first.
     try std.testing.expectEqual(codex_deny_exit_code, hookExitCode(.grok, .ask, false));
     try std.testing.expectEqual(codex_deny_exit_code, hookExitCode(.grok, .err, false));
     try std.testing.expectEqual(exit_codes.success, hookExitCode(.grok, .allow, false));
@@ -6403,19 +6573,21 @@ test "hook Claude maps residual ask to permissionDecision allow never deny" {
 }
 
 test "coding hosts permit residual ask unless unattended" {
-    try std.testing.expectEqual(PluginDecision.allow, wireCodingHostAsk(.ask, false));
-    try std.testing.expectEqual(PluginDecision.block, wireCodingHostAsk(.ask, true));
-    try std.testing.expectEqual(PluginDecision.block, wireCodingHostAsk(.block, false));
-    try std.testing.expectEqual(PluginDecision.allow, wireCodingHostAsk(.allow, true));
+    try std.testing.expectEqual(PluginDecision.allow, applyHostWireRewrite(.ask, .leftover, false));
+    try std.testing.expectEqual(PluginDecision.block, applyHostWireRewrite(.ask, .leftover, true));
+    try std.testing.expectEqual(PluginDecision.block, applyHostWireRewrite(.block, null, false));
+    try std.testing.expectEqual(PluginDecision.allow, applyHostWireRewrite(.allow, null, true));
+    try std.testing.expectEqual(PluginDecision.block, applyHostWireRewrite(.ask, null, false));
 }
 
-test "fromDecisionResult stage plus wireCodingHostAsk is not allow" {
+test "fromDecisionResult stage plus host-wire rewrite is not allow" {
     const staged = PluginDecision.fromDecisionResult(.stage, false);
     try std.testing.expectEqual(PluginDecision.stage, staged);
-    try std.testing.expect(wireCodingHostAsk(staged, false) != .allow);
-    try std.testing.expectEqual(PluginDecision.stage, wireCodingHostAsk(staged, false));
+    try std.testing.expect(applyHostWireRewrite(staged, null, false) != .allow);
+    try std.testing.expectEqual(PluginDecision.stage, applyHostWireRewrite(staged, null, false));
     try std.testing.expectEqual(PluginDecision.block, PluginDecision.fromDecisionResult(.stage, true));
-    try std.testing.expectEqual(PluginDecision.block, wireCodingHostAsk(.block, false));
+    try std.testing.expectEqual(PluginDecision.block, applyHostWireRewrite(.stage, null, true));
+    try std.testing.expectEqual(PluginDecision.block, applyHostWireRewrite(.block, null, false));
     try std.testing.expectEqualStrings("ask", claudePermissionDecisionString(.stage));
     try std.testing.expect(!std.mem.eql(u8, claudePermissionDecisionString(.stage), "allow"));
 }
@@ -6429,13 +6601,13 @@ test "unattended env lookup hardens coding-host residual ask" {
         }
     };
     const from_ci = env_util.unattendedFromLookup(Lookup{ .key = "CI", .value = "1" });
-    try std.testing.expectEqual(PluginDecision.block, wireCodingHostAsk(.ask, from_ci));
+    try std.testing.expectEqual(PluginDecision.block, applyHostWireRewrite(.ask, .leftover, from_ci));
     const attended = env_util.unattendedFromLookup(Lookup{ .key = "CI", .value = "0" });
-    try std.testing.expectEqual(PluginDecision.allow, wireCodingHostAsk(.ask, attended));
+    try std.testing.expectEqual(PluginDecision.allow, applyHostWireRewrite(.ask, .leftover, attended));
 }
 
 test "hook emit after wire rewrite is allow for attended Hermes" {
-    const wired = wireCodingHostAsk(.ask, false);
+    const wired = applyHostWireRewrite(.ask, .leftover, false);
     try std.testing.expectEqual(PluginDecision.allow, wired);
     const result = HookResponse{
         .decision = wired,
@@ -6456,12 +6628,15 @@ test "hook emit after wire rewrite is allow for attended Hermes" {
 }
 
 test "hook emit after wire rewrite is allow for attended Grok and OpenClaw" {
-    const attended = wireCodingHostAsk(.ask, false);
+    const attended = applyHostWireRewrite(.ask, .leftover, false);
     try std.testing.expectEqual(PluginDecision.allow, attended);
     try std.testing.expectEqual(exit_codes.success, hookExitCode(.grok, attended, false));
     try std.testing.expectEqual(exit_codes.success, hookExitCode(.openclaw, attended, false));
     try std.testing.expect(agentEmitShape(.grok, .PreToolUse, attended) != .grok_deny_json);
     try std.testing.expectEqual(AgentEmitShape.generic_json, agentEmitShape(.openclaw, .PreToolUse, attended));
+    // Leaked raw `.ask` still fail-closes on the Grok emit helper.
+    try std.testing.expectEqual(codex_deny_exit_code, hookExitCode(.grok, .ask, false));
+    try std.testing.expectEqual(AgentEmitShape.grok_deny_json, agentEmitShape(.grok, .PreToolUse, .ask));
 
     const oc_result = HookResponse{
         .decision = attended,
@@ -6481,7 +6656,7 @@ test "hook emit after wire rewrite is allow for attended Grok and OpenClaw" {
     try std.testing.expect(std.mem.indexOf(u8, oc_json, "\"decision\": \"ask\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, oc_json, "\"decision\": \"block\"") == null);
 
-    const ci = wireCodingHostAsk(.ask, true);
+    const ci = applyHostWireRewrite(.ask, .leftover, true);
     try std.testing.expectEqual(PluginDecision.block, ci);
     try std.testing.expectEqual(codex_deny_exit_code, hookExitCode(.grok, ci, true));
     try std.testing.expectEqual(AgentEmitShape.grok_deny_json, agentEmitShape(.grok, .PreToolUse, ci));
@@ -6490,7 +6665,7 @@ test "hook emit after wire rewrite is allow for attended Grok and OpenClaw" {
 
 test "hook emit after wire does not allow staged writes" {
     const staged = PluginDecision.fromDecisionResult(.stage, false);
-    const wired_claude = wireCodingHostAsk(staged, false);
+    const wired_claude = applyHostWireRewrite(staged, null, false);
     try std.testing.expect(wired_claude != .allow);
     try std.testing.expectEqualStrings("ask", claudePermissionDecisionString(wired_claude));
 
@@ -6509,7 +6684,7 @@ test "hook emit after wire does not allow staged writes" {
     try std.testing.expect(std.mem.indexOf(u8, claude_json, "\"permissionDecision\":\"allow\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, claude_json, "\"permissionDecision\":\"ask\"") != null);
 
-    const wired_hermes = wireCodingHostAsk(staged, false);
+    const wired_hermes = applyHostWireRewrite(staged, null, false);
     try std.testing.expect(wired_hermes != .allow);
     const hermes_result = HookResponse{
         .decision = wired_hermes,

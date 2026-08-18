@@ -377,24 +377,23 @@ describe('parseHookResponse (fail-closed blocking path)', () => {
     assert.strictEqual(r.reason, 'ryk_missing_decision');
   });
 
-  it('ask decision on blocking path is leftover-ask permit', () => {
+  it('ask decision on blocking path is unexpected-ask deny', () => {
     const r = parseHookResponse(
       JSON.stringify({ decision: 'ask', reason: 'needs_approval' }),
       true
     );
-    assert.strictEqual(r.decision, 'allow');
-    assert.strictEqual(r.reason, 'needs_approval');
+    assert.strictEqual(r.decision, 'block');
+    assert.strictEqual(r.reason, 'ryk_unexpected_ask');
   });
 
-  it('ask decision is leftover-ask permit and keeps rule provenance', () => {
+  it('ask decision is unexpected-ask deny and does not permit leftover unused policy ask', () => {
     const r = parseHookResponse(
       JSON.stringify({ decision: 'ask', reason: 'needs_approval', rule: 'policy.rule' }),
       true,
       {}
     );
-    assert.strictEqual(r.decision, 'allow');
-    assert.strictEqual(r.rule, 'policy.rule');
-    assert.strictEqual(r.reason, 'needs_approval');
+    assert.strictEqual(r.decision, 'block');
+    assert.strictEqual(r.reason, 'ryk_unexpected_ask');
   });
 
   it('ask decision blocks immediately in unattended mode', () => {
@@ -405,6 +404,15 @@ describe('parseHookResponse (fail-closed blocking path)', () => {
     );
     assert.strictEqual(r.decision, 'block');
     assert.strictEqual(r.reason, 'ryk_unattended_ask');
+  });
+
+  it('stage decision is never leftover-ask permit', () => {
+    const r = parseHookResponse(
+      JSON.stringify({ decision: 'stage', reason: 'staged_write' }),
+      true
+    );
+    assert.strictEqual(r.decision, 'block');
+    assert.strictEqual(r.reason, 'ryk_unrecognized_decision');
   });
 
   it('unrecognized decision on blocking path → block', () => {

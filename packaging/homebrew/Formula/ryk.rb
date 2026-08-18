@@ -11,18 +11,18 @@
 class Ryk < Formula
   desc "Local runtime firewall for AI agents"
   homepage "https://github.com/christopherkarani/ryk"
-  version "0.2.19"
+  version "0.2.20"
   license "Apache-2.0"
 
   on_macos do
     if Hardware::CPU.arm?
       url "https://github.com/christopherkarani/ryk/releases/download/v#{version}/ryk-v#{version}-darwin-arm64.tar.gz"
       # ryk:sha256:darwin-arm64
-      sha256 "7673b6c3e76b268f2ebf0e98194685827be5d5b173280cffe90d505be48985ee"
+      sha256 "e15a37ebde00c95000dcd6a4c8e673874e098e0ae01d8ac933e80db866cdc28e"
     else
       url "https://github.com/christopherkarani/ryk/releases/download/v#{version}/ryk-v#{version}-darwin-amd64.tar.gz"
       # ryk:sha256:darwin-amd64
-      sha256 "b9c671a0a51ee163b00b52655ef17b0fe9eb3938cb6efaff19a6d51fdcc5327d"
+      sha256 "1f1bcfaad1ec0b2e4827affcd74bd20821b196b653ba0731dd53121e0c5a8ca7"
     end
   end
 
@@ -30,11 +30,11 @@ class Ryk < Formula
     if Hardware::CPU.arm?
       url "https://github.com/christopherkarani/ryk/releases/download/v#{version}/ryk-v#{version}-linux-arm64.tar.gz"
       # ryk:sha256:linux-arm64
-      sha256 "f640e01c524eb74570c296e77fd49c2cb892c65fb7288294a328aa19a2259ed6"
+      sha256 "7e31ae8e55dd42ee1e384500264c6bbfbba7b2ec33c99aa1e9180e31501dfb9a"
     else
       url "https://github.com/christopherkarani/ryk/releases/download/v#{version}/ryk-v#{version}-linux-amd64.tar.gz"
       # ryk:sha256:linux-amd64
-      sha256 "37509e24228e161d21070056e7509e8ff836aa016f44d165543fe606299bba47"
+      sha256 "e1c272d1d95956fd42e0b72a92649dfa36bcfbd202b73c748ac5fb68c410631b"
     end
   end
 

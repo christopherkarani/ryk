@@ -788,15 +788,6 @@ fn writeDoctorPlain(io: std.Io, allocator: std.mem.Allocator, stdout: anytype, r
     try stdout.writeAll("\n");
 }
 
-fn hostBinaryDetected(report: PluginDoctorReport, host_name: []const u8) bool {
-    if (std.mem.eql(u8, host_name, "codex")) return report.host_binaries.codex;
-    if (std.mem.eql(u8, host_name, "claude")) return report.host_binaries.claude;
-    if (std.mem.eql(u8, host_name, "opencode")) return report.host_binaries.opencode;
-    if (std.mem.eql(u8, host_name, "openclaw")) return report.host_binaries.openclaw;
-    if (std.mem.eql(u8, host_name, "hermes")) return report.host_binaries.hermes;
-    return false;
-}
-
 fn smokeForPluginDoctor(
     allocator: std.mem.Allocator,
     report: PluginDoctorReport,
@@ -851,7 +842,7 @@ fn writeUnifiedHostStatusTable(
 
     for (row_hosts.items, 0..) |host_name, i| {
         const installed = hostPluginInstalledFromReport(host_name, report);
-        const detected = hostBinaryDetected(report, host_name);
+        const detected = hostBinaryDetectedFromReport(host_name, report);
         const wired: []const u8 = if (installed) "yes" else if (detected) "no" else "—";
         const smoke = smokeForPluginDoctor(allocator, report, host_name, target);
         const allow_s = try allocator.dupe(u8, smoke.allow.toString());
@@ -2101,6 +2092,17 @@ pub fn hostPluginInstalledFromReport(host_name: []const u8, report: PluginDoctor
     if (std.mem.eql(u8, host_name, "claude")) {
         return report.marketplace.claude_user_plugin and report.marketplace.claude_marketplace;
     }
+    return false;
+}
+
+/// PATH presence from the plugin-report snapshot (one walk at collect time).
+/// Unknown hosts (pi, grok, anything else) are not in HostBinaryStatus → false.
+pub fn hostBinaryDetectedFromReport(host_name: []const u8, report: PluginDoctorReport) bool {
+    if (std.mem.eql(u8, host_name, "codex")) return report.host_binaries.codex;
+    if (std.mem.eql(u8, host_name, "claude")) return report.host_binaries.claude;
+    if (std.mem.eql(u8, host_name, "opencode")) return report.host_binaries.opencode;
+    if (std.mem.eql(u8, host_name, "openclaw")) return report.host_binaries.openclaw;
+    if (std.mem.eql(u8, host_name, "hermes")) return report.host_binaries.hermes;
     return false;
 }
 
@@ -3478,6 +3480,84 @@ test "hostPluginInstalledFromReport hermes requires name: ryk not config substri
     var parsed_ok = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json_ok, .{});
     defer parsed_ok.deinit();
     try std.testing.expect(hostPluginInstalledFromDoctorJson("hermes", parsed_ok.value));
+}
+
+fn testReportHostBinaries(bins: HostBinaryStatus) PluginDoctorReport {
+    return .{
+        .ryk_version = "test",
+        .ryk_binary_path = null,
+        .cwd = @constCast(""),
+        .workspace_root = "",
+        .policy_present = false,
+        .policy_valid = false,
+        .policy_error = null,
+        .audit_replay_available = false,
+        .mcp_support_status = "",
+        .plugin_directories = .{ .codex = false, .claude = false, .opencode = false, .openclaw = false, .hermes = false, .common = false },
+        .host_binaries = bins,
+        .opencode_paths = .{ .project_plugin_exists = false, .global_plugin_exists = false, .config_references_plugin = false },
+        .openclaw_paths = .{
+            .host_plugin_installed = false,
+            .plugin_manifest_exists = false,
+            .package_json_exists = false,
+            .source_exists = false,
+            .detection_note = "",
+        },
+        .hermes_paths = .{
+            .repo_manifest_exists = false,
+            .repo_source_exists = false,
+            .repo_mapping_exists = false,
+            .user_manifest_exists = false,
+            .user_source_exists = false,
+            .user_mapping_exists = false,
+            .config_references_plugin = false,
+            .user_manifest_name_is_ryk = false,
+        },
+        .hermes_hook_smoke_passed = false,
+        .marketplace = .{
+            .codex_marketplace = false,
+            .claude_marketplace = false,
+            .codex_plugin_manifest = false,
+            .claude_plugin_manifest = false,
+            .codex_user_plugin = false,
+            .claude_user_plugin = false,
+        },
+        .platform_summary = "",
+        .warnings = &.{},
+    };
+}
+
+test "hostBinaryDetectedFromReport reads snapshot for each known host and unknown host" {
+    const mixed = testReportHostBinaries(.{
+        .codex = true,
+        .claude = false,
+        .opencode = true,
+        .openclaw = false,
+        .hermes = true,
+    });
+    try std.testing.expect(hostBinaryDetectedFromReport("codex", mixed));
+    try std.testing.expect(!hostBinaryDetectedFromReport("claude", mixed));
+    try std.testing.expect(hostBinaryDetectedFromReport("opencode", mixed));
+    try std.testing.expect(!hostBinaryDetectedFromReport("openclaw", mixed));
+    try std.testing.expect(hostBinaryDetectedFromReport("hermes", mixed));
+    try std.testing.expect(!hostBinaryDetectedFromReport("pi", mixed));
+    try std.testing.expect(!hostBinaryDetectedFromReport("grok", mixed));
+    try std.testing.expect(!hostBinaryDetectedFromReport("unknown", mixed));
+
+    const all_on = testReportHostBinaries(.{
+        .codex = true,
+        .claude = true,
+        .opencode = true,
+        .openclaw = true,
+        .hermes = true,
+    });
+    try std.testing.expect(hostBinaryDetectedFromReport("codex", all_on));
+    try std.testing.expect(hostBinaryDetectedFromReport("claude", all_on));
+    try std.testing.expect(hostBinaryDetectedFromReport("opencode", all_on));
+    try std.testing.expect(hostBinaryDetectedFromReport("openclaw", all_on));
+    try std.testing.expect(hostBinaryDetectedFromReport("hermes", all_on));
+    try std.testing.expect(!hostBinaryDetectedFromReport("pi", all_on));
+    try std.testing.expect(!hostBinaryDetectedFromReport("", all_on));
 }
 
 test "classifyHostInstallOutcome enable failure stays failed when installed_after false" {

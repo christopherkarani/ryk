@@ -95,7 +95,9 @@ fn countCEnviron() usize {
 }
 
 fn createProcessEnvMap(allocator: std.mem.Allocator) !std.process.Environ.Map {
-    return try std.process.Environ.createMap(processEnviron(), allocator);
+    var env_map = try std.process.Environ.createMap(processEnviron(), allocator);
+    try env_map.put("RYK_HOOK_SERVER", "0");
+    return env_map;
 }
 
 fn isolatedHomePath(allocator: std.mem.Allocator, label: []const u8) ![]const u8 {
@@ -163,6 +165,9 @@ fn runRykIn(
     cwd: ?[]const u8,
 ) !HookRunResult {
     const io = std.testing.io;
+    var owned_env = if (env_map == null) try createProcessEnvMap(allocator) else null;
+    defer if (owned_env) |*map| map.deinit();
+    const env_ptr: ?*const std.process.Environ.Map = if (env_map) |map| map else if (owned_env) |*map| map else null;
     var child = if (cwd) |cwd_path|
         try std.process.spawn(io, .{
             .argv = args,
@@ -170,7 +175,7 @@ fn runRykIn(
             .stdin = .pipe,
             .stdout = .pipe,
             .stderr = .pipe,
-            .environ_map = env_map,
+            .environ_map = env_ptr,
         })
     else
         try std.process.spawn(io, .{
@@ -178,7 +183,7 @@ fn runRykIn(
             .stdin = .pipe,
             .stdout = .pipe,
             .stderr = .pipe,
-            .environ_map = env_map,
+            .environ_map = env_ptr,
         });
 
     if (child.stdin) |stdin| {

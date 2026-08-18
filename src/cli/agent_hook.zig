@@ -23,6 +23,9 @@ const fm_steward_client = @import("fm_steward_client.zig");
 const telemetry = @import("../telemetry.zig");
 const core_api = @import("ryk_core").api;
 const policy = @import("ryk_core").policy;
+const hook_client = @import("hook_client.zig");
+const hook_ipc = @import("hook_ipc.zig");
+const host_wire_rewrite = @import("host_wire_rewrite.zig");
 
 const max_payload_len = 256 * 1024;
 
@@ -80,7 +83,68 @@ pub fn commandWithEvaluator(
     };
     defer allocator.free(payload);
 
+    if (try tryHookServer(io, allocator, payload, stdout)) |code| {
+        return code;
+    }
+
     return evaluatePayload(allocator, payload, stdout, evaluator);
+}
+
+fn tryHookServer(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    payload: []const u8,
+    stdout: anytype,
+) !?u8 {
+    if (!hook_client.shouldTry()) return null;
+    const bin = std.process.executablePathAlloc(io, allocator) catch "";
+    defer if (bin.len > 0) allocator.free(bin);
+    const cwd_z = hook_client.resolveClientWorkspace(io, allocator) orelse return null;
+    defer allocator.free(cwd_z);
+
+    var owned = hook_client.tryServe(io, allocator, .{
+        .id = 1,
+        .method = "hook",
+        .bin = bin,
+        .version = build_options.version,
+        .host = "cursor",
+        .event = "beforeShellExecution",
+        // Client folds mode=ci with process unattended keys; hook-serve must not getenvUnattended.
+        .ci = hook_client.clientUnattendedCi(resolveModeFromEnv() == .ci),
+        .workspace = cwd_z,
+        .cwd = cwd_z,
+        .payload_json = payload,
+    }) catch |err| switch (err) {
+        error.Unavailable => return null,
+        error.BrokenSession, error.OutOfMemory => {
+            try writeFailClosedDeny(stdout, if (err == error.OutOfMemory)
+                "ryk: hook server ran out of memory; denied fail-closed"
+            else
+                "ryk: hook server session ended before a decision; denied fail-closed");
+            return fail_closed_deny_exit_code;
+        },
+    };
+    defer owned.deinit(allocator);
+    try stdout.writeAll(owned.response().stdout);
+    return owned.response().exit;
+}
+
+pub fn evaluateForServer(allocator: std.mem.Allocator, payload: []const u8, raise_ci: bool) !hook_ipc.HostEmit {
+    var stdout_buf: std.Io.Writer.Allocating = .init(allocator);
+    errdefer stdout_buf.deinit();
+    // Floor stays strict so a prewarm cannot freeze soft RYK_MODE. `raise_ci`
+    // is the client's raise-only bit (in-process RYK_MODE=ci).
+    const code = try evaluatePayloadWithMode(allocator, payload, &stdout_buf.writer, null, servedCursorMode(raise_ci));
+    return .{
+        .exit = code,
+        .stdout = try stdout_buf.toOwnedSlice(),
+        .stderr = try allocator.dupe(u8, ""),
+    };
+}
+
+/// Served Cursor ignores process RYK_MODE / RYK_ALLOW_MODE_SOFTEN.
+fn servedCursorMode(raise_ci: bool) policy.schema.Mode {
+    return if (raise_ci) moreRestrictiveMode(.strict, .ci) else .strict;
 }
 
 /// Soft modes (observe / ask / yolo / trusted) that can weaken pack hits.
@@ -226,11 +290,12 @@ pub fn evaluatePayloadWithModeOpts(
     // Live agent-hook sets disable_fm (no fm-steward spawn). Tests may inject
     // `fm_client` on evaluatePayloadWithModeOpts to exercise the seatbelt.
     // Bare agent-hook has no policy YAML, so permit is empty (matrix + sticky
-    // only); sticky is process-session store.
-    // Leftover unused policy ask is permit on Cursor / Claude-compatible
+    // only); sticky is keyed by host session id.
+    // Leftover unused policy ask is allow on attended Cursor / Claude-compatible
     // agent_hook so coding agents can work. SoftBlock, FM steward ask, and
     // staged writes never become allow. Unattended / mode=.ci hardens leftover
-    // ask → deny.
+    // ask → deny. Cursor has no ask UI: leftover unused ask is remapped to
+    // allow before emit; SoftBlock/FM still deny on Cursor and agent_hook.
     const decision = try shell_eval.decisionFromDaemonResultWithPolicy(
         allocator,
         daemon_response.value.result,
@@ -238,7 +303,7 @@ pub fn evaluatePayloadWithModeOpts(
         .{
             .command = owned_command,
             .permit = .{},
-            .sticky = shell_eval.getSessionStickyStore(),
+            .sticky = shell_eval.getSessionStickyStoreFor(opts.session_id),
             .effect_class = null,
             .disable_fm = opts.disable_fm,
             .fm_client = opts.fm_client,
@@ -249,12 +314,18 @@ pub fn evaluatePayloadWithModeOpts(
     );
     defer decision.deinit(allocator);
 
-    switch (decision.decision.result) {
-        .deny, .redact, .stage, .broker => {
-            // Keep host JSON contracts valid; enrich the human-readable reason
-            // string with a short tip when present (no new required fields).
-            // Re-redact the final presentation string so tips cannot leak secrets
-            // even if a future path skips remediation sanitization.
+    const unattended = opts.unattended orelse host_wire_rewrite.unattendedFromEnv(mode == .ci);
+    const wire_policy: host_wire_rewrite.PolicyDecisionForWire = switch (decision.decision.result) {
+        .allow => .allow,
+        .observe => .observe,
+        .ask => .{ .ask = host_wire_rewrite.fromAskOrigin(decision.ask_origin) },
+        .stage => .stage,
+        .deny, .redact, .broker => .deny,
+    };
+    const wire_outcome = host_wire_rewrite.rewrite(wire_policy, unattended);
+    switch (wire_outcome) {
+        .allow, .observe => try writeAllow(stdout, format),
+        .deny, .stage => {
             const combined = if (decision.owned_remediation) |tip| blk: {
                 break :blk try std.fmt.allocPrint(allocator, "{s}. Tip: {s}", .{ decision.owned_reason, tip });
             } else try allocator.dupe(u8, decision.owned_reason);
@@ -263,26 +334,6 @@ pub fn evaluatePayloadWithModeOpts(
             defer allocator.free(reason);
             try writeDeny(stdout, format, reason);
         },
-        .ask => {
-            const unattended = opts.unattended orelse env_util.getenvUnattended() or mode == .ci;
-            const leftover = decision.ask_origin.mayPermitOnCodingHost();
-            if (unattended) {
-                // Unattended / CI hardens leftover ask *and* SoftBlock/FM hold to deny.
-                const reason = try core_api.redactAlloc(allocator, decision.owned_reason);
-                defer allocator.free(reason);
-                try writeDeny(stdout, format, reason);
-            } else if (leftover) {
-                try writeAllow(stdout, format);
-            } else {
-                // SoftBlock / FM: hold on Claude-compatible agent_hook; Cursor
-                // has no ask channel so writeAsk denies.
-                const reason = try core_api.redactAlloc(allocator, decision.owned_reason);
-                defer allocator.free(reason);
-                try writeAsk(stdout, format, reason);
-            }
-        },
-        // observe is intentional warn-allow (proceed while recording risk).
-        .allow, .observe => try writeAllow(stdout, format),
     }
 
     return exit_codes.success;
@@ -380,15 +431,6 @@ fn writeAllow(stdout: anytype, format: InputFormat) !void {
         .cursor_shell => try stdout.writeAll(
             \\{"permission":"allow","continue":true,"userMessage":"","agentMessage":"","user_message":"","agent_message":""}
         ),
-    }
-}
-
-fn writeAsk(stdout: anytype, format: InputFormat, reason: []const u8) !void {
-    switch (format) {
-        // Claude-compatible PreToolUse supports permissionDecision "ask".
-        .agent_hook => try writeAgentPermission(stdout, "ask", reason),
-        // Cursor beforeShellExecution has no ask; deny so approval is not skipped.
-        .cursor_shell => try writeCursorDenial(stdout, reason),
     }
 }
 
@@ -748,7 +790,7 @@ test "SoftBlock ask is not permit on agent_hook" {
         .disable_fm = true,
         .unattended = false,
     });
-    try std.testing.expect(std.mem.indexOf(u8, stdout.buffered(), "\"permissionDecision\":\"ask\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout.buffered(), "\"permissionDecision\":\"deny\"") != null);
 }
 
 test "critical deny stays deny even in observe mode" {
@@ -762,6 +804,14 @@ test "critical deny stays deny even in observe mode" {
 
 test "agent hook mode version is wired into build metadata" {
     try std.testing.expect(build_options.version.len > 0);
+}
+
+test "agent hook served Cursor pins strict and ignores process-env soften" {
+    try std.testing.expectEqual(policy.schema.Mode.strict, servedCursorMode(false));
+    try std.testing.expectEqual(policy.schema.Mode.ci, servedCursorMode(true));
+    try std.testing.expect(isSoftMode(.observe));
+    try std.testing.expect(isSoftMode(.ask));
+    try std.testing.expect(hook_client.serveErrorIsFailClosed(error.OutOfMemory));
 }
 
 test "resolveModeFromEnv floors soft modes without RYK_ALLOW_MODE_SOFTEN" {
@@ -918,7 +968,7 @@ test "agent_hook product path FM ask upgrades soft allow" {
     const out = stdout.buffered();
     try std.testing.expectEqual(@as(u32, 1), fm_state.call_count);
     try std.testing.expect(fm_state.saw_expected_session);
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"permissionDecision\":\"ask\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"permissionDecision\":\"deny\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "curl pipe needs confirmation") != null);
 
     var unattended_state = AgentHookFmFakeState{

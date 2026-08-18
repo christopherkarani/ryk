@@ -1,5 +1,6 @@
 const std = @import("std");
 const exit_codes = @import("exit_codes.zig");
+const hook_client = @import("hook_client.zig");
 const host_ask_resume = @import("host_ask_resume.zig");
 
 /// Exact host names that rewrite to `ryk run -- <host> …`.
@@ -105,6 +106,7 @@ pub fn tryDispatch(
         , .{ command, command, command, command });
         return exit_codes.success;
     }
+    hook_client.prewarmBestEffort(io, allocator);
     if (try host_ask_resume.formatWarn(allocator, &.{command})) |ask_warn| {
         defer allocator.free(ask_warn);
         try stderr.print("ryk: {s}\n", .{ask_warn});

@@ -11,7 +11,7 @@ Pi setup is required.
 | `bash` | `ryk evaluate --json --stdin`; failures block by default |
 | `write` / `edit` | `ryk decide file` with `operation: write` |
 | `read` | `ryk decide file` with `operation: read` |
-| `grep` / `find` / `ls` | Root preflight via `ryk decide file` (same as read). Residual ask is permit. |
+| `grep` / `find` / `ls` | Root preflight via `ryk decide file` (same as read). Leftover unused policy ask is rewritten by `ryk decide`. |
 | `contact_supervisor` / `intercom` / `subagent` | Passthrough (no name-gate) |
 | Other custom tool names | `ryk decide tool` name gate |
 
@@ -28,23 +28,24 @@ environment-variable reference before the model sees the message.
   output, or times out.
 - `/ryk-setup`, `/ryk-start`, `/ryk-stop`, `/ryk-doctor`, and `/ryk-mode`
   manage the current Pi integration.
-- Residual policy `ask` is permit so coding agents can work. ryk only
-  hard-stops explicit deny. Set `RYK_UNATTENDED=1` (or `CI` / `RYK_CI` /
-  `RYK_NONINTERACTIVE`) to auto-deny residual ask. `RYK_PI_MODE=strict`
-  fail-closes protocol/eval failures; it does not turn residual ask into deny.
+- Leftover unused policy ask is rewritten by `ryk evaluate` / `ryk decide`
+  (attended → permit, unattended → deny). A leaked `ask` is fail-closed deny.
+  `RYK_PI_MODE=strict` fail-closes protocol/eval failures.
 - Process-level environment, network, and secretless controls require launching
   Pi through `ryk run -- pi`.
 
 ### Policy `ask` session matrix
 
-When `ryk evaluate` / `ryk decide` returns policy **`ask`**, residual ask is
-permit unless the operator set an unattended flag:
+`ryk evaluate` and machine-JSON `ryk decide` rewrite leftover unused policy ask
+on the coding-host enforcement wire (attended → **allow**; unattended → **deny**).
+If a leaked `ask` still reaches the extension, that is unexpected ask →
+fail-closed deny.
 
-| Session class | Detection | Policy `ask` outcome |
-|---------------|-----------|----------------------|
-| Attended (interactive, print, subagent) | no `RYK_UNATTENDED` / `CI` / `RYK_CI` | **Permit** — ryk only hard-stops explicit deny |
-| Unattended | `RYK_UNATTENDED`, `CI`, `RYK_CI`, or `RYK_NONINTERACTIVE` | **Auto-deny** with explicit reason |
-| Strict | `RYK_PI_MODE=strict` | Protocol/eval failure fail-closes. Residual policy ask still permits unless unattended. |
+| Session class | Detection | Leftover unused policy ask | Leaked `ask` |
+|---------------|-----------|----------------------------|--------------|
+| Attended (interactive, print, subagent) | no `RYK_UNATTENDED` / `CI` / `RYK_CI` | **allow** from evaluate/decide | **deny** |
+| Unattended | `RYK_UNATTENDED`, `CI`, `RYK_CI`, or `RYK_NONINTERACTIVE` | **deny** from evaluate/decide | **deny** |
+| Strict | `RYK_PI_MODE=strict` | Same as attended/unattended above | Protocol/eval failure fail-closes |
 
 ### Protocol failure recovery
 

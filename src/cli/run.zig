@@ -926,7 +926,7 @@ fn commandWithStdioAndEnv(io: std.Io, argv: []const []const u8, stdout: anytype,
                         const sticky_severity = shell_eval.riskLevelFromScore(command_decision.decision.risk_score orelse 80);
                         // best-effort sticky; re-ask on failure
                         shell_eval.recordStickyFromAskWithHints(
-                            shell_eval.getSessionStickyStore(),
+                            shell_eval.getSessionStickyStoreFor(session.id.slice()),
                             raw_display,
                             sticky_scope,
                             sticky_severity,
@@ -1778,13 +1778,29 @@ fn parseOptions(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: a
             try suggestions.writeUnknownOption(stderr, "ryk run", arg, &.{ "--workspace", "--mode", "--policy", "--session-name", "--no-secrets", "--secretless", "--with-host-secrets", "--inherit-env", "--no-network", "--allow-network", "--network", "--network-backend", "--os-sandbox", "--seatbelt-profile", "--require-backend", "--help", "-h" }, "run");
             return error.Usage;
         } else {
-            try stderr.writeAll("ryk run: expected '--' before the command you want to run.\n" ++
-                "\n" ++
-                "Example:\n" ++
-                "  ryk run -- ./scripts/agent-task.sh\n" ++
-                "  ryk run --mode strict -- npm install\n" ++
-                "\n" ++
-                "Run 'ryk help run' for more examples.\n");
+            // #292: bare tokens after `ryk run` need host-alias vs separator guidance.
+            if (host_launch.isHostLaunchAlias(arg)) {
+                try stderr.print(
+                    "ryk run: expected '--' before the command you want to run.\n" ++
+                        "\n" ++
+                        "For host '{s}', prefer the alias:\n" ++
+                        "  ryk {s}\n" ++
+                        "Or pass it after the separator:\n" ++
+                        "  ryk run -- {s}\n" ++
+                        "\n" ++
+                        "Run 'ryk help run' for more examples.\n",
+                    .{ arg, arg, arg },
+                );
+            } else {
+                try stderr.writeAll("ryk run: expected '--' before the command you want to run.\n" ++
+                    "\n" ++
+                    "Example:\n" ++
+                    "  ryk run -- ./scripts/agent-task.sh\n" ++
+                    "  ryk run --mode strict -- npm install\n" ++
+                    "\n" ++
+                    "Host agents: `ryk pi` / `ryk claude` (or `ryk run -- pi`).\n" ++
+                    "Run 'ryk help run' for more examples.\n");
+            }
             return error.Usage;
         }
     }
@@ -2637,7 +2653,7 @@ test "run rejects missing child command" {
 
 test "run rejects child command without separator" {
     var stdout_buf: [512]u8 = undefined;
-    var stderr_buf: [512]u8 = undefined;
+    var stderr_buf: [1024]u8 = undefined;
     var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
     var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
 
@@ -2647,6 +2663,19 @@ test "run rejects child command without separator" {
     // TDD: warm multi-line error message with examples + help pointer (foundation UX)
     try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "Example:") != null);
     try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "ryk help run") != null);
+}
+
+test "run without separator points host aliases at ryk <host>" {
+    var stdout_buf: [512]u8 = undefined;
+    var stderr_buf: [1024]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+
+    const code = try command(std.testing.io, &.{"pi"}, &stdout_writer, &stderr_writer);
+    try std.testing.expectEqual(exit_codes.usage, code);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "expected '--'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "ryk pi") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "ryk run -- pi") != null);
 }
 
 test "run reports missing command usefully" {
