@@ -397,10 +397,15 @@ The following patterns are denied by default for file reads:
 **/id_ed25519
 **/*_rsa
 **/*_ed25519
-**/*credentials*
-**/*credential*
-**/*secret*
-**/*token*
+**/credentials.json
+**/.credentials.json
+**/secrets.json
+**/secrets.yaml
+**/secrets.yml
+**/.secrets
+**/application_default_credentials.json
+**/service_account.json
+~/.config/gcloud/**
 ~/Library/Keychains/**
 ./Library/Keychains/**
 ~/Library/Application Support/**/Cookies*

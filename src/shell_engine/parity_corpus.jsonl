@@ -336,9 +336,10 @@
 {"command": "git reset --hard HEAD~5", "expected": "deny", "rule_id": "core.git:reset-hard", "source": "true_positives/git_destructive.toml", "description": "git reset --hard with ref"}
 {"command": "git clean -fd", "expected": "deny", "rule_id": "core.git:clean-force", "source": "true_positives/git_destructive.toml", "description": "git clean with force"}
 {"command": "git clean -fdx", "expected": "deny", "rule_id": "core.git:clean-force", "source": "true_positives/git_destructive.toml", "description": "git clean -fdx removes ignored files"}
-{"command": "git stash drop", "expected": "deny", "rule_id": "core.git:stash-drop", "source": "true_positives/git_destructive.toml", "description": "git stash drop discards stash"}
+{"command": "git stash drop", "expected": "allow", "rule_id": null, "source": "false_positives/git_safe.toml", "description": "git stash drop of one stash is recoverable; not hook-blocking"}
 {"command": "git stash clear", "expected": "deny", "rule_id": "core.git:stash-clear", "source": "true_positives/git_destructive.toml", "description": "git stash clear drops all stashes"}
 {"command": "git branch -D feature-branch", "expected": "deny", "rule_id": "core.git:branch-force-delete", "source": "true_positives/git_destructive.toml", "description": "git branch -D force deletes"}
+{"command": "git branch -f main", "expected": "allow", "rule_id": null, "source": "false_positives/git_safe.toml", "description": "git branch -f updates a branch pointer; not force-delete"}
 {"command": "git push --force origin main", "expected": "deny", "rule_id": "core.git:push-force-long", "source": "true_positives/git_destructive.toml", "description": "git push --force"}
 {"command": "git push -f origin main", "expected": "deny", "rule_id": "core.git:push-force-short", "source": "true_positives/git_destructive.toml", "description": "git push -f (short form)"}
 {"command": "rm -rf /", "expected": "deny", "rule_id": "core.filesystem:rm-rf-root-home", "source": "true_positives/rm_destructive.toml", "description": "rm -rf with root path"}

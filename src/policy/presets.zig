@@ -783,10 +783,15 @@ const coding_dcg_rules =
     \\      - "~/.profile"
     \\      - "**/id_rsa"
     \\      - "**/id_ed25519"
-    \\      - "**/*credentials*"
-    \\      - "**/*credential*"
-    \\      - "**/*secret*"
-    \\      - "**/*token*"
+    \\      - "**/credentials.json"
+    \\      - "**/.credentials.json"
+    \\      - "**/secrets.json"
+    \\      - "**/secrets.yaml"
+    \\      - "**/secrets.yml"
+    \\      - "**/.secrets"
+    \\      - "**/application_default_credentials.json"
+    \\      - "**/service_account.json"
+    \\      - "~/.config/gcloud/**"
     \\  write:
     \\    allow:
     \\      - "./**"
@@ -1224,7 +1229,9 @@ test "quick install agent presets have conservative defaults (network deny + bro
     // (histories + macOS Library paths + expanded credential patterns).
     try std.testing.expect(std.mem.indexOf(u8, generic, "~/.zsh_history") != null);
     try std.testing.expect(std.mem.indexOf(u8, generic, "~/Library/Application Support/**/Login Data*") != null);
-    try std.testing.expect(std.mem.indexOf(u8, generic, "**/*credential*") != null);
+    try std.testing.expect(std.mem.indexOf(u8, generic, "**/credentials.json") != null);
+    try std.testing.expect(std.mem.indexOf(u8, generic, "**/*token*") == null);
+    try std.testing.expect(std.mem.indexOf(u8, generic, "**/*secret*") == null);
 
     // Protected write directories present (the DX fix will make these robust to bare paths too).
     try std.testing.expect(std.mem.indexOf(u8, generic, "./.git/**") != null);

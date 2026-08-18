@@ -30,6 +30,14 @@ reimplement leftover unused policy ask: a leaked `decision: ask` is
 fail-closed deny. Stage, FM steward soft→ask, SoftBlock, and explicit deny
 never become allow. ryk still hard-stops explicit deny/block.
 
+Attended `ryk hook` also remaps leftover unused **file.read default-deny**
+(unmatched non-secret path, including a sibling worktree or notes file) to
+leftover unused ask → permit. Explicit `files.read.deny`, secret heuristics,
+and symlink-escape normalize failures stay deny. Unattended / `--ci` still
+denies. Intercept `decideRead` stays workspace-only. Default Grok install
+hooks Bash + Read only; Write/Edit are not on the hook wire. Max protection
+is opt-in `ryk <agent>` (OS sandbox).
+
 When unattended (`CI`, `RYK_CI`, `RYK_NONINTERACTIVE`, `RYK_UNATTENDED`, or
 host `--ci`):
 

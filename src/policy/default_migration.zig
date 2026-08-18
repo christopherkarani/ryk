@@ -35,12 +35,16 @@ pub const Classification = enum {
 ///   - dce92836… v1.2.0 – v1.2.9
 ///   - 5d072e47… v1.2.10 – v1.2.12
 ///   - 1e231762… v1.2.13 (last pre-DCG ask-mode default)
+///   - 7a275948… v1.2.14–v0.2.20 first coding DCG bodies
+///   - c7b18804… v0.2.21 coding DCG with substring *token*/*secret*/*credential* globs
 pub const legacy_generic_agent_sha256_hex = [_][]const u8{
     "2dbf4c02f21a12fbc70f039794d0948bfeca7a648137aad00a59bd0f8b1dfbf4",
     "0a885ae1f1b976545182034e743e5b7823760328ccea7de4fcdf7b1f68c93950",
     "dce9283649bda4097cdec4ae0df0e9c886798fc4d17d8040495c802b25073ea2",
     "5d072e477c4e981b57b17f2e61aa928eb849df4c2a9db05b47cdbe8201a702a8",
     "1e2317625c539ccbd9687289063c3302416cfda2b18a09f65d993283036997f4",
+    "7a275948b7bfb0e85edbef571d6fe1e01f18172335617cc150757fee02a294b8",
+    "c7b188043631a498623293988b324c4a6e5b09f83f89d763b5205dd1eba7f57a",
 };
 
 pub fn sha256Hex(content: []const u8) [64]u8 {

@@ -645,6 +645,11 @@ fn builtinHostRuntimeReadAllow(allocator: std.mem.Allocator, surface: Surface, v
             .reason = "built-in allow: host instruction file",
             .pattern = "host instruction file",
         },
+        .support => .{
+            .id = host_runtime_reads.host_support_read_allow_id,
+            .reason = "built-in allow: host support file",
+            .pattern = "host support file",
+        },
     };
 
     const rule_id = try allocator.dupe(u8, meta.id);
@@ -1054,6 +1059,7 @@ test "generic-agent allows home AGENTS.md and CLAUDE.md reads" {
     if (blocked.matched_rule) |rule| {
         try std.testing.expect(!std.mem.eql(u8, rule.id, "builtin.files.read.allow[host_instruction]"));
         try std.testing.expect(!std.mem.eql(u8, rule.id, "builtin.files.read.allow[host_skill]"));
+        try std.testing.expect(!std.mem.eql(u8, rule.id, "builtin.files.read.allow[host_support]"));
     }
 }
 
@@ -1071,7 +1077,6 @@ test "host skill read allow does not unlock secrets or grok auth" {
         ".grok/config.toml",
         ".ssh/id_ed25519",
         ".grok/skills/../auth.json",
-        ".grok/skills/my-secret/SKILL.md",
     };
     for (blocked_rels) |rel| {
         const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/{s}", .{ home, rel });
@@ -1082,6 +1087,7 @@ test "host skill read allow does not unlock secrets or grok auth" {
         if (result.matched_rule) |rule| {
             try std.testing.expect(!std.mem.eql(u8, rule.id, "builtin.files.read.allow[host_skill]"));
             try std.testing.expect(!std.mem.eql(u8, rule.id, "builtin.files.read.allow[host_instruction]"));
+            try std.testing.expect(!std.mem.eql(u8, rule.id, "builtin.files.read.allow[host_support]"));
         }
     }
 
@@ -1102,6 +1108,7 @@ test "host skill read allow does not unlock secrets or grok auth" {
     if (write_result.matched_rule) |rule| {
         try std.testing.expect(!std.mem.eql(u8, rule.id, "builtin.files.read.allow[host_skill]"));
         try std.testing.expect(!std.mem.eql(u8, rule.id, "builtin.files.read.allow[host_instruction]"));
+        try std.testing.expect(!std.mem.eql(u8, rule.id, "builtin.files.read.allow[host_support]"));
     }
 
     const skill_env = try std.fmt.allocPrint(std.testing.allocator, "{s}/.grok/skills/x/.env", .{home});
@@ -1111,7 +1118,92 @@ test "host skill read allow does not unlock secrets or grok auth" {
     try std.testing.expect(env_result.decision.result != .allow);
     if (env_result.matched_rule) |rule| {
         try std.testing.expect(!std.mem.eql(u8, rule.id, "builtin.files.read.allow[host_skill]"));
+        try std.testing.expect(!std.mem.eql(u8, rule.id, "builtin.files.read.allow[host_support]"));
     }
+}
+
+test "coding DCG allows workspace source whose name contains secret or token" {
+    const load = @import("load.zig");
+    const presets = @import("presets.zig");
+    var policy = try load.parseFromSlice(std.testing.allocator, presets.agentPresetText(.generic_agent), "generic-agent.yaml");
+    defer policy.deinit();
+
+    const allowed = [_][]const u8{
+        "./ryk-pi/test/secret_capture.test.ts",
+        "./src/auth/token.zig",
+        "./src/policy/secret_redaction.zig",
+        "./docs/credentials.md",
+    };
+    for (allowed) |path| {
+        var result = try fileRead(&policy, path, std.testing.allocator);
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqual(core.decision.DecisionResult.allow, result.decision.result);
+    }
+
+    const skill_named_secret = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/.grok/skills/my-secret/SKILL.md",
+        .{std.mem.sliceTo(std.c.getenv("HOME") orelse return error.SkipZigTest, 0)},
+    );
+    defer std.testing.allocator.free(skill_named_secret);
+    var skill = try fileRead(&policy, skill_named_secret, std.testing.allocator);
+    defer skill.deinit(std.testing.allocator);
+    try std.testing.expectEqual(core.decision.DecisionResult.allow, skill.decision.result);
+    try std.testing.expectEqualStrings("builtin.files.read.allow[host_skill]", skill.matched_rule.?.id);
+}
+
+test "coding DCG still denies real secret files" {
+    const load = @import("load.zig");
+    const presets = @import("presets.zig");
+    var policy = try load.parseFromSlice(std.testing.allocator, presets.agentPresetText(.generic_agent), "generic-agent.yaml");
+    defer policy.deinit();
+
+    const denied = [_][]const u8{
+        "./.env",
+        "./.env.local",
+        "./credentials.json",
+        "./.credentials.json",
+        "./secrets.json",
+        "./config/secrets.yaml",
+        "./application_default_credentials.json",
+        "./service_account.json",
+        "~/.ssh/id_rsa",
+        "~/.aws/credentials",
+        "~/.config/gcloud/application_default_credentials.json",
+    };
+    for (denied) |path| {
+        var result = try fileRead(&policy, path, std.testing.allocator);
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqual(core.decision.DecisionResult.deny, result.decision.result);
+    }
+}
+
+test "coding DCG allows host docs rules and observation reads" {
+    const load = @import("load.zig");
+    const presets = @import("presets.zig");
+    var policy = try load.parseFromSlice(std.testing.allocator, presets.agentPresetText(.generic_agent), "generic-agent.yaml");
+    defer policy.deinit();
+
+    const home = std.mem.sliceTo(std.c.getenv("HOME") orelse return error.SkipZigTest, 0);
+    const allowed_rels = [_][]const u8{
+        ".grok/docs/user-guide/hooks.md",
+        ".grok/rules/wax.md",
+        ".grok/skill-observations/log.md",
+    };
+    for (allowed_rels) |rel| {
+        const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/{s}", .{ home, rel });
+        defer std.testing.allocator.free(path);
+        var result = try fileRead(&policy, path, std.testing.allocator);
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqual(core.decision.DecisionResult.allow, result.decision.result);
+        try std.testing.expectEqualStrings("builtin.files.read.allow[host_support]", result.matched_rule.?.id);
+    }
+
+    const auth_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/.grok/auth.json", .{home});
+    defer std.testing.allocator.free(auth_path);
+    var auth = try fileRead(&policy, auth_path, std.testing.allocator);
+    defer auth.deinit(std.testing.allocator);
+    try std.testing.expect(auth.decision.result != .allow);
 }
 
 test "deny priority beats allow for file paths" {

@@ -157,29 +157,34 @@ const read_rules = [_]BuiltinRule{
     .{ .id = "builtin.files.read.deny[8]", .pattern = "**/id_ed25519" },
     .{ .id = "builtin.files.read.deny[9]", .pattern = "**/*_rsa" },
     .{ .id = "builtin.files.read.deny[10]", .pattern = "**/*_ed25519" },
-    .{ .id = "builtin.files.read.deny[11]", .pattern = "**/*credentials*" },
-    .{ .id = "builtin.files.read.deny[12]", .pattern = "**/*credential*" },
-    .{ .id = "builtin.files.read.deny[13]", .pattern = "**/*secret*" },
-    .{ .id = "builtin.files.read.deny[14]", .pattern = "**/*token*" },
-    .{ .id = "builtin.files.read.deny[15]", .pattern = "~/Library/Keychains/**" },
-    .{ .id = "builtin.files.read.deny[16]", .pattern = "./Library/Keychains/**" },
-    .{ .id = "builtin.files.read.deny[17]", .pattern = "~/Library/Application Support/**/Cookies*" },
-    .{ .id = "builtin.files.read.deny[18]", .pattern = "./Library/Application Support/**/Cookies*" },
-    .{ .id = "builtin.files.read.deny[19]", .pattern = "~/Library/Application Support/**/Login Data*" },
-    .{ .id = "builtin.files.read.deny[20]", .pattern = "./Library/Application Support/**/Login Data*" },
-    .{ .id = "builtin.files.read.deny[21]", .pattern = "~/Library/Application Support/Google/Chrome/**" },
-    .{ .id = "builtin.files.read.deny[22]", .pattern = "./Library/Application Support/Google/Chrome/**" },
-    .{ .id = "builtin.files.read.deny[23]", .pattern = "~/Library/Application Support/BraveSoftware/**" },
-    .{ .id = "builtin.files.read.deny[24]", .pattern = "./Library/Application Support/BraveSoftware/**" },
-    .{ .id = "builtin.files.read.deny[25]", .pattern = "~/Library/Application Support/Firefox/**" },
-    .{ .id = "builtin.files.read.deny[26]", .pattern = "./Library/Application Support/Firefox/**" },
-    .{ .id = "builtin.files.read.deny[27]", .pattern = "~/Library/Mobile Documents/**" },
-    .{ .id = "builtin.files.read.deny[28]", .pattern = "./Library/Mobile Documents/**" },
-    .{ .id = "builtin.files.read.deny[29]", .pattern = "~/.zsh_history" },
-    .{ .id = "builtin.files.read.deny[30]", .pattern = "~/.bash_history" },
-    .{ .id = "builtin.files.read.deny[31]", .pattern = "~/.zshrc" },
-    .{ .id = "builtin.files.read.deny[32]", .pattern = "~/.bashrc" },
-    .{ .id = "builtin.files.read.deny[33]", .pattern = "~/.profile" },
+    .{ .id = "builtin.files.read.deny[11]", .pattern = "**/credentials.json" },
+    .{ .id = "builtin.files.read.deny[12]", .pattern = "**/.credentials.json" },
+    .{ .id = "builtin.files.read.deny[13]", .pattern = "**/secrets.json" },
+    .{ .id = "builtin.files.read.deny[14]", .pattern = "**/secrets.yaml" },
+    .{ .id = "builtin.files.read.deny[15]", .pattern = "**/secrets.yml" },
+    .{ .id = "builtin.files.read.deny[16]", .pattern = "**/.secrets" },
+    .{ .id = "builtin.files.read.deny[17]", .pattern = "**/application_default_credentials.json" },
+    .{ .id = "builtin.files.read.deny[18]", .pattern = "**/service_account.json" },
+    .{ .id = "builtin.files.read.deny[19]", .pattern = "~/.config/gcloud/**" },
+    .{ .id = "builtin.files.read.deny[20]", .pattern = "~/Library/Keychains/**" },
+    .{ .id = "builtin.files.read.deny[21]", .pattern = "./Library/Keychains/**" },
+    .{ .id = "builtin.files.read.deny[22]", .pattern = "~/Library/Application Support/**/Cookies*" },
+    .{ .id = "builtin.files.read.deny[23]", .pattern = "./Library/Application Support/**/Cookies*" },
+    .{ .id = "builtin.files.read.deny[24]", .pattern = "~/Library/Application Support/**/Login Data*" },
+    .{ .id = "builtin.files.read.deny[25]", .pattern = "./Library/Application Support/**/Login Data*" },
+    .{ .id = "builtin.files.read.deny[26]", .pattern = "~/Library/Application Support/Google/Chrome/**" },
+    .{ .id = "builtin.files.read.deny[27]", .pattern = "./Library/Application Support/Google/Chrome/**" },
+    .{ .id = "builtin.files.read.deny[28]", .pattern = "~/Library/Application Support/BraveSoftware/**" },
+    .{ .id = "builtin.files.read.deny[29]", .pattern = "./Library/Application Support/BraveSoftware/**" },
+    .{ .id = "builtin.files.read.deny[30]", .pattern = "~/Library/Application Support/Firefox/**" },
+    .{ .id = "builtin.files.read.deny[31]", .pattern = "./Library/Application Support/Firefox/**" },
+    .{ .id = "builtin.files.read.deny[32]", .pattern = "~/Library/Mobile Documents/**" },
+    .{ .id = "builtin.files.read.deny[33]", .pattern = "./Library/Mobile Documents/**" },
+    .{ .id = "builtin.files.read.deny[34]", .pattern = "~/.zsh_history" },
+    .{ .id = "builtin.files.read.deny[35]", .pattern = "~/.bash_history" },
+    .{ .id = "builtin.files.read.deny[36]", .pattern = "~/.zshrc" },
+    .{ .id = "builtin.files.read.deny[37]", .pattern = "~/.bashrc" },
+    .{ .id = "builtin.files.read.deny[38]", .pattern = "~/.profile" },
 };
 
 const write_rules = [_]BuiltinRule{
@@ -1498,6 +1503,38 @@ test "decideWrite allows workspace src/ok.zig under coding DCG and strict" {
     defer strict_decision.deinit(std.testing.allocator);
     try std.testing.expect(strict_decision.decision.result == .allow or strict_decision.decision.result == .stage);
     try std.testing.expect(strict_decision.decision.result != .deny);
+}
+
+test "coding intercept does not deny workspace source named secret or token" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "ryk-pi/test");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "ryk-pi/test/secret_capture.test.ts", .data = "test\n" });
+    try tmp.dir.createDirPath(std.testing.io, "src/auth");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "src/auth/token.zig", .data = "pub const x = 1;\n" });
+    const root = try testAllocRealPath(std.testing.io, tmp.dir, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    var loaded = try policy.load.loadAgentPreset(std.testing.allocator, .generic_agent);
+    defer loaded.deinit();
+
+    var secret_src = try decideRead(io, std.testing.allocator, &loaded, root, "ryk-pi/test/secret_capture.test.ts");
+    defer secret_src.deinit(std.testing.allocator);
+    try std.testing.expect(secret_src.decision.result != .deny);
+
+    var token_src = try decideRead(io, std.testing.allocator, &loaded, root, "src/auth/token.zig");
+    defer token_src.deinit(std.testing.allocator);
+    try std.testing.expect(token_src.decision.result != .deny);
+
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "credentials.json", .data = "{}\n" });
+    var creds = try decideRead(io, std.testing.allocator, &loaded, root, "credentials.json");
+    defer creds.deinit(std.testing.allocator);
+    try std.testing.expectEqual(core.decision.DecisionResult.deny, creds.decision.result);
+
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "secrets.json", .data = "{}\n" });
+    var secrets = try decideRead(io, std.testing.allocator, &loaded, root, "secrets.json");
+    defer secrets.deinit(std.testing.allocator);
+    try std.testing.expectEqual(core.decision.DecisionResult.deny, secrets.decision.result);
 }
 
 test "default sensitive read decisions deny env and fake ssh key" {

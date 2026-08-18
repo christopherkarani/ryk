@@ -1667,7 +1667,12 @@ fn evaluateHook(
             const evaluation = try core_api.explainAction(allocator, @ptrCast(policy_value), explain_kind, explain_target);
             defer evaluation.deinit(allocator);
 
-            const decision = PluginDecision.fromDecisionResult(evaluation.decision.result, ci_mode);
+            const matched_id = if (evaluation.matched_rule) |rule| rule.id else null;
+            var result = evaluation.decision.result;
+            if (explain_kind == .file_read and isLeftoverUnusedFileReadDefaultDeny(result, matched_id, evaluation.decision.reason)) {
+                result = .ask;
+            }
+            const decision = PluginDecision.fromDecisionResult(result, ci_mode);
             const risk = RiskLevel.fromScore(evaluation.decision.risk_score);
 
             const message = try buildMessage(allocator, decision, permission_kind);
@@ -1677,7 +1682,7 @@ fn evaluateHook(
                 .risk = risk,
                 .category = @tagName(explain_kind),
                 .reason = evaluation.decision.reason,
-                .rule = if (evaluation.matched_rule) |rule| rule.id else null,
+                .rule = matched_id,
                 .message = message,
             }, &redactions, &limitations);
         },
@@ -2662,7 +2667,12 @@ fn evaluateFilePolicyPreToolUse(
     const evaluation = try core_api.explainAction(allocator, @ptrCast(policy_value), kind.explainKind(), policy_path);
     defer evaluation.deinit(allocator);
 
-    const decision = PluginDecision.fromDecisionResult(evaluation.decision.result, ci_mode);
+    const matched_id = if (evaluation.matched_rule) |rule| rule.id else null;
+    var result = evaluation.decision.result;
+    if (kind == .read and isLeftoverUnusedFileReadDefaultDeny(result, matched_id, evaluation.decision.reason)) {
+        result = .ask;
+    }
+    const decision = PluginDecision.fromDecisionResult(result, ci_mode);
     const message = try buildMessage(allocator, decision, cat);
     defer allocator.free(message);
     return HookResponse.take(allocator, .{
@@ -2670,9 +2680,28 @@ fn evaluateFilePolicyPreToolUse(
         .risk = RiskLevel.fromScore(evaluation.decision.risk_score),
         .category = cat,
         .reason = evaluation.decision.reason,
-        .rule = if (evaluation.matched_rule) |rule| rule.id else null,
+        .rule = matched_id,
         .message = message,
     }, redactions, limitations);
+}
+
+/// Attended coding-host hooks should not workspace-confine non-secret reads.
+/// Explicit deny, secret heuristics, and symlink-escape normalize failures stay
+/// deny. Leftover unused default deny becomes leftover ask (permit unless unattended).
+fn isLeftoverUnusedFileReadDefaultDeny(
+    result: core.decision.DecisionResult,
+    rule_id: ?[]const u8,
+    reason: []const u8,
+) bool {
+    if (result != .deny) return false;
+    if (rule_id) |id| {
+        if (std.mem.startsWith(u8, id, "files.read.deny")) return false;
+        if (std.mem.startsWith(u8, id, "builtin.files.read.deny")) return false;
+    }
+    if (std.mem.indexOf(u8, reason, "risk heuristic") != null) return false;
+    if (std.mem.indexOf(u8, reason, "outside workspace") != null) return false;
+    return std.mem.indexOf(u8, reason, "files.read.default") != null or
+        std.mem.indexOf(u8, reason, "mode default") != null;
 }
 
 fn evaluateNativePreToolUseRoute(
@@ -3151,7 +3180,18 @@ fn extractToolArgsObject(payload: std.json.Value) ?std.json.Value {
 
 /// Write/edit tools only. Never include read_file / Read / read — those are isFileReadTool.
 fn isFileWriteTool(tool_name: []const u8) bool {
-    const file_tools = &[_][]const u8{ "edit", "write", "file_write", "file_edit", "apply", "create_file", "write_file" };
+    const file_tools = &[_][]const u8{
+        "edit",
+        "write",
+        "file_write",
+        "file_edit",
+        "apply",
+        "apply_patch",
+        "create_file",
+        "write_file",
+        "search_replace",
+        "str_replace",
+    };
     for (file_tools) |ft| {
         if (std.ascii.eqlIgnoreCase(tool_name, ft)) return true;
     }
@@ -3530,9 +3570,9 @@ test "hook Grok PreToolUse rejects web_search as unsupported" {
     try std.testing.expectError(error.UnsupportedGrokPreToolUse, grokHookPayload(web_search.value, .PreToolUse));
 }
 
-test "hook Grok PreToolUse accepts write edit write_file create_file with target_file" {
+test "hook Grok PreToolUse accepts write edit write_file create_file search_replace with target_file" {
     const allocator = std.testing.allocator;
-    const tools = [_][]const u8{ "write", "edit", "write_file", "create_file" };
+    const tools = [_][]const u8{ "write", "edit", "write_file", "create_file", "search_replace", "str_replace", "apply_patch" };
     for (tools) |tool_name| {
         const json = try std.fmt.allocPrint(
             allocator,
@@ -3669,6 +3709,93 @@ test "hook PreToolUse file_read allows README.md" {
     defer result.deinit(allocator);
 
     try std.testing.expectEqual(PluginDecision.allow, result.decision);
+    try std.testing.expectEqualStrings("file.read", result.category);
+}
+
+test "hook PreToolUse file_read permits leftover unused outside-workspace path" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "workspace", .default_dir);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "notes.md", .data = "scratch\n" });
+
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, "workspace", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const notes_path = try tmp.dir.realPathFileAlloc(std.testing.io, "notes.md", std.testing.allocator);
+    defer std.testing.allocator.free(notes_path);
+
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const allocator = gpa_state.allocator();
+
+    var policy_obj = try core_api.loadPolicyPreset(allocator, .strict);
+    defer policy_obj.deinit();
+
+    const payload_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"toolName\":\"read_file\",\"toolInput\":{{\"target_file\":\"{s}\"}}}}",
+        .{notes_path},
+    );
+    defer allocator.free(payload_json);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload_json, .{});
+    defer parsed.deinit();
+
+    var result = try evaluateHookForTestWithOptions(
+        allocator,
+        root,
+        @ptrCast(@alignCast(policy_obj)),
+        .grok,
+        .PreToolUse,
+        parsed.value,
+        false,
+        null,
+    );
+    defer result.deinit(allocator);
+
+    result.decision = applyHostWireRewrite(result.decision, result.ask_origin, false);
+    try std.testing.expectEqual(PluginDecision.allow, result.decision);
+    try std.testing.expectEqualStrings("file.read", result.category);
+}
+
+test "hook PreToolUse leftover unused file.read stays deny when unattended" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "workspace", .default_dir);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "notes.md", .data = "scratch\n" });
+
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, "workspace", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const notes_path = try tmp.dir.realPathFileAlloc(std.testing.io, "notes.md", std.testing.allocator);
+    defer std.testing.allocator.free(notes_path);
+
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const allocator = gpa_state.allocator();
+
+    var policy_obj = try core_api.loadPolicyPreset(allocator, .strict);
+    defer policy_obj.deinit();
+
+    const payload_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"toolName\":\"read_file\",\"toolInput\":{{\"target_file\":\"{s}\"}}}}",
+        .{notes_path},
+    );
+    defer allocator.free(payload_json);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload_json, .{});
+    defer parsed.deinit();
+
+    var result = try evaluateHookForTestWithOptions(
+        allocator,
+        root,
+        @ptrCast(@alignCast(policy_obj)),
+        .grok,
+        .PreToolUse,
+        parsed.value,
+        true,
+        null,
+    );
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqual(PluginDecision.block, result.decision);
     try std.testing.expectEqualStrings("file.read", result.category);
 }
 
@@ -3839,6 +3966,24 @@ test "hook PreToolUse file_read allows workspace symlink to host skill" {
     try std.testing.expectEqualStrings("file.read", result.category);
     try std.testing.expect(result.rule != null);
     try std.testing.expectEqualStrings("builtin.files.read.allow[host_skill]", result.rule.?);
+}
+
+test "hook classifies search_replace as file_write not unsupported or file_read" {
+    const allocator = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        \\{"toolName":"search_replace","toolInput":{"target_file":"README.md"}}
+    ,
+        .{},
+    );
+    defer parsed.deinit();
+
+    const classification = classifyHookEvent(.PreToolUse, parsed.value);
+    try std.testing.expectEqual(HookEventClassification.non_shell, std.meta.activeTag(classification));
+    try std.testing.expectEqual(NonShellHookEvent.file_write, classification.non_shell);
+    try std.testing.expect(classification.non_shell != .file_read);
+    try std.testing.expect(classification.non_shell != .generic_tool);
 }
 
 test "hook classifies Write target_file as file_write not file_read" {

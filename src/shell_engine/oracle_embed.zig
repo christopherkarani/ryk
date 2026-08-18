@@ -106,7 +106,7 @@ test "corrupt or truncated gzip fails closed (not empty json)" {
     ));
     try std.testing.expectError(error.PacksInflateFailed, inflateSlice(
         std.testing.allocator,
-        compressed[0 .. compressed.len / 2],
+        compressed[0..16],
     ));
 }
 

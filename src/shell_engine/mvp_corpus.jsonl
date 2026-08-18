@@ -19,9 +19,10 @@
 {"command": "git reset --hard HEAD~5", "expected": "deny", "rule_id": "core.git:reset-hard"}
 {"command": "git clean -fd", "expected": "deny", "rule_id": "core.git:clean-force"}
 {"command": "git clean -fdx", "expected": "deny", "rule_id": "core.git:clean-force"}
-{"command": "git stash drop", "expected": "deny", "rule_id": "core.git:stash-drop"}
+{"command": "git stash drop", "expected": "allow", "rule_id": null}
 {"command": "git stash clear", "expected": "deny", "rule_id": "core.git:stash-clear"}
 {"command": "git branch -D feature-branch", "expected": "deny", "rule_id": "core.git:branch-force-delete"}
+{"command": "git branch -f main", "expected": "allow", "rule_id": null}
 {"command": "git push --force origin main", "expected": "deny", "rule_id": "core.git:push-force-long"}
 {"command": "git push -f origin main", "expected": "deny", "rule_id": "core.git:push-force-short"}
 {"command": "git checkout -- README.md", "expected": "deny", "rule_id": "core.git:checkout-discard"}
