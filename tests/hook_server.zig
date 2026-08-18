@@ -765,6 +765,83 @@ test "one server permits leftover unused ask on coding hosts" {
     try std.testing.expectEqual(@as(u8, 2), ci_resp.response.exit);
 }
 
+test "one server denies leftover unused ask when req.ci is true" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    // Override stays unset so req.ci=true is what hardens leftover. Sibling
+    // leftover-allow pins test_unattended_override=false so live CI cannot flip it.
+    try std.testing.expect(hook.test_unattended_override == null);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(dir);
+    const short = try makeTestSock(std.testing.allocator, "leftover-ci");
+    defer short.deinit(std.testing.allocator);
+    const sock = short.sock;
+    const ws = try std.fs.path.join(std.testing.allocator, &.{ dir, "ask-ws" });
+    defer std.testing.allocator.free(ws);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, ws);
+
+    const policy_text = try readFile(std.testing.allocator, default_policy);
+    defer std.testing.allocator.free(policy_text);
+    const ask_policy = try std.mem.replaceOwned(u8, std.testing.allocator, policy_text, "mode: strict", "mode: ask");
+    defer std.testing.allocator.free(ask_policy);
+    try writeWorkspacePolicy(std.testing.io, ws, ask_policy);
+
+    const leftover_cmd = "git restore README.md";
+    const grok_payload = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"hookEventName\":\"pre_tool_use\",\"sessionId\":\"ryk-fixture\",\"cwd\":\"/tmp\",\"workspaceRoot\":\"/tmp\",\"toolName\":\"run_terminal_cmd\",\"toolUseId\":\"fixture-ask\",\"toolInput\":{{\"command\":\"{s}\"}},\"toolInputTruncated\":false}}",
+        .{leftover_cmd},
+    );
+    defer std.testing.allocator.free(grok_payload);
+    const eval_payload = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"schema_version\":1,\"request_id\":\"req-ci\",\"kind\":\"shell_command\",\"command\":\"{s}\",\"cwd\":\"{s}\",\"source\":{{\"host\":\"pi\",\"tool_name\":\"bash\",\"mode\":\"tui\",\"session_id\":\"pi-leftover-ci\"}}}}",
+        .{ leftover_cmd, ws },
+    );
+    defer std.testing.allocator.free(eval_payload);
+
+    const server = try startServer(sock);
+    defer stopServer(sock, server);
+
+    const grok_req = try hook_ipc.stringifyRequest(std.testing.allocator, .{
+        .id = 1,
+        .method = "hook",
+        .host = "grok",
+        .event = "PreToolUse",
+        .ci = true,
+        .workspace = ws,
+        .payload_json = grok_payload,
+    });
+    defer std.testing.allocator.free(grok_req);
+    const grok_raw = try exchange(std.testing.allocator, sock, grok_req);
+    defer std.testing.allocator.free(grok_raw);
+    var grok_resp = try hook_ipc.parseResponse(std.testing.allocator, grok_raw);
+    defer grok_resp.deinit();
+    try std.testing.expectEqual(@as(u8, 2), grok_resp.response.exit);
+    const grok_decision = try parseDecision(std.testing.allocator, grok_resp.response.stdout);
+    defer std.testing.allocator.free(grok_decision);
+    try std.testing.expectEqualStrings("deny", grok_decision);
+
+    const eval_req = try hook_ipc.stringifyRequest(std.testing.allocator, .{
+        .id = 2,
+        .method = "evaluate",
+        .ci = true,
+        .workspace = ws,
+        .payload_json = eval_payload,
+    });
+    defer std.testing.allocator.free(eval_req);
+    const eval_raw = try exchange(std.testing.allocator, sock, eval_req);
+    defer std.testing.allocator.free(eval_raw);
+    var eval_resp = try hook_ipc.parseResponse(std.testing.allocator, eval_raw);
+    defer eval_resp.deinit();
+    try std.testing.expectEqual(@as(u8, 2), eval_resp.response.exit);
+    const eval_decision = try parseDecision(std.testing.allocator, eval_resp.response.stdout);
+    defer std.testing.allocator.free(eval_decision);
+    try std.testing.expectEqualStrings("deny", eval_decision);
+}
+
 test "one server serves cursor allow" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     const tmp_sock = try makeTestSock(std.testing.allocator, "cur");

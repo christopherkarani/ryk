@@ -28,8 +28,6 @@ const daemon_protocol_version: i64 = 1;
 const event_source_evaluate = "evaluate";
 
 pub const exit_allowed: u8 = 0;
-/// Leftover unused policy ask is rewritten to allow (exit 0) on this wire.
-pub const exit_ask: u8 = 0;
 pub const exit_denied: u8 = 2;
 pub const exit_evaluator_error: u8 = 3;
 pub const exit_invalid_input: u8 = 64;
@@ -219,7 +217,8 @@ fn tryHookServer(
         .method = "evaluate",
         .bin = bin,
         .version = build_options.version,
-        .ci = resolveEvaluateMode(.strict) == .ci,
+        // Client folds CI / RYK_CI / RYK_NONINTERACTIVE / RYK_UNATTENDED; hook-serve must not getenvUnattended.
+        .ci = hook_client.clientUnattendedCi(resolveEvaluateMode(.strict) == .ci),
         .workspace = cwd_z,
         .cwd = cwd_z,
         .payload_json = payload,
@@ -1322,7 +1321,8 @@ test "evaluate daemon failures map to JSON error exit 3" {
 }
 
 // ---------------------------------------------------------------------------
-// WP4 + FM product path (Phase 4 WP4a) — evaluate emits decision=ask
+// WP4 + FM product path (Phase 4 WP4a) — leftover unused ask → allow;
+// never-permit (SoftBlock / FM) → deny
 // ---------------------------------------------------------------------------
 
 test "evaluate ask mode high-severity leftover unused policy ask emits allow" {

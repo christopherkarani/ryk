@@ -102,7 +102,7 @@ Most hosts **cannot** veto or open approve-and-resume on prompt submission. ryk 
 ```text
 allow  → None
 block  → {"action":"block","message":"..."}
-ask    → None (proceed; CI / unattended → block)
+ask    → {"action":"block",...} (unexpected after ryk hook rewrite)
 warn   → log advisory; None (proceed)
 other  → block fail-closed
 ```

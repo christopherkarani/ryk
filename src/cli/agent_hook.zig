@@ -109,7 +109,8 @@ fn tryHookServer(
         .version = build_options.version,
         .host = "cursor",
         .event = "beforeShellExecution",
-        .ci = resolveModeFromEnv() == .ci,
+        // Client folds mode=ci with process unattended keys; hook-serve must not getenvUnattended.
+        .ci = hook_client.clientUnattendedCi(resolveModeFromEnv() == .ci),
         .workspace = cwd_z,
         .cwd = cwd_z,
         .payload_json = payload,
@@ -294,8 +295,7 @@ pub fn evaluatePayloadWithModeOpts(
     // agent_hook so coding agents can work. SoftBlock, FM steward ask, and
     // staged writes never become allow. Unattended / mode=.ci hardens leftover
     // ask → deny. Cursor has no ask UI: leftover unused ask is remapped to
-    // allow before emit; SoftBlock/FM still deny on Cursor and stay ask JSON
-    // on agent_hook.
+    // allow before emit; SoftBlock/FM still deny on Cursor and agent_hook.
     const decision = try shell_eval.decisionFromDaemonResultWithPolicy(
         allocator,
         daemon_response.value.result,
@@ -431,15 +431,6 @@ fn writeAllow(stdout: anytype, format: InputFormat) !void {
         .cursor_shell => try stdout.writeAll(
             \\{"permission":"allow","continue":true,"userMessage":"","agentMessage":"","user_message":"","agent_message":""}
         ),
-    }
-}
-
-fn writeAsk(stdout: anytype, format: InputFormat, reason: []const u8) !void {
-    switch (format) {
-        // Claude-compatible PreToolUse supports permissionDecision "ask".
-        .agent_hook => try writeAgentPermission(stdout, "ask", reason),
-        // Cursor beforeShellExecution has no ask; deny so approval is not skipped.
-        .cursor_shell => try writeCursorDenial(stdout, reason),
     }
 }
 

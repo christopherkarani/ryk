@@ -421,7 +421,8 @@ fn tryHookServer(
         .version = build_options.version,
         .host = @tagName(host),
         .event = event_name,
-        .ci = ci,
+        // Client folds `--ci` with process unattended keys; hook-serve must not getenvUnattended.
+        .ci = hook_client.clientUnattendedCi(ci),
         .probe = probe,
         .workspace = cwd_z,
         .cwd = cwd_z,

@@ -57,7 +57,7 @@ The installer copies this directory to `~/.hermes/plugins/ryk/` and enables it w
 
 ## Hook Coverage
 
-- `pre_tool_call` is the tool policy gate: hard `block`, residual `ask` is permit, advisory log for `warn`.
+- `pre_tool_call` is the tool policy gate: hard `block`; leftover unused policy ask is rewritten by `ryk hook`; a leaked `ask` is fail-closed deny; advisory log for `warn`.
 - `pre_llm_call` is context-only and is **not** an enforcement or approval path (see above).
 - `on_session_start`, `post_tool_call`, `on_session_end`, `on_session_finalize`, and `on_session_reset` are mapped to ryk lifecycle events.
 - `post_llm_call` and `subagent_stop` are informational.
@@ -68,7 +68,7 @@ The installer copies this directory to `~/.hermes/plugins/ryk/` and enables it w
 Hermes versions that honor hook return values apply `pre_tool_call` directives in gateway sessions:
 
 - **`block`**: Denied tools do not execute. Hermes reports the plugin block to the agent as a tool failure.
-- **`ask`**: Permit (same as allow) unless unattended/CI, which hardens to `block`.
+- **`ask`**: Leftover unused policy ask is rewritten by `ryk hook`. A leaked `ask` is fail-closed deny.
 - **`warn`**: Advisory only (tool proceeds after a log line).
 
 Limitations (honest):
