@@ -349,7 +349,25 @@ pub fn createShimDirectory(
             try writePosixShim(io, allocator, shim_dir, name, ryk_executable);
         }
     }
+    try verifyRequiredShims(io, shim_dir);
     return shim_dir;
+}
+
+/// Fail closed if a required PATH shim is missing on disk.
+/// Required set is every name in `shim_names` (includes git, rm, curl, sh).
+pub fn verifyRequiredShims(io: std.Io, shim_dir: []const u8) !void {
+    inline for (shim_names) |name| {
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = shimOnDiskPath(&path_buf, shim_dir, name) catch return error.RequiredShimMissing;
+        std.Io.Dir.cwd().access(io, path, .{}) catch return error.RequiredShimMissing;
+    }
+}
+
+fn shimOnDiskPath(buf: []u8, shim_dir: []const u8, name: []const u8) ![]u8 {
+    if (builtin.os.tag == .windows) {
+        return std.fmt.bufPrint(buf, "{s}{c}{s}.cmd", .{ shim_dir, std.fs.path.sep, name });
+    }
+    return std.fmt.bufPrint(buf, "{s}{c}{s}", .{ shim_dir, std.fs.path.sep, name });
 }
 
 pub fn prependShimPath(allocator: std.mem.Allocator, env_map: *std.process.Environ.Map, shim_dir: []const u8) !void {
@@ -1521,6 +1539,54 @@ test "shim list covers high-risk PATH filesystem tools" {
         }
         try std.testing.expect(found);
     }
+}
+
+test "shim_names keeps git and excludes cat find sudo" {
+    var has_git = false;
+    inline for (shim_names) |name| {
+        if (std.mem.eql(u8, name, "git")) has_git = true;
+        try std.testing.expect(!std.mem.eql(u8, name, "cat"));
+        try std.testing.expect(!std.mem.eql(u8, name, "find"));
+        try std.testing.expect(!std.mem.eql(u8, name, "sudo"));
+    }
+    try std.testing.expect(has_git);
+}
+
+test "shim directory includes git wrapper with posix shim exec" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+
+    const shim_dir = try createShimDirectory(std.testing.io, std.testing.allocator, root, "git-shim-test", "/usr/bin/true");
+    defer std.testing.allocator.free(shim_dir);
+
+    const shim_path = try std.fs.path.join(std.testing.allocator, &.{ shim_dir, "git" });
+    defer std.testing.allocator.free(shim_path);
+    try std.Io.Dir.cwd().access(std.testing.io, shim_path, .{});
+    const script = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, shim_path, std.testing.allocator, .limited(1024));
+    defer std.testing.allocator.free(script);
+    try std.testing.expect(std.mem.indexOf(u8, script, "shim exec -- \"git\"") != null);
+}
+
+test "verifyRequiredShims fail-closed when required git shim is missing" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+
+    const shim_dir = try createShimDirectory(std.testing.io, std.testing.allocator, root, "missing-git-shim-test", "/usr/bin/true");
+    defer std.testing.allocator.free(shim_dir);
+
+    const git_path = try std.fs.path.join(std.testing.allocator, &.{ shim_dir, "git" });
+    defer std.testing.allocator.free(git_path);
+    try std.Io.Dir.cwd().deleteFile(std.testing.io, git_path);
+
+    try std.testing.expectError(error.RequiredShimMissing, verifyRequiredShims(std.testing.io, shim_dir));
 }
 
 test "shim directory includes sh bash and zsh wrappers" {

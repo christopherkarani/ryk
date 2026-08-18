@@ -7,7 +7,7 @@ ryk writes per-session artifacts under `.ryk/sessions/<session-id>/`.
 - `events.jsonl`: deterministic security events.
 - `summary.json`: machine-readable session summary.
 - `summary.md`: human-readable summary.
-- `.ryk/last`: pointer to the last session.
+- `.ryk/last`: pointer to the last session. Written when the session starts (`createAuditWriter` / `SessionWriter` init), not only when the child exits. End-of-run rewrite keeps the same id.
 
 ## Commands
 
@@ -22,6 +22,10 @@ Bare `ryk replay` loads the **last** session and highlights denied actions. No s
 ./zig-out/bin/ryk replay --session <id>
 ./zig-out/bin/ryk replay --list
 ```
+
+## Session ids vs host conversation ids
+
+Ryk session ids look like `2026-05-05T12-12-10Z_abcd` (timestamp_hex). Host conversation ids are 36-character UUIDs (`8-4-4-4-12` hex) and live in a different namespace. `ryk replay --session <uuid>` does not map a host conversation id onto a ryk session.
 
 ## Alt-screen timeline
 

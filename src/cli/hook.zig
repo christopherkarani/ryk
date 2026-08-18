@@ -172,8 +172,9 @@ fn grokHookPayload(value: std.json.Value, event: Event) GrokHookPayloadError!std
         {
             return error.InvalidGrokHookPayload;
         }
-        // Phase 3: shell or file-read tools only. Unknown tools stay unsupported.
-        if (!isShellTool(tool_name) and !isFileReadTool(tool_name)) return error.UnsupportedGrokPreToolUse;
+        // Shell, file-read, and file-write tools. Unknown tools stay unsupported.
+        if (!isShellTool(tool_name) and !isFileReadTool(tool_name) and !isFileWriteTool(tool_name))
+            return error.UnsupportedGrokPreToolUse;
     }
 
     return value;
@@ -3506,6 +3507,45 @@ test "hook Grok PreToolUse rejects web_search as unsupported" {
     try std.testing.expectError(error.UnsupportedGrokPreToolUse, grokHookPayload(web_search.value, .PreToolUse));
 }
 
+test "hook Grok PreToolUse accepts write edit write_file create_file with target_file" {
+    const allocator = std.testing.allocator;
+    const tools = [_][]const u8{ "write", "edit", "write_file", "create_file" };
+    for (tools) |tool_name| {
+        const json = try std.fmt.allocPrint(
+            allocator,
+            "{{\"hookEventName\":\"pre_tool_use\",\"cwd\":\"/tmp/project\",\"toolName\":\"{s}\",\"toolInput\":{{\"target_file\":\".env\"}}}}",
+            .{tool_name},
+        );
+        defer allocator.free(json);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+        defer parsed.deinit();
+        _ = try grokHookPayload(parsed.value, .PreToolUse);
+    }
+}
+
+test "hook Grok PreToolUse rejects future_tool and web_search as unsupported" {
+    const allocator = std.testing.allocator;
+    var future_tool = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        \\{"hook_event_name":"PreToolUse","cwd":"/tmp/project","tool_name":"future_tool","tool_input":{}}
+    ,
+        .{},
+    );
+    defer future_tool.deinit();
+    try std.testing.expectError(error.UnsupportedGrokPreToolUse, grokHookPayload(future_tool.value, .PreToolUse));
+
+    var web_search = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        \\{"hookEventName":"pre_tool_use","cwd":"/tmp/project","toolName":"web_search","toolInput":{"query":"x"}}
+    ,
+        .{},
+    );
+    defer web_search.deinit();
+    try std.testing.expectError(error.UnsupportedGrokPreToolUse, grokHookPayload(web_search.value, .PreToolUse));
+}
+
 test "hook extractFilePath finds camelCase toolInput.target_file and snake file_path" {
     const allocator = std.testing.allocator;
     var camel = try std.json.parseFromSlice(
@@ -3755,6 +3795,109 @@ test "hook PreToolUse file_read allows workspace symlink to host skill" {
     try std.testing.expectEqualStrings("file.read", result.category);
     try std.testing.expect(result.rule != null);
     try std.testing.expectEqualStrings("builtin.files.read.allow[host_skill]", result.rule.?);
+}
+
+test "hook classifies Write target_file as file_write not file_read" {
+    const allocator = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        \\{"toolName":"Write","toolInput":{"target_file":".env"}}
+    ,
+        .{},
+    );
+    defer parsed.deinit();
+
+    const classification = classifyHookEvent(.PreToolUse, parsed.value);
+    try std.testing.expectEqual(HookEventClassification.non_shell, std.meta.activeTag(classification));
+    try std.testing.expectEqual(NonShellHookEvent.file_write, classification.non_shell);
+    try std.testing.expect(classification.non_shell != .file_read);
+    try std.testing.expect(classification.non_shell != .generic_tool);
+}
+
+test "hook PreToolUse Write blocks .env via files.write.deny" {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const allocator = gpa_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".env", .data = "TOKEN=fake_secret_value\n" });
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+
+    var policy_obj = try policy.load.loadAgentPreset(allocator, .generic_agent);
+    defer policy_obj.deinit();
+
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        \\{"toolName":"Write","toolInput":{"target_file":".env"}}
+    ,
+        .{},
+    );
+    defer parsed.deinit();
+
+    var result = try evaluateHookForTestWithOptions(
+        allocator,
+        root,
+        &policy_obj,
+        .grok,
+        .PreToolUse,
+        parsed.value,
+        false,
+        null,
+    );
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqual(PluginDecision.block, result.decision);
+    try std.testing.expectEqualStrings("file.write", result.category);
+    try std.testing.expect(result.rule != null);
+    try std.testing.expect(std.mem.startsWith(u8, result.rule.?, "files.write.deny["));
+    try std.testing.expect(!std.mem.startsWith(u8, result.rule.?, "builtin."));
+}
+
+test "hook Grok Bash PreToolUse denies unmatched curl destination" {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const allocator = gpa_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, ".ryk");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = ".ryk/policy.yaml",
+        .data = policy.presets.coding_dcg_policy,
+    });
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+
+    var policy_obj = try policy.load.loadAgentPreset(allocator, .generic_agent);
+    defer policy_obj.deinit();
+
+    const payload_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"hookEventName\":\"pre_tool_use\",\"cwd\":\"{s}\",\"toolName\":\"Bash\",\"toolInput\":{{\"command\":\"curl https://example.invalid/\"}}}}",
+        .{root},
+    );
+    defer allocator.free(payload_json);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload_json, .{});
+    defer parsed.deinit();
+
+    var result = try evaluateHookForTestWithOptions(
+        allocator,
+        root,
+        &policy_obj,
+        .grok,
+        .PreToolUse,
+        parsed.value,
+        false,
+        null,
+    );
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqual(PluginDecision.block, result.decision);
+    try std.testing.expect(result.decision != .allow);
 }
 
 test "hook PreToolUse Read alias blocks .env via files.read.deny" {

@@ -796,6 +796,10 @@ const coding_dcg_rules =
     \\      - ".git/**"
     \\      - "./.ryk/**"
     \\      - ".ryk/**"
+    \\      - "./.env"
+    \\      - "./.env.*"
+    \\      - "**/.env"
+    \\      - "**/.env.*"
     \\    mode: staged
     \\
     \\commands:
@@ -1323,4 +1327,50 @@ test "generic-agent on-disk YAML matches coding DCG embedded contract" {
     try std.testing.expectEqual(@as(usize, 0), disk.commands.allow.len);
     try std.testing.expectEqual(schema.DecisionValue.allow, embedded.commands.default.?);
     try std.testing.expectEqual(schema.DecisionValue.allow, disk.commands.default.?);
+}
+
+fn writeDenyHas(policy: *const schema.Policy, want: []const u8) bool {
+    for (policy.files.write.deny) |pattern| {
+        if (std.mem.eql(u8, pattern, want)) return true;
+    }
+    return false;
+}
+
+test "coding DCG files.write deny covers .env patterns on embedded and generic-agent.yaml" {
+    const load = @import("load.zig");
+    const evaluate = @import("evaluate.zig");
+    const core = @import("../core/public.zig");
+
+    var embedded = try load.loadAgentPreset(std.testing.allocator, .generic_agent);
+    defer embedded.deinit();
+    var disk = try load.loadFile(
+        std.testing.io,
+        std.testing.allocator,
+        "policies/presets/generic-agent.yaml",
+    );
+    defer disk.deinit();
+
+    const expected = [_][]const u8{ "./.env", "./.env.*", "**/.env", "**/.env.*" };
+    for (expected) |pattern| {
+        try std.testing.expect(writeDenyHas(&embedded, pattern));
+        try std.testing.expect(writeDenyHas(&disk, pattern));
+    }
+
+    var env_write = try evaluate.fileWrite(&embedded, "./.env", std.testing.allocator);
+    defer env_write.deinit(std.testing.allocator);
+    try std.testing.expectEqual(core.decision.DecisionResult.deny, env_write.decision.result);
+    try std.testing.expect(env_write.decision.rule_id != null);
+    try std.testing.expect(std.mem.startsWith(u8, env_write.decision.rule_id.?, "files.write.deny"));
+
+    var env_local = try evaluate.fileWrite(&embedded, "./.env.local", std.testing.allocator);
+    defer env_local.deinit(std.testing.allocator);
+    try std.testing.expectEqual(core.decision.DecisionResult.deny, env_local.decision.result);
+
+    var nested_env = try evaluate.fileWrite(&embedded, "./src/.env", std.testing.allocator);
+    defer nested_env.deinit(std.testing.allocator);
+    try std.testing.expectEqual(core.decision.DecisionResult.deny, nested_env.decision.result);
+
+    var ok_write = try evaluate.fileWrite(&embedded, "./src/ok.zig", std.testing.allocator);
+    defer ok_write.deinit(std.testing.allocator);
+    try std.testing.expect(ok_write.decision.result != .deny);
 }

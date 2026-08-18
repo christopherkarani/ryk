@@ -7,6 +7,23 @@ const catalog = @import("catalog.zig");
 const ids = @import("ids.zig");
 const network_tags = @import("network_tags.zig");
 
+pub fn freeCurlLikeHosts(allocator: std.mem.Allocator, hosts: [][]const u8) void {
+    for (hosts) |h| allocator.free(h);
+    allocator.free(hosts);
+}
+
+/// Transfer hosts from curl/wget operands (allocator-owned unique list).
+/// Reused by effect classification and the shell_eval destination allowlist fence.
+pub fn extractCurlLikeHosts(allocator: std.mem.Allocator, command_text: []const u8) ![][]const u8 {
+    var hosts: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (hosts.items) |h| allocator.free(h);
+        hosts.deinit(allocator);
+    }
+    try appendCurlLikeHosts(allocator, command_text, &hosts);
+    return try hosts.toOwnedSlice(allocator);
+}
+
 /// Classify a command display string into effect hits (owned slice).
 pub fn classifyCommand(allocator: std.mem.Allocator, command_text: []const u8) ![]catalog.EffectHit {
     var hits: std.ArrayList(catalog.EffectHit) = .empty;
@@ -431,11 +448,22 @@ fn curlFlagTakesValue(flag: []const u8) bool {
     return false;
 }
 
-/// Append effect hits for every curl/wget URL / tagged host operand in command position.
-fn appendCurlLikeHostEffects(
+fn appendUniqueOwnedHost(allocator: std.mem.Allocator, hosts: *std.ArrayList([]const u8), host: []const u8) !void {
+    const trimmed = std.mem.trim(u8, host, " \t\r\n");
+    if (trimmed.len == 0) return;
+    for (hosts.items) |existing| {
+        if (std.ascii.eqlIgnoreCase(existing, trimmed)) return;
+    }
+    const owned = try allocator.dupe(u8, trimmed);
+    errdefer allocator.free(owned);
+    try hosts.append(allocator, owned);
+}
+
+/// Collect unique curl/wget transfer hosts from command-position operands.
+fn appendCurlLikeHosts(
     allocator: std.mem.Allocator,
     command_text: []const u8,
-    hits: *std.ArrayList(catalog.EffectHit),
+    hosts: *std.ArrayList([]const u8),
 ) !void {
     const tokens = try tokenizeSimple(allocator, command_text);
     defer allocator.free(tokens);
@@ -456,15 +484,13 @@ fn appendCurlLikeHostEffects(
             // --url=VALUE / -url=VALUE → transfer URL (always classify).
             if (std.mem.startsWith(u8, t, "--url=") or std.mem.startsWith(u8, t, "-url=")) {
                 const raw = if (std.mem.startsWith(u8, t, "--url=")) t["--url=".len..] else t["-url=".len..];
-                const host = network_tags.hostFromUrlOrHost(raw);
-                try appendCurlHostHit(allocator, hits, host);
+                try appendUniqueOwnedHost(allocator, hosts, network_tags.hostFromUrlOrHost(raw));
                 continue;
             }
 
             // --url / -url VALUE → transfer URL (always classify).
             if ((std.mem.eql(u8, t, "--url") or std.mem.eql(u8, t, "-url")) and j + 1 < tokens.len) {
-                const host = network_tags.hostFromUrlOrHost(tokens[j + 1]);
-                try appendCurlHostHit(allocator, hits, host);
+                try appendUniqueOwnedHost(allocator, hosts, network_tags.hostFromUrlOrHost(tokens[j + 1]));
                 j += 1;
                 continue;
             }
@@ -478,17 +504,32 @@ fn appendCurlLikeHostEffects(
             }
 
             if (startsWithIgnoreCase(t, "https://") or startsWithIgnoreCase(t, "http://")) {
-                const host = network_tags.hostFromUrlOrHost(t);
-                try appendCurlHostHit(allocator, hits, host);
+                try appendUniqueOwnedHost(allocator, hosts, network_tags.hostFromUrlOrHost(t));
                 continue;
             }
 
-            // Bare host-looking tokens that match a curated tag.
+            // Bare host-looking tokens (allowlist default-deny needs unmatched hosts too).
             if (std.mem.indexOfScalar(u8, t, '.') != null) {
-                const host = network_tags.hostFromUrlOrHost(t);
-                try appendCurlHostHit(allocator, hits, host);
+                try appendUniqueOwnedHost(allocator, hosts, network_tags.hostFromUrlOrHost(t));
             }
         }
+    }
+}
+
+/// Append effect hits for every curl/wget URL / tagged host operand in command position.
+fn appendCurlLikeHostEffects(
+    allocator: std.mem.Allocator,
+    command_text: []const u8,
+    hits: *std.ArrayList(catalog.EffectHit),
+) !void {
+    var hosts: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (hosts.items) |h| allocator.free(h);
+        hosts.deinit(allocator);
+    }
+    try appendCurlLikeHosts(allocator, command_text, &hosts);
+    for (hosts.items) |host| {
+        try appendCurlHostHit(allocator, hits, host);
     }
 }
 
@@ -710,4 +751,21 @@ test "curl publish host after more than 48 tokens still classifies" {
     defer std.testing.allocator.free(hits);
     try std.testing.expect(hits.len >= 1);
     try std.testing.expectEqualStrings("comms.publish", hits[0].id);
+}
+
+test "extractCurlLikeHosts collects unmatched and allowlisted destinations" {
+    const invalid = try extractCurlLikeHosts(std.testing.allocator, "curl https://example.invalid/");
+    defer freeCurlLikeHosts(std.testing.allocator, invalid);
+    try std.testing.expectEqual(@as(usize, 1), invalid.len);
+    try std.testing.expectEqualStrings("example.invalid", invalid[0]);
+
+    const github = try extractCurlLikeHosts(std.testing.allocator, "curl https://api.github.com/");
+    defer freeCurlLikeHosts(std.testing.allocator, github);
+    try std.testing.expectEqual(@as(usize, 1), github.len);
+    try std.testing.expectEqualStrings("api.github.com", github[0]);
+
+    const wget_url = try extractCurlLikeHosts(std.testing.allocator, "wget --url https://example.invalid/install.sh");
+    defer freeCurlLikeHosts(std.testing.allocator, wget_url);
+    try std.testing.expectEqual(@as(usize, 1), wget_url.len);
+    try std.testing.expectEqualStrings("example.invalid", wget_url[0]);
 }

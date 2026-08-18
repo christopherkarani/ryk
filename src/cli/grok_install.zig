@@ -24,6 +24,13 @@ pub const shell_matcher = "Bash";
 /// via the Claude Read alias.
 pub const read_matcher = "Read";
 
+/// Matcher that official Grok Build expands to its file-write tool (`write_file`)
+/// via the Claude Write alias.
+pub const write_matcher = "Write";
+
+/// Matcher that official Grok Build expands to its file-edit tool via the Claude Edit alias.
+pub const edit_matcher = "Edit";
+
 pub const MergeResult = struct {
     bytes: []u8,
     changed: bool,
@@ -143,7 +150,7 @@ pub fn isSupportedCliHelp(help_output: []const u8) bool {
 }
 
 /// Build the managed hook document owned by ryk (full file replace).
-/// PreToolUse registers Bash (shell) and Read (file-read) matchers with the same command.
+/// PreToolUse registers Bash, Read, Write, and Edit matchers with the same command.
 pub fn managedHookDocumentAlloc(allocator: std.mem.Allocator, ryk_binary: []const u8) ![]u8 {
     const command = try hookCommandAlloc(allocator, ryk_binary);
     defer allocator.free(command);
@@ -172,12 +179,37 @@ pub fn managedHookDocumentAlloc(allocator: std.mem.Allocator, ryk_binary: []cons
         \\            "timeout": 30
         \\          }}
         \\        ]
+        \\      }},
+        \\      {{
+        \\        "matcher": "{s}",
+        \\        "hooks": [
+        \\          {{
+        \\            "type": "command",
+        \\            "command": {s},
+        \\            "timeout": 30
+        \\          }}
+        \\        ]
+        \\      }},
+        \\      {{
+        \\        "matcher": "{s}",
+        \\        "hooks": [
+        \\          {{
+        \\            "type": "command",
+        \\            "command": {s},
+        \\            "timeout": 30
+        \\          }}
+        \\        ]
         \\      }}
         \\    ]
         \\  }}
         \\}}
         \\
-    , .{ shell_matcher, quoted_command, read_matcher, quoted_command });
+    , .{
+        shell_matcher, quoted_command,
+        read_matcher,  quoted_command,
+        write_matcher, quoted_command,
+        edit_matcher,  quoted_command,
+    });
 }
 
 /// Merge ryk's Grok PreToolUse hook into an existing settings document.
@@ -213,11 +245,13 @@ pub fn mergeSettingsAlloc(
     }
     if (pre_tool_use.?.* != .array) return error.InvalidPreToolUseHooks;
 
-    // Require both Bash and Read matchers with the current fail-closed command.
+    // Require Bash, Read, Write, and Edit matchers with the current fail-closed command.
     // Legacy `…/ryk hook grok PreToolUse` still counts as ryk (uninstall/identity)
     // but must be rewritten — official Grok fail-opens on that shape when ryk is gone.
     var has_bash_ryk = false;
     var has_read_ryk = false;
+    var has_write_ryk = false;
+    var has_edit_ryk = false;
     var rewritten = false;
     for (pre_tool_use.?.array.items) |*entry| {
         if (try rewriteRykHookCommands(tree_allocator, entry, command)) rewritten = true;
@@ -227,10 +261,12 @@ pub fn mergeSettingsAlloc(
             if (m == .string) {
                 if (std.mem.eql(u8, m.string, shell_matcher)) has_bash_ryk = true;
                 if (std.mem.eql(u8, m.string, read_matcher)) has_read_ryk = true;
+                if (std.mem.eql(u8, m.string, write_matcher)) has_write_ryk = true;
+                if (std.mem.eql(u8, m.string, edit_matcher)) has_edit_ryk = true;
             }
         }
     }
-    if (has_bash_ryk and has_read_ryk and !rewritten) {
+    if (has_bash_ryk and has_read_ryk and has_write_ryk and has_edit_ryk and !rewritten) {
         return .{
             .bytes = try allocator.dupe(u8, existing),
             .changed = false,
@@ -242,6 +278,12 @@ pub fn mergeSettingsAlloc(
     }
     if (!has_read_ryk) {
         try appendRykMatcherEntry(tree_allocator, &pre_tool_use.?.array, command, read_matcher);
+    }
+    if (!has_write_ryk) {
+        try appendRykMatcherEntry(tree_allocator, &pre_tool_use.?.array, command, write_matcher);
+    }
+    if (!has_edit_ryk) {
+        try appendRykMatcherEntry(tree_allocator, &pre_tool_use.?.array, command, edit_matcher);
     }
 
     const bytes = try std.json.Stringify.valueAlloc(allocator, parsed.value, .{ .whitespace = .indent_2 });
@@ -762,12 +804,14 @@ pub fn parseBakedRykBinaryFromHookDocument(allocator: std.mem.Allocator, bytes: 
 // Tests
 // ---------------------------------------------------------------------------
 
-test "Grok managed hook document targets Bash and Read matchers and ryk PreToolUse" {
+test "Grok managed hook document targets Bash, Read, and Write/Edit matchers and ryk PreToolUse" {
     const allocator = std.testing.allocator;
     const managed = try managedHookDocumentAlloc(allocator, "/opt/ryk/bin/ryk");
     defer allocator.free(managed);
     try std.testing.expect(std.mem.indexOf(u8, managed, "\"matcher\": \"Bash\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, managed, "\"matcher\": \"Read\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, managed, "\"matcher\": \"Write\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, managed, "\"matcher\": \"Edit\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, managed, "/opt/ryk/bin/ryk") != null);
     try std.testing.expect(std.mem.indexOf(u8, managed, "hook grok PreToolUse") != null);
     try std.testing.expect(std.mem.indexOf(u8, managed, "ryk binary unavailable") != null);
@@ -777,6 +821,8 @@ test "Grok managed hook document targets Bash and Read matchers and ryk PreToolU
     try std.testing.expect(merged.changed);
     try std.testing.expect(std.mem.indexOf(u8, merged.bytes, "\"matcher\": \"Bash\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, merged.bytes, "\"matcher\": \"Read\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, merged.bytes, "\"matcher\": \"Write\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, merged.bytes, "\"matcher\": \"Edit\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, merged.bytes, "/opt/ryk/bin/ryk") != null);
     try std.testing.expect(std.mem.indexOf(u8, merged.bytes, "hook grok PreToolUse") != null);
 }
@@ -812,17 +858,19 @@ test "Grok settings merge preserves unrelated settings and existing hooks" {
     const hooks = parsed.value.object.get("hooks").?.object;
     try std.testing.expect(hooks.get("SessionStart") != null);
     const pre_tool = hooks.get("PreToolUse").?.array.items;
-    // Unrelated edit matcher + Bash + Read ryk matchers.
-    try std.testing.expectEqual(@as(usize, 3), pre_tool.len);
+    // Unrelated edit matcher + Bash + Read + Write + Edit ryk matchers.
+    try std.testing.expectEqual(@as(usize, 5), pre_tool.len);
     try std.testing.expectEqualStrings("./existing-hook.sh", pre_tool[0].object.get("hooks").?.array.items[0].object.get("command").?.string);
     const ryk_cmd = pre_tool[1].object.get("hooks").?.array.items[0].object.get("command").?.string;
     try std.testing.expect(isRykGrokHookCommand(ryk_cmd));
     try std.testing.expect(std.mem.indexOf(u8, ryk_cmd, "/opt/ryk/bin/ryk") != null);
     try std.testing.expectEqualStrings(shell_matcher, pre_tool[1].object.get("matcher").?.string);
     try std.testing.expectEqualStrings(read_matcher, pre_tool[2].object.get("matcher").?.string);
+    try std.testing.expectEqualStrings(write_matcher, pre_tool[3].object.get("matcher").?.string);
+    try std.testing.expectEqualStrings(edit_matcher, pre_tool[4].object.get("matcher").?.string);
 }
 
-test "Grok settings merge upgrades Bash-only ryk hook to dual Bash and Read matchers" {
+test "Grok settings merge upgrades Bash-only ryk hook to Bash, Read, and Write/Edit matchers" {
     const allocator = std.testing.allocator;
     const bash_only =
         \\{
@@ -843,16 +891,20 @@ test "Grok settings merge upgrades Bash-only ryk hook to dual Bash and Read matc
     try std.testing.expect(merged.changed);
     try std.testing.expect(std.mem.indexOf(u8, merged.bytes, "\"matcher\": \"Bash\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, merged.bytes, "\"matcher\": \"Read\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, merged.bytes, "\"matcher\": \"Write\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, merged.bytes, "\"matcher\": \"Edit\"") != null);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, merged.bytes, .{});
     defer parsed.deinit();
     const pre_tool = parsed.value.object.get("hooks").?.object.get("PreToolUse").?.array.items;
-    try std.testing.expectEqual(@as(usize, 2), pre_tool.len);
+    try std.testing.expectEqual(@as(usize, 4), pre_tool.len);
     try std.testing.expectEqualStrings(shell_matcher, pre_tool[0].object.get("matcher").?.string);
     try std.testing.expectEqualStrings(read_matcher, pre_tool[1].object.get("matcher").?.string);
+    try std.testing.expectEqualStrings(write_matcher, pre_tool[2].object.get("matcher").?.string);
+    try std.testing.expectEqualStrings(edit_matcher, pre_tool[3].object.get("matcher").?.string);
 }
 
-test "Grok settings merge upgrades Read-only ryk hook to dual Bash and Read matchers" {
+test "Grok settings merge upgrades Read-only ryk hook to Bash, Read, and Write/Edit matchers" {
     const allocator = std.testing.allocator;
     const read_only =
         \\{
@@ -875,9 +927,11 @@ test "Grok settings merge upgrades Read-only ryk hook to dual Bash and Read matc
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, merged.bytes, .{});
     defer parsed.deinit();
     const pre_tool = parsed.value.object.get("hooks").?.object.get("PreToolUse").?.array.items;
-    try std.testing.expectEqual(@as(usize, 2), pre_tool.len);
+    try std.testing.expectEqual(@as(usize, 4), pre_tool.len);
     try std.testing.expectEqualStrings(read_matcher, pre_tool[0].object.get("matcher").?.string);
     try std.testing.expectEqualStrings(shell_matcher, pre_tool[1].object.get("matcher").?.string);
+    try std.testing.expectEqualStrings(write_matcher, pre_tool[2].object.get("matcher").?.string);
+    try std.testing.expectEqualStrings(edit_matcher, pre_tool[3].object.get("matcher").?.string);
 }
 
 test "Grok settings merge is idempotent and detects an existing ryk hook" {
@@ -925,6 +979,8 @@ test "Grok installed check requires managed hooks/ryk.json not legacy user-setti
     defer std.testing.allocator.free(written);
     try std.testing.expect(std.mem.indexOf(u8, written, "\"matcher\": \"Bash\"") != null or std.mem.indexOf(u8, written, "\"matcher\":\"Bash\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "\"matcher\": \"Read\"") != null or std.mem.indexOf(u8, written, "\"matcher\":\"Read\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"matcher\": \"Write\"") != null or std.mem.indexOf(u8, written, "\"matcher\":\"Write\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"matcher\": \"Edit\"") != null or std.mem.indexOf(u8, written, "\"matcher\":\"Edit\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "/opt/ryk/bin/ryk") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "hook grok PreToolUse") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "ryk binary unavailable") != null);
@@ -1155,9 +1211,11 @@ test "Grok settings merge upgrades legacy direct hook to fail-closed wrapper" {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, merged.bytes, .{});
     defer parsed.deinit();
     const pre_tool = parsed.value.object.get("hooks").?.object.get("PreToolUse").?.array.items;
-    try std.testing.expectEqual(@as(usize, 2), pre_tool.len);
+    try std.testing.expectEqual(@as(usize, 4), pre_tool.len);
     const bash_cmd = pre_tool[0].object.get("hooks").?.array.items[0].object.get("command").?.string;
     const read_cmd = pre_tool[1].object.get("hooks").?.array.items[0].object.get("command").?.string;
+    try std.testing.expectEqualStrings(write_matcher, pre_tool[2].object.get("matcher").?.string);
+    try std.testing.expectEqualStrings(edit_matcher, pre_tool[3].object.get("matcher").?.string);
     try std.testing.expect(isRykGrokHookCommand(bash_cmd));
     try std.testing.expect(isRykGrokHookCommand(read_cmd));
     try std.testing.expect(!isLegacyDirectRykGrokHook(bash_cmd));

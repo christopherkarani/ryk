@@ -132,11 +132,11 @@ printf '%s' "{\"schema_version\":1,\"kind\":\"shell_command\",\"command\":\"echo
   | ./zig-out/bin/ryk evaluate --json --stdin
 # Expect: "decision": "allow" (exit 0) under yolo’s ask-like matrix
 
-# 2) High non-critical destroy (rm -rf of a workspace dir) → may ask; not refuse-all
+# 2) Recursive force-delete is a critical hard fence (yolo/ask cannot unlock)
 printf '%s' "{\"schema_version\":1,\"kind\":\"shell_command\",\"command\":\"rm -rf ./build\",\"cwd\":\"$(pwd)\"}" \
   | ./zig-out/bin/ryk evaluate --json --stdin
-# Expect: "decision": "ask" (exit 0) under yolo/ask for core.filesystem:rm-rf-general.
-#         curl|bash is critical (zig.shell:network-pipe-to-shell) and still denies under yolo.
+# Expect: "decision": "deny" for core.filesystem:rm-rf-general (critical).
+#         curl|bash is also critical (zig.shell:network-pipe-to-shell) and still denies under yolo.
 
 # Optional: RYK_MODE=strict|ci can only raise above policy yolo; RYK_MODE=yolo alone
 # does not soft-mode a strict discovered policy.
