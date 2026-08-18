@@ -33,6 +33,7 @@ const apply_posix = @import("apply_posix.zig");
 const session_tmp = @import("session_tmp.zig");
 const path_list = @import("path_list.zig");
 pub const host_config_grants = @import("host_config_grants.zig");
+const os_grant_collect = @import("os_grant_collect.zig");
 
 /// Re-export session-tmp surface for callers that only import apply.
 pub const workspace_session_tmp_name = session_tmp.workspace_session_tmp_name;
@@ -83,6 +84,7 @@ pub const ChildMaterials = union(enum) {
         /// Divergence rebuilds a different profile hash and fails the attach
         /// handshake with no diagnostic pointing at the mismatch.
         ro_paths: [][]const u8,
+        ro_file_paths: [][]const u8,
         host_rw_paths: [][]const u8,
     },
     seatbelt: struct {
@@ -102,6 +104,7 @@ pub const ChildMaterials = union(enum) {
             .landlock => |*p| {
                 p.compiled.deinit();
                 path_list.free(p.allocator, p.ro_paths);
+                path_list.free(p.allocator, p.ro_file_paths);
                 path_list.free(p.allocator, p.host_rw_paths);
             },
             .seatbelt => |*s| s.allocator.free(s.sbpl_z),
@@ -160,6 +163,15 @@ pub const ApplyBoundary = struct {
     /// child network rules that force outbound TCP through the loopback proxy.
     network_proxy_port: ?u16 = null,
     require_network_route_forcing: bool = false,
+    /// When true, attach collects the usual OS grants (ancestor, host-config,
+    /// system, toolchain, argv0 exec/install). Launch lists are extras only.
+    collect_usual: bool = false,
+    /// Trusted host-config table key (empty = generic). Used with collect_usual.
+    host: []const u8 = "",
+    /// `$HOME` for host-config / ancestor walks. Used with collect_usual.
+    home: []const u8 = "",
+    /// Agent argv0 for usual exec/install collect. Used with collect_usual.
+    argv0: ?[]const u8 = null,
     /// macOS Seatbelt residual grade (ignored on non-macOS). Default hardened.
     seatbelt_profile: macos_profile.SeatbeltProfileGrade = macos_profile.SeatbeltProfileGrade.default_grade,
     /// When `error.RequireFailed` is returned, set to a static reason code if non-null.
@@ -331,6 +343,7 @@ pub const ApplyResult = struct {
                 ll.route_forcing,
                 ll.include_tmp,
                 ll.ro_paths,
+                ll.ro_file_paths,
                 ll.host_rw_paths,
                 argv_owned,
                 env_map,
@@ -1604,13 +1617,46 @@ pub fn applyBeforeExec(boundary: ApplyBoundary) ApplyError!ApplyResult {
     // OOM is never a soft grade-drop: propagate so callers fail closed hard.
     // InvalidWorkspace / InvalidExecPath / other compile failures → profile_compile_failed
     // (on→RequireFailed, auto→unavailable).
+    var usual_grants: ?os_grant_collect.CollectedGrants = null;
+    defer if (usual_grants) |*c| c.deinit();
+    var extra_grants_owned: []profile.ExtraGrant = &.{};
+    defer if (extra_grants_owned.len > 0) boundary.allocator.free(extra_grants_owned);
+
+    if (boundary.collect_usual) {
+        var launch_extras: std.ArrayList(os_grant_collect.ExtraGrant) = .empty;
+        defer launch_extras.deinit(boundary.allocator);
+        for (boundary.launch_exec_paths) |p| {
+            launch_extras.append(boundary.allocator, .{ .path = p, .mode = .exec, .kind = .file }) catch
+                return error.OutOfMemory;
+        }
+        for (boundary.launch_ro_paths) |p| {
+            launch_extras.append(boundary.allocator, .{ .path = p, .mode = .ro, .kind = .folder }) catch
+                return error.OutOfMemory;
+        }
+        for (boundary.launch_host_rw_paths) |p| {
+            launch_extras.append(boundary.allocator, .{ .path = p, .mode = .rw, .kind = .folder }) catch
+                return error.OutOfMemory;
+        }
+        var usual_io: std.Io.Threaded = .init_single_threaded;
+        usual_grants = os_grant_collect.collectUsualGrants(usual_io.io(), boundary.allocator, .{
+            .workspace_root = boundary.workspace_root,
+            .host = boundary.host,
+            .home = boundary.home,
+            .argv0 = boundary.argv0,
+            .env_map = boundary.env_map,
+            .extras = launch_extras.items,
+        }) catch return error.OutOfMemory;
+        extra_grants_owned = usual_grants.?.extraGrantsAlloc() catch return error.OutOfMemory;
+    }
+
     var compiled = profile.compileProfile(boundary.allocator, .{
         .workspace_root = boundary.workspace_root,
         .control_roots = boundary.control_roots,
         .include_tmp = boundary.include_tmp,
-        .exec_paths = boundary.launch_exec_paths,
-        .ro_paths = boundary.launch_ro_paths,
-        .host_rw_paths = boundary.launch_host_rw_paths,
+        .exec_paths = if (boundary.collect_usual) &.{} else boundary.launch_exec_paths,
+        .ro_paths = if (boundary.collect_usual) &.{} else boundary.launch_ro_paths,
+        .host_rw_paths = if (boundary.collect_usual) &.{} else boundary.launch_host_rw_paths,
+        .extra_grants = extra_grants_owned,
         .protect_workspace_secrets = boundary.protect_workspace_secrets,
     }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -1741,10 +1787,11 @@ pub fn applyBeforeExec(boundary: ApplyBoundary) ApplyError!ApplyResult {
             // Posture is `prepared`, not grade-drop `unavailable`.
             // Linux: transfer landlock profile. macOS: keep SBPL. Spawn path applies then activates.
             if (platform.mechanism == .landlock) {
-                const ro_paths = try path_list.clone(boundary.allocator, boundary.launch_ro_paths);
-                errdefer path_list.free(boundary.allocator, ro_paths);
-                const host_rw_paths = try path_list.clone(boundary.allocator, boundary.launch_host_rw_paths);
-                errdefer path_list.free(boundary.allocator, host_rw_paths);
+                const split = try cloneCompileInputsForLandlock(
+                    boundary.allocator,
+                    boundary,
+                    extra_grants_owned,
+                );
                 transfer_landlock = true;
                 return .{
                     .receipt = posture.preparedReceipt(.landlock, platform.reason_code),
@@ -1758,8 +1805,9 @@ pub fn applyBeforeExec(boundary: ApplyBoundary) ApplyError!ApplyResult {
                         .compiled = compiled,
                         .route_forcing = platform.landlock_route_forcing,
                         .include_tmp = boundary.include_tmp,
-                        .ro_paths = ro_paths,
-                        .host_rw_paths = host_rw_paths,
+                        .ro_paths = split.ro_paths,
+                        .ro_file_paths = split.ro_file_paths,
+                        .host_rw_paths = split.host_rw_paths,
                     } },
                     .network_route_forced = platform.network_route_forced,
                     .session_tmp = blk: {
@@ -1830,6 +1878,66 @@ pub fn applyBeforeExec(boundary: ApplyBoundary) ApplyError!ApplyResult {
             };
         },
     }
+}
+
+const LandlockCompileInputs = struct {
+    ro_paths: [][]const u8,
+    ro_file_paths: [][]const u8,
+    host_rw_paths: [][]const u8,
+};
+
+fn cloneCompileInputsForLandlock(
+    allocator: std.mem.Allocator,
+    boundary: ApplyBoundary,
+    extra_grants: []const profile.ExtraGrant,
+) error{OutOfMemory}!LandlockCompileInputs {
+    if (!boundary.collect_usual) {
+        const ro_paths = try path_list.clone(allocator, boundary.launch_ro_paths);
+        errdefer path_list.free(allocator, ro_paths);
+        const ro_file_paths = try path_list.clone(allocator, &.{});
+        errdefer path_list.free(allocator, ro_file_paths);
+        const host_rw_paths = try path_list.clone(allocator, boundary.launch_host_rw_paths);
+        return .{
+            .ro_paths = ro_paths,
+            .ro_file_paths = ro_file_paths,
+            .host_rw_paths = host_rw_paths,
+        };
+    }
+
+    var ro: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (ro.items) |p| allocator.free(p);
+        ro.deinit(allocator);
+    }
+    var ro_file: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (ro_file.items) |p| allocator.free(p);
+        ro_file.deinit(allocator);
+    }
+    var rw: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (rw.items) |p| allocator.free(p);
+        rw.deinit(allocator);
+    }
+
+    for (extra_grants) |g| {
+        const owned = try allocator.dupe(u8, g.path);
+        errdefer allocator.free(owned);
+        switch (g.mode) {
+            .exec => allocator.free(owned),
+            .ro => switch (g.kind) {
+                .file => try ro_file.append(allocator, owned),
+                .folder => try ro.append(allocator, owned),
+            },
+            .rw => try rw.append(allocator, owned),
+        }
+    }
+
+    return .{
+        .ro_paths = try ro.toOwnedSlice(allocator),
+        .ro_file_paths = try ro_file.toOwnedSlice(allocator),
+        .host_rw_paths = try rw.toOwnedSlice(allocator),
+    };
 }
 
 /// Platform prepare: Linux → Landlock ABI probe + prepared child plan; macOS → Seatbelt prepare.
@@ -1966,6 +2074,72 @@ test "Landlock prepare is unavailable when the ABI probe fails" {
     const outcome = tryPlatformApplyLinux(null);
     try std.testing.expectEqual(PlatformApplyStatus.unavailable, outcome.status);
     try std.testing.expectEqualStrings("landlock_unavailable", outcome.reason_code);
+}
+
+test "applyBeforeExec collect_usual stamps ancestor instruction as file" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var home_tmp = std.testing.tmpDir(.{});
+    defer home_tmp.cleanup();
+    const home = try home_tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(home);
+
+    try home_tmp.dir.createDirPath(io, "proj/ws/.ryk");
+    try home_tmp.dir.createDirPath(io, "proj/ws/.git");
+    try home_tmp.dir.writeFile(io, .{
+        .sub_path = "proj/AGENTS.md",
+        .data = "PARENT_AGENTS_OK\n",
+    });
+    try home_tmp.dir.writeFile(io, .{
+        .sub_path = "proj/secret.env",
+        .data = "SIBLING_SECRET\n",
+    });
+
+    const workspace = try std.fs.path.join(allocator, &.{ home, "proj", "ws" });
+    defer allocator.free(workspace);
+    const parent_agents = try std.fs.path.join(allocator, &.{ home, "proj", "AGENTS.md" });
+    defer allocator.free(parent_agents);
+    const parent_dir = try std.fs.path.join(allocator, &.{ home, "proj" });
+    defer allocator.free(parent_dir);
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("HOME", home);
+    try env_map.put("PATH", "/usr/bin:/bin");
+
+    var result = try applyBeforeExec(.{
+        .allocator = allocator,
+        .mode = .auto,
+        .workspace_root = workspace,
+        .env_map = &env_map,
+        .collect_usual = true,
+        .home = home,
+    });
+    defer result.deinit();
+
+    switch (result.materials) {
+        .seatbelt => |s| {
+            const needle_lit = try std.fmt.allocPrint(allocator, "(literal \"{s}\")", .{parent_agents});
+            defer allocator.free(needle_lit);
+            const needle_sub = try std.fmt.allocPrint(allocator, "(subpath \"{s}\")", .{parent_agents});
+            defer allocator.free(needle_sub);
+            const parent_sub = try std.fmt.allocPrint(allocator, "(subpath \"{s}\")", .{parent_dir});
+            defer allocator.free(parent_sub);
+            try std.testing.expect(std.mem.indexOf(u8, s.sbpl_z, needle_lit) != null);
+            try std.testing.expect(std.mem.indexOf(u8, s.sbpl_z, needle_sub) == null);
+            try std.testing.expect(std.mem.indexOf(u8, s.sbpl_z, parent_sub) == null);
+        },
+        .landlock => |ll| {
+            try std.testing.expect(pathsContain(ll.ro_file_paths, parent_agents));
+            try std.testing.expect(ll.compiled.hasGrantWithKind(parent_agents, .ro, .file));
+            try std.testing.expect(!ll.compiled.hasGrant(parent_dir, .ro));
+            const secret = try std.fmt.allocPrint(allocator, "{s}/secret.env", .{parent_dir});
+            defer allocator.free(secret);
+            try std.testing.expect(!ll.compiled.isGrantedReadable(secret));
+        },
+        .none => return error.SkipZigTest,
+    }
 }
 
 test "mode off returns disabled receipt without scrub or active claim" {

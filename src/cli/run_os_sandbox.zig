@@ -417,13 +417,8 @@ pub fn applyForRun(
     else
         try allocator.alloc([]const u8, 0);
     defer sandbox.host_config_grants.freeHostConfigWriteDenies(allocator, config_write_denies);
-    const agent_exec_paths: []const []const u8 = if (launch_argv0) |argv0|
-        try sandbox.apply.collectLaunchExecPaths(launch_io, allocator, argv0, env_map)
-    else
-        try allocator.alloc([]const u8, 0);
-    defer sandbox.apply.freeLaunchExecPaths(allocator, agent_exec_paths);
-    // Phase 4: essentials tool pack → file-only .exec grants (rg/fd/jq/zig/git).
-    // Default essentials when OS attach is planned; RYK_TOOL_PACK=none kills the pack.
+    // Phase 4: essentials tool pack → extras (file .exec + folder RO).
+    // Attach collects the usual grants (ancestor/host-config/system/toolchain/argv0).
     const os_attach_planned = mode != .off;
     const tool_pack = sandbox.tool_pack.resolveToolPack(env_map, os_attach_planned);
     const pack_exec_paths = try sandbox.tool_pack.collectPackExecPaths(
@@ -440,113 +435,17 @@ pub fn applyForRun(
         pack_exec_paths,
     );
     defer sandbox.tool_pack.freePackExecPaths(allocator, pack_ro_paths);
-    // Honesty labels for the child (even when pack resolves empty).
     try env_map.put(sandbox.tool_pack.tool_pack_env, tool_pack.toString());
-    const agent_and_pack = try copyMergedPathLists(allocator, agent_exec_paths, pack_exec_paths);
-    defer path_list.free(allocator, agent_and_pack);
-    const launch_exec_paths = try copyMergedPathLists(
-        allocator,
-        agent_and_pack,
-        extra_exec_paths,
-    );
+    const launch_exec_paths = try copyMergedPathLists(allocator, pack_exec_paths, extra_exec_paths);
     defer path_list.free(allocator, launch_exec_paths);
-
-    // Node/npm agents: RO package root so nested optional deps + vendor binaries
-    // are readable after empty-backpack Seatbelt (file-only .exec is not enough).
-    // Host system RO (e.g. codex `/etc/codex`) merges into the same `.ro` list.
-    // macOS: Apple developer toolchains (CLT / Xcode Developer) so /usr/bin/git
-    // libxcselect stubs work for every agent (opencode, hermes, …) without a
-    // false “install developer tools” dialog — never bare /Applications.
-    // Nested scopes so mergeOwnedPathLists consume + errdefer pairs end before
-    // later fallible work (otherwise OOM after consume double-frees inputs).
-    const base_launch_ro_paths: []const []const u8 = blk: {
-        const install_system_toolchain: []const []const u8 = merge_ist: {
-            const install_system: []const []const u8 = if (launch_argv0) |argv0| inner: {
-                const install_ro = try sandbox.apply.collectLaunchInstallRoPaths(launch_io, allocator, argv0, env_map);
-                errdefer sandbox.apply.freeLaunchInstallRoPaths(allocator, install_ro);
-                const system_ro = try sandbox.host_config_grants.collectHostSystemRoPaths(allocator, trusted_host);
-                errdefer sandbox.host_config_grants.freeHostSystemRoPaths(allocator, system_ro);
-                break :inner try mergeOwnedPathLists(allocator, install_ro, system_ro);
-            } else try allocator.alloc([]const u8, 0);
-            errdefer path_list.free(allocator, install_system);
-
-            const toolchain_ro = try sandbox.host_config_grants.collectMacosDeveloperToolchainRoPaths(
-                launch_io,
-                allocator,
-                env_map,
-            );
-            errdefer sandbox.host_config_grants.freeHostSystemRoPaths(allocator, toolchain_ro);
-            // Consumes both inputs on success; errdefers above only run if this fails.
-            break :merge_ist try mergeOwnedPathLists(allocator, install_system, toolchain_ro);
-        };
-        errdefer path_list.free(allocator, install_system_toolchain);
-
-        // Parent-of-workspace AGENTS.md / CLAUDE.md (file RO only). Pi and peers
-        // walk up from cwd; empty backpack previously denied these by design and
-        // agents printed EPERM warnings. Never grants parent directory trees.
-        const ancestor_ro = try sandbox.host_config_grants.collectAncestorInstructionRoPaths(
-            launch_io,
-            allocator,
-            workspace_root,
-            home_for_config,
-        );
-        errdefer sandbox.host_config_grants.freeHostSystemRoPaths(allocator, ancestor_ro);
-        break :blk try mergeOwnedPathLists(allocator, install_system_toolchain, ancestor_ro);
-    };
-    defer path_list.free(allocator, base_launch_ro_paths);
-    // Pack dylib/formula RO (Homebrew linked libs) + MCP/extra RO.
-    const base_and_pack_ro = try copyMergedPathLists(allocator, base_launch_ro_paths, pack_ro_paths);
-    defer path_list.free(allocator, base_and_pack_ro);
-    const launch_ro_paths = try copyMergedPathLists(
-        allocator,
-        base_and_pack_ro,
-        extra_ro_paths,
-    );
+    const launch_ro_paths = try copyMergedPathLists(allocator, pack_ro_paths, extra_ro_paths);
     defer path_list.free(allocator, launch_ro_paths);
 
-    // Pin DEVELOPER_DIR for the child (prefer CLT). Stops libxcselect from
-    // requiring host select-link resolution when links are stale/broken, and
-    // avoids the false “install developer tools” dialog under Seatbelt.
-    // Uses launch_ro_paths after merge so the map value is duped from a live path.
-    if (builtin.os.tag == .macos) {
-        const existing = env_map.get("DEVELOPER_DIR");
-        const existing_ok = if (existing) |d|
-            sandbox.host_config_grants.isAllowlistedMacosDeveloperToolchainPath(d)
-        else
-            false;
-        if (!existing_ok) {
-            if (sandbox.host_config_grants.preferredMacosDeveloperDir(launch_ro_paths)) |preferred| {
-                try env_map.put("DEVELOPER_DIR", preferred);
-            }
-        }
-        // Keep PATH identical to the environment used by MCP inventory
-        // preflight. DEVELOPER_DIR is enough for libxcselect; prepending a
-        // toolchain here could change a bare MCP command after approval.
-    }
-
-    const base_host_rw_paths_unfiltered: []const []const u8 = if (trusted_host.len > 0)
-        try sandbox.host_config_grants.collectHostConfigPaths(launch_io, allocator, trusted_host, home_for_config)
-    else
-        try allocator.alloc([]const u8, 0);
-    defer sandbox.host_config_grants.freeHostConfigPaths(allocator, base_host_rw_paths_unfiltered);
     const custom_codex_home = if (trusted_host.len > 0)
         try collectCustomCodexHome(launch_io, allocator, trusted_host, home_for_config, env_map)
     else
         try allocator.alloc([]const u8, 0);
     defer path_list.free(allocator, custom_codex_home);
-    const base_host_rw_paths = try withoutDefaultCodexHome(
-        allocator,
-        base_host_rw_paths_unfiltered,
-        home_for_config,
-        custom_codex_home.len > 0,
-    );
-    defer path_list.free(allocator, base_host_rw_paths);
-    const base_and_codex_rw_paths = try copyMergedPathLists(
-        allocator,
-        base_host_rw_paths,
-        custom_codex_home,
-    );
-    defer path_list.free(allocator, base_and_codex_rw_paths);
     const custom_host_config = if (trusted_host.len > 0)
         try collectCustomHostConfigPaths(launch_io, allocator, trusted_host, home_for_config, env_map)
     else
@@ -554,7 +453,7 @@ pub fn applyForRun(
     defer path_list.free(allocator, custom_host_config);
     const launch_host_rw_paths = try copyMergedPathLists(
         allocator,
-        base_and_codex_rw_paths,
+        custom_codex_home,
         custom_host_config,
     );
     defer path_list.free(allocator, launch_host_rw_paths);
@@ -569,6 +468,10 @@ pub fn applyForRun(
         // Authority files as control roots: Landlock expands host RW with these RO.
         // Merged with default `.ryk`/`.git` inside compileProfile.
         .control_roots = config_write_denies,
+        .collect_usual = mode != .off,
+        .host = trusted_host,
+        .home = home_for_config,
+        .argv0 = launch_argv0,
         .launch_exec_paths = launch_exec_paths,
         .launch_ro_paths = launch_ro_paths,
         .launch_host_rw_paths = launch_host_rw_paths,

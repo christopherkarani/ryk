@@ -579,10 +579,15 @@ fn addPathBeneathRuleInner(
     var stx = std.mem.zeroes(linux.Statx);
     const stx_rc = linux.statx(path_fd, "", linux.AT.EMPTY_PATH, .{ .TYPE = true }, &stx);
     if (linux.errno(stx_rc) != .SUCCESS or !stx.mask.TYPE) {
-        if (file_only or required) return error.ApplyFailed;
+        // Optional file RO (ancestor instruction) must not fail the whole apply
+        // when statx omits TYPE. Required exec/RW still fail closed.
+        if (required) return error.ApplyFailed;
         return false;
     }
-    if (file_only and !linux.S.ISREG(stx.mode)) return error.ApplyFailed;
+    if (file_only and !linux.S.ISREG(stx.mode)) {
+        if (required) return error.ApplyFailed;
+        return false;
+    }
 
     // File/device FDs reject directory-only (and IOCTL-on-non-device) bits.
     var effective = allowed;
@@ -732,12 +737,12 @@ fn applySelfLinux(
             continue;
         }
 
-        const required = grant.mode == .rw;
-        // `.exec` is file-only: refuse directory PATH_BENEATH (tree exec/read widen).
-        // File PATH_BENEATH is sufficient for execve — Landlock does not mediate
-        // directory path-walk (see docs/platform-linux.md); do not grant ancestors.
-        const installed = if (grant.mode == .exec)
-            try addPathBeneathRuleFileOnly(ruleset_fd, grant.path, allowed, true)
+        const required = grant.mode == .rw or grant.mode == .exec;
+        // File kind and `.exec` are this-path-only: refuse directory PATH_BENEATH
+        // (tree read/exec widen). Missing optional file RO is skipped; required
+        // exec/RW still fail closed.
+        const installed = if (grant.kind == .file or grant.mode == .exec)
+            try addPathBeneathRuleFileOnly(ruleset_fd, grant.path, allowed, required)
         else
             try addPathBeneathRule(ruleset_fd, grant.path, allowed, required);
         if (installed and grant.mode == .rw and std.mem.eql(u8, grant.path, compiled.workspace_root)) {

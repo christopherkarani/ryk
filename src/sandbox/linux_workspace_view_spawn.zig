@@ -21,6 +21,7 @@ const empty_bootstrap_environment = [_:null]?[*:0]const u8{};
 pub const ProfileInputs = struct {
     include_tmp: bool = false,
     ro_paths: []const []const u8 = &.{},
+    ro_file_paths: []const []const u8 = &.{},
     host_rw_paths: []const []const u8 = &.{},
     network_proxy_port: ?u16 = null,
     require_network_route_forcing: bool = false,
@@ -135,6 +136,7 @@ fn spawnWithOperations(request: LaunchRequest, operations: Operations) !SpawnedW
             .control_roots = request.compiled.control_roots,
             .exec_paths = exec_paths,
             .ro_paths = request.profile.ro_paths,
+            .ro_file_paths = request.profile.ro_file_paths,
             .host_rw_paths = request.profile.host_rw_paths,
             .network_proxy_port = request.profile.network_proxy_port,
             .require_network_route_forcing = request.profile.require_network_route_forcing,
@@ -747,6 +749,9 @@ test "bootstrap profile rebuild matches all parent launch grant inputs" {
     const allocator = std.testing.allocator;
     const exec_paths = [_][]const u8{ "/home/user/.local/bin/agent", "/home/user/.local/bin/agent-real" };
     const ro_paths = [_][]const u8{"/home/user/.local/share/agent"};
+    const extra_grants = [_]profile_mod.ExtraGrant{
+        .{ .path = "/home/user/CodingProjects/AGENTS.md", .mode = .ro, .kind = .file },
+    };
     const host_rw_paths = [_][]const u8{"/home/user/.config/agent"};
     var parent = try profile_mod.compileProfile(allocator, .{
         .workspace_root = "/work/project",
@@ -754,6 +759,7 @@ test "bootstrap profile rebuild matches all parent launch grant inputs" {
         .include_tmp = false,
         .exec_paths = &exec_paths,
         .ro_paths = &ro_paths,
+        .extra_grants = &extra_grants,
         .host_rw_paths = &host_rw_paths,
         .protect_workspace_secrets = true,
         .system_ro_prefixes = &[_][]const u8{"/usr"},
@@ -766,6 +772,7 @@ test "bootstrap profile rebuild matches all parent launch grant inputs" {
         .include_tmp = false,
         .exec_paths = &exec_paths,
         .ro_paths = &ro_paths,
+        .extra_grants = &extra_grants,
         .host_rw_paths = &host_rw_paths,
         .protect_workspace_secrets = true,
         .system_ro_prefixes = &[_][]const u8{"/usr"},
@@ -777,6 +784,8 @@ test "bootstrap profile rebuild matches all parent launch grant inputs" {
     try std.testing.expect(parent.hasGrant("/home/user/.local/bin/agent", .exec));
     try std.testing.expect(rebuilt.hasGrant("/home/user/.local/bin/agent", .exec));
     try std.testing.expect(parent.hasGrant("/home/user/.local/share/agent", .ro));
+    try std.testing.expect(parent.hasGrantWithKind("/home/user/CodingProjects/AGENTS.md", .ro, .file));
+    try std.testing.expect(rebuilt.hasGrantWithKind("/home/user/CodingProjects/AGENTS.md", .ro, .file));
     try std.testing.expect(rebuilt.hasGrant("/home/user/.config/agent", .rw));
 
     // Omitting any launch grant class must change the digest.

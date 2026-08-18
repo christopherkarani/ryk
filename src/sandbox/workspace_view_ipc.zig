@@ -9,14 +9,14 @@ const std = @import("std");
 
 pub const cookie_len = 32;
 pub const profile_hash_len = 32;
-/// v3 (2026-08-13): fixed payload grew 28 → 36 bytes with ro_path_count +
-/// host_rw_path_count (2 × u32) and two new string lists (ro_paths,
-/// host_rw_paths). v2 bootstrap children reject v3 parents as UnsupportedVersion.
-pub const protocol_version: u16 = 3;
+/// v4 (2026-08-18): fixed payload grew 36 → 40 bytes with ro_file_path_count
+/// and a file-only RO list so ancestor instruction keeps OS grant kind file
+/// on protect-on rebuild. v3 bootstrap children reject v4 parents.
+pub const protocol_version: u16 = 4;
 
 const magic = [4]u8{ 'R', 'Y', 'K', 'W' };
 const header_len = 12;
-const request_fixed_payload_len = cookie_len + profile_hash_len + 36;
+const request_fixed_payload_len = cookie_len + profile_hash_len + 40;
 const request_variable_offset = header_len + request_fixed_payload_len;
 const request_options_offset = header_len + cookie_len + profile_hash_len;
 const request_stdio_offset = request_options_offset + 1;
@@ -24,10 +24,9 @@ const response_status_offset = header_len + cookie_len + profile_hash_len;
 const response_proof_offset = response_status_offset + 1;
 const response_reason_offset = response_proof_offset + 1;
 pub const response_frame_len = header_len + cookie_len + profile_hash_len + 8;
-/// Allocations in `decodeRequestAlloc`: 1 frame storage copy + 6 slice tables
-/// (control_roots, exec_paths, ro_paths, host_rw_paths, argv, environ). The
-/// allocation-failure injection test walks every index below this count.
-const decode_allocation_count = 7;
+/// Allocations in `decodeRequestAlloc`: 1 frame storage copy + 7 slice tables
+/// (control_roots, exec_paths, ro_paths, ro_file_paths, host_rw_paths, argv, environ).
+const decode_allocation_count = 8;
 
 const option_include_tmp: u8 = 1 << 0;
 const option_has_proxy: u8 = 1 << 1;
@@ -46,6 +45,7 @@ pub const Limits = struct {
     max_control_roots: usize = 256,
     max_exec_paths: usize = 64,
     max_ro_paths: usize = 256,
+    max_ro_file_paths: usize = 256,
     max_host_rw_paths: usize = 256,
     max_arguments: usize = 4096,
     max_environment_entries: usize = 8192,
@@ -69,6 +69,8 @@ pub const ProfileOptions = struct {
     exec_paths: []const []const u8 = &.{},
     /// Original parent compile inputs required for profile-hash parity.
     ro_paths: []const []const u8 = &.{},
+    /// File-only RO grants (ancestor instruction). Rebuild as extra_grants kind file.
+    ro_file_paths: []const []const u8 = &.{},
     host_rw_paths: []const []const u8 = &.{},
     network_proxy_port: ?u16 = null,
     require_network_route_forcing: bool = false,
@@ -91,6 +93,7 @@ pub const OwnedProfileOptions = struct {
     control_roots: [][]const u8,
     exec_paths: [][]const u8,
     ro_paths: [][]const u8,
+    ro_file_paths: [][]const u8,
     host_rw_paths: [][]const u8,
     network_proxy_port: ?u16,
     require_network_route_forcing: bool,
@@ -117,6 +120,7 @@ pub const OwnedBootstrapRequest = struct {
         self.allocator.free(self.profile.control_roots);
         self.allocator.free(self.profile.exec_paths);
         self.allocator.free(self.profile.ro_paths);
+        self.allocator.free(self.profile.ro_file_paths);
         self.allocator.free(self.profile.host_rw_paths);
         self.allocator.free(self.argv);
         self.allocator.free(self.environ);
@@ -131,6 +135,7 @@ pub const OwnedBootstrapRequest = struct {
         self.profile.control_roots = &.{};
         self.profile.exec_paths = &.{};
         self.profile.ro_paths = &.{};
+        self.profile.ro_file_paths = &.{};
         self.profile.host_rw_paths = &.{};
     }
 
@@ -147,6 +152,7 @@ pub const OwnedBootstrapRequest = struct {
                 .control_roots = self.profile.control_roots,
                 .exec_paths = self.profile.exec_paths,
                 .ro_paths = self.profile.ro_paths,
+                .ro_file_paths = self.profile.ro_file_paths,
                 .host_rw_paths = self.profile.host_rw_paths,
                 .network_proxy_port = self.profile.network_proxy_port,
                 .require_network_route_forcing = self.profile.require_network_route_forcing,
@@ -312,6 +318,7 @@ pub fn encodedRequestSize(request: BootstrapRequest, limits: Limits) CodecError!
     size = try addStringListSize(size, request.profile.control_roots);
     size = try addStringListSize(size, request.profile.exec_paths);
     size = try addStringListSize(size, request.profile.ro_paths);
+    size = try addStringListSize(size, request.profile.ro_file_paths);
     size = try addStringListSize(size, request.profile.host_rw_paths);
     size = try addStringListSize(size, request.argv);
     size = try addStringListSize(size, request.environ);
@@ -351,6 +358,7 @@ pub fn encodeRequest(
     try writer.putU32(try usizeToU32(request.profile.control_roots.len));
     try writer.putU32(try usizeToU32(request.profile.exec_paths.len));
     try writer.putU32(try usizeToU32(request.profile.ro_paths.len));
+    try writer.putU32(try usizeToU32(request.profile.ro_file_paths.len));
     try writer.putU32(try usizeToU32(request.profile.host_rw_paths.len));
     try writer.putU32(try usizeToU32(request.argv.len));
     try writer.putU32(try usizeToU32(request.environ.len));
@@ -361,6 +369,7 @@ pub fn encodeRequest(
     try writeStringList(&writer, request.profile.control_roots);
     try writeStringList(&writer, request.profile.exec_paths);
     try writeStringList(&writer, request.profile.ro_paths);
+    try writeStringList(&writer, request.profile.ro_file_paths);
     try writeStringList(&writer, request.profile.host_rw_paths);
     try writeStringList(&writer, request.argv);
     try writeStringList(&writer, request.environ);
@@ -383,6 +392,8 @@ pub fn decodeRequestAlloc(
     errdefer allocator.free(exec_paths);
     const ro_paths = try allocator.alloc([]const u8, meta.ro_path_count);
     errdefer allocator.free(ro_paths);
+    const ro_file_paths = try allocator.alloc([]const u8, meta.ro_file_path_count);
+    errdefer allocator.free(ro_file_paths);
     const host_rw_paths = try allocator.alloc([]const u8, meta.host_rw_path_count);
     errdefer allocator.free(host_rw_paths);
     const argv = try allocator.alloc([]const u8, meta.argument_count);
@@ -403,6 +414,7 @@ pub fn decodeRequestAlloc(
     _ = try reader.readU32(); // control_root_count
     _ = try reader.readU32(); // exec_path_count
     _ = try reader.readU32(); // ro_path_count
+    _ = try reader.readU32(); // ro_file_path_count
     _ = try reader.readU32(); // host_rw_path_count
     _ = try reader.readU32(); // argument_count
     _ = try reader.readU32(); // environment_count
@@ -413,6 +425,7 @@ pub fn decodeRequestAlloc(
     try readStringListViews(&reader, control_roots);
     try readStringListViews(&reader, exec_paths);
     try readStringListViews(&reader, ro_paths);
+    try readStringListViews(&reader, ro_file_paths);
     try readStringListViews(&reader, host_rw_paths);
     try readStringListViews(&reader, argv);
     try readStringListViews(&reader, environ);
@@ -432,6 +445,7 @@ pub fn decodeRequestAlloc(
             .control_roots = control_roots,
             .exec_paths = exec_paths,
             .ro_paths = ro_paths,
+            .ro_file_paths = ro_file_paths,
             .host_rw_paths = host_rw_paths,
             .network_proxy_port = if (option_flags & option_has_proxy != 0) proxy_port_raw else null,
             .require_network_route_forcing = option_flags & option_require_route != 0,
@@ -531,6 +545,7 @@ const RequestMeta = struct {
     control_root_count: usize,
     exec_path_count: usize,
     ro_path_count: usize,
+    ro_file_path_count: usize,
     host_rw_path_count: usize,
     argument_count: usize,
     environment_count: usize,
@@ -543,6 +558,7 @@ fn validateBorrowedRequest(request: BootstrapRequest, limits: Limits) CodecError
     if (request.profile.control_roots.len > limits.max_control_roots) return error.TooManyControlRoots;
     if (request.profile.exec_paths.len > limits.max_exec_paths) return error.TooManyExecPaths;
     if (request.profile.ro_paths.len > limits.max_ro_paths) return error.TooManyRoPaths;
+    if (request.profile.ro_file_paths.len > limits.max_ro_file_paths) return error.TooManyRoPaths;
     if (request.profile.host_rw_paths.len > limits.max_host_rw_paths) return error.TooManyHostRwPaths;
     if (request.argv.len == 0) return error.EmptyArguments;
     if (request.argv.len > limits.max_arguments) return error.TooManyArguments;
@@ -552,6 +568,7 @@ fn validateBorrowedRequest(request: BootstrapRequest, limits: Limits) CodecError
     for (request.profile.control_roots) |root| try validatePath(root, limits.max_path_bytes, false);
     for (request.profile.exec_paths) |exec_path| try validatePath(exec_path, limits.max_path_bytes, true);
     for (request.profile.ro_paths) |ro_path| try validatePath(ro_path, limits.max_path_bytes, true);
+    for (request.profile.ro_file_paths) |ro_file_path| try validatePath(ro_file_path, limits.max_path_bytes, true);
     for (request.profile.host_rw_paths) |host_rw_path| try validatePath(host_rw_path, limits.max_path_bytes, true);
     for (request.argv, 0..) |arg, index| {
         try validateItem(arg, limits.max_item_bytes);
@@ -566,6 +583,7 @@ fn validateBorrowedRequest(request: BootstrapRequest, limits: Limits) CodecError
     _ = try usizeToU32(request.profile.control_roots.len);
     _ = try usizeToU32(request.profile.exec_paths.len);
     _ = try usizeToU32(request.profile.ro_paths.len);
+    _ = try usizeToU32(request.profile.ro_file_paths.len);
     _ = try usizeToU32(request.profile.host_rw_paths.len);
     _ = try usizeToU32(request.argv.len);
     _ = try usizeToU32(request.environ.len);
@@ -586,6 +604,7 @@ fn validateRequestFrame(frame: []const u8, limits: Limits) CodecError!RequestMet
     const control_root_count: usize = try reader.readU32();
     const exec_path_count: usize = try reader.readU32();
     const ro_path_count: usize = try reader.readU32();
+    const ro_file_path_count: usize = try reader.readU32();
     const host_rw_path_count: usize = try reader.readU32();
     const argument_count: usize = try reader.readU32();
     const environment_count: usize = try reader.readU32();
@@ -595,6 +614,7 @@ fn validateRequestFrame(frame: []const u8, limits: Limits) CodecError!RequestMet
     if (control_root_count > limits.max_control_roots) return error.TooManyControlRoots;
     if (exec_path_count > limits.max_exec_paths) return error.TooManyExecPaths;
     if (ro_path_count > limits.max_ro_paths) return error.TooManyRoPaths;
+    if (ro_file_path_count > limits.max_ro_file_paths) return error.TooManyRoPaths;
     if (host_rw_path_count > limits.max_host_rw_paths) return error.TooManyHostRwPaths;
     if (argument_count == 0) return error.EmptyArguments;
     if (argument_count > limits.max_arguments) return error.TooManyArguments;
@@ -608,6 +628,7 @@ fn validateRequestFrame(frame: []const u8, limits: Limits) CodecError!RequestMet
     try scanStringList(&reader, control_root_count, limits.max_path_bytes, .path);
     try scanStringList(&reader, exec_path_count, limits.max_path_bytes, .absolute_path);
     try scanStringList(&reader, ro_path_count, limits.max_path_bytes, .absolute_path);
+    try scanStringList(&reader, ro_file_path_count, limits.max_path_bytes, .absolute_path);
     try scanStringList(&reader, host_rw_path_count, limits.max_path_bytes, .absolute_path);
     try scanStringList(&reader, argument_count, limits.max_item_bytes, .argument);
     try scanStringList(&reader, environment_count, limits.max_item_bytes, .environment);
@@ -621,6 +642,7 @@ fn validateRequestFrame(frame: []const u8, limits: Limits) CodecError!RequestMet
         .control_root_count = control_root_count,
         .exec_path_count = exec_path_count,
         .ro_path_count = ro_path_count,
+        .ro_file_path_count = ro_file_path_count,
         .host_rw_path_count = host_rw_path_count,
         .argument_count = argument_count,
         .environment_count = environment_count,
@@ -851,6 +873,7 @@ test "request frame round trips every bootstrap field" {
     const control_roots = [_][]const u8{ "/work/.ryk", "/run/ryk-control" };
     const exec_paths = [_][]const u8{ "/home/user/.local/bin/agent", "/home/user/.local/bin/agent-real" };
     const ro_paths = [_][]const u8{ "/home/user/.local/share/agent", "/etc/agent/config" };
+    const ro_file_paths = [_][]const u8{"/home/user/AGENTS.md"};
     const host_rw_paths = [_][]const u8{"/home/user/.config/agent"};
     const argv = [_][]const u8{ "/usr/bin/agent", "--mode", "safe" };
     const environ = [_][]const u8{ "PATH=/usr/bin:/bin", "RYK_SESSION_ID=session-test" };
@@ -866,6 +889,7 @@ test "request frame round trips every bootstrap field" {
             .control_roots = &control_roots,
             .exec_paths = &exec_paths,
             .ro_paths = &ro_paths,
+            .ro_file_paths = &ro_file_paths,
             .host_rw_paths = &host_rw_paths,
             .network_proxy_port = 43123,
             .require_network_route_forcing = true,
@@ -888,6 +912,7 @@ test "request frame round trips every bootstrap field" {
     try expectStringListsEqual(request.profile.control_roots, decoded.profile.control_roots);
     try expectStringListsEqual(request.profile.exec_paths, decoded.profile.exec_paths);
     try expectStringListsEqual(request.profile.ro_paths, decoded.profile.ro_paths);
+    try expectStringListsEqual(request.profile.ro_file_paths, decoded.profile.ro_file_paths);
     try expectStringListsEqual(request.profile.host_rw_paths, decoded.profile.host_rw_paths);
     try std.testing.expectEqual(request.profile.include_tmp, decoded.profile.include_tmp);
     try std.testing.expectEqual(request.profile.network_proxy_port, decoded.profile.network_proxy_port);
@@ -1109,6 +1134,7 @@ test "request allocation failures propagate and clean up partial decode" {
     const roots = [_][]const u8{"/work/.ryk"};
     const exec_paths = [_][]const u8{"/usr/bin/agent"};
     const ro_paths = [_][]const u8{"/usr/share/agent"};
+    const ro_file_paths = [_][]const u8{"/home/user/CodingProjects/AGENTS.md"};
     const host_rw_paths = [_][]const u8{"/home/user/.agent"};
     const argv = [_][]const u8{"/usr/bin/agent"};
     const environ = [_][]const u8{"PATH=/usr/bin"};
@@ -1123,6 +1149,7 @@ test "request allocation failures propagate and clean up partial decode" {
             .control_roots = &roots,
             .exec_paths = &exec_paths,
             .ro_paths = &ro_paths,
+            .ro_file_paths = &ro_file_paths,
             .host_rw_paths = &host_rw_paths,
             .protect_workspace_secrets = true,
         },

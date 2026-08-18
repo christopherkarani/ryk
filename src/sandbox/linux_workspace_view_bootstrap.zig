@@ -44,6 +44,17 @@ pub fn parseFds(argv: []const []const u8) ParseError!BootstrapFds {
     return .{ .request = request, .response = response };
 }
 
+fn extraGrantsFromRoFiles(
+    paths: []const []const u8,
+    buf: []profile.ExtraGrant,
+) error{TooManyRoPaths}![]const profile.ExtraGrant {
+    if (paths.len > buf.len) return error.TooManyRoPaths;
+    for (paths, 0..) |path, i| {
+        buf[i] = .{ .path = path, .mode = .ro, .kind = .file };
+    }
+    return buf[0..paths.len];
+}
+
 pub fn profileDigest(canonical_bytes: []const u8) [32]u8 {
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(canonical_bytes, &digest, .{});
@@ -131,12 +142,16 @@ fn runLinux(allocator: std.mem.Allocator, fds: BootstrapFds) !void {
     // Rebuild with the same CompileOptions the parent hashed (including launch
     // .exec grants). Protect-on is required by the wire protocol; the rebuild
     // mirrors sealed options including the request flag and profile hash check.
+    var extra_grant_buf: [256]profile.ExtraGrant = undefined;
+    const extra_grants = extraGrantsFromRoFiles(request.profile.ro_file_paths, extra_grant_buf[0..]) catch
+        return response.fail(.profile_rebuild_failed);
     var compiled = profile.compileProfile(allocator, .{
         .workspace_root = request.workspace_root,
         .control_roots = request.profile.control_roots,
         .include_tmp = request.profile.include_tmp,
         .exec_paths = request.profile.exec_paths,
         .ro_paths = request.profile.ro_paths,
+        .extra_grants = extra_grants,
         .host_rw_paths = request.profile.host_rw_paths,
         .protect_workspace_secrets = request.profile.protect_workspace_secrets,
     }) catch return response.fail(.profile_rebuild_failed);
