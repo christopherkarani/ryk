@@ -555,7 +555,14 @@ async function callRyk(rykBin, event, data, sessionId, blocking, logger, options
             : softAllow('ryk_binary_untrusted', 'ryk executable provenance or identity could not be re-attested; skipping this non-blocking event.');
     }
     try {
-        const stdout = await runRykHookProcess(rykBin, ['hook', 'openclaw', event], payload.json, blocking ? 15000 : 10000, options.cwd);
+        const hookArgs = ['hook', 'openclaw', event];
+        // Unattended/CI must pass --ci so leftover unused ryk ask hardens inside
+        // the CLI, not only in the host mapping layer. Stage, FM steward ask, and
+        // SoftBlock never ride the leftover-ask permit wire.
+        if (options.unattended || isUnattended()) {
+            hookArgs.push('--ci');
+        }
+        const stdout = await runRykHookProcess(rykBin, hookArgs, payload.json, blocking ? 15000 : 10000, options.cwd);
         return parseHookResponse(stdout, blocking, options);
     }
     catch {

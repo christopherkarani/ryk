@@ -203,6 +203,12 @@ fn serverEvaluateWire(cached_policy: ?*const core_api.LoadedPolicy) EvaluateWire
     return .{ .cached_policy = cached_policy };
 }
 
+/// Hook-serve strips CI/RYK_* from the child. Leftover unattended must ride
+/// this client-stamped bit (`RYK_MODE=ci` or parent `getenvUnattended`).
+fn evaluateClientRaiseCi(mode_is_ci: bool, parent_unattended: bool) bool {
+    return mode_is_ci or parent_unattended;
+}
+
 fn tryHookServer(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -221,7 +227,7 @@ fn tryHookServer(
         .method = "evaluate",
         .bin = bin,
         .version = build_options.version,
-        .ci = resolveEvaluateMode(.strict) == .ci,
+        .ci = evaluateClientRaiseCi(resolveEvaluateMode(.strict) == .ci, env_util.getenvUnattended()),
         .workspace = cwd_z,
         .cwd = cwd_z,
         .payload_json = payload,
@@ -1389,6 +1395,55 @@ test "evaluate leftover unused ask is deny when unattended" {
         .disable_fm = true,
         .raise_ci = true,
         .unattended = true,
+    });
+    try std.testing.expectEqual(exit_denied, code);
+    const output = stdout.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"deny\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"ask\"") == null);
+}
+
+test "evaluate leftover unused ask is deny when parent is unattended even if hook-serve stripped child env" {
+    const Lookup = struct {
+        key: []const u8,
+        value: []const u8,
+        pub fn get(self: @This(), key: []const u8) ?[]const u8 {
+            return if (std.mem.eql(u8, key, self.key)) self.value else null;
+        }
+    };
+    const EmptyLookup = struct {
+        pub fn get(_: @This(), _: []const u8) ?[]const u8 {
+            return null;
+        }
+    };
+    const parent_unattended = env_util.unattendedFromLookup(Lookup{ .key = "RYK_UNATTENDED", .value = "1" });
+    const child_unattended = env_util.unattendedFromLookup(EmptyLookup{});
+    try std.testing.expect(parent_unattended);
+    try std.testing.expect(!child_unattended);
+    try std.testing.expect(evaluateClientRaiseCi(false, parent_unattended));
+    try std.testing.expect(!evaluateClientRaiseCi(false, child_unattended));
+
+    const raise_ci = evaluateClientRaiseCi(false, parent_unattended);
+    try std.testing.expectEqual(leftover_ask.Outcome.deny, leftover_ask.codingHostAskOutcome(
+        true,
+        .leftover,
+        raise_ci or child_unattended,
+    ));
+
+    const allocator = std.testing.allocator;
+    defer shell_eval.resetSessionStickyStoreForTests();
+    const cwd = try testCwd(allocator);
+    defer allocator.free(cwd);
+    const payload = try validPayload(allocator, "git push --force", cwd);
+    defer allocator.free(payload);
+    var stdout_buf: [8192]u8 = undefined;
+    var stdout: std.Io.Writer = .fixed(&stdout_buf);
+
+    const code = try evaluatePayload(std.testing.io, allocator, payload, &stdout, mockDenyHigh, .disabled, .{
+        .mode_override = .ask,
+        .commands_allow_override = &.{},
+        .disable_fm = true,
+        .raise_ci = raise_ci,
+        .unattended = raise_ci or child_unattended,
     });
     try std.testing.expectEqual(exit_denied, code);
     const output = stdout.buffered();

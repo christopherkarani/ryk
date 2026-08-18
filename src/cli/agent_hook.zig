@@ -90,6 +90,12 @@ pub fn commandWithEvaluator(
     return evaluatePayload(allocator, payload, stdout, evaluator);
 }
 
+/// Hook-serve strips CI/RYK_* from the child. Leftover unattended must ride
+/// this client-stamped bit (`RYK_MODE=ci` or parent `getenvUnattended`).
+fn agentHookClientRaiseCi(mode_is_ci: bool, parent_unattended: bool) bool {
+    return mode_is_ci or parent_unattended;
+}
+
 fn tryHookServer(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -109,7 +115,7 @@ fn tryHookServer(
         .version = build_options.version,
         .host = "cursor",
         .event = "beforeShellExecution",
-        .ci = resolveModeFromEnv() == .ci,
+        .ci = agentHookClientRaiseCi(resolveModeFromEnv() == .ci, env_util.getenvUnattended()),
         .workspace = cwd_z,
         .cwd = cwd_z,
         .payload_json = payload,
@@ -804,6 +810,32 @@ test "observe mode high-severity deny is warn-allow (empty agent / allow cursor)
     const cursor_payload = "{\"command\":\"git push --force\",\"cwd\":\"/tmp\"}";
     _ = try evaluatePayloadWithModeOpts(allocator, cursor_payload, &cursor_stdout, shell_eval.mockDaemonDenyHighEvaluator, .observe, test_no_fm);
     try std.testing.expect(std.mem.indexOf(u8, cursor_stdout.buffered(), "\"permission\":\"allow\"") != null);
+}
+
+test "agent hook client raise-ci is true when getenvUnattended would be true" {
+    const Lookup = struct {
+        key: []const u8,
+        value: []const u8,
+        pub fn get(self: @This(), key: []const u8) ?[]const u8 {
+            return if (std.mem.eql(u8, key, self.key)) self.value else null;
+        }
+    };
+    const EmptyLookup = struct {
+        pub fn get(_: @This(), _: []const u8) ?[]const u8 {
+            return null;
+        }
+    };
+    const parent_unattended = env_util.unattendedFromLookup(Lookup{ .key = "CI", .value = "1" });
+    const child_unattended = env_util.unattendedFromLookup(EmptyLookup{});
+    try std.testing.expect(parent_unattended);
+    try std.testing.expect(!child_unattended);
+    try std.testing.expect(agentHookClientRaiseCi(false, parent_unattended));
+    try std.testing.expect(!agentHookClientRaiseCi(false, child_unattended));
+    try std.testing.expectEqual(leftover_ask.Outcome.deny, leftover_ask.codingHostAskOutcome(
+        true,
+        .leftover,
+        agentHookClientRaiseCi(false, parent_unattended) or child_unattended,
+    ));
 }
 
 test "SoftBlock ask is not permit on agent_hook" {

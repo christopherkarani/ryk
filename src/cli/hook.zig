@@ -392,6 +392,12 @@ fn hookCommand(io: std.Io, host: Host, event: Event, original_event_name: []cons
     return evaluateFromPayload(io, allocator, host, event, original_event_name, payload_text, ci_mode, null, null, stdout, stderr);
 }
 
+/// Hook-serve strips CI/RYK_* from the child. Leftover unattended must ride
+/// this client-stamped bit (`--ci` or parent `getenvUnattended`).
+fn hookClientRaiseCi(cli_ci: bool, parent_unattended: bool) bool {
+    return cli_ci or parent_unattended;
+}
+
 fn tryHookServer(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -417,7 +423,7 @@ fn tryHookServer(
         .version = build_options.version,
         .host = @tagName(host),
         .event = event_name,
-        .ci = ci,
+        .ci = hookClientRaiseCi(ci, env_util.getenvUnattended()),
         .probe = probe,
         .workspace = cwd_z,
         .cwd = cwd_z,
@@ -6693,6 +6699,34 @@ test "hook Claude maps block to permissionDecision deny with short reason" {
     try std.testing.expect(reason.len > 0);
     try std.testing.expect(reason.len <= claude_permission_reason_max);
     try std.testing.expectEqual(exit_codes.success, hookExitCode(.claude, .block, false));
+}
+
+test "hook-serve leftover ask is deny when parent is unattended and child env is stripped" {
+    const Lookup = struct {
+        key: []const u8,
+        value: []const u8,
+        pub fn get(self: @This(), key: []const u8) ?[]const u8 {
+            return if (std.mem.eql(u8, key, self.key)) self.value else null;
+        }
+    };
+    const EmptyLookup = struct {
+        pub fn get(_: @This(), _: []const u8) ?[]const u8 {
+            return null;
+        }
+    };
+    const parent_unattended = env_util.unattendedFromLookup(Lookup{ .key = "RYK_UNATTENDED", .value = "1" });
+    const child_unattended = env_util.unattendedFromLookup(EmptyLookup{});
+    try std.testing.expect(parent_unattended);
+    try std.testing.expect(!child_unattended);
+    try std.testing.expect(hookClientRaiseCi(false, parent_unattended));
+    try std.testing.expect(!hookClientRaiseCi(false, child_unattended));
+
+    const raise_ci = hookClientRaiseCi(false, parent_unattended);
+    try std.testing.expectEqual(leftover_ask.Outcome.deny, leftover_ask.codingHostAskOutcome(
+        true,
+        .leftover,
+        raise_ci or child_unattended,
+    ));
 }
 
 test "hook Claude maps leftover remapped ask to permissionDecision allow never deny" {

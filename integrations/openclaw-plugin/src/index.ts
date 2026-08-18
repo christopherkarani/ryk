@@ -746,9 +746,16 @@ async function callRyk(
   }
 
   try {
+    const hookArgs = ['hook', 'openclaw', event];
+    // Unattended/CI must pass --ci so leftover unused ryk ask hardens inside
+    // the CLI, not only in the host mapping layer. Stage, FM steward ask, and
+    // SoftBlock never ride the leftover-ask permit wire.
+    if (options.unattended || isUnattended()) {
+      hookArgs.push('--ci');
+    }
     const stdout = await runRykHookProcess(
       rykBin,
-      ['hook', 'openclaw', event],
+      hookArgs,
       payload.json,
       blocking ? 15000 : 10000,
       options.cwd
