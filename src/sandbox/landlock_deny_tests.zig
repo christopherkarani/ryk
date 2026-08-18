@@ -6,6 +6,7 @@ const builtin = @import("builtin");
 const profile = @import("profile.zig");
 const landlock = @import("landlock.zig");
 const host_config_grants = @import("host_config_grants.zig");
+const os_grant_collect = @import("os_grant_collect.zig");
 
 const applySelf = landlock.applySelf;
 const buildChildLandlockPlan = landlock.buildChildLandlockPlan;
@@ -1176,6 +1177,90 @@ test "real FS: grok missing active_sessions.lock O_RDWR create allowed; docs log
         5 => return error.GrokDocsWriteGranted,
         6 => return error.GrokLogsWriteGranted,
         7 => return error.GrokModelsCacheWriteGranted,
+        else => return error.UnexpectedSandboxProbeExit,
+    }
+}
+
+test "real FS: helper ancestor instruction is file RO; parent dir sibling denied" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (!landlock.isAbiAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const linux = std.os.linux;
+
+    var home_tmp = std.testing.tmpDir(.{});
+    defer home_tmp.cleanup();
+    const home = try home_tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(home);
+
+    try home_tmp.dir.createDirPath(io, "proj/ws/.ryk");
+    try home_tmp.dir.createDirPath(io, "proj/ws/.git");
+    try home_tmp.dir.writeFile(io, .{
+        .sub_path = "proj/AGENTS.md",
+        .data = "PARENT_AGENTS_OK",
+    });
+    try home_tmp.dir.writeFile(io, .{
+        .sub_path = "proj/secret.env",
+        .data = "SIBLING_SECRET",
+    });
+
+    const workspace = try std.fs.path.join(allocator, &.{ home, "proj", "ws" });
+    defer allocator.free(workspace);
+    const parent_agents = try std.fs.path.join(allocator, &.{ home, "proj", "AGENTS.md" });
+    defer allocator.free(parent_agents);
+    const sibling = try std.fs.path.join(allocator, &.{ home, "proj", "secret.env" });
+    defer allocator.free(sibling);
+
+    var collected = try os_grant_collect.collectUsualGrants(io, allocator, .{
+        .workspace_root = workspace,
+        .home = home,
+    });
+    defer collected.deinit();
+    const extras = try collected.extraGrantsAlloc();
+    defer allocator.free(extras);
+
+    var compiled = try profile.compileProfile(allocator, .{
+        .workspace_root = workspace,
+        .include_tmp = false,
+        .system_ro_prefixes = profile.defaultSystemRoPrefixes(),
+        .extra_grants = extras,
+    });
+    defer compiled.deinit();
+    try std.testing.expect(compiled.hasGrantWithKind(parent_agents, .ro, .file));
+    try std.testing.expect(!compiled.isGrantedReadable(sibling));
+
+    var plan = try buildChildLandlockPlan(allocator, &compiled);
+    defer plan.deinit();
+
+    const pid_rc = linux.fork();
+    if (linux.errno(pid_rc) != .SUCCESS) return error.SkipZigTest;
+    if (pid_rc == 0) {
+        applySelf(&compiled, &plan, null) catch linux.exit(2);
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        @memcpy(path_buf[0..parent_agents.len], parent_agents);
+        path_buf[parent_agents.len] = 0;
+        const pfd = linux.open(path_buf[0..parent_agents.len :0].ptr, .{ .CLOEXEC = true }, 0);
+        if (linux.errno(pfd) != .SUCCESS) linux.exit(4);
+        _ = linux.close(@intCast(pfd));
+        @memcpy(path_buf[0..sibling.len], sibling);
+        path_buf[sibling.len] = 0;
+        const sfd = linux.open(path_buf[0..sibling.len :0].ptr, .{ .CLOEXEC = true }, 0);
+        if (linux.errno(sfd) == .SUCCESS) {
+            _ = linux.close(@intCast(sfd));
+            linux.exit(3);
+        }
+        linux.exit(0);
+    }
+
+    var status: u32 = 0;
+    _ = linux.waitpid(@intCast(pid_rc), &status, 0);
+    const exit_code: u8 = @intCast((status >> 8) & 0xff);
+    switch (exit_code) {
+        0 => {},
+        2 => return error.LandlockApplyFailedOnHost,
+        3 => return error.SiblingReadableUnderFileGrant,
+        4 => return error.AncestorInstructionUnreadable,
         else => return error.UnexpectedSandboxProbeExit,
     }
 }

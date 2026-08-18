@@ -743,9 +743,15 @@ fn appendGrantAllows(
             try appendAllowLiteral(out, allocator, "process-exec", g.path);
         },
         .ro => {
-            try appendAllowSubpath(out, allocator, "file-read-metadata", g.path);
-            try appendAllowSubpath(out, allocator, "file-read*", g.path);
-            try appendAllowSubpath(out, allocator, "process-exec", g.path);
+            if (g.kind == .file) {
+                try appendAllowLiteral(out, allocator, "file-read-metadata", g.path);
+                try appendAllowLiteral(out, allocator, "file-read*", g.path);
+                try appendAllowLiteral(out, allocator, "process-exec", g.path);
+            } else {
+                try appendAllowSubpath(out, allocator, "file-read-metadata", g.path);
+                try appendAllowSubpath(out, allocator, "file-read*", g.path);
+                try appendAllowSubpath(out, allocator, "process-exec", g.path);
+            }
         },
         .rw => {
             try appendAllowSubpath(out, allocator, "file-read-metadata", g.path);
@@ -1000,6 +1006,24 @@ test "SBPL emits process-exec for launch .exec grants without HOME" {
     // Still no broad HOME.
     try std.testing.expect(!sbplGrantsHome(sbpl, home));
     try std.testing.expect(std.mem.indexOf(u8, sbpl, "(subpath \"/Users/dev\")") == null);
+}
+
+test "SBPL ancestor instruction file RO emits literal not subpath" {
+    const allocator = std.testing.allocator;
+    const parent_agents = "/Users/dev/CodingProjects/AGENTS.md";
+    var compiled = try profile.compileProfile(allocator, .{
+        .workspace_root = "/Users/dev/CodingProjects/ryk",
+        .system_ro_prefixes = &[_][]const u8{ "/usr", "/bin" },
+        .extra_grants = &.{.{ .path = parent_agents, .mode = .ro, .kind = .file }},
+    });
+    defer compiled.deinit();
+
+    const sbpl = try renderSbpl(allocator, &compiled);
+    defer allocator.free(sbpl);
+
+    try std.testing.expect(std.mem.indexOf(u8, sbpl, "(allow file-read* (literal \"/Users/dev/CodingProjects/AGENTS.md\"))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sbpl, "(allow file-read* (subpath \"/Users/dev/CodingProjects/AGENTS.md\"))") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sbpl, "(allow file-read* (subpath \"/Users/dev/CodingProjects\"))") == null);
 }
 
 test "SBPL never grants broad HOME" {

@@ -7,6 +7,7 @@ const builtin = @import("builtin");
 const profile = @import("profile.zig");
 const canary = @import("canary.zig");
 const macos_seatbelt = @import("macos_seatbelt.zig");
+const os_grant_collect = @import("os_grant_collect.zig");
 
 const sandboxInitAvailable = macos_seatbelt.sandboxInitAvailable;
 const detectProductVersion = macos_seatbelt.detectProductVersion;
@@ -1073,6 +1074,7 @@ test "real FS deny: hardlink alias of workspace .env denied under protect" {
     var ws_tmp = std.testing.tmpDir(.{});
     defer ws_tmp.cleanup();
     try ws_tmp.dir.createDirPath(io, ".ryk");
+    try ws_tmp.dir.createDirPath(io, ".git");
 
     var synth = try canary.generate(allocator);
     defer synth.deinit();
@@ -1084,12 +1086,19 @@ test "real FS deny: hardlink alias of workspace .env denied under protect" {
         error.PathAlreadyExists => {},
         else => return error.SkipZigTest,
     };
+    // Same plant under `.git/` — object-store skip must not hide this readable alias.
+    ws_tmp.dir.hardLink(".env", ws_tmp.dir, ".git/notes-git.txt", io, .{}) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return error.SkipZigTest,
+    };
 
     const ws_root = try ws_tmp.dir.realPathFileAlloc(io, ".", allocator);
     defer allocator.free(ws_root);
 
     const alias_path = try std.fs.path.join(allocator, &.{ ws_root, "notes.txt" });
     defer allocator.free(alias_path);
+    const git_alias_path = try std.fs.path.join(allocator, &.{ ws_root, ".git", "notes-git.txt" });
+    defer allocator.free(git_alias_path);
     const neighbor_path = try std.fs.path.join(allocator, &.{ ws_root, "neighbor.txt" });
     defer allocator.free(neighbor_path);
 
@@ -1114,9 +1123,12 @@ test "real FS deny: hardlink alias of workspace .env denied under protect" {
     // Prepare scan must emit an explicit deny for the alias path.
     try std.testing.expect(std.mem.indexOf(u8, sbpl, "multi-nlink non-secret basenames") != null);
     try std.testing.expect(std.mem.indexOf(u8, sbpl, "notes.txt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sbpl, "notes-git.txt") != null);
 
     const alias_z = try allocator.dupeZ(u8, alias_path);
     defer allocator.free(alias_z);
+    const git_alias_z = try allocator.dupeZ(u8, git_alias_path);
+    defer allocator.free(git_alias_z);
     const neighbor_z = try allocator.dupeZ(u8, neighbor_path);
     defer allocator.free(neighbor_z);
 
@@ -1130,6 +1142,17 @@ test "real FS deny: hardlink alias of workspace .env denied under protect" {
             var buf: [256]u8 = undefined;
             const n = std.c.read(afd, &buf, buf.len);
             _ = std.c.close(afd);
+            if (n > 0 and std.mem.indexOf(u8, buf[0..@intCast(n)], synth.body) != null) {
+                std.c._exit(4);
+            }
+            std.c._exit(3);
+        }
+
+        const gfd = std.c.open(git_alias_z.ptr, .{ .ACCMODE = .RDONLY });
+        if (gfd >= 0) {
+            var buf: [256]u8 = undefined;
+            const n = std.c.read(gfd, &buf, buf.len);
+            _ = std.c.close(gfd);
             if (n > 0 and std.mem.indexOf(u8, buf[0..@intCast(n)], synth.body) != null) {
                 std.c._exit(4);
             }
@@ -1820,6 +1843,91 @@ test "real FS: hermes nested uv python exec under launch grants" {
         2 => return error.SeatbeltApplyFailedOnHost,
         3 => return error.HermesNestedPythonExecDenied,
         5 => return error.HermesUvPythonUnreadable,
+        else => return error.UnexpectedSandboxChildExit,
+    }
+}
+
+test "real FS: helper ancestor instruction is file RO; parent dir sibling denied" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    if (!sandboxInitAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var home_tmp = std.testing.tmpDir(.{});
+    defer home_tmp.cleanup();
+    const home = try home_tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(home);
+
+    try home_tmp.dir.createDirPath(io, "proj/ws/.ryk");
+    try home_tmp.dir.createDirPath(io, "proj/ws/.git");
+    try home_tmp.dir.writeFile(io, .{
+        .sub_path = "proj/AGENTS.md",
+        .data = "PARENT_AGENTS_OK",
+    });
+    try home_tmp.dir.writeFile(io, .{
+        .sub_path = "proj/secret.env",
+        .data = "SIBLING_SECRET",
+    });
+
+    const workspace = try std.fs.path.join(allocator, &.{ home, "proj", "ws" });
+    defer allocator.free(workspace);
+    const parent_agents = try std.fs.path.join(allocator, &.{ home, "proj", "AGENTS.md" });
+    defer allocator.free(parent_agents);
+    const sibling = try std.fs.path.join(allocator, &.{ home, "proj", "secret.env" });
+    defer allocator.free(sibling);
+
+    var collected = try os_grant_collect.collectUsualGrants(io, allocator, .{
+        .workspace_root = workspace,
+        .home = home,
+    });
+    defer collected.deinit();
+    const extras = try collected.extraGrantsAlloc();
+    defer allocator.free(extras);
+
+    var compiled = try profile.compileProfile(allocator, .{
+        .workspace_root = workspace,
+        .include_tmp = false,
+        .extra_grants = extras,
+    });
+    defer compiled.deinit();
+    try std.testing.expect(compiled.hasGrantWithKind(parent_agents, .ro, .file));
+    try std.testing.expect(!compiled.isGrantedReadable(sibling));
+
+    const prepared = prepareForChildApply(allocator, &compiled);
+    defer if (prepared.sbpl_z) |p| allocator.free(p);
+    try std.testing.expectEqual(.prepared, prepared.status);
+    const sbpl_z = prepared.sbpl_z orelse return error.TestUnexpectedResult;
+
+    const parent_z = try allocator.dupeZ(u8, parent_agents);
+    defer allocator.free(parent_z);
+    const sibling_z = try allocator.dupeZ(u8, sibling);
+    defer allocator.free(sibling_z);
+
+    const pid = std.c.fork();
+    if (pid < 0) return error.SkipZigTest;
+    if (pid == 0) {
+        applyInChild(sbpl_z.ptr) catch std.c._exit(2);
+        const parent_fd = std.c.open(parent_z.ptr, .{ .ACCMODE = .RDONLY });
+        if (parent_fd < 0) std.c._exit(4);
+        var buf: [32]u8 = undefined;
+        const n = std.c.read(parent_fd, &buf, buf.len);
+        _ = std.c.close(parent_fd);
+        if (n != "PARENT_AGENTS_OK".len) std.c._exit(4);
+        const sib_fd = std.c.open(sibling_z.ptr, .{ .ACCMODE = .RDONLY });
+        if (sib_fd >= 0) {
+            _ = std.c.close(sib_fd);
+            std.c._exit(3);
+        }
+        std.c._exit(0);
+    }
+
+    const exit_code = try waitExitCode(pid);
+    switch (exit_code) {
+        0 => {},
+        2 => return error.SeatbeltApplyFailedOnHost,
+        3 => return error.SiblingReadableUnderFileGrant,
+        4 => return error.AncestorInstructionUnreadable,
         else => return error.UnexpectedSandboxChildExit,
     }
 }

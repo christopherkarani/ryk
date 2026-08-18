@@ -29,9 +29,28 @@ pub const AccessMode = enum {
     }
 };
 
+/// Whether an OS grant is this path only or the tree under it.
+pub const GrantKind = enum {
+    file,
+    folder,
+
+    pub fn toString(self: GrantKind) []const u8 {
+        return @tagName(self);
+    }
+};
+
 pub const PathGrant = struct {
     path: []const u8,
     mode: AccessMode,
+    /// Stamped at collect. File never becomes folder later.
+    kind: GrantKind = .folder,
+};
+
+/// Tagged extra grant for compile. Extras default to folder.
+pub const ExtraGrant = struct {
+    path: []const u8,
+    mode: AccessMode = .ro,
+    kind: GrantKind = .folder,
 };
 
 pub const CompileOptions = struct {
@@ -69,6 +88,8 @@ pub const CompileOptions = struct {
     /// `compileProfile` rejects filesystem root (`InvalidRwPath`). Callers must
     /// filter forbidden paths (`.ssh`, bare home) before compile.
     host_rw_paths: []const []const u8 = &.{},
+    /// Tagged extra OS grants (ancestor instruction file RO, launch extras).
+    extra_grants: []const ExtraGrant = &.{},
     /// Deny workspace `.env` / `.env.*` content at the OS sandbox layer.
     /// Exact safe templates remain readable: `.env.example`, `.env.sample`,
     /// and `.env.template`.
@@ -115,6 +136,19 @@ pub const CompiledProfile = struct {
         return false;
     }
 
+    /// True if any grant has the given path, mode, and OS grant kind.
+    pub fn hasGrantWithKind(
+        self: *const CompiledProfile,
+        path: []const u8,
+        mode: AccessMode,
+        kind: GrantKind,
+    ) bool {
+        for (self.grants) |g| {
+            if (g.mode == mode and g.kind == kind and pathEqual(g.path, path)) return true;
+        }
+        return false;
+    }
+
     /// True if `path` is under a control root (not agent-writable).
     pub fn isControlPath(self: *const CompiledProfile, path: []const u8) bool {
         for (self.control_roots) |root| {
@@ -136,7 +170,7 @@ pub const CompiledProfile = struct {
     pub fn isAgentWritable(self: *const CompiledProfile, path: []const u8) bool {
         if (self.isControlPath(path)) return false;
         for (self.grants) |g| {
-            if (g.mode == .rw and isPathWithin(path, g.path)) return true;
+            if (g.mode == .rw and grantCoversPath(g, path)) return true;
         }
         return false;
     }
@@ -200,9 +234,10 @@ pub const CompiledProfile = struct {
     }
 
     /// True when `path` is covered by any path grant (content-readable under pure model).
+    /// File grants cover this path only; folder grants cover the tree.
     pub fn isGrantedReadable(self: *const CompiledProfile, path: []const u8) bool {
         for (self.grants) |g| {
-            if (isPathWithin(path, g.path)) return true;
+            if (grantCoversPath(g, path)) return true;
         }
         return false;
     }
@@ -487,17 +522,28 @@ pub fn compileProfile(allocator: std.mem.Allocator, options: CompileOptions) !Co
         try appendUniqueExecGrant(&grants_list, allocator, raw_exec);
     }
 
-    // Optional extra RO trees — never bare HOME or `/`.
+    // Optional extra RO trees — never bare HOME or `/`. Folder unless extra_grants.
     for (options.ro_paths) |raw_ro| {
-        try appendUniqueRoGrant(&grants_list, allocator, raw_ro);
+        try appendUniqueRoGrant(&grants_list, allocator, raw_ro, .folder);
     }
 
     // Host-agent config RW trees (e.g. $HOME/.claude) — never bare HOME or `/`.
     // Dedup against existing workspace RW is handled by appendUniqueHostRwGrant.
     var has_host_config_rw = false;
     for (options.host_rw_paths) |raw_rw| {
-        try appendUniqueHostRwGrant(&grants_list, allocator, raw_rw);
+        try appendUniqueHostRwGrant(&grants_list, allocator, raw_rw, .folder);
         has_host_config_rw = true;
+    }
+
+    for (options.extra_grants) |extra| {
+        switch (extra.mode) {
+            .exec => try appendUniqueExecGrant(&grants_list, allocator, extra.path),
+            .ro => try appendUniqueRoGrant(&grants_list, allocator, extra.path, extra.kind),
+            .rw => {
+                try appendUniqueHostRwGrant(&grants_list, allocator, extra.path, extra.kind);
+                has_host_config_rw = true;
+            },
+        }
     }
 
     // Control roots: always workspace/.ryk and workspace/.git plus any listed roots.
@@ -691,6 +737,13 @@ fn pathEqual(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
 }
 
+fn grantCoversPath(g: PathGrant, path: []const u8) bool {
+    return switch (g.kind) {
+        .file => pathEqual(g.path, path),
+        .folder => isPathWithin(path, g.path),
+    };
+}
+
 fn appendUniqueRwGrant(
     grants_list: *std.ArrayList(PathGrant),
     allocator: std.mem.Allocator,
@@ -727,26 +780,35 @@ fn appendUniqueExecGrant(
             return;
         }
     }
-    try grants_list.append(allocator, .{ .path = canon, .mode = .exec });
+    try grants_list.append(allocator, .{ .path = canon, .mode = .exec, .kind = .file });
 }
 
-/// Append a unique `.ro` grant for a directory (or file) tree. Fail closed on `/`.
-/// Does not open the path (pure compile). Callers filter bare HOME / `.ssh` first.
+/// Append a unique `.ro` grant. Fail closed on `/`. Does not open the path.
+/// File never upgrades an existing folder grant into a wider tree; folder
+/// never replaces a file grant.
 fn appendUniqueRoGrant(
     grants_list: *std.ArrayList(PathGrant),
     allocator: std.mem.Allocator,
     raw_path: []const u8,
+    kind: GrantKind,
 ) !void {
     const canon = try canonicalizeAbsolute(allocator, raw_path);
     errdefer allocator.free(canon);
     if (canon.len == 1 and canon[0] == '/') return error.InvalidRoPath;
-    for (grants_list.items) |g| {
+    for (grants_list.items) |*g| {
         if (pathEqual(g.path, canon) and g.mode == .ro) {
+            if (g.kind == .file and kind == .folder) {
+                allocator.free(canon);
+                return;
+            }
+            if (g.kind == .folder and kind == .file) {
+                g.kind = .file;
+            }
             allocator.free(canon);
             return;
         }
     }
-    try grants_list.append(allocator, .{ .path = canon, .mode = .ro });
+    try grants_list.append(allocator, .{ .path = canon, .mode = .ro, .kind = kind });
 }
 
 /// Append a unique `.rw` grant for a host-agent config tree. Fail closed on `/`.
@@ -754,17 +816,25 @@ fn appendUniqueHostRwGrant(
     grants_list: *std.ArrayList(PathGrant),
     allocator: std.mem.Allocator,
     raw_path: []const u8,
+    kind: GrantKind,
 ) !void {
     const canon = try canonicalizeAbsolute(allocator, raw_path);
     errdefer allocator.free(canon);
     if (canon.len == 1 and canon[0] == '/') return error.InvalidRwPath;
-    for (grants_list.items) |g| {
+    for (grants_list.items) |*g| {
         if (pathEqual(g.path, canon) and g.mode == .rw) {
+            if (g.kind == .file and kind == .folder) {
+                allocator.free(canon);
+                return;
+            }
+            if (g.kind == .folder and kind == .file) {
+                g.kind = .file;
+            }
             allocator.free(canon);
             return;
         }
     }
-    try grants_list.append(allocator, .{ .path = canon, .mode = .rw });
+    try grants_list.append(allocator, .{ .path = canon, .mode = .rw, .kind = kind });
 }
 
 fn pathLessThan(_: void, a: []const u8, b: []const u8) bool {
@@ -774,7 +844,8 @@ fn pathLessThan(_: void, a: []const u8, b: []const u8) bool {
 fn grantLessThan(_: void, a: PathGrant, b: PathGrant) bool {
     const path_order = std.mem.order(u8, a.path, b.path);
     if (path_order != .eq) return path_order == .lt;
-    return @intFromEnum(a.mode) < @intFromEnum(b.mode);
+    if (a.mode != b.mode) return @intFromEnum(a.mode) < @intFromEnum(b.mode);
+    return @intFromEnum(a.kind) < @intFromEnum(b.kind);
 }
 
 /// Lexically canonicalize an absolute Unix-style path. Fail closed if not absolute.
@@ -829,7 +900,7 @@ fn resolveControlRoot(allocator: std.mem.Allocator, workspace_root: []const u8, 
     return try joinAbsolute(allocator, workspace_root, raw);
 }
 
-/// Sorted newline list of `mode\\tpath` grants and `control\\tpath` carve-outs.
+/// Sorted newline list of `mode\\tkind\\tpath` grants and `control\\tpath` carve-outs.
 fn serializeCanonical(
     allocator: std.mem.Allocator,
     grants: []const PathGrant,
@@ -843,7 +914,11 @@ fn serializeCanonical(
     }
 
     for (grants) |g| {
-        const line = try std.fmt.allocPrint(allocator, "{s}\t{s}", .{ g.mode.toString(), g.path });
+        const line = try std.fmt.allocPrint(allocator, "{s}\t{s}\t{s}", .{
+            g.mode.toString(),
+            g.kind.toString(),
+            g.path,
+        });
         lines.append(allocator, line) catch |err| {
             allocator.free(line);
             return err;
@@ -1046,6 +1121,25 @@ test "launch exec_paths reject filesystem root" {
         .system_ro_prefixes = &[_][]const u8{"/usr"},
         .exec_paths = &.{"/"},
     }));
+}
+
+test "extra grant file RO compiles as file not parent folder" {
+    const allocator = std.testing.allocator;
+    const parent_agents = "/Users/dev/CodingProjects/AGENTS.md";
+    const parent_dir = "/Users/dev/CodingProjects";
+    var compiled = try compileProfile(allocator, .{
+        .workspace_root = "/Users/dev/CodingProjects/ryk",
+        .system_ro_prefixes = &[_][]const u8{"/usr"},
+        .extra_grants = &.{.{ .path = parent_agents, .mode = .ro, .kind = .file }},
+    });
+    defer compiled.deinit();
+
+    try std.testing.expect(compiled.hasGrantWithKind(parent_agents, .ro, .file));
+    try std.testing.expect(!compiled.hasGrantWithKind(parent_agents, .ro, .folder));
+    try std.testing.expect(!compiled.hasGrant(parent_dir, .ro));
+    try std.testing.expect(compiled.isGrantedReadable(parent_agents));
+    try std.testing.expect(!compiled.isGrantedReadable(parent_dir));
+    try std.testing.expect(!compiled.isGrantedReadable("/Users/dev/CodingProjects/secret.env"));
 }
 
 test "codex system ro_paths compile narrow /etc/codex without bare /etc or HOME" {
