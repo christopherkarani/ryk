@@ -1,6 +1,6 @@
 # Winget manifest template. Release automation must replace checksums before publishing.
 PackageIdentifier: ChrisKarani.Ryk
-PackageVersion: 0.2.20
+PackageVersion: 0.2.21
 PackageName: ryk
 Publisher: Chris Karani
 License: Apache-2.0
@@ -13,8 +13,8 @@ Installers:
     InstallerType: zip
     NestedInstallerType: portable
     NestedInstallerFiles:
-      - RelativeFilePath: ryk-v0.2.20-windows-amd64\bin\ryk.exe
+      - RelativeFilePath: ryk-v0.2.21-windows-amd64\bin\ryk.exe
         PortableCommandAlias: ryk
-    InstallerUrl: https://github.com/christopherkarani/ryk/releases/download/v0.2.20/ryk-v0.2.20-windows-amd64.zip
+    InstallerUrl: https://github.com/christopherkarani/ryk/releases/download/v0.2.21/ryk-v0.2.21-windows-amd64.zip
     InstallerSha256: PLACEHOLDER_WINDOWS_AMD64_SHA256
 ReleaseNotes: Canonical ryk CLI. Verify checksums.txt before publishing.

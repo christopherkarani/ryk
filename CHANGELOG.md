@@ -1,5 +1,44 @@
 # Changelog
 
+## [0.2.21] - 2026-08-18
+
+## What's Changed
+* fix(sandbox): pin launch argv OOM ownership without a live Environ.Map by @christopherkarani in https://github.com/christopherkarani/ryk/pull/514
+* test(hook): isolate leftover-ask fixture from ambient CI by @christopherkarani in https://github.com/christopherkarani/ryk/pull/516
+* fix(policy): allow host skill and AGENTS.md reads outside workspace by @christopherkarani in https://github.com/christopherkarani/ryk/pull/513
+* fix(cli): drop Rust daemon claims from help catalog by @christopherkarani in https://github.com/christopherkarani/ryk/pull/517
+* fix(cli): reuse plugin PATH snapshot in doctor host rows by @christopherkarani in https://github.com/christopherkarani/ryk/pull/518
+* docs(mcp): document workspace .ryk/mcp manifests by @christopherkarani in https://github.com/christopherkarani/ryk/pull/521
+* perf(shell_engine): yield waiters during registry init by @christopherkarani in https://github.com/christopherkarani/ryk/pull/520
+* perf(cli): parse deadlock corpus once and share embed by @christopherkarani in https://github.com/christopherkarani/ryk/pull/519
+* fix(cli): drop cursor from stop help and uninstall dry-run by @christopherkarani in https://github.com/christopherkarani/ryk/pull/512
+* fix(cli): remap leftover unused ask in one helper before hosts see it by @christopherkarani in https://github.com/christopherkarani/ryk/pull/522
+* fix(hosts): rewrite leftover unused policy ask on coding-host wires by @christopherkarani in https://github.com/christopherkarani/ryk/pull/524
+* docs: untrack stale docs/agent-handoffs pack by @christopherkarani in https://github.com/christopherkarani/ryk/pull/510
+* fix(cli): packs default is count + one next by @christopherkarani in https://github.com/christopherkarani/ryk/pull/509
+* fix(cli): honest --json help and replay --list JSON by @christopherkarani in https://github.com/christopherkarani/ryk/pull/504
+* docs(compatibility): map session sandbox grades to canonical grades by @christopherkarani in https://github.com/christopherkarani/ryk/pull/505
+* fix(intercept): bound proxy upstream dial without ConnectOptions.timeout by @christopherkarani in https://github.com/christopherkarani/ryk/pull/506
+* fix(cli): drop process-level shield banner by @christopherkarani in https://github.com/christopherkarani/ryk/pull/508
+* fix(cli): color only DENY Decision on test/explain by @christopherkarani in https://github.com/christopherkarani/ryk/pull/507
+* docs(redteam): document --ci exit codes 0/1/2/6 by @christopherkarani in https://github.com/christopherkarani/ryk/pull/523
+* fix(hosts): fail-close unexpected Pi evaluate leftover ask by @christopherkarani in https://github.com/christopherkarani/ryk/pull/525
+* fix(cli): one next on public help, not start-or-help-all by @christopherkarani in https://github.com/christopherkarani/ryk/pull/511
+* fix(cli): honest in-process engine on start and doctor by @christopherkarani in https://github.com/christopherkarani/ryk/pull/359
+* perf(scan): cache walkCollect host discovery walks by @christopherkarani in https://github.com/christopherkarani/ryk/pull/498
+* perf(cli): stream-scan last session audit_degraded in doctor by @christopherkarani in https://github.com/christopherkarani/ryk/pull/502
+* fix(mediate): fail-closed privilege, rm-rf, curl dest, shims, replay, .env write by @christopherkarani in https://github.com/christopherkarani/ryk/pull/526
+* fix(feed): redact user-controlled fields on JSONL load (#298) by @christopherkarani in https://github.com/christopherkarani/ryk/pull/472
+* fix(sandbox): keep ancestor instruction as a file OS grant by @christopherkarani in https://github.com/christopherkarani/ryk/pull/527
+* ci(openclaw): check committed dist on release only by @christopherkarani in https://github.com/christopherkarani/ryk/pull/503
+* fix(cli): drop doctor linear box walls (#205) by @christopherkarani in https://github.com/christopherkarani/ryk/pull/528
+* fix(cli): stop test/explain DENY Next ping-pong (#239) by @christopherkarani in https://github.com/christopherkarani/ryk/pull/529
+* fix(sandbox): skip git objects and ryk sessions in Seatbelt hardlink scan by @christopherkarani in https://github.com/christopherkarani/ryk/pull/530
+* fix(hook): allow workspace symlink reads to host skills by @christopherkarani in https://github.com/christopherkarani/ryk/pull/531
+
+
+**Full Changelog**: https://github.com/christopherkarani/ryk/compare/v0.2.20...v0.2.21
+
 ## [Unreleased]
 
 * `ryk test` and default `ryk explain` DENY no longer ping-pong Next between the other inspect verb. Safer is the one action when a safer command exists.

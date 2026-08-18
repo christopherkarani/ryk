@@ -1,4 +1,4 @@
 name: ryk
-version: 0.2.20
+version: 0.2.21
 description: ryk runtime guardrails for Hermes Agent.
 entrypoint: __init__.py
