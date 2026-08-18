@@ -25,31 +25,7 @@ const exit_codes = @import("exit_codes.zig");
 const shell_eval = @import("shell_eval.zig");
 const shell_engine = @import("../shell_engine/mod.zig");
 const ryk_policy = @import("ryk_core").policy;
-
-const corpus = @embedFile("deadlock_replay_corpus.jsonl");
-
-const Case = struct {
-    command: []const u8,
-    expect: []const u8,
-    note: []const u8,
-};
-
-fn parseLine(line: []const u8) !Case {
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, line, .{});
-    defer parsed.deinit();
-    const obj = parsed.value.object;
-    return .{
-        .command = try std.testing.allocator.dupe(u8, obj.get("command").?.string),
-        .expect = try std.testing.allocator.dupe(u8, obj.get("expect").?.string),
-        .note = try std.testing.allocator.dupe(u8, if (obj.get("note")) |n| n.string else ""),
-    };
-}
-
-fn freeCase(case: Case) void {
-    std.testing.allocator.free(case.command);
-    std.testing.allocator.free(case.expect);
-    std.testing.allocator.free(case.note);
-}
+const deadlock_corpus = @import("deadlock_corpus.zig");
 
 fn riskFromEngineSeverity(severity: shell_engine.Severity) shell_eval.RiskLevel {
     return switch (severity) {
@@ -128,40 +104,34 @@ test "Door A deadlock transcripts replay clean on both product surfaces" {
     );
     defer policy.deinit();
 
-    var total: usize = 0;
-    var it = std.mem.splitScalar(u8, corpus, '\n');
-    while (it.next()) |raw| {
-        const line = std.mem.trim(u8, raw, " \t\r");
-        if (line.len == 0) continue;
-        const case = try parseLine(line);
-        defer freeCase(case);
-        total += 1;
+    const steps = try deadlock_corpus.parsedSteps();
+    try std.testing.expect(steps.len >= 20);
 
-        const hook = try hookSurfaceDecision(allocator, &policy, case.command);
-        const decide_code = try decideSurfaceDecision(io, allocator, policy_path, case.command);
+    for (steps) |step| {
+        const hook = try hookSurfaceDecision(allocator, &policy, step.command);
+        const decide_code = try decideSurfaceDecision(io, allocator, policy_path, step.command);
 
-        if (std.mem.eql(u8, case.expect, "allow")) {
-            std.testing.expectEqual(shell_eval.PluginDecision.allow, hook) catch |err| {
-                std.debug.print("hook surface blocked normal work `{s}` ({s})\n", .{ case.command, case.note });
-                return err;
-            };
-            std.testing.expectEqual(exit_codes.success, decide_code) catch |err| {
-                std.debug.print("decide surface blocked normal work `{s}` ({s})\n", .{ case.command, case.note });
-                return err;
-            };
-        } else if (std.mem.eql(u8, case.expect, "deny")) {
-            std.testing.expectEqual(shell_eval.PluginDecision.block, hook) catch |err| {
-                std.debug.print("hook surface allowed danger `{s}` ({s})\n", .{ case.command, case.note });
-                return err;
-            };
-            std.testing.expectEqual(exit_codes.denial, decide_code) catch |err| {
-                std.debug.print("decide surface allowed danger `{s}` ({s})\n", .{ case.command, case.note });
-                return err;
-            };
-        } else {
-            std.debug.print("unknown expect value `{s}` in corpus line for `{s}`\n", .{ case.expect, case.command });
-            return error.InvalidCorpusExpectation;
+        switch (step.expect) {
+            .allow => {
+                std.testing.expectEqual(shell_eval.PluginDecision.allow, hook) catch |err| {
+                    std.debug.print("hook surface blocked normal work `{s}` ({s})\n", .{ step.command, step.note });
+                    return err;
+                };
+                std.testing.expectEqual(exit_codes.success, decide_code) catch |err| {
+                    std.debug.print("decide surface blocked normal work `{s}` ({s})\n", .{ step.command, step.note });
+                    return err;
+                };
+            },
+            .deny => {
+                std.testing.expectEqual(shell_eval.PluginDecision.block, hook) catch |err| {
+                    std.debug.print("hook surface allowed danger `{s}` ({s})\n", .{ step.command, step.note });
+                    return err;
+                };
+                std.testing.expectEqual(exit_codes.denial, decide_code) catch |err| {
+                    std.debug.print("decide surface allowed danger `{s}` ({s})\n", .{ step.command, step.note });
+                    return err;
+                };
+            },
         }
     }
-    try std.testing.expect(total >= 20);
 }
