@@ -20,6 +20,8 @@ const rust_visibility = @import("feed_visibility.zig");
 const telemetry = @import("../telemetry.zig");
 const hook_client = @import("hook_client.zig");
 const hook_ipc = @import("hook_ipc.zig");
+const leftover_ask = @import("leftover_ask.zig");
+const env_util = @import("../env_util.zig");
 
 const max_payload_len = 256 * 1024;
 const api_schema_version: i64 = 1;
@@ -49,6 +51,9 @@ const EvaluateWireOpts = struct {
     cached_policy: ?*const core_api.LoadedPolicy = null,
     /// Client asked to raise leftover ask → deny (`RYK_MODE=ci` / `--ci`).
     raise_ci: bool = false,
+    /// When set, overrides `raise_ci` + ambient CI for leftover remap.
+    /// Tests pin attended leftover permit so GHA `CI=true` cannot flip it.
+    unattended: ?bool = null,
 };
 
 pub const EvaluateRequest = struct {
@@ -198,6 +203,12 @@ fn serverEvaluateWire(cached_policy: ?*const core_api.LoadedPolicy) EvaluateWire
     return .{ .cached_policy = cached_policy };
 }
 
+/// Hook-serve strips CI/RYK_* from the child. Leftover unattended must ride
+/// this client-stamped bit (`RYK_MODE=ci` or parent `getenvUnattended`).
+fn evaluateClientRaiseCi(mode_is_ci: bool, parent_unattended: bool) bool {
+    return mode_is_ci or parent_unattended;
+}
+
 fn tryHookServer(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -216,7 +227,7 @@ fn tryHookServer(
         .method = "evaluate",
         .bin = bin,
         .version = build_options.version,
-        .ci = resolveEvaluateMode(.strict) == .ci,
+        .ci = evaluateClientRaiseCi(resolveEvaluateMode(.strict) == .ci, env_util.getenvUnattended()),
         .workspace = cwd_z,
         .cwd = cwd_z,
         .payload_json = payload,
@@ -341,7 +352,6 @@ fn moreRestrictiveMode(a: policy.schema.Mode, b: policy.schema.Mode) policy.sche
 /// Resolve evaluate mode like product hooks: discovered policy mode, with
 /// `RYK_MODE` only allowed to raise strictness (never ambient soften).
 fn resolveEvaluateMode(base: policy.schema.Mode) policy.schema.Mode {
-    const env_util = @import("../env_util.zig");
     if (env_util.getenvBrand("MODE")) |raw_c| {
         const raw = std.mem.span(raw_c);
         if (policy.schema.Mode.parse(raw)) |env_mode| {
@@ -584,9 +594,11 @@ fn requestIdBestEffort(allocator: std.mem.Allocator, payload: []const u8) !?[]co
 ///
 /// Exit codes (stable contract):
 /// - allow / observe → exit 0, decision "allow"
-/// - ask → exit 0, decision "ask" (host maps JSON; do not invent a new exit)
+/// - leftover unused ask (attended) → exit 0, decision "allow"
+/// - leftover unused ask (unattended / CI) and SoftBlock / FM ask → exit 2, decision "deny"
 /// - deny / redact / stage / broker → exit 2, decision "deny"
 /// - evaluator fail-closed / protocol → exit 3, decision "error"
+/// Hosts never see leftover unused `ask` as the decision field. Reason may still say it.
 fn writeEvaluationResponse(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -723,7 +735,18 @@ fn writeEvaluationResponse(
         null;
     defer if (safe_remediation) |text| allocator.free(text);
 
-    const decision_tag: []const u8 = switch (owned.decision.result) {
+    const unattended = wire.unattended orelse (wire.raise_ci or env_util.getenvUnattended());
+    const host_result: core.decision.DecisionResult = switch (leftover_ask.codingHostAskOutcome(
+        owned.decision.result == .ask,
+        owned.ask_origin,
+        unattended,
+    )) {
+        .allow => .allow,
+        .deny, .hold => .deny,
+        .unchanged => owned.decision.result,
+    };
+
+    const decision_tag: []const u8 = switch (host_result) {
         .allow, .observe => "allow",
         .ask => "ask",
         .deny, .redact, .stage, .broker => "deny",
@@ -742,7 +765,7 @@ fn writeEvaluationResponse(
         feed_destination,
     );
 
-    return switch (owned.decision.result) {
+    return switch (host_result) {
         .allow, .observe => {
             const response = MachineResponse{
                 .request_id = request.request_id,
@@ -1277,8 +1300,8 @@ test "evaluate feed records product ask after FM upgrades engine allow" {
         .commands_allow_override = &.{},
         .fm_client = client,
     });
-    try std.testing.expectEqual(exit_ask, code);
-    try std.testing.expect(std.mem.indexOf(u8, stdout.buffered(), "\"decision\": \"ask\"") != null);
+    try std.testing.expectEqual(exit_denied, code);
+    try std.testing.expect(std.mem.indexOf(u8, stdout.buffered(), "\"decision\": \"deny\"") != null);
 
     const workspace_records = try feed_writer.loadRecent(std.testing.io, std.testing.allocator, root, 4);
     defer {
@@ -1287,7 +1310,7 @@ test "evaluate feed records product ask after FM upgrades engine allow" {
     }
     try std.testing.expectEqual(@as(usize, 1), workspace_records.len);
     // Critical: feed must reflect product ask, not raw engine Allow.
-    try std.testing.expectEqualStrings("ask", workspace_records[0].record.decision);
+    try std.testing.expectEqualStrings("deny", workspace_records[0].record.decision);
     try std.testing.expectEqualStrings(event_source_evaluate, workspace_records[0].record.event_source);
     try std.testing.expect(std.mem.indexOf(u8, workspace_records[0].record.reason, "hard-danger") != null);
 }
@@ -1331,7 +1354,7 @@ test "evaluate daemon failures map to JSON error exit 3" {
 // WP4 + FM product path (Phase 4 WP4a) — evaluate emits decision=ask
 // ---------------------------------------------------------------------------
 
-test "evaluate ask mode high-severity deny emits decision ask exit 0" {
+test "evaluate leftover unused ask is allow on attended coding-host JSON" {
     const allocator = std.testing.allocator;
     defer shell_eval.resetSessionStickyStoreForTests();
     const cwd = try testCwd(allocator);
@@ -1345,14 +1368,87 @@ test "evaluate ask mode high-severity deny emits decision ask exit 0" {
         .mode_override = .ask,
         .commands_allow_override = &.{},
         .disable_fm = true,
+        .unattended = false,
     });
-    try std.testing.expectEqual(exit_ask, code);
-    try std.testing.expectEqual(exit_allowed, code); // ask shares exit 0 with allow
+    try std.testing.expectEqual(exit_allowed, code);
     const output = stdout.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"ask\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"allow\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"ask\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, output, "\"severity\": \"high\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "requires approval") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "\"error\": null") != null);
+}
+
+test "evaluate leftover unused ask is deny when unattended" {
+    const allocator = std.testing.allocator;
+    defer shell_eval.resetSessionStickyStoreForTests();
+    const cwd = try testCwd(allocator);
+    defer allocator.free(cwd);
+    const payload = try validPayload(allocator, "git push --force", cwd);
+    defer allocator.free(payload);
+    var stdout_buf: [8192]u8 = undefined;
+    var stdout: std.Io.Writer = .fixed(&stdout_buf);
+
+    const code = try evaluatePayload(std.testing.io, allocator, payload, &stdout, mockDenyHigh, .disabled, .{
+        .mode_override = .ask,
+        .commands_allow_override = &.{},
+        .disable_fm = true,
+        .raise_ci = true,
+        .unattended = true,
+    });
+    try std.testing.expectEqual(exit_denied, code);
+    const output = stdout.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"deny\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"ask\"") == null);
+}
+
+test "evaluate leftover unused ask is deny when parent is unattended even if hook-serve stripped child env" {
+    const Lookup = struct {
+        key: []const u8,
+        value: []const u8,
+        pub fn get(self: @This(), key: []const u8) ?[]const u8 {
+            return if (std.mem.eql(u8, key, self.key)) self.value else null;
+        }
+    };
+    const EmptyLookup = struct {
+        pub fn get(_: @This(), _: []const u8) ?[]const u8 {
+            return null;
+        }
+    };
+    const parent_unattended = env_util.unattendedFromLookup(Lookup{ .key = "RYK_UNATTENDED", .value = "1" });
+    const child_unattended = env_util.unattendedFromLookup(EmptyLookup{});
+    try std.testing.expect(parent_unattended);
+    try std.testing.expect(!child_unattended);
+    try std.testing.expect(evaluateClientRaiseCi(false, parent_unattended));
+    try std.testing.expect(!evaluateClientRaiseCi(false, child_unattended));
+
+    const raise_ci = evaluateClientRaiseCi(false, parent_unattended);
+    try std.testing.expectEqual(leftover_ask.Outcome.deny, leftover_ask.codingHostAskOutcome(
+        true,
+        .leftover,
+        raise_ci or child_unattended,
+    ));
+
+    const allocator = std.testing.allocator;
+    defer shell_eval.resetSessionStickyStoreForTests();
+    const cwd = try testCwd(allocator);
+    defer allocator.free(cwd);
+    const payload = try validPayload(allocator, "git push --force", cwd);
+    defer allocator.free(payload);
+    var stdout_buf: [8192]u8 = undefined;
+    var stdout: std.Io.Writer = .fixed(&stdout_buf);
+
+    const code = try evaluatePayload(std.testing.io, allocator, payload, &stdout, mockDenyHigh, .disabled, .{
+        .mode_override = .ask,
+        .commands_allow_override = &.{},
+        .disable_fm = true,
+        .raise_ci = raise_ci,
+        .unattended = raise_ci or child_unattended,
+    });
+    try std.testing.expectEqual(exit_denied, code);
+    const output = stdout.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"deny\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"ask\"") == null);
 }
 
 test "evaluate FM hard-danger residual upgrades allow to ask with reason" {
@@ -1377,10 +1473,11 @@ test "evaluate FM hard-danger residual upgrades allow to ask with reason" {
         .commands_allow_override = &.{},
         .fm_client = client,
     });
-    try std.testing.expectEqual(exit_ask, code);
+    try std.testing.expectEqual(exit_denied, code);
     try std.testing.expectEqual(@as(u32, 1), state.call_count);
     const output = stdout.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"ask\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"deny\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"ask\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, output, "curl | sh is hard-danger shaped") != null);
 }
 
@@ -1407,9 +1504,9 @@ test "evaluate FM reason with secret-shaped text is redacted in JSON" {
         .commands_allow_override = &.{},
         .fm_client = client,
     });
-    try std.testing.expectEqual(exit_ask, code);
+    try std.testing.expectEqual(exit_denied, code);
     const output = stdout.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"ask\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"deny\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "sk-fakeSyntheticOpenAIKey1234567890") == null);
     try std.testing.expect(std.mem.indexOf(u8, output, "[REDACTED]") != null);
 }

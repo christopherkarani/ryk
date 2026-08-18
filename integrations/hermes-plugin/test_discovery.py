@@ -596,8 +596,25 @@ class HermesPluginDiscoveryTests(unittest.TestCase):
                 result = handler(tool_name="terminal", args={"command": "git status"})
             self.assertEqual(result, {"action": "block", "message": "blocked by ryk"})
 
-    def test_pre_tool_call_ask_permits_unless_unattended(self) -> None:
-        """Residual ask is permit so agents can work; no Hermes approve UI."""
+    def test_pre_tool_call_leftover_allow_from_ryk_proceeds(self) -> None:
+        """Leftover unused ask is remapped by ryk; plugin proceeds on allow."""
+        ctx = mock.Mock()
+        _PLUGIN._register(ctx, "pre_tool_call")
+        handler = ctx.register_hook.call_args.args[1]
+        with mock.patch.object(
+            _PLUGIN,
+            "_call_ryk",
+            return_value={
+                "decision": "allow",
+                "message": "leftover unused policy ask permitted",
+                "rule_id": "core.filesystem:destructive_rm",
+            },
+        ):
+            result = handler(tool_name="terminal", args={"command": "rm -rf /tmp/x"})
+        self.assertIsNone(result)
+
+    def test_pre_tool_call_unexpected_ask_is_fail_closed(self) -> None:
+        """Plugin must not invent leftover-ask permit if ryk still emitted ask."""
         ctx = mock.Mock()
         _PLUGIN._register(ctx, "pre_tool_call")
         handler = ctx.register_hook.call_args.args[1]
@@ -620,7 +637,7 @@ class HermesPluginDiscoveryTests(unittest.TestCase):
                 },
             ):
                 result = handler(tool_name="terminal", args={"command": "rm -rf /tmp/x"})
-        self.assertIsNone(result)
+        self.assertEqual(result["action"], "block")
 
     def test_pre_tool_call_stage_never_permits(self) -> None:
         """Staged writes are hold/deny, not leftover unused ask."""
@@ -795,7 +812,7 @@ class HermesPluginDiscoveryTests(unittest.TestCase):
         for decision, expected in (
             ("allow", "proceed"),
             ("block", "hard_block"),
-            ("ask", "proceed"),
+            ("ask", "hard_block"),
             ("warn", "advisory_log"),
         ):
             with self.subTest(decision=decision):
@@ -810,13 +827,13 @@ class HermesPluginDiscoveryTests(unittest.TestCase):
             {"decision": "block", "message": "no"}, "terminal", {}
         )
         self.assertEqual(blocked["action"], "block")
-        permitted = _PLUGIN._mapping.map_pre_tool_call(
+        unexpected_ask = _PLUGIN._mapping.map_pre_tool_call(
             {"decision": "ask", "message": "need"},
             "terminal",
             {"command": "x"},
             environ={},
         )
-        self.assertIsNone(permitted)
+        self.assertEqual(unexpected_ask["action"], "block")
         staged = _PLUGIN._mapping.map_pre_tool_call(
             {"decision": "stage", "message": "staged write"},
             "terminal",
@@ -905,7 +922,7 @@ class HermesPluginDiscoveryTests(unittest.TestCase):
         self.assertIn("core.shell:network", rule_only)
         self.assertNotIn("\n", rule_only)
 
-    def test_attended_ask_is_permit_with_no_host_message(self) -> None:
+    def test_unexpected_ask_is_fail_closed(self) -> None:
         mapping = _PLUGIN._mapping
         out = mapping.map_pre_tool_call(
             {
@@ -921,7 +938,7 @@ class HermesPluginDiscoveryTests(unittest.TestCase):
             {"command": "rm -rf /tmp/x"},
             environ={},
         )
-        self.assertIsNone(out)
+        self.assertEqual(out["action"], "block")
 
     def test_ci_ask_block_message_is_short_single_line(self) -> None:
         mapping = _PLUGIN._mapping

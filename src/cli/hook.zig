@@ -20,6 +20,7 @@ const grok_deny_reason = @import("grok_deny_reason.zig");
 const hook_client = @import("hook_client.zig");
 const hook_ipc = @import("hook_ipc.zig");
 const env_util = @import("../env_util.zig");
+const leftover_ask = @import("leftover_ask.zig");
 
 // Maximum JSON payload size to prevent memory exhaustion from hostile hosts.
 const max_payload_len = 256 * 1024; // 256 KiB
@@ -391,6 +392,12 @@ fn hookCommand(io: std.Io, host: Host, event: Event, original_event_name: []cons
     return evaluateFromPayload(io, allocator, host, event, original_event_name, payload_text, ci_mode, null, null, stdout, stderr);
 }
 
+/// Hook-serve strips CI/RYK_* from the child. Leftover unattended must ride
+/// this client-stamped bit (`--ci` or parent `getenvUnattended`).
+fn hookClientRaiseCi(cli_ci: bool, parent_unattended: bool) bool {
+    return cli_ci or parent_unattended;
+}
+
 fn tryHookServer(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -416,7 +423,7 @@ fn tryHookServer(
         .version = build_options.version,
         .host = @tagName(host),
         .event = event_name,
-        .ci = ci,
+        .ci = hookClientRaiseCi(ci, env_util.getenvUnattended()),
         .probe = probe,
         .workspace = cwd_z,
         .cwd = cwd_z,
@@ -796,12 +803,15 @@ fn evaluateFromPayload(
     const unattended = ci_mode or env_util.getenvUnattended();
     if (result.decision == .stage and unattended) {
         result.decision = .block;
-    } else if (result.ask_origin.mayPermitOnCodingHost()) {
-        result.decision = wireCodingHostAsk(result.decision, unattended);
-    } else if (result.decision == .ask) {
-        // SoftBlock / FM: OpenCode and Hermes treat leftover ask as proceed,
-        // so the hook wire denies instead of emitting ask.
-        result.decision = .block;
+    } else switch (leftover_ask.codingHostAskOutcome(
+        result.decision == .ask,
+        result.ask_origin,
+        unattended,
+    )) {
+        .allow => result.decision = .allow,
+        .deny => result.decision = .block,
+        .hold => {},
+        .unchanged => {},
     }
 
     telemetry.recordEnforcement(
@@ -965,8 +975,11 @@ fn isCodexDenyOutput(host: Host, decision: PluginDecision) bool {
 /// (every `Host` value) permit leftover unused ask so agents can work.
 /// Stage, SoftBlock, and FM steward ask never enter this helper.
 fn wireCodingHostAsk(decision: PluginDecision, unattended: bool) PluginDecision {
-    if (decision != .ask) return decision;
-    return if (unattended) .block else .allow;
+    return switch (leftover_ask.codingHostAskOutcome(decision == .ask, .leftover, unattended)) {
+        .allow => .allow,
+        .deny => if (decision == .ask) .block else decision,
+        .hold, .unchanged => decision,
+    };
 }
 
 fn usesExitTwoDenyOutput(host: Host, decision: PluginDecision) bool {
@@ -1066,15 +1079,15 @@ fn usesClaudeHostShapedPermission(host: Host, event: Event) bool {
 
 /// Map ryk plugin decisions to Claude `permissionDecision` values.
 /// - block/err → deny
-/// - leftover unused ask → allow (coding-host permit; unattended/`--ci` already
-///   rewrote leftover ask→block before emit)
+/// - leftover unused ask is already remapped to allow before emit
+/// - remaining `.ask` is SoftBlock/FM hold → ask (never allow)
 /// - stage → ask (hold for review; never allow)
 /// - allow/context_only/warn → allow (warn is not a hard veto; documented proceed)
 fn claudePermissionDecisionString(decision: PluginDecision) []const u8 {
     return switch (decision) {
         .block, .err => "deny",
-        .stage => "ask",
-        .ask, .allow, .context_only, .warn => "allow",
+        .ask, .stage => "ask",
+        .allow, .context_only, .warn => "allow",
     };
 }
 
@@ -6688,18 +6701,48 @@ test "hook Claude maps block to permissionDecision deny with short reason" {
     try std.testing.expectEqual(exit_codes.success, hookExitCode(.claude, .block, false));
 }
 
-test "hook Claude maps residual ask to permissionDecision allow never deny" {
+test "hook-serve leftover ask is deny when parent is unattended and child env is stripped" {
+    const Lookup = struct {
+        key: []const u8,
+        value: []const u8,
+        pub fn get(self: @This(), key: []const u8) ?[]const u8 {
+            return if (std.mem.eql(u8, key, self.key)) self.value else null;
+        }
+    };
+    const EmptyLookup = struct {
+        pub fn get(_: @This(), _: []const u8) ?[]const u8 {
+            return null;
+        }
+    };
+    const parent_unattended = env_util.unattendedFromLookup(Lookup{ .key = "RYK_UNATTENDED", .value = "1" });
+    const child_unattended = env_util.unattendedFromLookup(EmptyLookup{});
+    try std.testing.expect(parent_unattended);
+    try std.testing.expect(!child_unattended);
+    try std.testing.expect(hookClientRaiseCi(false, parent_unattended));
+    try std.testing.expect(!hookClientRaiseCi(false, child_unattended));
+
+    const raise_ci = hookClientRaiseCi(false, parent_unattended);
+    try std.testing.expectEqual(leftover_ask.Outcome.deny, leftover_ask.codingHostAskOutcome(
+        true,
+        .leftover,
+        raise_ci or child_unattended,
+    ));
+}
+
+test "hook Claude maps leftover remapped ask to permissionDecision allow never deny" {
     const allocator = std.testing.allocator;
+    const leftover = wireCodingHostAsk(.ask, false);
+    try std.testing.expectEqual(PluginDecision.allow, leftover);
+    try std.testing.expectEqualStrings("allow", claudePermissionDecisionString(leftover));
+    try std.testing.expect(!std.mem.eql(u8, claudePermissionDecisionString(leftover), "deny"));
+
     var result = try testClaudeHookResponse(
         allocator,
-        .ask,
+        leftover,
         "needs approval",
         "command requires user approval per ryk policy.",
     );
     defer result.deinit(allocator);
-
-    try std.testing.expectEqualStrings("allow", claudePermissionDecisionString(.ask));
-    try std.testing.expect(!std.mem.eql(u8, claudePermissionDecisionString(.ask), "deny"));
 
     var stdout_buf: [1024]u8 = undefined;
     var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
@@ -6707,6 +6750,27 @@ test "hook Claude maps residual ask to permissionDecision allow never deny" {
     const out = stdout_writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, out, "\"permissionDecision\":\"allow\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"permissionDecision\":\"deny\"") == null);
+}
+
+test "hook Claude SoftBlock hold ask is permissionDecision ask never allow" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectEqualStrings("ask", claudePermissionDecisionString(.ask));
+    try std.testing.expect(!std.mem.eql(u8, claudePermissionDecisionString(.ask), "allow"));
+
+    var result = try testClaudeHookResponse(
+        allocator,
+        .ask,
+        "soft-block hold",
+        "soft-block requires review; never leftover unused-ask permit.",
+    );
+    defer result.deinit(allocator);
+
+    var stdout_buf: [1024]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    try writeClaudePermissionDecision(allocator, &stdout_writer, .PreToolUse, result);
+    const out = stdout_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"permissionDecision\":\"ask\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"permissionDecision\":\"allow\"") == null);
 }
 
 test "coding hosts permit residual ask unless unattended" {

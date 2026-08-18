@@ -213,9 +213,10 @@ def map_pre_tool_call(
             "message": format_tool_message(response, default="blocked by ryk"),
         }
     if decision == "ask":
+        # Leftover unused ask is remapped by ryk hook/evaluate before emit.
+        # An unexpected ask on this wire is fail-closed (do not invent allow).
+        message = format_tool_message(response, default="approval required by ryk")
         if ci_mode(environ, unattended_marker=unattended_marker):
-            # Keep one host line: reserve room for the CI clause inside the 200 budget.
-            message = format_tool_message(response, default="approval required by ryk")
             ci_suffix = (
                 " (CI/noninteractive: ryk ask hardened to block; "
                 "no approval prompt available)"
@@ -226,8 +227,14 @@ def map_pre_tool_call(
                 "action": "block",
                 "message": f"{base}{ci_suffix}",
             }
-        # Residual ask is permit so agents can work. No Hermes approve UI.
-        return None
+        return {
+            "action": "block",
+            "message": _bounded_text(
+                message,
+                "ryk leftover unused ask was not remapped; blocked fail-closed.",
+                _MAX_HOST_MESSAGE_CHARS,
+            ),
+        }
     return {
         "action": "block",
         "message": "ryk returned an invalid tool decision; blocked fail-closed.",
@@ -239,7 +246,7 @@ def tool_action_mode(decision: str) -> str:
     return {
         "allow": "proceed",
         "block": "hard_block",
-        "ask": "proceed",
+        "ask": "hard_block",
         "stage": "hard_block",
         "warn": "advisory_log",
         "error": "fail_closed_block",

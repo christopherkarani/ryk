@@ -468,20 +468,9 @@ function normalizeBlockingDecision(decision, base, options = {}) {
         };
     }
     if (decision === 'ask') {
-        if (options.unattended) {
-            return failClosedBlock('ryk_unattended_ask', 'ryk requested approval, but this OpenClaw process is unattended; blocking without waiting.', base);
-        }
-        // Leftover unused policy ask is permit (same coding-host wire as Grok).
-        // Stage / SoftBlock / FM ask are remapped to block by ryk hook before emit.
-        return {
-            ...base,
-            decision: 'allow',
-            risk: base.risk ?? 'low',
-            category: base.category ?? 'unknown',
-            reason: base.reason ?? 'ryk_leftover_ask_permit',
-            message: sanitizeDiagnostic(base.message) || sanitizeDiagnostic(base.reason) ||
-                'ryk leftover unused policy ask is permitted.',
-        };
+        return failClosedBlock(options.unattended ? 'ryk_unattended_ask' : 'ryk_unexpected_ask', options.unattended
+            ? 'ryk requested approval, but this OpenClaw process is unattended; blocking without waiting.'
+            : 'ryk leftover unused ask was not remapped; blocking fail-closed.', base);
     }
     if (!ALLOW_DECISIONS.has(decision)) {
         return failClosedBlock('ryk_unrecognized_decision', `ryk returned unrecognized decision "${decision}"; blocking as a precaution.`, base);
@@ -503,7 +492,8 @@ function normalizeBlockingDecision(decision, base, options = {}) {
  * Non-blocking: soft-allow on empty/malformed.
  * Blocking: fail closed on empty/whitespace, parse errors, missing/non-string
  * decision, unattended leftover `ask`, and unrecognized decisions. Attended
- * leftover unused policy `ask` is permit (allow). Approval is not translated
+ * leftover unused policy `ask` is remapped by ryk hook before emit.
+ * An unexpected leftover `ask` here is fail-closed. Approval is not translated
  * into a host-native request.
  */
 export function parseHookResponse(stdout, blocking, options = {}) {
@@ -565,7 +555,14 @@ async function callRyk(rykBin, event, data, sessionId, blocking, logger, options
             : softAllow('ryk_binary_untrusted', 'ryk executable provenance or identity could not be re-attested; skipping this non-blocking event.');
     }
     try {
-        const stdout = await runRykHookProcess(rykBin, ['hook', 'openclaw', event], payload.json, blocking ? 15000 : 10000, options.cwd);
+        const hookArgs = ['hook', 'openclaw', event];
+        // Unattended/CI must pass --ci so leftover unused ryk ask hardens inside
+        // the CLI, not only in the host mapping layer. Stage, FM steward ask, and
+        // SoftBlock never ride the leftover-ask permit wire.
+        if (options.unattended || isUnattended()) {
+            hookArgs.push('--ci');
+        }
+        const stdout = await runRykHookProcess(rykBin, hookArgs, payload.json, blocking ? 15000 : 10000, options.cwd);
         return parseHookResponse(stdout, blocking, options);
     }
     catch {

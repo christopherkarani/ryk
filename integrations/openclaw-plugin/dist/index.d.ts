@@ -105,7 +105,8 @@ export declare function openClawSessionId(ctx: unknown): string | undefined;
  * Non-blocking: soft-allow on empty/malformed.
  * Blocking: fail closed on empty/whitespace, parse errors, missing/non-string
  * decision, unattended leftover `ask`, and unrecognized decisions. Attended
- * leftover unused policy `ask` is permit (allow). Approval is not translated
+ * leftover unused policy `ask` is remapped by ryk hook before emit.
+ * An unexpected leftover `ask` here is fail-closed. Approval is not translated
  * into a host-native request.
  */
 export declare function parseHookResponse(stdout: string, blocking: boolean, options?: {

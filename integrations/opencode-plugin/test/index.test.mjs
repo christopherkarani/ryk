@@ -29,7 +29,7 @@ async function withFakeRyk(run, scriptBody, pluginExtras = {}) {
 payload=$(cat)
 case "$payload" in
   *'"command":"rm -rf'* ) printf '%s\\n' '{"decision":"block","message":"command blocked"}' ;;
-  *'"command":"rm'* ) printf '%s\\n' '{"decision":"ask","message":"approval required"}' ;;
+  *'"command":"rm'* ) printf '%s\\n' '{"decision":"allow","message":"leftover unused policy ask permitted"}' ;;
   * ) printf '%s\\n' '{"decision":"allow"}' ;;
 esac
 `;
@@ -114,34 +114,42 @@ test('tool.execute.before blocks rm -rf build', async () => {
   });
 });
 
-test('tool.execute.before unattended residual ask is deny', async () => {
-  await withFakeRyk(async (plugin) => {
-    process.env.RYK_UNATTENDED = '1';
-    const before = plugin['tool.execute.before'];
-    await assert.rejects(
-      before(
-        { tool: 'bash', sessionID: 'session-1', callID: 'call-1' },
-        { args: { command: 'rm file.txt' } }
-      ),
-      (err) => {
-        assertShortBlockThrow(err, /approval required|ryk blocked/);
-        return true;
-      }
-    );
-  });
+test('tool.execute.before unexpected ask is deny', async () => {
+  await withFakeRyk(
+    async (plugin) => {
+      const before = plugin['tool.execute.before'];
+      await assert.rejects(
+        before(
+          { tool: 'bash', sessionID: 'session-1', callID: 'call-1' },
+          { args: { command: 'rm file.txt' } }
+        ),
+        (err) => {
+          assertShortBlockThrow(err, /approval required|ryk blocked|unrecognized/);
+          return true;
+        }
+      );
+    },
+    `#!/bin/sh
+printf '%s\\n' '{"decision":"ask","message":"approval required"}'
+`
+  );
 });
 
-test('permission.ask unattended residual ask is deny', async () => {
-  await withFakeRyk(async (plugin) => {
-    process.env.RYK_UNATTENDED = '1';
-    const permissionAsk = plugin['permission.ask'];
-    const output = { status: 'ask' };
-    await permissionAsk({ sessionID: 'session-1', command: 'rm file.txt' }, output);
-    assert.equal(output.status, 'deny');
-  });
+test('permission.ask unexpected ask is deny', async () => {
+  await withFakeRyk(
+    async (plugin) => {
+      const permissionAsk = plugin['permission.ask'];
+      const output = { status: 'ask' };
+      await permissionAsk({ sessionID: 'session-1', command: 'rm file.txt' }, output);
+      assert.equal(output.status, 'deny');
+    },
+    `#!/bin/sh
+printf '%s\\n' '{"decision":"ask","message":"approval required"}'
+`
+  );
 });
 
-test('permission.ask permits ryk ask so agents can work', async () => {
+test('permission.ask leftover remapped allow proceeds', async () => {
   await withFakeRyk(async (plugin) => {
     const permissionAsk = plugin['permission.ask'];
     assert.ok(permissionAsk);
@@ -1909,9 +1917,9 @@ test('parseHookResponse unknown decision blocks on blocking path', () => {
   assert.equal(r.reason, 'ryk_unrecognized_decision');
 });
 
-test('parseHookResponse keeps ask on blocking path for permission.ask UX', () => {
+test('parseHookResponse fail-closes unexpected ask on blocking path', () => {
   const r = parseHookResponse(JSON.stringify({ decision: 'ask', message: 'need approval' }), true);
-  assert.equal(r.decision, 'ask');
+  assert.equal(r.decision, 'block');
 });
 
 test('shell.env scrubs secret-looking variables', async () => {

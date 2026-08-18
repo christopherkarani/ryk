@@ -377,18 +377,18 @@ describe('parseHookResponse (fail-closed blocking path)', () => {
     assert.strictEqual(r.reason, 'ryk_missing_decision');
   });
 
-  it('ask decision on blocking path is leftover-ask permit', () => {
+  it('unexpected ask on blocking path is fail-closed', () => {
     const r = parseHookResponse(
       JSON.stringify({ decision: 'ask', reason: 'needs_approval' }),
       true
     );
-    assert.strictEqual(r.decision, 'allow');
-    assert.strictEqual(r.reason, 'needs_approval');
+    assert.strictEqual(r.decision, 'block');
+    assert.strictEqual(r.reason, 'ryk_unexpected_ask');
   });
 
-  it('ask decision is leftover-ask permit and keeps rule provenance', () => {
+  it('leftover allow from ryk proceeds and keeps rule provenance', () => {
     const r = parseHookResponse(
-      JSON.stringify({ decision: 'ask', reason: 'needs_approval', rule: 'policy.rule' }),
+      JSON.stringify({ decision: 'allow', reason: 'needs_approval', rule: 'policy.rule' }),
       true,
       {}
     );

@@ -17,6 +17,7 @@ const build_options = @import("build_options");
 
 const brand = @import("brand.zig");
 const env_util = @import("../env_util.zig");
+const leftover_ask = @import("leftover_ask.zig");
 const exit_codes = @import("exit_codes.zig");
 const shell_eval = @import("shell_eval.zig");
 const fm_steward_client = @import("fm_steward_client.zig");
@@ -89,6 +90,12 @@ pub fn commandWithEvaluator(
     return evaluatePayload(allocator, payload, stdout, evaluator);
 }
 
+/// Hook-serve strips CI/RYK_* from the child. Leftover unattended must ride
+/// this client-stamped bit (`RYK_MODE=ci` or parent `getenvUnattended`).
+fn agentHookClientRaiseCi(mode_is_ci: bool, parent_unattended: bool) bool {
+    return mode_is_ci or parent_unattended;
+}
+
 fn tryHookServer(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -108,7 +115,7 @@ fn tryHookServer(
         .version = build_options.version,
         .host = "cursor",
         .event = "beforeShellExecution",
-        .ci = resolveModeFromEnv() == .ci,
+        .ci = agentHookClientRaiseCi(resolveModeFromEnv() == .ci, env_util.getenvUnattended()),
         .workspace = cwd_z,
         .cwd = cwd_z,
         .payload_json = payload,
@@ -329,20 +336,22 @@ pub fn evaluatePayloadWithModeOpts(
         },
         .ask => {
             const unattended = opts.unattended orelse env_util.getenvUnattended() or mode == .ci;
-            const leftover = decision.ask_origin.mayPermitOnCodingHost();
-            if (unattended) {
-                // Unattended / CI hardens leftover ask *and* SoftBlock/FM hold to deny.
-                const reason = try core_api.redactAlloc(allocator, decision.owned_reason);
-                defer allocator.free(reason);
-                try writeDeny(stdout, format, reason);
-            } else if (leftover) {
-                try writeAllow(stdout, format);
-            } else {
-                // SoftBlock / FM: hold on Claude-compatible agent_hook; Cursor
-                // has no ask channel so writeAsk denies.
-                const reason = try core_api.redactAlloc(allocator, decision.owned_reason);
-                defer allocator.free(reason);
-                try writeAsk(stdout, format, reason);
+            switch (leftover_ask.codingHostAskOutcome(
+                true,
+                decision.ask_origin,
+                unattended,
+            )) {
+                .allow => try writeAllow(stdout, format),
+                .hold => {
+                    const reason = try core_api.redactAlloc(allocator, decision.owned_reason);
+                    defer allocator.free(reason);
+                    try writeHold(stdout, format, reason);
+                },
+                .deny, .unchanged => {
+                    const reason = try core_api.redactAlloc(allocator, decision.owned_reason);
+                    defer allocator.free(reason);
+                    try writeDeny(stdout, format, reason);
+                },
             }
         },
         // observe is intentional warn-allow (proceed while recording risk).
@@ -447,18 +456,18 @@ fn writeAllow(stdout: anytype, format: InputFormat) !void {
     }
 }
 
-fn writeAsk(stdout: anytype, format: InputFormat, reason: []const u8) !void {
+fn writeDeny(stdout: anytype, format: InputFormat, reason: []const u8) !void {
     switch (format) {
-        // Claude-compatible PreToolUse supports permissionDecision "ask".
-        .agent_hook => try writeAgentPermission(stdout, "ask", reason),
-        // Cursor beforeShellExecution has no ask; deny so approval is not skipped.
+        .agent_hook => try writeAgentPermission(stdout, "deny", reason),
         .cursor_shell => try writeCursorDenial(stdout, reason),
     }
 }
 
-fn writeDeny(stdout: anytype, format: InputFormat, reason: []const u8) !void {
+/// SoftBlock / FM hold. Claude-compatible agent_hook has an ask channel;
+/// Cursor does not — deny there is correct. Never allow.
+fn writeHold(stdout: anytype, format: InputFormat, reason: []const u8) !void {
     switch (format) {
-        .agent_hook => try writeAgentPermission(stdout, "deny", reason),
+        .agent_hook => try writeAgentPermission(stdout, "ask", reason),
         .cursor_shell => try writeCursorDenial(stdout, reason),
     }
 }
@@ -803,6 +812,32 @@ test "observe mode high-severity deny is warn-allow (empty agent / allow cursor)
     try std.testing.expect(std.mem.indexOf(u8, cursor_stdout.buffered(), "\"permission\":\"allow\"") != null);
 }
 
+test "agent hook client raise-ci is true when getenvUnattended would be true" {
+    const Lookup = struct {
+        key: []const u8,
+        value: []const u8,
+        pub fn get(self: @This(), key: []const u8) ?[]const u8 {
+            return if (std.mem.eql(u8, key, self.key)) self.value else null;
+        }
+    };
+    const EmptyLookup = struct {
+        pub fn get(_: @This(), _: []const u8) ?[]const u8 {
+            return null;
+        }
+    };
+    const parent_unattended = env_util.unattendedFromLookup(Lookup{ .key = "CI", .value = "1" });
+    const child_unattended = env_util.unattendedFromLookup(EmptyLookup{});
+    try std.testing.expect(parent_unattended);
+    try std.testing.expect(!child_unattended);
+    try std.testing.expect(agentHookClientRaiseCi(false, parent_unattended));
+    try std.testing.expect(!agentHookClientRaiseCi(false, child_unattended));
+    try std.testing.expectEqual(leftover_ask.Outcome.deny, leftover_ask.codingHostAskOutcome(
+        true,
+        .leftover,
+        agentHookClientRaiseCi(false, parent_unattended) or child_unattended,
+    ));
+}
+
 test "SoftBlock ask is not permit on agent_hook" {
     const allocator = std.testing.allocator;
     var stdout_buf: [1024]u8 = undefined;
@@ -813,6 +848,20 @@ test "SoftBlock ask is not permit on agent_hook" {
         .unattended = false,
     });
     try std.testing.expect(std.mem.indexOf(u8, stdout.buffered(), "\"permissionDecision\":\"ask\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout.buffered(), "\"permissionDecision\":\"allow\"") == null);
+}
+
+test "SoftBlock ask is deny on Cursor shell hook" {
+    const allocator = std.testing.allocator;
+    var stdout_buf: [1024]u8 = undefined;
+    var stdout: std.Io.Writer = .fixed(&stdout_buf);
+    const payload = "{\"command\":\"risky\",\"cwd\":\"/tmp\"}";
+    _ = try evaluatePayloadWithModeOpts(allocator, payload, &stdout, shell_eval.mockDaemonSoftBlockAllowEvaluator, .strict, .{
+        .disable_fm = true,
+        .unattended = false,
+    });
+    try std.testing.expect(std.mem.indexOf(u8, stdout.buffered(), "\"permission\":\"deny\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout.buffered(), "\"permission\":\"allow\"") == null);
 }
 
 test "critical deny stays deny even in observe mode" {
@@ -961,8 +1010,8 @@ fn agentHookFakeFmClient(state: *AgentHookFmFakeState) fm_steward_client.Client 
 }
 
 test "agent_hook product path FM ask upgrades soft allow" {
-    // Daemon Allow + FM ask stays ask (not leftover unused-policy permit).
-    // Pin unattended so live CI=true cannot flip this path to deny.
+    // Daemon Allow + FM ask is hold on Claude agent_hook (never leftover permit).
+    // Pin unattended so live CI=true cannot change the leftover path.
     const allocator = std.testing.allocator;
     var fm_state = AgentHookFmFakeState{
         .verdict = .ask,
@@ -991,6 +1040,7 @@ test "agent_hook product path FM ask upgrades soft allow" {
     try std.testing.expectEqual(@as(u32, 1), fm_state.call_count);
     try std.testing.expect(fm_state.saw_expected_session);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"permissionDecision\":\"ask\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"permissionDecision\":\"allow\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "curl pipe needs confirmation") != null);
 
     var unattended_state = AgentHookFmFakeState{

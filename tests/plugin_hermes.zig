@@ -86,7 +86,7 @@ test "hermes plugin readme documents install and limits" {
     try std.testing.expect(std.mem.indexOf(u8, content, "tell the model to call") == null);
 }
 
-test "hermes plugin source maps residual ask to proceed unless unattended" {
+test "hermes plugin source does not remap leftover ask to proceed" {
     const content = try readFile(std.testing.allocator, source_path);
     defer std.testing.allocator.free(content);
 
@@ -98,9 +98,9 @@ test "hermes plugin source maps residual ask to proceed unless unattended" {
     try std.testing.expect(fileExists(mapping_path));
     const mapping = try readFile(std.testing.allocator, mapping_path);
     defer std.testing.allocator.free(mapping);
-    try std.testing.expect(std.mem.indexOf(u8, mapping, "Residual ask is permit") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mapping, "do not invent allow") != null);
     try std.testing.expect(std.mem.indexOf(u8, mapping, "ci_mode") != null);
-    try std.testing.expect(std.mem.indexOf(u8, mapping, "\"ask\": \"proceed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mapping, "\"ask\": \"hard_block\"") != null);
 }
 
 test "all hermes fixtures exist" {

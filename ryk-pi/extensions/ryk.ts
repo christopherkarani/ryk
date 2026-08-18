@@ -735,11 +735,14 @@ async function runRykEvaluateOnce(
 	if (decision === "allow" && result.code === 0) {
 		return { kind: "allow", response: parsed };
 	}
-	// evaluate ask uses exit 0 with decision "ask" (allow/deny exit contract preserved).
+	// Leftover unused ask is remapped by ryk evaluate. If ask still appears
+	// (Pi file tools still call `ryk decide`), attended leftover is permit.
+	// resolvePolicyAsk auto-denies unattended. SoftBlock/stage arrive as
+	// deny/stage and never become allow.
 	if (decision === "ask" && (result.code === 0 || result.code === null)) {
 		return {
 			kind: "ask",
-			reason: sanitizeVisibleText(getDecisionReason(parsed)),
+			reason: sanitizeVisibleText(getDecisionReason(parsed)) || "requires approval",
 			response: parsed,
 		};
 	}
@@ -1543,8 +1546,8 @@ export function installRykExtension(
 					decision.kind === "allow" &&
 					BROAD_DISCOVERY_TOOLS.has(event.toolName)
 				) {
-					// Root already passed decide-file. Residual leftover ask is
-					// permit; do not invent a second host approval gate.
+					// Root already passed decide-file. Leftover unused ask is
+					// remapped by ryk; do not invent a second host approval gate.
 					return undefined;
 				}
 				return applyToolDecision(
@@ -1865,10 +1868,11 @@ async function applyToolDecision(
 }
 
 /**
- * Single entry for leftover unused policy ask:
- * - unattended / CI → auto-deny
- * - otherwise leftover unused policy ask is permit so coding agents can work
- * Staged writes, FM steward ask, SoftBlock, and explicit deny never reach here.
+ * Leftover unused policy ask on the plugin wire:
+ * - hook/evaluate remaps leftover unused ask to allow first
+ * - `ryk decide` still emits leftover unused ask — permit on attended Pi
+ * Staged writes, FM steward ask, SoftBlock, and explicit deny never become allow.
+ * Unattended (`CI` / `RYK_CI` / `RYK_NONINTERACTIVE` / `RYK_UNATTENDED`) still denies.
  */
 async function resolvePolicyAsk(
 	reason: string,
