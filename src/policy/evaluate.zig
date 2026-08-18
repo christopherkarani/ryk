@@ -54,7 +54,7 @@ pub fn action(policy: *const schema.Policy, requested: core.types.Action, ctx: s
             defer allocator.free(selector);
             return evaluateRuleSet(allocator, mode, .mcp, "mcp", policy.mcp, selector);
         },
-        .approval_decision, .staging_decision => defaultDecision(allocator, mode, null, "unsupported policy action surface"),
+        .approval_decision, .staging_decision => defaultDecision(allocator, mode, null, "unsupported policy action surface", false),
     };
 }
 
@@ -339,14 +339,14 @@ fn evaluateNetworkPolicy(
         return explicitOwnedLabel(allocator, mode, decision, "network.ask", match);
     }
 
-    if (network_policy.default) |default| return defaultDecision(allocator, mode, default, "network.default");
+    if (network_policy.default) |default| return defaultDecision(allocator, mode, default, "network.default", false),
     const fallback: schema.DecisionValue = switch (effective) {
         .off, .allowlist => .deny,
         .ask => .ask,
         .observe => .observe,
         .open => .allow,
     };
-    return defaultDecision(allocator, mode, fallback, "network mode default");
+    return defaultDecision(allocator, mode, fallback, "network mode default", false),
 }
 
 const NetworkParts = struct {
@@ -598,8 +598,8 @@ fn evaluateEnv(allocator: std.mem.Allocator, mode: schema.Mode, env_policy: sche
     if (findMatch(.env, env_policy.allow, name)) |match| return explicit(allocator, mode, .allow, "env.allow", match.index, match.pattern);
     if (findMatch(.env, env_policy.ask, name)) |match| return explicit(allocator, mode, .ask, "env.ask", match.index, match.pattern);
     if (riskHeuristic(.env, name)) |risk| return riskDecision(allocator, mode, risk);
-    if (env_policy.default) |default| return defaultDecision(allocator, mode, default, "env.default");
-    return defaultDecision(allocator, mode, null, "mode default");
+    if (env_policy.default) |default| return defaultDecision(allocator, mode, default, "env.default", false);
+    return defaultDecision(allocator, mode, null, "mode default", false);
 }
 
 fn evaluateRuleSet(
@@ -622,9 +622,9 @@ fn evaluateRuleSet(
     if (rules.default) |default| {
         const default_label = try std.fmt.allocPrint(allocator, "{s}.default", .{label});
         defer allocator.free(default_label);
-        return defaultDecision(allocator, mode, default, default_label);
+        return defaultDecision(allocator, mode, default, default_label, surface == .file_read);
     }
-    return defaultDecision(allocator, mode, null, "mode default");
+    return defaultDecision(allocator, mode, null, "mode default", surface == .file_read);
 }
 
 /// Host skill trees and home/ancestor AGENTS.md / CLAUDE.md. Explicit deny
@@ -809,11 +809,28 @@ fn riskDecision(allocator: std.mem.Allocator, mode: schema.Mode, risk: Risk) !sc
     };
 }
 
-fn defaultDecision(allocator: std.mem.Allocator, mode: schema.Mode, explicit_default: ?schema.DecisionValue, label: []const u8) !schema.Evaluation {
+fn defaultDecision(
+    allocator: std.mem.Allocator,
+    mode: schema.Mode,
+    explicit_default: ?schema.DecisionValue,
+    label: []const u8,
+    tag_rule: bool,
+) !schema.Evaluation {
     const value = explicit_default orelse modeDefault(mode);
     const actual = if (mode == .ci and value == .ask) schema.DecisionValue.deny else value;
     const explanation = try std.fmt.allocPrint(allocator, "{s}: {s}", .{ label, if (mode == .ci and value == .ask) "ask converted to deny in ci mode" else actual.toString() });
     errdefer allocator.free(explanation);
+    if (!tag_rule) {
+        return .{
+            .decision = .{
+                .result = actual.toDecisionResult(),
+                .reason = explanation,
+                .requires_user = actual == .ask,
+                .ci_may_proceed = actual == .allow or actual == .observe,
+            },
+            .explanation = explanation,
+        };
+    }
     const rule_id = try allocator.dupe(u8, label);
     return .{
         .decision = .{
