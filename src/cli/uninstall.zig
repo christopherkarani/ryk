@@ -96,7 +96,7 @@ pub fn command(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: an
     try stdout.writeAll("→ Step 1 of 3: Removing plugins...\n");
     var all_disabled = false;
     if (opts.dry_run) {
-        try stdout.writeAll("  [dry-run] would remove plugins from: codex, claude, cursor, opencode, openclaw, hermes\n");
+        try stdout.writeAll("  [dry-run] would remove plugins from: codex, claude, opencode, openclaw, hermes\n");
         all_disabled = true;
     } else {
         try stdout.writeAll("(OpenClaw and Hermes use host CLIs with 10s timeout + direct fallback)\n");
@@ -880,6 +880,23 @@ test "uninstall --dry-run does not require --yes" {
     const code = try command(std.testing.io, &.{"--dry-run"}, &stdout_writer, &stderr_writer);
     try std.testing.expectEqual(exit_codes.success, code);
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "dry-run") != null);
+}
+
+test "uninstall dry-run does not advertise cursor" {
+    var stdout_buf: [16 * 1024]u8 = undefined;
+    var stderr_buf: [256]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+
+    const code = try command(std.testing.io, &.{"--dry-run"}, &stdout_writer, &stderr_writer);
+    try std.testing.expectEqual(exit_codes.success, code);
+    const printed = stdout_writer.buffered();
+    const marker = "would remove plugins from:";
+    const line_idx = std.mem.indexOf(u8, printed, marker) orelse return error.TestUnexpectedResult;
+    const line_rest = printed[line_idx..];
+    const line_end = std.mem.indexOfScalar(u8, line_rest, '\n') orelse line_rest.len;
+    const plugin_line = line_rest[0..line_end];
+    try std.testing.expect(std.mem.indexOf(u8, plugin_line, "cursor") == null);
 }
 
 test "uninstall removes the ryk CLI and daemon" {

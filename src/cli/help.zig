@@ -554,14 +554,14 @@ pub const commands =
             "Stops leftover local daemon socket artifacts ($HOME/.ryk/daemon.sock, daemon.pid) when safe.",
             "Best-effort stops the local ryk hook server. This is local process cleanup, not a hosted service.",
         } },
-        .{ .name = "stop", .summary = "Stop ryk protection for host agents", .usage = "ryk stop [codex|claude|cursor|opencode|openclaw|hermes|all] [--yes|--no]", .category = .integrations, .public = true, .examples = &.{
+        .{ .name = "stop", .summary = "Stop ryk protection for host agents", .usage = "ryk stop [codex|claude|opencode|openclaw|hermes|all] [--yes|--no]", .category = .integrations, .public = true, .examples = &.{
             "ryk stop",
             "ryk stop codex",
-            "ryk stop cursor",
+            "ryk stop claude",
         }, .details = &.{
             "Removes ryk plugin registrations from host agents without removing the ryk binary or policy files.",
             "Non-interactive cancel: --no. Mutation requires --yes or an interactive confirm.",
-            "Hosts: codex, claude, cursor, opencode, openclaw, hermes, grok. Defaults to all if no host is specified.",
+            "Hosts: codex, claude, opencode, openclaw, hermes, grok. Defaults to all if no host is specified.",
             "Cursor: removes the ryk shell hook wrapper and disables simple ryk-only hooks.json files.",
             "OpenCode: removes .opencode/plugins/ryk.ts, ryk-tui.ts and ~/.config/opencode/plugins/ryk.ts, ryk-tui.ts",
             "OpenClaw: runs 'openclaw plugins uninstall ryk'",
@@ -570,13 +570,13 @@ pub const commands =
             "Codex / Claude: removes known plugin paths (host-managed install locations).",
             "Restart protection later with: ryk start",
         } },
-        .{ .name = "disable", .summary = "Stop ryk protection for host agents", .usage = "ryk disable [codex|claude|cursor|opencode|openclaw|hermes|all] [--yes|--no]", .category = .integrations, .hidden = true, .examples = &.{
+        .{ .name = "disable", .summary = "Stop ryk protection for host agents", .usage = "ryk disable [codex|claude|opencode|openclaw|hermes|all] [--yes|--no]", .category = .integrations, .hidden = true, .examples = &.{
             "ryk disable",
             "ryk disable codex",
         }, .details = &.{
             "Alias of `ryk stop`. Removes ryk plugin registrations from host agents without removing the ryk binary or policy files.",
             "Non-interactive cancel: --no. Mutation requires --yes or an interactive confirm.",
-            "Hosts: codex, claude, cursor, opencode, openclaw, hermes, grok. Defaults to all if no host is specified.",
+            "Hosts: codex, claude, opencode, openclaw, hermes, grok. Defaults to all if no host is specified.",
             "Restart protection later with: ryk start",
         } },
         .{ .name = "uninstall", .summary = "Uninstall ryk from this machine", .usage = "ryk uninstall [--plugins-only] [--keep-config] [--dry-run] [--yes]", .category = .integrations, .details = &.{
@@ -1664,4 +1664,38 @@ test "hook-serve is hidden and has --help text" {
     var writer: std.Io.Writer = .fixed(&buf);
     try std.testing.expect(try writeCommand(std.testing.io, &writer, "hook-serve"));
     try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "ryk hook-serve") != null);
+}
+
+fn expectStopFamilyDoesNotAdvertiseCursor(printed: []const u8, verb: []const u8) !void {
+    try std.testing.expect(std.mem.indexOf(u8, printed, "ryk ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, printed, verb) != null);
+    try std.testing.expect(std.mem.indexOf(u8, printed, "codex") != null);
+    try std.testing.expect(std.mem.indexOf(u8, printed, "|cursor|") == null);
+    try std.testing.expect(std.mem.indexOf(u8, printed, "[codex|claude|cursor") == null);
+
+    var expected_example_buf: [64]u8 = undefined;
+    const expected_example = try std.fmt.bufPrint(&expected_example_buf, "ryk {s} cursor", .{verb});
+    try std.testing.expect(std.mem.indexOf(u8, printed, expected_example) == null);
+
+    const hosts_idx = std.mem.indexOf(u8, printed, "Hosts:") orelse return error.TestUnexpectedResult;
+    const hosts_rest = printed[hosts_idx..];
+    const hosts_end = std.mem.indexOfScalar(u8, hosts_rest, '\n') orelse hosts_rest.len;
+    try std.testing.expect(std.mem.indexOf(u8, hosts_rest[0..hosts_end], "cursor") == null);
+}
+
+test "stop help does not advertise cursor" {
+    var buf: [8192]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try std.testing.expect(try writeCommand(std.testing.io, &writer, "stop"));
+    const printed = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, printed, "ryk stop") != null);
+    try std.testing.expect(std.mem.indexOf(u8, printed, "Cursor: removes the ryk shell hook wrapper") != null);
+    try expectStopFamilyDoesNotAdvertiseCursor(printed, "stop");
+}
+
+test "disable help does not advertise cursor" {
+    var buf: [8192]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try std.testing.expect(try writeCommand(std.testing.io, &writer, "disable"));
+    try expectStopFamilyDoesNotAdvertiseCursor(writer.buffered(), "disable");
 }
