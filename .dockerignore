@@ -5,11 +5,6 @@ dist
 dist-dry-run
 node_modules
 **/node_modules
-orca-rs/target
-orca-rs/fuzz
-orca-rs/.xwin-cache
-orca-rs/.beads
-orca-rs/.pi
 ryk-dashboard-ui/.next
 ryk-dashboard-ui/tsconfig.tsbuildinfo
 .aegis

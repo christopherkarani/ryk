@@ -78,6 +78,15 @@ test "gitignore blocks handoffs, releases, and orca husks" {
     try expectContains(text, "orca-*/");
 }
 
+test "retired orca product trees are absent" {
+    const retired = [_][]const u8{
+        "orca-dashboard-ui",
+        "orca-pi",
+        "orca-rs",
+    };
+    for (retired) |path| try expectMissing(path);
+}
+
 test "public README stays product-focused and safety-bounded" {
     const text = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "README.md", std.testing.allocator, .limited(512 * 1024));
     defer std.testing.allocator.free(text);
