@@ -18,11 +18,11 @@ class Ryk < Formula
     if Hardware::CPU.arm?
       url "https://github.com/christopherkarani/ryk/releases/download/v#{version}/ryk-v#{version}-darwin-arm64.tar.gz"
       # ryk:sha256:darwin-arm64
-      sha256 "e15a37ebde00c95000dcd6a4c8e673874e098e0ae01d8ac933e80db866cdc28e"
+      sha256 "d3fd24db58992b9d88afa2f5317b09b1f06a44ba1e7d5fe598903a0dcdb1e4d6"
     else
       url "https://github.com/christopherkarani/ryk/releases/download/v#{version}/ryk-v#{version}-darwin-amd64.tar.gz"
       # ryk:sha256:darwin-amd64
-      sha256 "1f1bcfaad1ec0b2e4827affcd74bd20821b196b653ba0731dd53121e0c5a8ca7"
+      sha256 "483a2d3df646f92d46adb47c71ecb7655d165fcbeaa3ec22d19a1fc8879b4a4b"
     end
   end
 
@@ -30,11 +30,11 @@ class Ryk < Formula
     if Hardware::CPU.arm?
       url "https://github.com/christopherkarani/ryk/releases/download/v#{version}/ryk-v#{version}-linux-arm64.tar.gz"
       # ryk:sha256:linux-arm64
-      sha256 "7e31ae8e55dd42ee1e384500264c6bbfbba7b2ec33c99aa1e9180e31501dfb9a"
+      sha256 "1fb8940386e25a134673d06cd1a2896ba063bd586dc2e20b3eb6894a56252d33"
     else
       url "https://github.com/christopherkarani/ryk/releases/download/v#{version}/ryk-v#{version}-linux-amd64.tar.gz"
       # ryk:sha256:linux-amd64
-      sha256 "e1c272d1d95956fd42e0b72a92649dfa36bcfbd202b73c748ac5fb68c410631b"
+      sha256 "023e4d4ba377c2269aa2be741dd4a7af28ccd554fb5aafbd6f8beaf2f14d304a"
     end
   end
 
