@@ -2240,7 +2240,7 @@ test "doctor names a test-program host bake and teaches doctor --fix" {
     var context = try testContext(std.testing.allocator, .{ .broken_evaluator_host = "pi" });
     defer context.deinit();
 
-    try writeReport(std.testing.io, &stdout_writer, .linux, report, context, false);
+    try writeReport(std.testing.io, &stdout_writer, .linux, report, context, true);
     const written = stdout_writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "broken") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "Hook is a test program, not ryk") != null);
@@ -2248,6 +2248,14 @@ test "doctor names a test-program host bake and teaches doctor --fix" {
     try std.testing.expect(std.mem.indexOf(u8, written, "test/non-product") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "OS-enforced") == null);
     try std.testing.expect(std.mem.indexOf(u8, written, "evaluator not product ryk") != null);
+
+    var linear_buf: [16384]u8 = undefined;
+    var linear_writer: std.Io.Writer = .fixed(&linear_buf);
+    try writeReport(std.testing.io, &linear_writer, .linux, report, context, false);
+    const linear = linear_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, linear, "Hook is a test program, not ryk") != null);
+    try std.testing.expect(std.mem.indexOf(u8, linear, "ryk doctor --fix") != null);
+    try std.testing.expect(!doctorLinearHasBoxWalls(linear));
 }
 
 test "doctor warns when Hermes is explicitly fail-open" {
