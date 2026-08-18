@@ -51,10 +51,11 @@ pub fn pathSafeSessionId(sid: []const u8) []const u8 {
     return if (sessionIdContainsStructuredSecret(sid)) path_safe_session_id else sid;
 }
 
-/// True when `value` contains a structured provider-token span (or a whole-value
-/// AWS access key). Does **not** treat high-entropy / JWT blobs as secrets.
-/// Session-id callers must use `pathSafeSessionId` — this is the scan, not the
-/// public contract.
+/// True when a session-id should become `path_safe_session_id`.
+/// Hits: `findStructuredSecret` at a session-id boundary, vendor prefixes
+/// (`xoxb-`, `sk_live_`, `glpat-`, `hf_`, …) at those same boundaries, or an
+/// `AKIA`/`ASIA` key. Does **not** treat high-entropy / JWT blobs as secrets.
+/// Callers must use `pathSafeSessionId`.
 fn sessionIdContainsStructuredSecret(value: []const u8) bool {
     // Session ids are path keys. `findStructuredSecret` is a free-text scanner
     // and matches `sk-` at every byte, so `task-<uuid>` / `ask-followup-1`
