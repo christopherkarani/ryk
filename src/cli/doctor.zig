@@ -980,9 +980,13 @@ fn writeMcpSetupReport(io: std.Io, stdout: anytype, context: IntegrationContext)
     try stdout.writeByte('\n');
 }
 
+const last_session_audit_degraded_needle = "\"type\":\"audit_degraded\"";
+const last_session_audit_scan_chunk_len = 4096;
+
 /// P1-1: true when the most recent session recorded an `audit_degraded` event
 /// (shim execs ran without in-shim audit evidence). Best-effort: any read
 /// failure reports as not degraded — doctor must not fail on missing evidence.
+/// Stream-scans events.jsonl (capped at max_audit_log_len); does not allocate the file.
 fn lastSessionAuditDegraded(io: std.Io, allocator: std.mem.Allocator, workspace_root: []const u8) bool {
     const last_path = std.fs.path.join(allocator, &.{ workspace_root, ".ryk", "last" }) catch return false;
     defer allocator.free(last_path);
@@ -992,9 +996,41 @@ fn lastSessionAuditDegraded(io: std.Io, allocator: std.mem.Allocator, workspace_
     if (session_id.len == 0) return false;
     const events_path = std.fs.path.join(allocator, &.{ workspace_root, ".ryk", "sessions", session_id, "events.jsonl" }) catch return false;
     defer allocator.free(events_path);
-    const events = std.Io.Dir.cwd().readFileAlloc(io, events_path, allocator, .limited(core.limits.max_audit_log_len)) catch return false;
-    defer allocator.free(events);
-    return std.mem.indexOf(u8, events, "\"type\":\"audit_degraded\"") != null;
+
+    const file = std.Io.Dir.cwd().openFile(io, events_path, .{}) catch return false;
+    defer file.close(io);
+
+    const needle = last_session_audit_degraded_needle;
+    const overlap = needle.len - 1;
+    var buf: [last_session_audit_scan_chunk_len]u8 = undefined;
+    var carry: usize = 0;
+    var scanned: usize = 0;
+
+    while (scanned < core.limits.max_audit_log_len) {
+        const room = buf.len - carry;
+        const remaining = core.limits.max_audit_log_len - scanned;
+        const want = @min(room, remaining);
+        if (want == 0) break;
+
+        const dest = buf[carry..][0..want];
+        const n = file.readStreaming(io, &.{dest}) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return false,
+        };
+        if (n == 0) break;
+
+        const view_len = carry + n;
+        if (std.mem.indexOf(u8, buf[0..view_len], needle) != null) return true;
+
+        scanned += n;
+        if (view_len <= overlap) {
+            carry = view_len;
+        } else {
+            @memmove(buf[0..overlap], buf[view_len - overlap .. view_len]);
+            carry = overlap;
+        }
+    }
+    return false;
 }
 
 fn writeIntegrationReport(io: std.Io, stdout: anytype, context: IntegrationContext) !void {
@@ -3322,4 +3358,73 @@ test "lastSessionAuditDegraded detects audit_degraded in the pointed-at session"
         .data = "{\"type\":\"session_start\"}\n{\"type\":\"command_allowed\"}\n",
     });
     try std.testing.expect(!lastSessionAuditDegraded(io, allocator, root));
+}
+
+test "lastSessionAuditDegraded is false for empty last pointer or missing events" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+
+    try tmp.dir.createDirPath(io, ".ryk");
+    try tmp.dir.writeFile(io, .{ .sub_path = ".ryk/last", .data = "" });
+    try std.testing.expect(!lastSessionAuditDegraded(io, allocator, root));
+
+    try tmp.dir.writeFile(io, .{ .sub_path = ".ryk/last", .data = "   \n\t" });
+    try std.testing.expect(!lastSessionAuditDegraded(io, allocator, root));
+
+    try tmp.dir.createDirPath(io, ".ryk/sessions/sess-no-events");
+    try tmp.dir.writeFile(io, .{ .sub_path = ".ryk/last", .data = "sess-no-events\n" });
+    try std.testing.expect(!lastSessionAuditDegraded(io, allocator, root));
+}
+
+test "lastSessionAuditDegraded finds audit_degraded past the stream window" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(allocator);
+    const pad_line = "{\"type\":\"session_start\"}\n";
+    while (payload.items.len < 12 * 1024) {
+        try payload.appendSlice(allocator, pad_line);
+    }
+    try payload.appendSlice(allocator, "{\"type\":\"audit_degraded\"}\n");
+
+    try tmp.dir.createDirPath(io, ".ryk/sessions/sess-late");
+    try tmp.dir.writeFile(io, .{ .sub_path = ".ryk/last", .data = "sess-late\n" });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = ".ryk/sessions/sess-late/events.jsonl",
+        .data = payload.items,
+    });
+    try std.testing.expect(lastSessionAuditDegraded(io, allocator, root));
+}
+
+test "lastSessionAuditDegraded finds audit_degraded split across a stream chunk" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+
+    const needle = last_session_audit_degraded_needle;
+    const prefix_len = last_session_audit_scan_chunk_len - (needle.len / 2);
+    const payload = try allocator.alloc(u8, prefix_len + needle.len);
+    defer allocator.free(payload);
+    @memset(payload[0..prefix_len], '.');
+    @memcpy(payload[prefix_len..], needle);
+
+    try tmp.dir.createDirPath(io, ".ryk/sessions/sess-split");
+    try tmp.dir.writeFile(io, .{ .sub_path = ".ryk/last", .data = "sess-split\n" });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = ".ryk/sessions/sess-split/events.jsonl",
+        .data = payload,
+    });
+    try std.testing.expect(lastSessionAuditDegraded(io, allocator, root));
 }
