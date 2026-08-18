@@ -579,7 +579,9 @@ fn addPathBeneathRuleInner(
     var stx = std.mem.zeroes(linux.Statx);
     const stx_rc = linux.statx(path_fd, "", linux.AT.EMPTY_PATH, .{ .TYPE = true }, &stx);
     if (linux.errno(stx_rc) != .SUCCESS or !stx.mask.TYPE) {
-        if (file_only or required) return error.ApplyFailed;
+        // Optional file RO (ancestor instruction) must not fail the whole apply
+        // when statx omits TYPE. Required exec/RW still fail closed.
+        if (required) return error.ApplyFailed;
         return false;
     }
     if (file_only and !linux.S.ISREG(stx.mode)) {
