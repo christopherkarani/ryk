@@ -56,6 +56,28 @@ pub const secret_hardlink_max_outside_residual_links: u64 = 8;
 /// rare; the cap is a fail-closed backstop against unbounded SBPL growth.
 pub const secret_hardlink_alias_deny_max: u32 = 4096;
 
+/// True when this directory is a git object store or ryk session-evidence tree.
+///
+/// Those trees share inodes across worktrees / local clones / session copies
+/// (`nlink=2`) and are not agent-facing source names. Walking them false-positives
+/// the outside-residual heuristic and can exceed `secret_hardlink_alias_deny_max`.
+///
+/// Only `**/.git/objects` and `**/.ryk/sessions` are skipped — not the parent
+/// `.git` / `.ryk` tree. A planted `notes.txt` under `.git/` or a nested
+/// submodule `.git/` must still be last-match denied. Control-root write-deny
+/// does not close a readable alias.
+pub fn shouldSkipHardlinkScanDirectory(name: []const u8, abs_path: []const u8) bool {
+    const parent_name = parentBasename(abs_path);
+    if (std.mem.eql(u8, name, "objects") and std.mem.eql(u8, parent_name, ".git")) return true;
+    if (std.mem.eql(u8, name, "sessions") and std.mem.eql(u8, parent_name, ".ryk")) return true;
+    return false;
+}
+
+fn parentBasename(abs_path: []const u8) []const u8 {
+    const parent = std.fs.path.dirname(abs_path) orelse return "";
+    return std.fs.path.basename(parent);
+}
+
 pub const NetworkRouteForcing = struct {
     proxy_port: u16,
 };
@@ -471,6 +493,11 @@ const InodeAgg = struct {
 ///   `error.ScanDepthExceeded`.
 /// - Filtered alias denylist exceeds `secret_hardlink_alias_deny_max` →
 ///   `error.HardlinkAliasDenyCapacity`.
+/// - `**/.git/objects` and `**/.ryk/sessions` are **not walked** (shared git
+///   objects / session evidence). Residual: a secret planted *only* as a
+///   non-secret name under those two store trees is not last-match denied.
+///   `.git/notes.txt`, nested submodule `.git/config`, and working-tree names
+///   are still scanned. Regex still covers secret basenames everywhere.
 ///
 /// Prepare maps `OutOfMemory` to `seatbelt_profile_oom`, alias-deny capacity to
 /// `seatbelt_hardlink_alias_deny_capacity`, and other scan errors to distinct
@@ -596,6 +623,9 @@ fn walkCollectHardlinkCandidates(
 
         switch (entry.kind) {
             .directory => {
+                // Shared object/session stores only. Count the dirent toward
+                // scan capacity; do not open or recurse into the store.
+                if (shouldSkipHardlinkScanDirectory(entry.name, child_path)) continue;
                 // iterate() reports real directories as .directory; symlinks are
                 // .sym_link and are intentionally not followed into the walk.
                 // Open failures fail closed: skipping an unreadable dir would
@@ -2039,6 +2069,178 @@ test "collectSecretHardlinkAliasPaths missing workspace is empty not ScanOpenFai
         io,
         "/tmp/ryk-hardlink-scan-missing-ws-does-not-exist",
     );
+    defer freeHardlinkAliasPaths(allocator, aliases);
+    try std.testing.expectEqual(@as(usize, 0), aliases.len);
+}
+
+test "shouldSkipHardlinkScanDirectory matches only git objects and ryk sessions" {
+    try std.testing.expect(!shouldSkipHardlinkScanDirectory(".git", "/ws/.git"));
+    try std.testing.expect(!shouldSkipHardlinkScanDirectory(".ryk", "/ws/.ryk"));
+    try std.testing.expect(shouldSkipHardlinkScanDirectory("objects", "/ws/.git/objects"));
+    try std.testing.expect(shouldSkipHardlinkScanDirectory("objects", "/ws/vendor/pkg/.git/objects"));
+    try std.testing.expect(!shouldSkipHardlinkScanDirectory("objects", "/ws/src/objects"));
+    try std.testing.expect(shouldSkipHardlinkScanDirectory("sessions", "/ws/.ryk/sessions"));
+    try std.testing.expect(!shouldSkipHardlinkScanDirectory("sessions", "/ws/src/sessions"));
+    try std.testing.expect(!shouldSkipHardlinkScanDirectory("hooks", "/ws/.git/hooks"));
+    try std.testing.expect(!shouldSkipHardlinkScanDirectory("src", "/ws/src"));
+}
+
+test "collectSecretHardlinkAliasPaths skips .git object-store hardlinks" {
+    // Git worktrees / local clones share objects (nlink=2). Those are not
+    // agent-facing secret aliases. Walking them false-positives the residual
+    // heuristic and can exceed secret_hardlink_alias_deny_max.
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var outside = std.testing.tmpDir(.{});
+    defer outside.cleanup();
+    var workspace = std.testing.tmpDir(.{});
+    defer workspace.cleanup();
+
+    try outside.dir.writeFile(io, .{ .sub_path = "blob", .data = "git-object-body" });
+    try workspace.dir.createDirPath(io, ".git/objects/ab");
+    outside.dir.hardLink("blob", workspace.dir, ".git/objects/ab/cdef", io, .{}) catch
+        return error.SkipZigTest;
+    try workspace.dir.writeFile(io, .{ .sub_path = "readme.txt", .data = "plain" });
+
+    const root = try workspace.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+
+    const aliases = try collectSecretHardlinkAliasPaths(allocator, io, root);
+    defer freeHardlinkAliasPaths(allocator, aliases);
+
+    try std.testing.expectEqual(@as(usize, 0), aliases.len);
+}
+
+test "collectSecretHardlinkAliasPaths still finds working-tree alias beside .git objects" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var outside = std.testing.tmpDir(.{});
+    defer outside.cleanup();
+    var workspace = std.testing.tmpDir(.{});
+    defer workspace.cleanup();
+
+    try outside.dir.writeFile(io, .{ .sub_path = "blob", .data = "git-object-body" });
+    try workspace.dir.createDirPath(io, ".git/objects/ab");
+    outside.dir.hardLink("blob", workspace.dir, ".git/objects/ab/cdef", io, .{}) catch
+        return error.SkipZigTest;
+
+    try workspace.dir.writeFile(io, .{ .sub_path = ".env", .data = "secret-body" });
+    workspace.dir.hardLink(".env", workspace.dir, "notes.txt", io, .{}) catch
+        return error.SkipZigTest;
+
+    const root = try workspace.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+
+    const aliases = try collectSecretHardlinkAliasPaths(allocator, io, root);
+    defer freeHardlinkAliasPaths(allocator, aliases);
+
+    try std.testing.expectEqual(@as(usize, 1), aliases.len);
+    try std.testing.expect(std.mem.endsWith(u8, aliases[0], "notes.txt"));
+    try std.testing.expect(std.mem.indexOf(u8, aliases[0], ".git") == null);
+}
+
+test "collectSecretHardlinkAliasPaths skips .ryk session hardlinks" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var outside = std.testing.tmpDir(.{});
+    defer outside.cleanup();
+    var workspace = std.testing.tmpDir(.{});
+    defer workspace.cleanup();
+
+    try outside.dir.writeFile(io, .{ .sub_path = "evt", .data = "session-bytes" });
+    try workspace.dir.createDirPath(io, ".ryk/sessions");
+    outside.dir.hardLink("evt", workspace.dir, ".ryk/sessions/evt.jsonl", io, .{}) catch
+        return error.SkipZigTest;
+
+    const root = try workspace.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+
+    const aliases = try collectSecretHardlinkAliasPaths(allocator, io, root);
+    defer freeHardlinkAliasPaths(allocator, aliases);
+
+    try std.testing.expectEqual(@as(usize, 0), aliases.len);
+}
+
+test "collectSecretHardlinkAliasPaths denies .git/notes.txt alias of workspace .env" {
+    // Whole-tree `.git` skip would hide this readable alias. Write-deny is not
+    // a read deny — last-match path deny must still fire.
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, ".git");
+    try tmp.dir.writeFile(io, .{ .sub_path = ".env", .data = "secret-body" });
+    tmp.dir.hardLink(".env", tmp.dir, ".git/notes.txt", io, .{}) catch
+        return error.SkipZigTest;
+
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+
+    const aliases = try collectSecretHardlinkAliasPaths(allocator, io, root);
+    defer freeHardlinkAliasPaths(allocator, aliases);
+
+    try std.testing.expectEqual(@as(usize, 1), aliases.len);
+    try std.testing.expect(std.mem.endsWith(u8, aliases[0], "notes.txt"));
+}
+
+test "collectSecretHardlinkAliasPaths denies alias under nested submodule .git" {
+    // Nested `.git` is not a default control root (still workspace RW).
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var outside = std.testing.tmpDir(.{});
+    defer outside.cleanup();
+    var workspace = std.testing.tmpDir(.{});
+    defer workspace.cleanup();
+
+    try outside.dir.writeFile(io, .{ .sub_path = ".env", .data = "OUTSIDE-SECRET" });
+    try workspace.dir.createDirPath(io, "vendor/pkg/.git");
+    outside.dir.hardLink(".env", workspace.dir, "vendor/pkg/.git/alias.txt", io, .{}) catch
+        return error.SkipZigTest;
+
+    const root = try workspace.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+
+    const aliases = try collectSecretHardlinkAliasPaths(allocator, io, root);
+    defer freeHardlinkAliasPaths(allocator, aliases);
+
+    try std.testing.expectEqual(@as(usize, 1), aliases.len);
+    try std.testing.expect(std.mem.endsWith(u8, aliases[0], "alias.txt"));
+}
+
+test "collectSecretHardlinkAliasPaths does not fail closed on mode-000 under .git" {
+    // Control-root trees are not walked. An unreadable git object dir must not
+    // fail protect-on prepare (git locks / packed dirs are not secret aliases).
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, ".git/objects/ab");
+    try tmp.dir.writeFile(io, .{ .sub_path = ".git/objects/ab/cdef", .data = "blob" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "readme.txt", .data = "plain" });
+
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const nested = try std.fs.path.join(allocator, &.{ root, ".git", "objects", "ab" });
+    defer allocator.free(nested);
+    const nested_z = try allocator.dupeZ(u8, nested);
+    defer allocator.free(nested_z);
+
+    if (std.c.chmod(nested_z.ptr, 0) != 0) return error.SkipZigTest;
+    defer _ = std.c.chmod(nested_z.ptr, 0o755);
+
+    const aliases = try collectSecretHardlinkAliasPaths(allocator, io, root);
     defer freeHardlinkAliasPaths(allocator, aliases);
     try std.testing.expectEqual(@as(usize, 0), aliases.len);
 }

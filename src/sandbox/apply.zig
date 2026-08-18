@@ -1721,7 +1721,12 @@ pub fn applyBeforeExec(boundary: ApplyBoundary) ApplyError!ApplyResult {
     );
     defer platform.deinit();
 
-    if (boundary.require_network_route_forcing and !platform.network_route_forced) {
+    // Route-force can only be missing after a successful prepare (no proxy
+    // port / no OS rules). Failed or unavailable prepare already has a more
+    // specific reason — do not remap those to network_route_forcing_unavailable.
+    if (boundary.require_network_route_forcing and !platform.network_route_forced and
+        platform.status == .prepared_child)
+    {
         setFailReason(boundary, "network_route_forcing_unavailable");
         return error.RequireFailed;
     }
@@ -2684,6 +2689,42 @@ test "require_network_route_forcing with sandbox off fails closed" {
     });
     try std.testing.expectError(error.RequireFailed, err);
     try std.testing.expectEqualStrings("network_route_forcing_unavailable", fail_reason);
+}
+
+test "require_network_route_forcing keeps the real Seatbelt prepare reason" {
+    // Mediation must not remap scan/render failures to
+    // network_route_forcing_unavailable — that hides the actual attach fault.
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    try tmp.dir.createDirPath(io, "d");
+    try tmp.dir.writeFile(io, .{ .sub_path = "d/.env", .data = "secret-body" });
+
+    const root = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const nested = try std.fs.path.join(std.testing.allocator, &.{ root, "d" });
+    defer std.testing.allocator.free(nested);
+    const nested_z = try std.testing.allocator.dupeZ(u8, nested);
+    defer std.testing.allocator.free(nested_z);
+
+    if (std.c.chmod(nested_z.ptr, 0) != 0) return error.SkipZigTest;
+    defer _ = std.c.chmod(nested_z.ptr, 0o755);
+
+    var fail_reason: []const u8 = "unset";
+    const err = applyBeforeExec(.{
+        .allocator = std.testing.allocator,
+        .mode = .on,
+        .workspace_root = root,
+        .env_map = null,
+        .protect_workspace_secrets = true,
+        .network_proxy_port = 18080,
+        .require_network_route_forcing = true,
+        .fail_reason_out = &fail_reason,
+    });
+    try std.testing.expectError(error.RequireFailed, err);
+    try std.testing.expectEqualStrings("seatbelt_secret_hardlink_scan_open", fail_reason);
 }
 
 test "activateAfterHandshake landlock route-forced network_scope is port-scoped not loopback" {

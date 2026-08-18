@@ -247,6 +247,9 @@ pub fn prepareForChildApplyWithOptions(
     // Protect-on: discover multi-nlink non-secret basenames under the workspace
     // so path-regex deny cannot be bypassed via a non-.env hardlink alias (Linux
     // FUSE taints multi-nlink; Seatbelt needs explicit last-match path denies).
+    // `**/.git/objects` and `**/.ryk/sessions` are not walked (shared git
+    // objects and session evidence are not agent-facing aliases). `.git` /
+    // `.ryk` themselves are still walked so planted `notes.txt` aliases deny.
     // Missing workspace yields an empty list (regex still applies). Open /
     // capacity / depth failures fail closed with distinct reason codes.
     // OOM uses seatbelt_profile_oom (hard OutOfMemory at apply).
@@ -633,4 +636,37 @@ test "prepare hardlink scan open failure maps to seatbelt_secret_hardlink_scan_o
     try std.testing.expectEqual(.failed, out.status);
     try std.testing.expectEqualStrings("seatbelt_secret_hardlink_scan_open", out.reason_code);
     try std.testing.expect(out.sbpl_z == null);
+}
+
+test "prepare protect-on succeeds when .git objects are shared hardlinks" {
+    // Worktree / local-clone object stores must not fail empty-backpack prepare.
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var outside = std.testing.tmpDir(.{});
+    defer outside.cleanup();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try outside.dir.writeFile(io, .{ .sub_path = "blob", .data = "git-object-body" });
+    try tmp.dir.createDirPath(io, ".git/objects/ab");
+    outside.dir.hardLink("blob", tmp.dir, ".git/objects/ab/cdef", io, .{}) catch
+        return error.SkipZigTest;
+    try tmp.dir.writeFile(io, .{ .sub_path = "readme.txt", .data = "plain" });
+
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+
+    var compiled = try profile.compileProfile(allocator, .{
+        .workspace_root = root,
+        .include_tmp = false,
+        .protect_workspace_secrets = true,
+    });
+    defer compiled.deinit();
+
+    const out = prepareForChildApplyWith(allocator, &compiled, .supported);
+    defer if (out.sbpl_z) |p| allocator.free(p);
+    try std.testing.expectEqual(.prepared, out.status);
+    try std.testing.expectEqualStrings("seatbelt_prepared", out.reason_code);
+    try std.testing.expect(out.sbpl_z != null);
 }
