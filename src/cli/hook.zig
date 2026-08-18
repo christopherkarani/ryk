@@ -1669,8 +1669,16 @@ fn evaluateHook(
 
             const matched_id = if (evaluation.matched_rule) |rule| rule.id else null;
             var result = evaluation.decision.result;
-            if (explain_kind == .file_read and isLeftoverUnusedFileReadDefaultDeny(result, matched_id, evaluation.decision.reason)) {
-                result = .ask;
+            if (explain_kind == .file_read) {
+                result = try leftoverUnusedFileReadDecision(
+                    io,
+                    allocator,
+                    workspace_root,
+                    policy_value,
+                    result,
+                    matched_id,
+                    explain_target,
+                );
             }
             const decision = PluginDecision.fromDecisionResult(result, ci_mode);
             const risk = RiskLevel.fromScore(evaluation.decision.risk_score);
@@ -2669,8 +2677,16 @@ fn evaluateFilePolicyPreToolUse(
 
     const matched_id = if (evaluation.matched_rule) |rule| rule.id else null;
     var result = evaluation.decision.result;
-    if (kind == .read and isLeftoverUnusedFileReadDefaultDeny(result, matched_id, evaluation.decision.reason)) {
-        result = .ask;
+    if (kind == .read) {
+        result = try leftoverUnusedFileReadDecision(
+            io,
+            allocator,
+            workspace_root,
+            policy_value,
+            result,
+            matched_id,
+            policy_path,
+        );
     }
     const decision = PluginDecision.fromDecisionResult(result, ci_mode);
     const message = try buildMessage(allocator, decision, cat);
@@ -2688,20 +2704,50 @@ fn evaluateFilePolicyPreToolUse(
 /// Attended coding-host hooks should not workspace-confine non-secret reads.
 /// Explicit deny, secret heuristics, and symlink-escape normalize failures stay
 /// deny. Leftover unused default deny becomes leftover ask (permit unless unattended).
+fn leftoverUnusedFileReadDecision(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    workspace_root: []const u8,
+    policy_value: *const policy.schema.Policy,
+    result: core.decision.DecisionResult,
+    rule_id: ?[]const u8,
+    policy_path: []const u8,
+) !core.decision.DecisionResult {
+    if (!isLeftoverUnusedFileReadDefaultDeny(result, rule_id)) return result;
+    if (policy.host_runtime_reads.isSecretReadPath(policy_path)) return result;
+    if (regularFileHasMultipleLinks(io, policy_path)) return result;
+
+    const resolved = try file_policy_path.tryResolveExistingPath(io, allocator, workspace_root, policy_path);
+    if (resolved) |path| {
+        defer allocator.free(path);
+        if (policy.host_runtime_reads.isSecretReadPath(path)) return result;
+        if (regularFileHasMultipleLinks(io, path)) return result;
+        if (!std.mem.eql(u8, path, policy_path)) {
+            var resolved_eval = try core_api.explainAction(allocator, @ptrCast(policy_value), .file_read, path);
+            defer resolved_eval.deinit(allocator);
+            const resolved_id = if (resolved_eval.matched_rule) |rule| rule.id else null;
+            if (resolved_eval.decision.result == .deny and
+                !isLeftoverUnusedFileReadDefaultDeny(resolved_eval.decision.result, resolved_id))
+            {
+                return result;
+            }
+        }
+    }
+    return .ask;
+}
+
 fn isLeftoverUnusedFileReadDefaultDeny(
     result: core.decision.DecisionResult,
     rule_id: ?[]const u8,
-    reason: []const u8,
 ) bool {
     if (result != .deny) return false;
-    if (rule_id) |id| {
-        if (std.mem.startsWith(u8, id, "files.read.deny")) return false;
-        if (std.mem.startsWith(u8, id, "builtin.files.read.deny")) return false;
-    }
-    if (std.mem.indexOf(u8, reason, "risk heuristic") != null) return false;
-    if (std.mem.indexOf(u8, reason, "outside workspace") != null) return false;
-    return std.mem.indexOf(u8, reason, "files.read.default") != null or
-        std.mem.indexOf(u8, reason, "mode default") != null;
+    const id = rule_id orelse return false;
+    return std.mem.eql(u8, id, "files.read.default") or std.mem.eql(u8, id, "mode default");
+}
+
+fn regularFileHasMultipleLinks(io: std.Io, path: []const u8) bool {
+    const st = std.Io.Dir.cwd().statFile(io, path, .{}) catch return false;
+    return st.kind == .file and st.nlink > 1;
 }
 
 fn evaluateNativePreToolUseRoute(
@@ -3795,6 +3841,209 @@ test "hook PreToolUse leftover unused file.read stays deny when unattended" {
     );
     defer result.deinit(allocator);
 
+    try std.testing.expectEqual(PluginDecision.block, result.decision);
+    try std.testing.expectEqualStrings("file.read", result.category);
+}
+
+fn evaluateGenericAgentReadHook(
+    allocator: std.mem.Allocator,
+    workspace_root: []const u8,
+    target_file: []const u8,
+    ci_mode: bool,
+) !HookResponse {
+    var policy_obj = try policy.load.loadAgentPreset(allocator, .generic_agent);
+    defer policy_obj.deinit();
+    const payload_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"toolName\":\"read_file\",\"toolInput\":{{\"target_file\":\"{s}\"}}}}",
+        .{target_file},
+    );
+    defer allocator.free(payload_json);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload_json, .{});
+    defer parsed.deinit();
+    return evaluateHookForTestWithOptions(
+        allocator,
+        workspace_root,
+        &policy_obj,
+        .grok,
+        .PreToolUse,
+        parsed.value,
+        ci_mode,
+        null,
+    );
+}
+
+test "hook PreToolUse generic_agent leftover unused notes.md still permits" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "workspace", .default_dir);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "notes.md", .data = "scratch\n" });
+
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, "workspace", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const notes_path = try tmp.dir.realPathFileAlloc(std.testing.io, "notes.md", std.testing.allocator);
+    defer std.testing.allocator.free(notes_path);
+
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const allocator = gpa_state.allocator();
+
+    var result = try evaluateGenericAgentReadHook(allocator, root, notes_path, false);
+    defer result.deinit(allocator);
+
+    result.decision = applyHostWireRewrite(result.decision, result.ask_origin, false);
+    try std.testing.expectEqual(PluginDecision.allow, result.decision);
+    try std.testing.expectEqualStrings("file.read", result.category);
+}
+
+test "hook PreToolUse generic_agent leftover unused stays deny when unattended" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "workspace", .default_dir);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "notes.md", .data = "scratch\n" });
+
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, "workspace", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const notes_path = try tmp.dir.realPathFileAlloc(std.testing.io, "notes.md", std.testing.allocator);
+    defer std.testing.allocator.free(notes_path);
+
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const allocator = gpa_state.allocator();
+
+    var result = try evaluateGenericAgentReadHook(allocator, root, notes_path, true);
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqual(PluginDecision.block, result.decision);
+}
+
+test "hook PreToolUse generic_agent blocks extra-worktree .env" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "workspace", .default_dir);
+    try tmp.dir.createDir(std.testing.io, "extra", .default_dir);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "extra/.env", .data = "TOKEN=fake_secret_value\n" });
+
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, "workspace", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const env_path = try tmp.dir.realPathFileAlloc(std.testing.io, "extra/.env", std.testing.allocator);
+    defer std.testing.allocator.free(env_path);
+
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const allocator = gpa_state.allocator();
+
+    var result = try evaluateGenericAgentReadHook(allocator, root, env_path, false);
+    defer result.deinit(allocator);
+
+    result.decision = applyHostWireRewrite(result.decision, result.ask_origin, false);
+    try std.testing.expectEqual(PluginDecision.block, result.decision);
+    try std.testing.expectEqualStrings("file.read", result.category);
+}
+
+test "hook PreToolUse generic_agent blocks grok auth.json" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "workspace");
+    try tmp.dir.createDirPath(std.testing.io, "home/.grok");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "home/.grok/auth.json", .data = "{}\n" });
+
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, "workspace", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const auth_path = try tmp.dir.realPathFileAlloc(std.testing.io, "home/.grok/auth.json", std.testing.allocator);
+    defer std.testing.allocator.free(auth_path);
+
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const allocator = gpa_state.allocator();
+
+    var result = try evaluateGenericAgentReadHook(allocator, root, auth_path, false);
+    defer result.deinit(allocator);
+
+    result.decision = applyHostWireRewrite(result.decision, result.ask_origin, false);
+    try std.testing.expectEqual(PluginDecision.block, result.decision);
+    try std.testing.expectEqualStrings("file.read", result.category);
+}
+
+test "hook PreToolUse generic_agent blocks parent-dir symlink to ssh config" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "workspace");
+    try tmp.dir.createDirPath(std.testing.io, "home/.ssh");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "home/.ssh/config", .data = "Host *\n" });
+
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, "workspace", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const ssh_dir = try tmp.dir.realPathFileAlloc(std.testing.io, "home/.ssh", std.testing.allocator);
+    defer std.testing.allocator.free(ssh_dir);
+    const alias = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(alias);
+    const notes_link = try std.fs.path.join(std.testing.allocator, &.{ alias, "notes" });
+    defer std.testing.allocator.free(notes_link);
+    std.Io.Dir.cwd().symLink(std.testing.io, ssh_dir, notes_link, .{}) catch |err| switch (err) {
+        error.PermissionDenied => return error.SkipZigTest,
+        else => return err,
+    };
+    const config_path = try std.fs.path.join(std.testing.allocator, &.{ notes_link, "config" });
+    defer std.testing.allocator.free(config_path);
+
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const allocator = gpa_state.allocator();
+
+    var result = try evaluateGenericAgentReadHook(allocator, root, config_path, false);
+    defer result.deinit(allocator);
+
+    result.decision = applyHostWireRewrite(result.decision, result.ask_origin, false);
+    try std.testing.expectEqual(PluginDecision.block, result.decision);
+    try std.testing.expectEqualStrings("file.read", result.category);
+}
+
+test "hook PreToolUse generic_agent blocks extra-worktree .envrc" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "workspace", .default_dir);
+    try tmp.dir.createDir(std.testing.io, "extra", .default_dir);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "extra/.envrc", .data = "export TOKEN=fake_secret_value\n" });
+
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, "workspace", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const envrc_path = try tmp.dir.realPathFileAlloc(std.testing.io, "extra/.envrc", std.testing.allocator);
+    defer std.testing.allocator.free(envrc_path);
+
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const allocator = gpa_state.allocator();
+
+    var result = try evaluateGenericAgentReadHook(allocator, root, envrc_path, false);
+    defer result.deinit(allocator);
+
+    result.decision = applyHostWireRewrite(result.decision, result.ask_origin, false);
+    try std.testing.expectEqual(PluginDecision.block, result.decision);
+    try std.testing.expectEqualStrings("file.read", result.category);
+}
+
+test "hook PreToolUse generic_agent blocks leftover notes hardlinked to extra-worktree .env" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "workspace", .default_dir);
+    try tmp.dir.createDir(std.testing.io, "extra", .default_dir);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "extra/.env", .data = "TOKEN=fake_secret_value\n" });
+    tmp.dir.hardLink("extra/.env", tmp.dir, "extra/notes.md", std.testing.io, .{}) catch return error.SkipZigTest;
+
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, "workspace", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const alias_path = try tmp.dir.realPathFileAlloc(std.testing.io, "extra/notes.md", std.testing.allocator);
+    defer std.testing.allocator.free(alias_path);
+
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const allocator = gpa_state.allocator();
+
+    var result = try evaluateGenericAgentReadHook(allocator, root, alias_path, false);
+    defer result.deinit(allocator);
+
+    result.decision = applyHostWireRewrite(result.decision, result.ask_origin, false);
     try std.testing.expectEqual(PluginDecision.block, result.decision);
     try std.testing.expectEqualStrings("file.read", result.category);
 }

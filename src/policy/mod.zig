@@ -31,6 +31,7 @@ test {
     _ = matchers;
     _ = network_eval;
     _ = presets;
+    _ = default_migration;
     _ = effects;
     _ = sticky;
     _ = risk_card;

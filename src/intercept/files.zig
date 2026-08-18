@@ -185,6 +185,13 @@ const read_rules = [_]BuiltinRule{
     .{ .id = "builtin.files.read.deny[36]", .pattern = "~/.zshrc" },
     .{ .id = "builtin.files.read.deny[37]", .pattern = "~/.bashrc" },
     .{ .id = "builtin.files.read.deny[38]", .pattern = "~/.profile" },
+    .{ .id = "builtin.files.read.deny[39]", .pattern = "**/.env" },
+    .{ .id = "builtin.files.read.deny[40]", .pattern = "**/.env.*" },
+    .{ .id = "builtin.files.read.deny[41]", .pattern = "**/.envrc" },
+    .{ .id = "builtin.files.read.deny[42]", .pattern = "**/auth.json" },
+    .{ .id = "builtin.files.read.deny[43]", .pattern = "**/.git-credentials" },
+    .{ .id = "builtin.files.read.deny[44]", .pattern = "**/credentials" },
+    .{ .id = "builtin.files.read.deny[45]", .pattern = "**/.aws/**" },
 };
 
 const write_rules = [_]BuiltinRule{
@@ -1535,6 +1542,17 @@ test "coding intercept does not deny workspace source named secret or token" {
     var secrets = try decideRead(io, std.testing.allocator, &loaded, root, "secrets.json");
     defer secrets.deinit(std.testing.allocator);
     try std.testing.expectEqual(core.decision.DecisionResult.deny, secrets.decision.result);
+
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".git-credentials", .data = "https://example.invalid\n" });
+    var git_creds = try decideRead(io, std.testing.allocator, &loaded, root, ".git-credentials");
+    defer git_creds.deinit(std.testing.allocator);
+    try std.testing.expectEqual(core.decision.DecisionResult.deny, git_creds.decision.result);
+
+    try tmp.dir.createDirPath(std.testing.io, ".aws");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".aws/credentials", .data = "[default]\n" });
+    var aws_creds = try decideRead(io, std.testing.allocator, &loaded, root, ".aws/credentials");
+    defer aws_creds.deinit(std.testing.allocator);
+    try std.testing.expectEqual(core.decision.DecisionResult.deny, aws_creds.decision.result);
 }
 
 test "default sensitive read decisions deny env and fake ssh key" {

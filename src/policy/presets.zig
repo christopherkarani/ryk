@@ -757,6 +757,13 @@ const coding_dcg_rules =
     \\    deny:
     \\      - "./.env"
     \\      - "./.env.*"
+    \\      - "**/.env"
+    \\      - "**/.env.*"
+    \\      - "**/.envrc"
+    \\      - "**/auth.json"
+    \\      - "**/.git-credentials"
+    \\      - "**/credentials"
+    \\      - "**/.aws/**"
     \\      - "~/.ssh/**"
     \\      - "~/.aws/**"
     \\      - "~/.gcloud/**"
@@ -1341,6 +1348,56 @@ fn writeDenyHas(policy: *const schema.Policy, want: []const u8) bool {
         if (std.mem.eql(u8, pattern, want)) return true;
     }
     return false;
+}
+
+fn readDenyHas(policy: *const schema.Policy, want: []const u8) bool {
+    for (policy.files.read.deny) |pattern| {
+        if (std.mem.eql(u8, pattern, want)) return true;
+    }
+    return false;
+}
+
+test "coding DCG files.read deny covers extra-worktree secrets and credentials" {
+    const load = @import("load.zig");
+    const evaluate = @import("evaluate.zig");
+    const core = @import("../core/public.zig");
+
+    var embedded = try load.loadAgentPreset(std.testing.allocator, .generic_agent);
+    defer embedded.deinit();
+    var disk = try load.loadFile(
+        std.testing.io,
+        std.testing.allocator,
+        "policies/presets/generic-agent.yaml",
+    );
+    defer disk.deinit();
+
+    const expected = [_][]const u8{
+        "./.env",
+        "./.env.*",
+        "**/.env",
+        "**/.env.*",
+        "**/.envrc",
+        "**/auth.json",
+        "**/.git-credentials",
+        "**/credentials",
+        "**/.aws/**",
+    };
+    for (expected) |pattern| {
+        try std.testing.expect(readDenyHas(&embedded, pattern));
+        try std.testing.expect(readDenyHas(&disk, pattern));
+    }
+
+    var git_creds = try evaluate.fileRead(&embedded, "./.git-credentials", std.testing.allocator);
+    defer git_creds.deinit(std.testing.allocator);
+    try std.testing.expectEqual(core.decision.DecisionResult.deny, git_creds.decision.result);
+
+    var aws_creds = try evaluate.fileRead(&embedded, "./.aws/credentials", std.testing.allocator);
+    defer aws_creds.deinit(std.testing.allocator);
+    try std.testing.expectEqual(core.decision.DecisionResult.deny, aws_creds.decision.result);
+
+    var token_src = try evaluate.fileRead(&embedded, "./src/auth/token.zig", std.testing.allocator);
+    defer token_src.deinit(std.testing.allocator);
+    try std.testing.expectEqual(core.decision.DecisionResult.allow, token_src.decision.result);
 }
 
 test "coding DCG files.write deny covers .env patterns on embedded and generic-agent.yaml" {

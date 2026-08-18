@@ -813,14 +813,19 @@ fn defaultDecision(allocator: std.mem.Allocator, mode: schema.Mode, explicit_def
     const value = explicit_default orelse modeDefault(mode);
     const actual = if (mode == .ci and value == .ask) schema.DecisionValue.deny else value;
     const explanation = try std.fmt.allocPrint(allocator, "{s}: {s}", .{ label, if (mode == .ci and value == .ask) "ask converted to deny in ci mode" else actual.toString() });
+    errdefer allocator.free(explanation);
+    const rule_id = try allocator.dupe(u8, label);
     return .{
         .decision = .{
             .result = actual.toDecisionResult(),
+            .rule_id = rule_id,
             .reason = explanation,
             .requires_user = actual == .ask,
             .ci_may_proceed = actual == .allow or actual == .observe,
         },
+        .matched_rule = .{ .id = rule_id, .pattern = rule_id },
         .explanation = explanation,
+        .owned_rule_id = rule_id,
     };
 }
 
@@ -839,7 +844,15 @@ const Risk = struct {
 
 fn riskHeuristic(surface: Surface, value: []const u8) ?Risk {
     return switch (surface) {
-        .file_read => if (matchers.matchesPath("~/.ssh/**", value) or matchers.matchesPath("~/.aws/**", value) or matchers.matchesPath("./.env*", value)) .{ .score = 90, .reason = "sensitive file path" } else null,
+        .file_read => if (host_runtime_reads.isSecretReadPath(value) or
+            matchers.matchesPath("~/.ssh/**", value) or
+            matchers.matchesPath("~/.aws/**", value) or
+            matchers.matchesPath("./.env*", value) or
+            matchers.matchesPath("**/.env", value) or
+            matchers.matchesPath("**/.env.*", value))
+            .{ .score = 90, .reason = "sensitive file path" }
+        else
+            null,
         .file_write => if (matchers.matchesPath("./.git/**", value) or matchers.matchesPath("./.ryk/**", value)) .{ .score = 80, .reason = "control directory write" } else null,
         .env => if (isSecretLikeEnvName(value)) .{ .score = 90, .reason = "secret-like environment variable" } else null,
         .command => commandRiskHeuristic(value),
@@ -1161,8 +1174,13 @@ test "coding DCG still denies real secret files" {
     const denied = [_][]const u8{
         "./.env",
         "./.env.local",
+        "./src/.env",
         "./credentials.json",
         "./.credentials.json",
+        "./auth.json",
+        "./.git-credentials",
+        "./credentials",
+        "./.aws/credentials",
         "./secrets.json",
         "./config/secrets.yaml",
         "./application_default_credentials.json",
@@ -1170,12 +1188,31 @@ test "coding DCG still denies real secret files" {
         "~/.ssh/id_rsa",
         "~/.aws/credentials",
         "~/.config/gcloud/application_default_credentials.json",
+        "/tmp/other-worktree/.env",
+        "/tmp/other-worktree/auth.json",
     };
     for (denied) |path| {
         var result = try fileRead(&policy, path, std.testing.allocator);
         defer result.deinit(std.testing.allocator);
         try std.testing.expectEqual(core.decision.DecisionResult.deny, result.decision.result);
     }
+
+    var token_src = try fileRead(&policy, "./src/auth/token.zig", std.testing.allocator);
+    defer token_src.deinit(std.testing.allocator);
+    try std.testing.expectEqual(core.decision.DecisionResult.allow, token_src.decision.result);
+}
+
+test "file read defaultDecision tags mode default rule id" {
+    const load = @import("load.zig");
+    const presets = @import("presets.zig");
+    var policy = try load.parseFromSlice(std.testing.allocator, presets.agentPresetText(.generic_agent), "generic-agent.yaml");
+    defer policy.deinit();
+
+    var leftover = try fileRead(&policy, "/tmp/other-worktree/notes.md", std.testing.allocator);
+    defer leftover.deinit(std.testing.allocator);
+    try std.testing.expectEqual(core.decision.DecisionResult.deny, leftover.decision.result);
+    try std.testing.expectEqualStrings("mode default", leftover.decision.rule_id.?);
+    try std.testing.expectEqualStrings("mode default", leftover.matched_rule.?.id);
 }
 
 test "coding DCG allows host docs rules and observation reads" {

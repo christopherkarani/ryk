@@ -46,6 +46,13 @@ files:
       # Expanded secret protections (kept in sync with embedded coding_dcg_rules).
       - "./.env"
       - "./.env.*"
+      - "**/.env"
+      - "**/.env.*"
+      - "**/.envrc"
+      - "**/auth.json"
+      - "**/.git-credentials"
+      - "**/credentials"
+      - "**/.aws/**"
       - "~/.ssh/**"
       - "~/.aws/**"
       - "~/.gcloud/**"

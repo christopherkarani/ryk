@@ -388,6 +388,12 @@ The following patterns are denied by default for file reads:
 ```
 ./.env
 ./.env.*
+**/.env
+**/.env.*
+**/auth.json
+**/.git-credentials
+**/credentials
+**/.aws/**
 ~/.ssh/**
 ~/.aws/**
 ~/.gcloud/**
