@@ -1096,7 +1096,7 @@ test("file-policy leftover remapped allow is permit without a prompt", async () 
 	});
 });
 
-test("unexpected leftover ask on decide-file is fail-closed", async () => {
+test("file-policy leftover unused ask from decide is permit without a prompt", async () => {
 	await withClearedUnattendedEnv(async () => {
 		const { pi, handlers } = makePi();
 		const { spawn } = makeSpawn([
@@ -1104,6 +1104,12 @@ test("unexpected leftover ask on decide-file is fail-closed", async () => {
 		]);
 		installRykExtension(pi, { spawn, rykBin: "ryk" });
 		const { ctx } = makeCtx();
+		let offered: string[] = [];
+		(ctx.ui as any).select = async (_title: string, options: string[]) => {
+			offered = options;
+			return "Block";
+		};
+
 		const result = await fireToolCall(
 			handlers.get("tool_call")![0],
 			ctx,
@@ -1111,7 +1117,8 @@ test("unexpected leftover ask on decide-file is fail-closed", async () => {
 			"write",
 			{ path: "src/main.ts", content: "x" },
 		);
-		assert.equal(result?.block, true);
+		assert.equal(result, undefined);
+		assert.equal(offered.length, 0);
 	});
 });
 
@@ -1392,7 +1399,7 @@ test("policy ask auto-denies when RYK_UNATTENDED is set", async () => {
 	try {
 		const { pi, handlers, messages } = makePi();
 		const { spawn } = makeSpawn([
-			{ code: 0, stdout: decideJson("allow", "file.write") },
+			{ code: 7, stdout: decideJson("ask", "file.write") },
 		]);
 		installRykExtension(pi, { spawn, rykBin: "ryk" });
 		const { ctx } = makeCtx({ hasUI: false, mode: "print" });
@@ -1781,7 +1788,7 @@ test("policy ask auto-deny still blocks when audit is unavailable", async () => 
 		const { pi, handlers, messages } = makePi();
 		delete (pi as { sendMessage?: unknown }).sendMessage;
 		const { spawn } = makeSpawn([
-			{ code: 0, stdout: decideJson("allow", "file.write") },
+			{ code: 7, stdout: decideJson("ask", "file.write") },
 		]);
 		installRykExtension(pi, { spawn, rykBin: "ryk" });
 		const { ctx } = makeCtx({ hasUI: false, mode: "print" });

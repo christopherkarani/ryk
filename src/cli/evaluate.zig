@@ -51,6 +51,9 @@ const EvaluateWireOpts = struct {
     cached_policy: ?*const core_api.LoadedPolicy = null,
     /// Client asked to raise leftover ask → deny (`RYK_MODE=ci` / `--ci`).
     raise_ci: bool = false,
+    /// When set, overrides `raise_ci` + ambient CI for leftover remap.
+    /// Tests pin attended leftover permit so GHA `CI=true` cannot flip it.
+    unattended: ?bool = null,
 };
 
 pub const EvaluateRequest = struct {
@@ -726,14 +729,14 @@ fn writeEvaluationResponse(
         null;
     defer if (safe_remediation) |text| allocator.free(text);
 
-    const unattended = wire.raise_ci or env_util.getenvUnattended();
+    const unattended = wire.unattended orelse (wire.raise_ci or env_util.getenvUnattended());
     const host_result: core.decision.DecisionResult = switch (leftover_ask.codingHostAskOutcome(
         owned.decision.result == .ask,
         owned.ask_origin,
         unattended,
     )) {
         .allow => .allow,
-        .deny => .deny,
+        .deny, .hold => .deny,
         .unchanged => owned.decision.result,
     };
 
@@ -1359,6 +1362,7 @@ test "evaluate leftover unused ask is allow on attended coding-host JSON" {
         .mode_override = .ask,
         .commands_allow_override = &.{},
         .disable_fm = true,
+        .unattended = false,
     });
     try std.testing.expectEqual(exit_allowed, code);
     const output = stdout.buffered();
@@ -1384,6 +1388,7 @@ test "evaluate leftover unused ask is deny when unattended" {
         .commands_allow_override = &.{},
         .disable_fm = true,
         .raise_ci = true,
+        .unattended = true,
     });
     try std.testing.expectEqual(exit_denied, code);
     const output = stdout.buffered();

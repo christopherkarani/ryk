@@ -336,6 +336,11 @@ pub fn evaluatePayloadWithModeOpts(
                 unattended,
             )) {
                 .allow => try writeAllow(stdout, format),
+                .hold => {
+                    const reason = try core_api.redactAlloc(allocator, decision.owned_reason);
+                    defer allocator.free(reason);
+                    try writeHold(stdout, format, reason);
+                },
                 .deny, .unchanged => {
                     const reason = try core_api.redactAlloc(allocator, decision.owned_reason);
                     defer allocator.free(reason);
@@ -448,6 +453,15 @@ fn writeAllow(stdout: anytype, format: InputFormat) !void {
 fn writeDeny(stdout: anytype, format: InputFormat, reason: []const u8) !void {
     switch (format) {
         .agent_hook => try writeAgentPermission(stdout, "deny", reason),
+        .cursor_shell => try writeCursorDenial(stdout, reason),
+    }
+}
+
+/// SoftBlock / FM hold. Claude-compatible agent_hook has an ask channel;
+/// Cursor does not — deny there is correct. Never allow.
+fn writeHold(stdout: anytype, format: InputFormat, reason: []const u8) !void {
+    switch (format) {
+        .agent_hook => try writeAgentPermission(stdout, "ask", reason),
         .cursor_shell => try writeCursorDenial(stdout, reason),
     }
 }
@@ -802,6 +816,20 @@ test "SoftBlock ask is not permit on agent_hook" {
         .unattended = false,
     });
     try std.testing.expect(std.mem.indexOf(u8, stdout.buffered(), "\"permissionDecision\":\"ask\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout.buffered(), "\"permissionDecision\":\"allow\"") == null);
+}
+
+test "SoftBlock ask is deny on Cursor shell hook" {
+    const allocator = std.testing.allocator;
+    var stdout_buf: [1024]u8 = undefined;
+    var stdout: std.Io.Writer = .fixed(&stdout_buf);
+    const payload = "{\"command\":\"risky\",\"cwd\":\"/tmp\"}";
+    _ = try evaluatePayloadWithModeOpts(allocator, payload, &stdout, shell_eval.mockDaemonSoftBlockAllowEvaluator, .strict, .{
+        .disable_fm = true,
+        .unattended = false,
+    });
+    try std.testing.expect(std.mem.indexOf(u8, stdout.buffered(), "\"permission\":\"deny\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout.buffered(), "\"permission\":\"allow\"") == null);
 }
 
 test "critical deny stays deny even in observe mode" {
@@ -950,7 +978,7 @@ fn agentHookFakeFmClient(state: *AgentHookFmFakeState) fm_steward_client.Client 
 }
 
 test "agent_hook product path FM ask upgrades soft allow" {
-    // Daemon Allow + FM ask is deny on the coding-host door (not leftover unused-policy permit).
+    // Daemon Allow + FM ask is hold on Claude agent_hook (never leftover permit).
     // Pin unattended so live CI=true cannot change the leftover path.
     const allocator = std.testing.allocator;
     var fm_state = AgentHookFmFakeState{
@@ -979,7 +1007,8 @@ test "agent_hook product path FM ask upgrades soft allow" {
     const out = stdout.buffered();
     try std.testing.expectEqual(@as(u32, 1), fm_state.call_count);
     try std.testing.expect(fm_state.saw_expected_session);
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"permissionDecision\":\"deny\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"permissionDecision\":\"ask\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"permissionDecision\":\"allow\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "curl pipe needs confirmation") != null);
 
     var unattended_state = AgentHookFmFakeState{

@@ -804,6 +804,7 @@ fn evaluateFromPayload(
     )) {
         .allow => result.decision = .allow,
         .deny => result.decision = .block,
+        .hold => {},
         .unchanged => {},
     }
 
@@ -971,7 +972,7 @@ fn wireCodingHostAsk(decision: PluginDecision, unattended: bool) PluginDecision 
     return switch (leftover_ask.codingHostAskOutcome(decision == .ask, .leftover, unattended)) {
         .allow => .allow,
         .deny => if (decision == .ask) .block else decision,
-        .unchanged => decision,
+        .hold, .unchanged => decision,
     };
 }
 
@@ -1072,15 +1073,15 @@ fn usesClaudeHostShapedPermission(host: Host, event: Event) bool {
 
 /// Map ryk plugin decisions to Claude `permissionDecision` values.
 /// - block/err → deny
-/// - leftover unused ask → allow (coding-host permit; unattended/`--ci` already
-///   rewrote leftover ask→block before emit)
+/// - leftover unused ask is already remapped to allow before emit
+/// - remaining `.ask` is SoftBlock/FM hold → ask (never allow)
 /// - stage → ask (hold for review; never allow)
 /// - allow/context_only/warn → allow (warn is not a hard veto; documented proceed)
 fn claudePermissionDecisionString(decision: PluginDecision) []const u8 {
     return switch (decision) {
         .block, .err => "deny",
-        .stage => "ask",
-        .ask, .allow, .context_only, .warn => "allow",
+        .ask, .stage => "ask",
+        .allow, .context_only, .warn => "allow",
     };
 }
 
@@ -6694,18 +6695,20 @@ test "hook Claude maps block to permissionDecision deny with short reason" {
     try std.testing.expectEqual(exit_codes.success, hookExitCode(.claude, .block, false));
 }
 
-test "hook Claude maps residual ask to permissionDecision allow never deny" {
+test "hook Claude maps leftover remapped ask to permissionDecision allow never deny" {
     const allocator = std.testing.allocator;
+    const leftover = wireCodingHostAsk(.ask, false);
+    try std.testing.expectEqual(PluginDecision.allow, leftover);
+    try std.testing.expectEqualStrings("allow", claudePermissionDecisionString(leftover));
+    try std.testing.expect(!std.mem.eql(u8, claudePermissionDecisionString(leftover), "deny"));
+
     var result = try testClaudeHookResponse(
         allocator,
-        .ask,
+        leftover,
         "needs approval",
         "command requires user approval per ryk policy.",
     );
     defer result.deinit(allocator);
-
-    try std.testing.expectEqualStrings("allow", claudePermissionDecisionString(.ask));
-    try std.testing.expect(!std.mem.eql(u8, claudePermissionDecisionString(.ask), "deny"));
 
     var stdout_buf: [1024]u8 = undefined;
     var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
@@ -6713,6 +6716,27 @@ test "hook Claude maps residual ask to permissionDecision allow never deny" {
     const out = stdout_writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, out, "\"permissionDecision\":\"allow\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"permissionDecision\":\"deny\"") == null);
+}
+
+test "hook Claude SoftBlock hold ask is permissionDecision ask never allow" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectEqualStrings("ask", claudePermissionDecisionString(.ask));
+    try std.testing.expect(!std.mem.eql(u8, claudePermissionDecisionString(.ask), "allow"));
+
+    var result = try testClaudeHookResponse(
+        allocator,
+        .ask,
+        "soft-block hold",
+        "soft-block requires review; never leftover unused-ask permit.",
+    );
+    defer result.deinit(allocator);
+
+    var stdout_buf: [1024]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    try writeClaudePermissionDecision(allocator, &stdout_writer, .PreToolUse, result);
+    const out = stdout_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"permissionDecision\":\"ask\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"permissionDecision\":\"allow\"") == null);
 }
 
 test "coding hosts permit residual ask unless unattended" {

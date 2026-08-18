@@ -735,12 +735,14 @@ async function runRykEvaluateOnce(
 	if (decision === "allow" && result.code === 0) {
 		return { kind: "allow", response: parsed };
 	}
-	// Leftover unused ask is remapped by ryk evaluate. Unexpected ask is fail-closed.
+	// Leftover unused ask is remapped by ryk evaluate. If ask still appears
+	// (Pi file tools still call `ryk decide`), attended leftover is permit.
+	// resolvePolicyAsk auto-denies unattended. SoftBlock/stage arrive as
+	// deny/stage and never become allow.
 	if (decision === "ask" && (result.code === 0 || result.code === null)) {
 		return {
-			kind: "deny",
-			reason: sanitizeVisibleText(getDecisionReason(parsed)) ||
-				"ryk leftover unused ask was not remapped; blocked fail-closed.",
+			kind: "ask",
+			reason: sanitizeVisibleText(getDecisionReason(parsed)) || "requires approval",
 			response: parsed,
 		};
 	}
@@ -1866,9 +1868,11 @@ async function applyToolDecision(
 }
 
 /**
- * Unexpected leftover unused policy ask on the plugin wire:
- * - fail-closed deny (ryk hook/evaluate remaps leftover unused ask first)
+ * Leftover unused policy ask on the plugin wire:
+ * - hook/evaluate remaps leftover unused ask to allow first
+ * - `ryk decide` still emits leftover unused ask — permit on attended Pi
  * Staged writes, FM steward ask, SoftBlock, and explicit deny never become allow.
+ * Unattended (`CI` / `RYK_CI` / `RYK_NONINTERACTIVE` / `RYK_UNATTENDED`) still denies.
  */
 async function resolvePolicyAsk(
 	reason: string,
@@ -1883,13 +1887,7 @@ async function resolvePolicyAsk(
 	if (isUnattendedEnv(env)) {
 		return handlePolicyAskAutoDeny(reason, pi, ctx, toolLabel, env);
 	}
-	return handlePolicyAskAutoDeny(
-		reason || "ryk leftover unused ask was not remapped; blocked fail-closed.",
-		pi,
-		ctx,
-		toolLabel,
-		env,
-	);
+	return undefined;
 }
 
 function recordOnceBypass(
