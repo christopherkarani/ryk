@@ -393,6 +393,20 @@ pub fn build(b: *std.Build) void {
     // Matrix and dispatch spawn `./zig-out/bin/ryk`; install first so they cannot skip.
     run_hook_host_matrix_tests.step.dependOn(&install_ryk.step);
 
+    const hook_server_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/hook_server.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ryk", .module = ryk_mod },
+            },
+        }),
+        .filters = test_filters,
+    });
+    const run_hook_server_tests = addRunTestTerminal(b, hook_server_tests);
+    run_hook_server_tests.step.dependOn(&install_ryk.step);
+
     const hook_dispatch_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/hook_dispatch.zig"),
@@ -679,12 +693,14 @@ pub fn build(b: *std.Build) void {
     // Named subset for hook host-matrix, dispatch, validation, and plugin-security.
     const test_hooks_step = b.step("test-hooks", "Run hook host-matrix, dispatch, validation, and plugin-security tests");
     test_hooks_step.dependOn(&run_hook_host_matrix_tests.step);
+    test_hooks_step.dependOn(&run_hook_server_tests.step);
     test_hooks_step.dependOn(&run_hook_dispatch_tests.step);
     test_hooks_step.dependOn(&run_hook_validation_tests.step);
     test_hooks_step.dependOn(&run_plugin_security_tests.step);
     test_hooks_step.dependOn(&run_hook_cold_latency_tests.step);
 
     test_step.dependOn(&run_hook_host_matrix_tests.step);
+    test_step.dependOn(&run_hook_server_tests.step);
     test_step.dependOn(&run_hook_dispatch_tests.step);
     test_step.dependOn(&run_hook_validation_tests.step);
     test_step.dependOn(&run_dashboard_feed_redaction_tests.step);

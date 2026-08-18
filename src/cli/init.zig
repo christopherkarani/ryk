@@ -89,10 +89,7 @@ pub fn command(io: std.Io, cwd: std.Io.Dir, argv: []const []const u8, stdout: an
         try stdout.writeAll("\n" ++
             "Your policy is ready.\n" ++
             "\n" ++
-            "Next steps:\n" ++
-            "  ryk policy check .ryk/policy.yaml\n" ++
-            "  ryk doctor\n" ++
-            "  ryk run -- <command>\n" ++
+            "Next: ryk doctor\n" ++
             "\n");
     }
 
@@ -330,10 +327,13 @@ test "init writes requested phase 18 presets as valid policies" {
 
         const code = try command(std.testing.io, tmp.dir, &.{ "--preset", preset_name, "--force" }, &stdout_writer, &stderr_writer);
         try std.testing.expectEqual(exit_codes.success, code);
-        try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "Next steps:") != null);
+        const out = stdout_writer.buffered();
+        try std.testing.expect(std.mem.indexOf(u8, out, "Next: ryk doctor") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "ryk policy check") == null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "ryk run --") == null);
         // Warm success path (checkmark + "Your policy is ready")
-        try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), style.Glyph.check ++ " Created") != null);
-        try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "Your policy is ready") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, style.Glyph.check ++ " Created") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "Your policy is ready") != null);
         try std.testing.expectEqualStrings("", stderr_writer.buffered());
 
         const policy = try tmp.dir.readFileAlloc(std.testing.io, ".ryk/policy.yaml", std.testing.allocator, .limited(16 * 1024));
@@ -342,6 +342,25 @@ test "init writes requested phase 18 presets as valid policies" {
         defer loaded.deinit();
         try policy_mod.validate.policy(&loaded);
     }
+}
+
+test "init un-quiet success lists one next: ryk doctor" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var stdout_buf: [2048]u8 = undefined;
+    var stderr_buf: [512]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+
+    const code = try command(std.testing.io, tmp.dir, &.{}, &stdout_writer, &stderr_writer);
+    try std.testing.expectEqual(exit_codes.success, code);
+    const out = stdout_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "Next: ryk doctor") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "ryk policy check") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "ryk run --") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, style.Glyph.check ++ " Created") != null);
+    try std.testing.expectEqualStrings("", stderr_writer.buffered());
 }
 
 test "init --mode overrides only top-level policy mode and writes parseable YAML" {
@@ -413,22 +432,13 @@ test "init rejects invalid preset names clearly" {
 
 // ---------------------------------------------------------------------------
 // AINA P3 S5 — init path discovery refresh (DIS-1 / DIS-7)
-// Plan §3.6: `ryk init` runs adapters for detected hosts and refreshes managed file.
+// `ryk init` runs adapters for detected hosts and refreshes managed file.
 //
-// Expected production API (implementer lands in init.zig; may share body with
-// start.zig via `@import("init.zig")` from start — do NOT import start from init):
-//
-//   pub fn refreshManagedDiscovery(
-//       io: std.Io,
-//       allocator: std.mem.Allocator,
-//       workspace_root: []const u8,
-//       home: []const u8,
-//       host_keys: []const []const u8,
-//   ) !void
-//
-// Product wire: after policy write, call refresh for known adapter keys
-// (pi/opencode minimum) using parent HOME + abs workspace_root. Soft-skip when
-// no auth configs. Never wipe user policy allows on rediscovery.
+// refreshManagedDiscovery is re-exported from policy/network_discovered (both
+// init and start re-export the same function; neither imports the other). After
+// policy write, call refresh for known adapter keys (pi/opencode minimum) using
+// parent HOME + abs workspace_root. Soft-skip when no auth configs. Never wipe
+// user policy allows on rediscovery.
 // ---------------------------------------------------------------------------
 
 const p3_init_pi_auth_json =

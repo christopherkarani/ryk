@@ -11,6 +11,7 @@ pub const run_command = @import("run.zig");
 pub const run_os_sandbox = @import("run_os_sandbox.zig");
 pub const env_schema_command = @import("env_schema.zig");
 pub const host_launch = @import("host_launch.zig");
+pub const host_ask_resume = @import("host_ask_resume.zig");
 pub const init = @import("init.zig");
 pub const doctor = @import("doctor.zig");
 pub const policy = @import("policy.zig");
@@ -41,6 +42,9 @@ pub const quickstart = @import("quickstart.zig");
 pub const decide = @import("decide.zig");
 pub const evaluate = @import("evaluate.zig");
 pub const hook = @import("hook.zig");
+pub const hook_ipc = @import("hook_ipc.zig");
+pub const hook_serve = @import("hook_serve.zig");
+pub const hook_client = @import("hook_client.zig");
 pub const dashboard_command = @import("dashboard.zig");
 pub const report = @import("report.zig");
 pub const ci = @import("ci.zig");
@@ -93,11 +97,12 @@ test {
     _ = pi_install;
     _ = grok_install;
     _ = plugin_install;
+    _ = interactive;
     _ = plugin;
     _ = @import("openclaw_status.zig");
     _ = start;
     _ = unattended;
-    _ = init; // AINA P3 refreshManagedDiscovery suite (was transitively linked via start→init)
+    _ = init; // AINA P3 refreshManagedDiscovery suite (init re-exports the policy seam)
     _ = setup;
     _ = quickstart;
     _ = help;
@@ -114,9 +119,13 @@ test {
     _ = daemon.errors;
     _ = shutdown;
     _ = shell_eval;
+    _ = @import("host_wire_rewrite.zig");
     _ = scan_command;
     // Pull hook.zig tests (daemon evaluate → HookResponse, strict refuse, redaction).
     _ = hook;
+    _ = @import("hook_ipc.zig");
+    _ = @import("hook_serve.zig");
+    _ = @import("hook_client.zig");
     // Grok deny reason smart-shrink (pure formatter; also imported by hook.zig).
     _ = @import("grok_deny_reason.zig");
     _ = shell_test;
@@ -163,6 +172,12 @@ test {
     _ = replay;
 }
 
+test "host_ask_resume matrix" {
+    _ = host_ask_resume;
+    _ = start;
+    _ = host_launch;
+}
+
 pub const version = build_options.version;
 
 /// Suggests a close command name for typos / prefixes. Returns null for no good match.
@@ -172,20 +187,13 @@ fn suggestCommand(unknown: []const u8) ?[]const u8 {
     return suggestions.closest(unknown, &names);
 }
 
-/// Commands that render their own branded header internally and so must NOT
-/// receive the shared entry banner (would double-print).
-/// `scan` keeps the progress phase banner-free (spinner only); durable brand
-/// lives on the result scorecard / alt-screen TUI header.
-const self_banner_commands = [_][]const u8{ "version", "--version", "help", "run", "start", "agents", "scan" };
-
 /// Commands whose output is always machine/raw (JSON, generated scripts, export
 /// lines, long-running servers) — never receive the human brand banner.
 const always_machine_commands = [_][]const u8{
-    "evaluate", "hook", "shim", "completions", "env", "dashboard", "cloud", "telemetry", "--print-install-env",
+    "evaluate", "hook", "hook-serve", "shim", "completions", "env", "dashboard", "cloud", "telemetry", "--print-install-env",
     // Zig-native shell tools (formerly daemon-proxied): keep machine/banner-free.
-    // `explain` is human pretty by default (DCG-class colors); machine only via
-    // `--format json` (isMachineArgv). Own header is `RYK EXPLAIN` (no brand banner).
-    "test",
+    // `explain` / `test` are human pretty by default; machine only via
+    // `--format json` (isMachineArgv). Banner stays off in shouldShowBanner.
 };
 
 fn isAlwaysMachineCommand(command: []const u8) bool {
@@ -238,68 +246,21 @@ fn isMachineArgv(argv: []const []const u8) bool {
     return false;
 }
 
-/// True when the compact brand banner should open this invocation. The banner
-/// is a presentation-only header; it never appears on `--json`/machine/raw paths
-/// (byte-identity invariant) nor on `--help`/`help <cmd>` reference output.
+/// Process-level brand banner is retired (#215). Always false so ordinary
+/// commands, `--quiet`, `--no-rich`, pipes, and errors stay quiet. Version and
+/// top-level help render their own headers; start/run/scan own session cards.
+/// Kept as a documented no-op so `machine_output` stays
+/// `!shouldShowBanner(...) and (machine | always-machine | raw)` — those
+/// predicates alone decide theme. Do not add doctor/policy/human packs to
+/// `always_machine_commands`.
 fn shouldShowBanner(command: []const u8, argv: []const []const u8) bool {
-    // Self-banner commands render their own header (version key-value grid, top
-    // help redesign, run session banner). Host launch aliases rewrite into run.
-    for (self_banner_commands) |s| {
-        if (std.mem.eql(u8, command, s)) return false;
-    }
-    // `ryk explain` owns its DCG-style header; never double-print brand banner.
-    if (std.mem.eql(u8, command, "explain")) return false;
-    if (host_launch.isHostLaunchAlias(command)) return false;
-    // `decide` is a frozen machine API by default. Only its explicit human
-    // output mode participates in shared presentation, even though JSON/stdin
-    // are still the input transports.
-    if (std.mem.eql(u8, command, "decide")) {
-        for (argv[1..]) |arg| {
-            if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) return false;
-        }
-        for (argv[1..]) |arg| if (std.mem.eql(u8, arg, "--human")) return true;
-        return false;
-    }
-    // Reports are generated/export surfaces and never receive a banner, but
-    // human error remediation remains presentation-capable. JSON is still
-    // classified as machine output by isMachineArgv.
-    if (std.mem.eql(u8, command, "report")) return false;
-    // `history --live` is intercepted by the Zig CLI before daemon passthrough.
-    // Treat its non-TTY rejection as a human surface so it matches `replay --tui`,
-    // while keeping machine conflicts/banner-free JSON byte contracts raw.
-    if (std.mem.eql(u8, command, "history")) {
-        var live = false;
-        var i: usize = 1;
-        while (i < argv.len) : (i += 1) {
-            const a = argv[i];
-            if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) return false;
-            if (std.mem.eql(u8, a, "--json") or std.mem.eql(u8, a, "--robot") or
-                std.mem.eql(u8, a, "--stdin")) return false;
-            if (std.mem.eql(u8, a, "--format") and i + 1 < argv.len and std.mem.eql(u8, argv[i + 1], "json")) return false;
-            if (std.mem.eql(u8, a, "--live")) live = true;
-        }
-        if (live) return true;
-    }
-    if (isRawGeneratedInvocation(command, argv) or isRawPassthroughInvocation(command, argv)) return false;
-    // Always-machine / raw / server commands.
-    if (isAlwaysMachineCommand(command)) return false;
-    // `help <cmd>` is command-specific reference help (no banner); bare `help`
-    // is top help and renders its own banner inside help.write.
-    if (std.mem.eql(u8, command, "help")) return false;
-    // Scan subcommand args (argv[1..]) for machine/help tokens.
-    var i: usize = 1;
-    while (i < argv.len) : (i += 1) {
-        const a = argv[i];
-        if (std.mem.eql(u8, a, "--json") or std.mem.eql(u8, a, "--stdin")) return false;
-        if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) return false;
-        if (std.mem.eql(u8, a, "--format") and i + 1 < argv.len and std.mem.eql(u8, argv[i + 1], "json")) return false;
-    }
-    // Unknown commands get no banner (error path); the brand header belongs only
-    // to recognised human commands.
-    return help.findCommand(command) != null;
+    _ = command;
+    _ = argv;
+    return false;
 }
 
 fn writeInvocationPresentation(io: std.Io, command: []const u8, argv: []const []const u8, stdout: anytype) !void {
+    // Documented no-op: process-level banner never prints (#215).
     if (shouldShowBanner(command, argv)) try tui.render.banner(io, stdout, version, null);
 }
 
@@ -377,6 +338,9 @@ fn runWithCwdUsing(
     if (argv.len > 0 and std.mem.eql(u8, argv[0], "hook")) {
         return hook.command(io, argv[1..], stdout, stderr);
     }
+    if (argv.len > 0 and std.mem.eql(u8, argv[0], "hook-serve")) {
+        return hook_serve.command(io, argv[1..], stdout, stderr);
+    }
     const no_rich_env = tui.output_policy.envDisablesRich(
         environ_map.get("RYK_NO_RICH"),
     );
@@ -413,10 +377,8 @@ fn runWithCwdUsing(
     }
 
     const command = argv[0];
-    // Compact brand header at the entry of every HUMAN command (Phase 2 brand
-    // cohesion). Suppressed for self-banner commands (version/help/run render
-    // their own header), always-machine/raw commands, --json/--stdin/--format
-    // json machine paths, --help reference output, and unknown commands.
+    // Process-level banner is a no-op (#215). Version / top-level help / start /
+    // run / scan still render their own headers inside those commands.
     try writeInvocationPresentation(io, command, argv, stdout);
     if (std.mem.eql(u8, command, "help")) {
         if (argv.len == 1) {
@@ -516,7 +478,13 @@ fn runWithCwdUsing(
         return exit_codes.success;
     }
     if (std.mem.eql(u8, command, "env")) {
-        if (argv.len > 1) return env_schema_command.command(io, argv[1..], stdout, stderr);
+        if (argv.len > 1) {
+            if (argv.len == 2 and (std.mem.eql(u8, argv[1], "--help") or std.mem.eql(u8, argv[1], "-h"))) {
+                _ = try help.writeCommand(io, stdout, "env");
+                return exit_codes.success;
+            }
+            return env_schema_command.command(io, argv[1..], stdout, stderr);
+        }
         try writeInstallEnv(io, stdout);
         return exit_codes.success;
     }
@@ -558,6 +526,7 @@ fn runWithCwdUsing(
     if (std.mem.eql(u8, command, "decide")) return decide.command(io, argv[1..], stdout, stderr);
     if (std.mem.eql(u8, command, "evaluate")) return evaluate.command(io, argv[1..], stdout, stderr);
     if (std.mem.eql(u8, command, "hook")) return hook.command(io, argv[1..], stdout, stderr);
+    if (std.mem.eql(u8, command, "hook-serve")) return hook_serve.command(io, argv[1..], stdout, stderr);
     if (std.mem.eql(u8, command, "dashboard")) return dashboard_command.command(io, argv[1..], stdout, stderr);
     if (std.mem.eql(u8, command, "cloud")) return dashboard_command.commandCloud(io, argv[1..], stdout, stderr);
     if (std.mem.eql(u8, command, "report")) return report.command(io, argv[1..], stdout, stderr);
@@ -780,10 +749,12 @@ test "help output is grouped, complete, and excludes hidden commands" {
     try std.testing.expect(std.mem.indexOf(u8, output, "ryk explain") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "ryk replay") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "help --all") != null);
-    // Phase 7 Task E: the --no-rich / RYK_NO_RICH escape hatch is discoverable
+    // The --no-rich / RYK_NO_RICH escape hatch is discoverable
     // from the top-level help (global-options surface).
     try std.testing.expect(std.mem.indexOf(u8, output, "Global options") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "--no-rich") != null);
+    // --json is per-command, not a working `ryk --json <cmd>` prefix.
+    try std.testing.expect(std.mem.indexOf(u8, output, "    --json") == null);
     // Hidden internal command absent
     try std.testing.expect(std.mem.indexOf(u8, output, "shim") == null);
     try std.testing.expectEqualStrings("", stderr_writer.buffered());
@@ -1311,11 +1282,12 @@ test "human parser invalid values sanitize terminal controls and suggest valid v
 }
 
 // ---------------------------------------------------------------------------
-// Phase 2 TDD: brand cohesion banner system (written FIRST — RED).
-// The compact `🛡  ryk · v<version>` header must open every HUMAN command,
-// be suppressed for --json / raw / machine / help-reference paths, and stay
-// byte-identical on --json. Banner marker in the plain-text degrade path is
-// the literal `🛡  ryk` glyph run (colour is suppressed under builtin.is_test).
+// Process-level brand banner is retired (#215).
+// Ordinary commands, `--quiet`, `--no-rich`, pipes, and errors must not print
+// `🛡  ryk · v<version>`. Brand stays on `version` / `--version` and top-level
+// help only; start/run/scan still own their session headers. `--json` stays
+// byte-identical. Marker in the plain-text degrade path is the literal
+// `🛡  ryk` glyph run (colour is suppressed under builtin.is_test).
 // ---------------------------------------------------------------------------
 
 test "version human path renders brand banner and key-value grid" {
@@ -1395,9 +1367,85 @@ test "banner renders on a human command (doctor)" {
     const code = try testRun(&.{"doctor"}, &stdout_writer, &stderr_writer);
     try std.testing.expectEqual(exit_codes.success, code);
     const out = stdout_writer.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, out, "\u{1F6E1}  ryk") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\u{1F6E1}") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "Summary:") != null);
     try std.testing.expectEqualStrings("", stderr_writer.buffered());
+}
+
+test "shouldShowBanner is false for ordinary human commands" {
+    try std.testing.expect(!shouldShowBanner("doctor", &.{"doctor"}));
+    try std.testing.expect(!shouldShowBanner("doctor", &.{ "doctor", "--quiet" }));
+    try std.testing.expect(!shouldShowBanner("init", &.{"init"}));
+    try std.testing.expect(!shouldShowBanner("init", &.{ "init", "--quiet" }));
+    try std.testing.expect(!shouldShowBanner("init", &.{ "init", "--preset", "generic-agent" }));
+    try std.testing.expect(!shouldShowBanner("init", &.{ "init", "--preset", "generic-agent", "--quiet" }));
+    try std.testing.expect(!shouldShowBanner("init", &.{ "init", "--force", "--quiet" }));
+    try std.testing.expect(!shouldShowBanner("policy", &.{ "policy", "check" }));
+    try std.testing.expect(!shouldShowBanner("feedback", &.{"feedback"}));
+    try std.testing.expect(!shouldShowBanner("plugin", &.{"plugin"}));
+    // `--no-rich` is stripped before this helper; process banner still must not print.
+    try std.testing.expect(!shouldShowBanner("doctor", &.{ "--no-rich", "doctor" }));
+}
+
+test "shouldShowBanner is false for init --quiet" {
+    try std.testing.expect(!shouldShowBanner("init", &.{ "init", "--quiet" }));
+    try std.testing.expect(!shouldShowBanner("init", &.{ "init", "--preset", "generic-agent", "--quiet" }));
+    try std.testing.expect(!shouldShowBanner("init", &.{ "init", "--force", "--quiet" }));
+    try std.testing.expect(!shouldShowBanner("init", &.{"init"}));
+    try std.testing.expect(!shouldShowBanner("init", &.{ "init", "--preset", "generic-agent" }));
+}
+
+test "shouldShowBanner is false for doctor --quiet" {
+    try std.testing.expect(!shouldShowBanner("doctor", &.{ "doctor", "--quiet" }));
+}
+
+test "init --quiet has no process-level banner" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var stdout_buf: [4096]u8 = undefined;
+    var stderr_buf: [1024]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+
+    const code = try testRunWithCwd(tmp.dir, &.{ "init", "--quiet" }, &stdout_writer, &stderr_writer);
+    try std.testing.expectEqual(exit_codes.success, code);
+    const out = stdout_writer.buffered();
+    const err = stderr_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "\u{1F6E1}") == null);
+    try std.testing.expect(std.mem.indexOf(u8, err, "\u{1F6E1}") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Created") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Next") == null);
+    try std.testing.expectEqualStrings("", out);
+    try std.testing.expectEqualStrings("", err);
+}
+
+test "init without --quiet has no process-level banner" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var stdout_buf: [4096]u8 = undefined;
+    var stderr_buf: [1024]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+
+    const code = try testRunWithCwd(tmp.dir, &.{"init"}, &stdout_writer, &stderr_writer);
+    try std.testing.expectEqual(exit_codes.success, code);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "\u{1F6E1}") == null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "\u{1F6E1}") == null);
+}
+
+test "doctor --no-rich has no process-level banner" {
+    var stdout_buf: [16384]u8 = undefined;
+    var stderr_buf: [256]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+
+    const code = try testRun(&.{ "--no-rich", "doctor" }, &stdout_writer, &stderr_writer);
+    try std.testing.expectEqual(exit_codes.success, code);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "\u{1F6E1}") == null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "\u{1F6E1}") == null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "Summary:") != null);
 }
 
 test "start owns its onboarding banner" {
@@ -1423,6 +1471,75 @@ test "banner suppressed for raw env output" {
     try std.testing.expect(std.mem.indexOf(u8, out, "PATH") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\u{1F6E1}  ryk") == null);
     try std.testing.expectEqualStrings("", stderr_writer.buffered());
+}
+
+test "env --help exits 0 and names eval verbs" {
+    var stdout_buf: [4096]u8 = undefined;
+    var stderr_buf: [256]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+
+    const code = try testRun(&.{ "env", "--help" }, &stdout_writer, &stderr_writer);
+    try std.testing.expectEqual(exit_codes.success, code);
+    const out = stdout_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "eval \"$(ryk env)\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "schema --agent") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "export PATH=") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "set \"PATH=") == null);
+
+    stdout_writer = .fixed(&stdout_buf);
+    stderr_writer = .fixed(&stderr_buf);
+    const short_code = try testRun(&.{ "env", "-h" }, &stdout_writer, &stderr_writer);
+    try std.testing.expectEqual(exit_codes.success, short_code);
+    const short_out = stdout_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, short_out, "eval \"$(ryk env)\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, short_out, "schema --agent") != null);
+}
+
+test "env schema --help exits 0 and is not usage-as-error" {
+    var stdout_buf: [4096]u8 = undefined;
+    var stderr_buf: [256]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+
+    const cases = [_][]const []const u8{
+        &.{ "env", "schema", "--help" },
+        &.{ "env", "schema", "-h" },
+        &.{ "env", "schema", "--agent", "--help" },
+    };
+    for (cases) |argv| {
+        stdout_writer = .fixed(&stdout_buf);
+        stderr_writer = .fixed(&stderr_buf);
+        const code = try testRun(argv, &stdout_writer, &stderr_writer);
+        try std.testing.expectEqual(exit_codes.success, code);
+        try std.testing.expectEqualStrings("", stderr_writer.buffered());
+        const out = stdout_writer.buffered();
+        try std.testing.expect(out.len > 0);
+        try std.testing.expect(std.mem.indexOf(u8, out, "schema --agent") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "export PATH=") == null);
+    }
+}
+
+test "env schema without --agent stays usage" {
+    var stdout_buf: [4096]u8 = undefined;
+    var stderr_buf: [256]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+
+    const cases = [_][]const []const u8{
+        &.{ "env", "schema" },
+        &.{ "env", "--agent" },
+    };
+    for (cases) |argv| {
+        stdout_writer = .fixed(&stdout_buf);
+        stderr_writer = .fixed(&stderr_buf);
+        const code = try testRun(argv, &stdout_writer, &stderr_writer);
+        try std.testing.expectEqual(exit_codes.usage, code);
+        try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "Usage: ryk env schema --agent") != null);
+        const out = stdout_writer.buffered();
+        try std.testing.expect(std.mem.indexOf(u8, out, "eval \"$(ryk env)\"") == null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "export PATH=") == null);
+    }
 }
 
 test "banner suppressed for completions raw output" {
@@ -1471,29 +1588,37 @@ test "top-level MCP generated surfaces preserve exact bytes" {
     ;
     const expected_trust =
         \\Direct policy mutation is not implemented for this command.
-        \\Add this snippet to your policy after reviewing the server manifest:
+        \\Add this snippet to .ryk/policy.yaml after reviewing the server manifest:
         \\
         \\mcp:
         \\  allow:
         \\    - "demo.read"
         \\
     ;
-    inline for (.{
-        .{ .argv = &.{ "mcp", "manifest", "generate", "--server", "demo" }, .expected = expected_manifest },
-        .{ .argv = &.{ "mcp", "trust", "demo", "--tool", "read" }, .expected = expected_trust },
-    }) |case| {
+    // manifest generate stays success; mcp trust is nonzero (#293) with stderr pointer.
+    {
         var stdout_buf: [2048]u8 = undefined;
         var stderr_buf: [512]u8 = undefined;
         var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
         var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
-        try std.testing.expectEqual(exit_codes.success, try testRun(case.argv, &stdout_writer, &stderr_writer));
-        try std.testing.expectEqualStrings(case.expected, stdout_writer.buffered());
+        try std.testing.expectEqual(exit_codes.success, try testRun(&.{ "mcp", "manifest", "generate", "--server", "demo" }, &stdout_writer, &stderr_writer));
+        try std.testing.expectEqualStrings(expected_manifest, stdout_writer.buffered());
         try std.testing.expectEqualStrings("", stderr_writer.buffered());
+    }
+    {
+        var stdout_buf: [2048]u8 = undefined;
+        var stderr_buf: [512]u8 = undefined;
+        var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+        var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+        try std.testing.expectEqual(exit_codes.general, try testRun(&.{ "mcp", "trust", "demo", "--tool", "read" }, &stdout_writer, &stderr_writer));
+        try std.testing.expectEqualStrings(expected_trust, stdout_writer.buffered());
+        try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "does not mutate policy") != null);
+        try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "policy.yaml") != null);
     }
 }
 
 test "history live human rejection gets a banner while machine conflict stays raw" {
-    try std.testing.expect(shouldShowBanner("history", &.{ "history", "--live" }));
+    try std.testing.expect(!shouldShowBanner("history", &.{ "history", "--live" }));
     try std.testing.expect(!shouldShowBanner("history", &.{ "history", "--live", "--json" }));
     try std.testing.expect(!shouldShowBanner("history", &.{ "history", "--live", "--robot" }));
 }
@@ -1569,8 +1694,8 @@ test "public dispatch preserves MCP protocol bytes; Zig-native test/explain no l
 /// Shared short-unavailable contract for hide-list + unfinished P0 verbs.
 /// Plan shape (flexible): `command '…' is not available` + `Run 'ryk help'…`, usage exit,
 /// no multi-line Rust-daemon essay. `require_empty_stdout` is true for raw-passthrough
-/// routes (daemon proxy / local-mutator); false for bare human-ish stubs like `packs`
-/// where brand banner may still hit stdout before the unavailable handler.
+/// routes (daemon proxy / local-mutator); false for bare human-ish stubs like `packs`.
+/// Process-level brand banner must not appear on stdout.
 fn expectShortUnavailable(
     command: []const u8,
     code: u8,
@@ -1579,10 +1704,11 @@ fn expectShortUnavailable(
     require_empty_stdout: bool,
 ) !void {
     try std.testing.expectEqual(exit_codes.usage, code);
+    try std.testing.expect(std.mem.indexOf(u8, stdout, "\u{1F6E1}") == null);
     if (require_empty_stdout) {
         try std.testing.expectEqualStrings("", stdout);
     } else {
-        // Banner may appear; long daemon essay must not land on stdout either.
+        // Process banner must not appear; long daemon essay must not land on stdout either.
         try std.testing.expect(std.mem.indexOf(u8, stdout, "not yet ported") == null);
         try std.testing.expect(std.mem.indexOf(u8, stdout, "Rust daemon") == null);
         try std.testing.expect(std.mem.indexOf(u8, stdout, "threat-model") == null);
@@ -1595,8 +1721,13 @@ fn expectShortUnavailable(
     try std.testing.expect(std.mem.indexOf(u8, stderr, "not yet ported") == null);
     try std.testing.expect(std.mem.indexOf(u8, stderr, "Rust daemon") == null);
     try std.testing.expect(std.mem.indexOf(u8, stderr, "threat-model") == null);
-    // Keep the message short (plan: ~two lines; one short notice + usage hint).
-    try std.testing.expect(stderr.len < 200);
+    // Keep hide-list messages short. history gets an extra migration line (#289).
+    if (std.mem.eql(u8, command, "history")) {
+        try std.testing.expect(stderr.len < 320);
+        try std.testing.expect(std.mem.indexOf(u8, stderr, "ryk replay") != null);
+    } else {
+        try std.testing.expect(stderr.len < 200);
+    }
 }
 
 test "P0 honesty: hide-list command yields short not-available and usage exit" {
@@ -1942,7 +2073,7 @@ test "banner suppressed on machine proxy path (packs --format json)" {
 }
 
 test "decide human mode gets a banner while default JSON remains machine output" {
-    try std.testing.expect(shouldShowBanner("decide", &.{ "decide", "command", "--human", "--json", "{}" }));
+    try std.testing.expect(!shouldShowBanner("decide", &.{ "decide", "command", "--human", "--json", "{}" }));
     try std.testing.expect(!shouldShowBanner("decide", &.{ "decide", "command", "--json", "{}" }));
     try std.testing.expect(!shouldShowBanner("decide", &.{ "decide", "command", "--human", "--stdin", "--help" }));
 }
@@ -2059,7 +2190,7 @@ test "banner suppressed on subcommand --help (doctor --help)" {
 }
 
 // ---------------------------------------------------------------------------
-// TDD tests for "Did you mean?" suggestions (written FIRST — RED, foundation work)
+// "Did you mean?" suggestion tests
 // ---------------------------------------------------------------------------
 
 test "unknown command suggests typo correction" {
@@ -2310,10 +2441,24 @@ test "policy command rejects unknown subcommands" {
 
     const code = try testRun(&.{ "policy", "--bad" }, &stdout_writer, &stderr_writer);
     try std.testing.expectEqual(exit_codes.usage, code);
-    // The brand banner opens the command (presentation only); the usage error
+    // Process-level banner must not print on usage errors; the usage error
     // still goes to stderr.
-    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "\u{1F6E1}  ryk") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "\u{1F6E1}") == null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "\u{1F6E1}") == null);
     try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "unknown subcommand") != null);
+}
+
+test "policy missing-file usage has no process-level banner" {
+    var stdout_buf: [512]u8 = undefined;
+    var stderr_buf: [512]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+
+    const code = try testRun(&.{ "policy", "check", "/no/such/ryk-policy-check-missing.yaml" }, &stdout_writer, &stderr_writer);
+    try std.testing.expectEqual(exit_codes.general, code);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "\u{1F6E1}") == null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "\u{1F6E1}") == null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "invalid policy") != null);
 }
 
 test "run dispatch launches child command" {
@@ -2335,9 +2480,7 @@ test "run dispatch launches child command" {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 3 TDD tests: messaging and help text updates for guided onboarding
-// These tests are written FIRST (RED). They will fail until help text is updated
-// to describe the new default guided behavior and de-emphasize --yes.
+// Messaging and help text updates for guided onboarding
 // ---------------------------------------------------------------------------
 
 test "start help does not advertise protection grade menu or --protection" {

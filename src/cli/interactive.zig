@@ -52,9 +52,12 @@ pub fn runMultiSelect(
 
     const owned = try list.toOwnedSlice(allocator);
     list = .empty;
+    // Ownership transferred out of list — free on any error before return (M002).
+    var result: MultiSelectResult = .{ .items = owned, .confirmed = false };
+    errdefer deinitMultiSelectResult(&result, allocator);
 
     try stdout.writeAll("\nDetected agent hosts:\n");
-    for (owned, 0..) |item, i| {
+    for (result.items, 0..) |item, i| {
         const marker = if (item.checked) "[x]" else "[ ]";
         try stdout.print("  {s} {d}) {s}\n", .{ marker, i + 1, item.label });
     }
@@ -69,12 +72,9 @@ pub fn runMultiSelect(
     };
     const input = std.mem.trim(u8, raw, " \t\r");
 
-    applyMultiSelectInput(owned, input);
-
-    return .{
-        .items = owned,
-        .confirmed = true,
-    };
+    applyMultiSelectInput(result.items, input);
+    result.confirmed = true;
+    return result;
 }
 
 fn flushIfSupported(writer: anytype) !void {
@@ -135,11 +135,15 @@ pub fn deinitMultiSelectResult(result: *MultiSelectResult, allocator: std.mem.Al
 /// Useful for logging / summaries in guided flows.
 pub fn getSelectedLabels(allocator: std.mem.Allocator, items: []const SelectionItem) ![][]const u8 {
     var list: std.ArrayList([]const u8) = .empty;
-    defer list.deinit(allocator);
+    errdefer {
+        for (list.items) |item| allocator.free(item);
+        list.deinit(allocator);
+    }
 
     for (items) |item| {
         if (item.checked) {
             const owned = try allocator.dupe(u8, item.label);
+            errdefer allocator.free(owned);
             try list.append(allocator, owned);
         }
     }
@@ -260,6 +264,20 @@ test "interactive: getSelectedLabels returns only checked items" {
     try std.testing.expectEqualStrings("OpenClaw", labels[1]);
 }
 
+fn getSelectedLabelsOomProbe(allocator: std.mem.Allocator) !void {
+    const items = [_]SelectionItem{
+        .{ .label = "one", .checked = true },
+        .{ .label = "two", .checked = true },
+    };
+    const labels = try getSelectedLabels(allocator, &items);
+    for (labels) |label| allocator.free(label);
+    allocator.free(labels);
+}
+
+test "interactive: getSelectedLabels does not leak on OOM" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, getSelectedLabelsOomProbe, .{});
+}
+
 test "interactive: deinitMultiSelectResult frees memory cleanly" {
     const allocator = std.testing.allocator;
 
@@ -306,7 +324,7 @@ test "interactive: runMultiSelect does not leak on allocation failure mid-initia
 }
 
 // ---------------------------------------------------------------------------
-// Phase 1: robust yes/no confirmation helper (TDD tests written FIRST)
+// Robust yes/no confirmation helper.
 // Replaces fragile single-char [0] == 'n' checks in uninstall/disable.
 // Supports full words, case-insensitive, re-prompt on garbage, default on empty.
 // Uses injected streams for full unit testability with fixedBufferStream.

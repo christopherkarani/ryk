@@ -16,7 +16,35 @@ pub fn feedPath(allocator: std.mem.Allocator, workspace_root: []const u8) ![]u8 
     return std.fs.path.join(allocator, &.{ workspace_root, ".ryk", feed_dir_name, feed_file_name });
 }
 
+pub const AppendOptions = struct {
+    sync: bool = true,
+    update_registry: bool = true,
+};
+
+/// Test-only: how many `file.sync` calls the feed writer issued.
+var test_sync_calls: usize = 0;
+
+fn maybeSync(io: std.Io, file: std.Io.File, do_sync: bool) !void {
+    if (!do_sync) return;
+    if (builtin.is_test) test_sync_calls += 1;
+    try file.sync(io);
+}
+
+fn isAllowDecision(decision: []const u8) bool {
+    return std.mem.eql(u8, decision, "allow") or std.mem.eql(u8, decision, "context_only");
+}
+
 pub fn appendRecord(io: std.Io, allocator: std.mem.Allocator, workspace_root: []const u8, record: rust_visibility.RustShellFeedRecord) !void {
+    return appendRecordWithOptions(io, allocator, workspace_root, record, .{});
+}
+
+pub fn appendRecordWithOptions(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    workspace_root: []const u8,
+    record: rust_visibility.RustShellFeedRecord,
+    opts: AppendOptions,
+) !void {
     const feed_dir = try std.fs.path.join(allocator, &.{ workspace_root, ".ryk", feed_dir_name });
     defer allocator.free(feed_dir);
     try std.Io.Dir.cwd().createDirPath(io, feed_dir);
@@ -24,10 +52,16 @@ pub fn appendRecord(io: std.Io, allocator: std.mem.Allocator, workspace_root: []
     const feed_path = try feedPath(allocator, workspace_root);
     defer allocator.free(feed_path);
 
-    try appendRecordAtPath(io, allocator, feed_path, record);
+    try appendRecordAtPath(io, allocator, feed_path, record, opts.sync);
 }
 
-fn appendRecordAtPath(io: std.Io, allocator: std.mem.Allocator, path: []const u8, record: rust_visibility.RustShellFeedRecord) !void {
+fn appendRecordAtPath(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    record: rust_visibility.RustShellFeedRecord,
+    do_sync: bool,
+) !void {
     var file = try std.Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = false, .lock = .exclusive });
     defer file.close(io);
     const end_offset = (try file.stat(io)).size;
@@ -43,7 +77,7 @@ fn appendRecordAtPath(io: std.Io, allocator: std.mem.Allocator, path: []const u8
     defer allocator.free(bytes);
     try file_writer.interface.writeAll(bytes);
     try file_writer.interface.flush();
-    try file.sync(io);
+    try maybeSync(io, file, do_sync);
 }
 
 pub fn appendGlobalRecord(
@@ -51,6 +85,29 @@ pub fn appendGlobalRecord(
     allocator: std.mem.Allocator,
     dashboard_root: []const u8,
     record: rust_visibility.RustShellFeedRecord,
+) !void {
+    return appendGlobalRecordWithOptions(io, allocator, dashboard_root, record, .{});
+}
+
+fn appendGlobalRecordWithSync(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    dashboard_root: []const u8,
+    record: rust_visibility.RustShellFeedRecord,
+    sync_after: bool,
+) !void {
+    return appendGlobalRecordWithOptions(io, allocator, dashboard_root, record, .{
+        .sync = sync_after,
+        .update_registry = true,
+    });
+}
+
+pub fn appendGlobalRecordWithOptions(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    dashboard_root: []const u8,
+    record: rust_visibility.RustShellFeedRecord,
+    opts: AppendOptions,
 ) !void {
     try std.Io.Dir.cwd().createDirPath(io, dashboard_root);
 
@@ -64,18 +121,21 @@ pub fn appendGlobalRecord(
     const events_path = try std.fs.path.join(allocator, &.{ dashboard_root, global_events_file_name });
     defer allocator.free(events_path);
     try rotateGlobalFeedIfNeeded(io, allocator, dashboard_root, events_path);
-    try appendRecordAtPath(io, allocator, events_path, record);
-    try updateWorkspaceRegistry(io, allocator, dashboard_root, record);
+    try appendRecordAtPath(io, allocator, events_path, record, opts.sync);
+    if (opts.update_registry) {
+        try updateWorkspaceRegistry(io, allocator, dashboard_root, record);
+    }
 }
 
 fn rotateGlobalFeedIfNeeded(io: std.Io, allocator: std.mem.Allocator, dashboard_root: []const u8, events_path: []const u8) !void {
-    const file = std.Io.Dir.cwd().openFile(io, events_path, .{}) catch |err| switch (err) {
-        error.FileNotFound => return,
-        else => return err,
+    const size = blk: {
+        const file = std.Io.Dir.cwd().openFile(io, events_path, .{}) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
+        defer file.close(io);
+        break :blk (try file.stat(io)).size;
     };
-    errdefer file.close(io);
-    const size = (try file.stat(io)).size;
-    file.close(io);
     if (size < core.limits.max_dashboard_feed_len) return;
 
     const rotated_path = try std.fs.path.join(allocator, &.{ dashboard_root, rotated_global_events_file_name });
@@ -88,12 +148,19 @@ fn rotateGlobalFeedIfNeeded(io: std.Io, allocator: std.mem.Allocator, dashboard_
 }
 
 /// Best-effort GUI feed write. Feed persistence must not affect hook/run fail-closed behavior.
+/// Hook/evaluate callers skip `file.sync` and do not rewrite `workspaces.json` on allow.
 pub fn appendRecordBestEffort(io: std.Io, allocator: std.mem.Allocator, workspace_root: []const u8, record: rust_visibility.RustShellFeedRecord) void {
-    appendRecord(io, allocator, workspace_root, record) catch {};
+    const opts = AppendOptions{
+        .sync = false,
+        .update_registry = !isAllowDecision(record.decision),
+    };
+    appendRecordWithOptions(io, allocator, workspace_root, record, opts) catch {};
     if (processGlobalWritesDisabled()) return;
     const dashboard_root = resolveGlobalDashboardRoot(allocator) catch return;
     defer allocator.free(dashboard_root);
-    appendGlobalRecord(io, allocator, dashboard_root, record) catch {};
+    // Hook path: keep the exclusive lock, skip events.jsonl fsync. Allow
+    // decisions skip the workspace registry rewrite.
+    appendGlobalRecordWithOptions(io, allocator, dashboard_root, record, opts) catch {};
 }
 
 pub fn processGlobalWritesDisabled() bool {
@@ -505,42 +572,64 @@ fn loadRecentFromPath(
     };
 }
 
-fn parseFeedRecord(allocator: std.mem.Allocator, line: []const u8, fallback_workspace_root: ?[]const u8) !rust_visibility.RustShellFeedRecord {
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
-    defer parsed.deinit();
-    if (parsed.value != .object) return error.InvalidFeedRecord;
+const FeedRecordJson = struct {
+    timestamp: []const u8,
+    workspace_root: ?[]const u8 = null,
+    event_type: []const u8,
+    decision: []const u8,
+    decision_source: []const u8,
+    event_source: []const u8,
+    host: ?[]const u8 = null,
+    daemon_status: []const u8,
+    pack_id: ?[]const u8 = null,
+    rule: ?[]const u8 = null,
+    severity: ?[]const u8 = null,
+    reason: []const u8,
+    remediation: ?[]const u8 = null,
+    target_summary: []const u8,
+    session_id: ?[]const u8 = null,
+    verified: bool = false,
+};
 
-    const object = parsed.value.object;
-    const timestamp = try dupRequiredString(allocator, object, "timestamp");
+fn parseFeedRecord(allocator: std.mem.Allocator, line: []const u8, fallback_workspace_root: ?[]const u8) !rust_visibility.RustShellFeedRecord {
+    // Typed parse avoids a json.Value object map + per-field lookups (#402).
+    const parsed = std.json.parseFromSlice(FeedRecordJson, allocator, line, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    }) catch return error.InvalidFeedRecord;
+    defer parsed.deinit();
+    const v = parsed.value;
+
+    const timestamp = try allocator.dupe(u8, v.timestamp);
     errdefer allocator.free(timestamp);
-    const workspace_root = try dupWorkspaceRoot(allocator, object, fallback_workspace_root);
+    const workspace_root = try dupWorkspaceRoot(allocator, v.workspace_root, fallback_workspace_root);
     errdefer allocator.free(workspace_root);
     validateFeedWorkspaceRoot(workspace_root) catch return error.InvalidFeedRecord;
-    const event_type = try dupRequiredString(allocator, object, "event_type");
+    const event_type = try allocator.dupe(u8, v.event_type);
     errdefer allocator.free(event_type);
-    const decision = try dupRequiredString(allocator, object, "decision");
+    const decision = try allocator.dupe(u8, v.decision);
     errdefer allocator.free(decision);
-    const decision_source = try dupRequiredString(allocator, object, "decision_source");
+    const decision_source = try allocator.dupe(u8, v.decision_source);
     errdefer allocator.free(decision_source);
-    const event_source = try dupRequiredString(allocator, object, "event_source");
+    const event_source = try allocator.dupe(u8, v.event_source);
     errdefer allocator.free(event_source);
-    const host = try dupOptionalString(allocator, object, "host");
+    const host = try dupeOptional(allocator, v.host);
     errdefer if (host) |value| allocator.free(value);
-    const daemon_status = try dupRequiredString(allocator, object, "daemon_status");
+    const daemon_status = try allocator.dupe(u8, v.daemon_status);
     errdefer allocator.free(daemon_status);
-    const pack_id = try dupOptionalString(allocator, object, "pack_id");
+    const pack_id = try dupeOptional(allocator, v.pack_id);
     errdefer if (pack_id) |value| allocator.free(value);
-    const rule = try dupOptionalString(allocator, object, "rule");
+    const rule = try dupeOptional(allocator, v.rule);
     errdefer if (rule) |value| allocator.free(value);
-    const severity = try dupOptionalString(allocator, object, "severity");
+    const severity = try dupeOptional(allocator, v.severity);
     errdefer if (severity) |value| allocator.free(value);
-    const reason = try dupRequiredString(allocator, object, "reason");
+    const reason = try allocator.dupe(u8, v.reason);
     errdefer allocator.free(reason);
-    const remediation = try dupOptionalString(allocator, object, "remediation");
+    const remediation = try dupeOptional(allocator, v.remediation);
     errdefer if (remediation) |value| allocator.free(value);
-    const target_summary = try dupRequiredString(allocator, object, "target_summary");
+    const target_summary = try allocator.dupe(u8, v.target_summary);
     errdefer allocator.free(target_summary);
-    const session_id = try dupOptionalString(allocator, object, "session_id");
+    const session_id = try dupeOptional(allocator, v.session_id);
     errdefer if (session_id) |value| allocator.free(value);
     if (session_id) |value| {
         // Reject path segments before aggregate joins session_id into a filesystem
@@ -563,12 +652,17 @@ fn parseFeedRecord(allocator: std.mem.Allocator, line: []const u8, fallback_work
         .remediation = remediation,
         .target_summary = target_summary,
         .session_id = session_id,
-        .verified = readBoolField(object, "verified"),
+        .verified = v.verified,
     };
 }
 
-fn dupWorkspaceRoot(allocator: std.mem.Allocator, object: std.json.ObjectMap, fallback: ?[]const u8) ![]u8 {
-    if (try dupOptionalString(allocator, object, "workspace_root")) |root| return root;
+fn dupeOptional(allocator: std.mem.Allocator, value: ?[]const u8) !?[]u8 {
+    const text = value orelse return null;
+    return try allocator.dupe(u8, text);
+}
+
+fn dupWorkspaceRoot(allocator: std.mem.Allocator, from_record: ?[]const u8, fallback: ?[]const u8) ![]u8 {
+    if (from_record) |root| return allocator.dupe(u8, root);
     if (fallback) |root| return allocator.dupe(u8, root);
     return error.InvalidFeedRecord;
 }
@@ -588,24 +682,6 @@ fn validateFeedWorkspaceRoot(value: []const u8) !void {
         }
         if (std.mem.eql(u8, part, "..") or std.mem.eql(u8, part, ".")) return error.InvalidFeedRecord;
     }
-}
-
-fn dupRequiredString(allocator: std.mem.Allocator, object: std.json.ObjectMap, field: []const u8) ![]u8 {
-    const value = object.get(field) orelse return error.InvalidFeedRecord;
-    if (value != .string) return error.InvalidFeedRecord;
-    return try allocator.dupe(u8, value.string);
-}
-
-fn dupOptionalString(allocator: std.mem.Allocator, object: std.json.ObjectMap, field: []const u8) !?[]u8 {
-    const value = object.get(field) orelse return null;
-    if (value == .null) return null;
-    if (value != .string) return error.InvalidFeedRecord;
-    return try allocator.dupe(u8, value.string);
-}
-
-fn readBoolField(object: std.json.ObjectMap, field: []const u8) bool {
-    const value = object.get(field) orelse return false;
-    return value == .bool and value.bool;
 }
 
 test "feed writer round-trips rust shell decision without raw command" {
@@ -697,6 +773,16 @@ test "feed record ring retains newest entries with O(1) eviction" {
     try std.testing.expectEqual(@as(usize, 2), owned.len);
     try std.testing.expectEqualStrings("b", owned[0].record.reason);
     try std.testing.expectEqualStrings("c", owned[1].record.reason);
+}
+
+test "feed typed parse ignores unknown fields" {
+    const line =
+        \\{"timestamp":"2026-07-13T00:00:00Z","workspace_root":"/tmp/legacy","event_type":"command_denied","decision":"deny","decision_source":"rust-daemon","event_source":"hook","host":"codex","daemon_status":"healthy","pack_id":"core.shell","severity":"high","reason":"blocked","remediation":null,"target_summary":"shell command (redacted)","session_id":null,"verified":false,"extra_future_field":{"n":1}}
+    ;
+    var record = try parseFeedRecord(std.testing.allocator, line, null);
+    defer record.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("deny", record.decision);
+    try std.testing.expect(record.rule == null);
 }
 
 test "feed loader accepts legacy records without rule" {
@@ -845,6 +931,42 @@ test "global feed matching loader retains only bounded blocked records" {
     defer loaded.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 2), loaded.records.len);
     for (loaded.records) |item| try std.testing.expect(rust_visibility.isBlockedFeedRecord(item.record));
+}
+
+test "global feed append without fsync is still readable" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const dashboard_root = try std.fs.path.join(std.testing.allocator, &.{ root, "dashboard" });
+    defer std.testing.allocator.free(dashboard_root);
+
+    var record = try rust_visibility.buildFeedRecordFromHookDecision(
+        std.testing.allocator,
+        std.testing.io,
+        root,
+        "codex",
+        "healthy",
+        "deny",
+        "blocked",
+        null,
+        null,
+        null,
+        null,
+        null,
+    );
+    defer record.deinit(std.testing.allocator);
+    try appendGlobalRecordWithSync(std.testing.io, std.testing.allocator, dashboard_root, record, false);
+
+    var loaded = try loadGlobalRecentMatchingWithHealth(
+        std.testing.io,
+        std.testing.allocator,
+        dashboard_root,
+        1,
+        .blocked,
+    );
+    defer loaded.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), loaded.records.len);
 }
 
 test "feed loader accepts histories larger than 64 MiB by reading a bounded tail" {
@@ -1082,4 +1204,73 @@ test "global feed append records workspace and updates registry" {
     defer std.testing.allocator.free(registry);
     try std.testing.expect(std.mem.indexOf(u8, registry, root) != null);
     try std.testing.expect(std.mem.indexOf(u8, registry, "\"last_host\":\"codex\"") != null);
+}
+
+test "hook-originated feed append skips file.sync" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+
+    var record = try rust_visibility.buildFeedRecordFromHookDecision(
+        std.testing.allocator,
+        std.testing.io,
+        root,
+        "grok",
+        "healthy",
+        "allow",
+        "allowed",
+        null,
+        null,
+        null,
+        null,
+        "req-hook-sync",
+    );
+    defer record.deinit(std.testing.allocator);
+
+    test_sync_calls = 0;
+    appendRecordBestEffort(std.testing.io, std.testing.allocator, root, record);
+    try std.testing.expectEqual(@as(usize, 0), test_sync_calls);
+
+    test_sync_calls = 0;
+    try appendRecord(std.testing.io, std.testing.allocator, root, record);
+    try std.testing.expect(test_sync_calls > 0);
+}
+
+test "hook allow does not rewrite workspace registry" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const dashboard_root = try std.fs.path.join(std.testing.allocator, &.{ root, "home", ".ryk", "dashboard" });
+    defer std.testing.allocator.free(dashboard_root);
+
+    var record = try rust_visibility.buildFeedRecordFromHookDecision(
+        std.testing.allocator,
+        std.testing.io,
+        root,
+        "grok",
+        "healthy",
+        "allow",
+        "allowed",
+        null,
+        null,
+        null,
+        null,
+        "req-hook-allow",
+    );
+    defer record.deinit(std.testing.allocator);
+
+    try appendGlobalRecordWithOptions(std.testing.io, std.testing.allocator, dashboard_root, record, .{
+        .sync = false,
+        .update_registry = false,
+    });
+
+    const registry_path = try std.fs.path.join(std.testing.allocator, &.{ dashboard_root, workspace_registry_file_name });
+    defer std.testing.allocator.free(registry_path);
+    std.Io.Dir.cwd().access(std.testing.io, registry_path, .{}) catch |err| {
+        try std.testing.expectEqual(error.FileNotFound, err);
+        return;
+    };
+    return error.TestUnexpectedResult;
 }

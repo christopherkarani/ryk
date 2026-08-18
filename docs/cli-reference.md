@@ -1,10 +1,10 @@
 # ryk CLI reference
 
-This is the command reference for the current Zig CLI. It covers commands that a user or an integration can invoke, the boundaries between those commands, and the behavior verified in the working tree.
+This is the command reference for the current Zig CLI. It covers commands that a user or an integration can invoke and the boundaries between those commands.
 
-The page was checked on 2026-08-08 against Zig 0.16.0 and a locally built `./zig-out/bin/ryk` binary. Outputs that depend on local policy, installed hosts, sessions, or daemon state are described without copying local identifiers. Run `ryk version` to confirm the installed release version.
+The CLI binary is the authority for flags, subcommands, and host-specific behavior on your installation. Run `ryk version` to confirm the installed release version. Outputs that depend on local policy, installed hosts, sessions, or daemon state are described without copying local identifiers.
 
-The primary sources are the [CLI dispatcher](../src/cli/mod.zig), [help declarations](../src/cli/help.zig), [run path](../src/cli/run.zig), [exit-code registry](../src/cli/exit_codes.zig), and the command implementations under src/cli/. The commands and examples below were cross-checked against those sources and manual probes. This page does not turn a capability report into a protection guarantee.
+The primary sources are the [CLI dispatcher](../src/cli/mod.zig), [help declarations](../src/cli/help.zig), [run path](../src/cli/run.zig), [exit-code registry](../src/cli/exit_codes.zig), and the command implementations under src/cli/. This page does not turn a capability report into a protection guarantee.
 
 ## Read the live contract first
 
@@ -58,7 +58,7 @@ ryk doctor --deadlock-check
 ryk replay --session last --verify
 ~~~
 
-doctor reports readiness and host capabilities. doctor --check is the automation gate and returns nonzero when core readiness fails. doctor --json is a small readiness document, but a JSON result with ready: false can still exit zero. Use --check when the process exit status is the gate. doctor --fix is a mutating repair path and cannot be combined with --check or --json.
+doctor reports readiness and host capabilities. doctor --check is the automation gate and returns nonzero when core readiness fails. doctor --json is a small readiness document, but a JSON result with ready: false can still exit zero. Use --check when the process exit status is the gate. doctor --fix is a mutating repair path and cannot be combined with --check or --json. Doctor names Pi/Grok hooks that point at a Zig test program or Zig compiler as `wired: broken`. doctor --fix, run as product ryk from a normal terminal, rebinds those hooks to the running ryk binary. A --fix invoked as zig-cache `test` refuses to rewrite hooks and says so.
 
 doctor --deadlock-check replays a standard coding workflow (build, test, package install, git inspection, recovery commands) plus dangerous control samples against the active policy, and reports the mismatches: a normal step that would ask or deny is a deadlock, because several hosts hard-block ask with no resume; a dangerous step that would be allowed is a fence hole. It is read-only, exits nonzero on either kind of mismatch, and cannot be combined with --fix, --check, or --json. Decisions use the same policy-plus-pack precedence a live session applies, so a clean result means the composed surface agrees, not just the YAML.
 
@@ -297,7 +297,7 @@ printf '%s\n' "{\"schema_version\":1,\"kind\":\"shell_command\",\"command\":\"gi
   ryk evaluate --json --stdin
 ~~~
 
-It writes its response to stdout for valid decisions and typed input errors. The tested exit contract is 0 allow, 2 deny, 3 evaluator failure, 64 invalid input, and 1 unexpected internal error. Non-shell evaluation is not supported by this API.
+It writes its response to stdout for valid decisions and typed input errors. The tested exit contract is 0 allow, 2 deny, 3 evaluator failure (including invalid, empty, or unreadable discovered policy), 64 invalid input, and 1 unexpected internal error. Missing policy files still fall back to builtin strict. Non-shell evaluation is not supported by this API.
 
 ### decide
 
@@ -323,6 +323,8 @@ ryk hook opencode tool.execute.before < host-payload.json
 ~~~
 
 The payload schema belongs to the host. Use the host integration documentation to construct it. Hook responses include host_limitations; hook enforcement is additive and does not replace supervision through ryk run. Shell tool-before events use the Zig shell engine, and the rejected Rust evaluator setting applies here too. `ryk hook --help` lists every dispatch host, including grok. Pi is extension-only (`ryk evaluate` / bundled extension); it is not a hook host.
+
+Hosts still spawn `ryk hook`, `ryk evaluate`, or bare `ryk`. Those commands try a per-user `ryk hook-serve` process for a warm decision, then fall back in-process. `ryk hook-serve` is internal (`ryk hook-serve --help`); it is not a second binary and is hidden from default help.
 
 ### Plugins and MCP
 
@@ -444,29 +446,6 @@ The CLI is local. The version contract states that it does not provide hosted po
 These are recorded because they affect documentation and automation:
 
 1. ryk help run mentions yolo in the displayed mode list, but the current run parser rejects --mode yolo and accepts only observe, ask, strict, and ci. Use the accepted list until the help and parser converge.
-2. ryk help decide and the parser accept --stdin. A direct pipe probe against this build failed with EndOfStream in the stdin reader, so do not treat the route as reliable in this build. Use the verified inline --json form for now. The source location is [decide.zig](../src/cli/decide.zig#L696).
-3. --json is scoped to a command implementation. In the checked build, replay --json --list rendered the list form rather than a JSON document. Treat each subcommand's help as its output contract.
+2. ryk help decide and the parser accept --stdin. Piped stdin has failed with EndOfStream in the reader, so do not treat that route as reliable. Prefer the inline --json form. The source location is [decide.zig](../src/cli/decide.zig#L696).
+3. --json is scoped to a command implementation. `replay --list --json` emits a JSON list document (`schema_version`, `sessions`). Treat each subcommand's help as its output contract.
 4. doctor --json can return exit 0 with ready: false; use doctor --check when readiness must control a job.
-
-## Verification record
-
-The following probes were run against the source-built binary, with state-changing probes restricted to temporary workspaces or dry-run forms:
-
-~~~sh
-./scripts/zig version
-./scripts/zig build
-./zig-out/bin/ryk help --all
-./zig-out/bin/ryk version --json
-./zig-out/bin/ryk explain "git status"
-./zig-out/bin/ryk explain --format json "rm -rf /"
-./zig-out/bin/ryk test "git status"
-./zig-out/bin/ryk test --format json "rm -rf /"
-./zig-out/bin/ryk policy check --preset strict
-./zig-out/bin/ryk packs --json
-./zig-out/bin/ryk replay --session last --verify
-./zig-out/bin/ryk report --session last --format json
-./zig-out/bin/ryk ci check --format json
-./zig-out/bin/ryk redteam --ci --json
-~~~
-
-Additional manual checks covered a temporary run workspace, child exit propagation, a denied strict-mode command, policy initialization, hook and evaluate fixtures, a loopback dashboard request, plugin diagnostics, and dry-run staged-change operations. No real host agent was launched during this documentation pass, so host alias behavior is source-verified rather than presented as a live host-session result.

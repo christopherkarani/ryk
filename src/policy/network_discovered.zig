@@ -1,6 +1,5 @@
 //! Managed store for discovered inference hostnames (AINA P3 S3).
 //!
-//! Normative: planning/2026-08-02-aina-p3-discovery-plan.md §3.5;
 //! SoT: A-P3-2, A-P3-3, DIS-5/7, SEC-3, EFF-4.
 //! Ownership contracts (producer **p3-managed** → launch/start-init):
 //!
@@ -17,7 +16,7 @@
 //!   refreshManagedDiscovery lives here (not in CLI init) so start/init stay
 //!   thin callers without CLI layering inversion.
 //!
-//! Preferred YAML shape (plan §3.5):
+//! Preferred YAML shape:
 //!
 //! ```yaml
 //! version: 1
@@ -42,7 +41,7 @@ const network_eval = @import("network_eval.zig");
 /// Max bytes read from the managed YAML file. Oversize → soft-empty load.
 const max_managed_file_bytes: usize = 256 * 1024;
 
-/// Cap host entries accepted on load (plan §3.3 bound).
+/// Cap host entries accepted on load.
 const max_managed_hosts: usize = 256;
 
 // ---------------------------------------------------------------------------

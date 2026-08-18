@@ -131,7 +131,7 @@ test "phase25 active contracts use canonical ryk identity" {
 
     const hermes_mapping = try readFile(std.testing.allocator, "integrations/common/schemas/examples/hermes-decision-mapping-v1.json");
     defer std.testing.allocator.free(hermes_mapping);
-    try std.testing.expect(std.mem.indexOf(u8, hermes_mapping, "rule_key ryk|") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hermes_mapping, "fail-closed deny") != null);
     try std.testing.expect(std.mem.indexOf(u8, hermes_mapping, "rule_key orca|") == null);
 
     const evidence = try readFile(std.testing.allocator, "src/sandbox/evidence.zig");

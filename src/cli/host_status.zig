@@ -8,6 +8,8 @@ const builtin = @import("builtin");
 const env_util = @import("../env_util.zig");
 const child_process = @import("child_process.zig");
 const pi_install = @import("pi_install.zig");
+const grok_install = @import("grok_install.zig");
+const brand = @import("brand.zig");
 
 pub const managed_hosts = [_][]const u8{ "codex", "claude", "opencode", "openclaw", "hermes" };
 pub const pi_process_command = "ryk run -- pi";
@@ -15,21 +17,43 @@ pub const pi_process_command = "ryk run -- pi";
 pub const PiStatus = struct {
     binary_detected: bool = false,
     extension_installed: bool = false,
+    /// False when the extension exists but `rykBin` is not product ryk.
+    evaluator_ok: bool = true,
 
     pub fn detected(self: PiStatus) bool {
         return self.binary_detected or self.extension_installed;
     }
 
     pub fn wiredLabel(self: PiStatus) []const u8 {
+        if (self.extension_installed and !self.evaluator_ok) return "broken";
         if (self.extension_installed) return "yes";
         if (self.binary_detected) return "no";
         return "—";
     }
 
     pub fn detail(self: PiStatus) []const u8 {
+        if (self.extension_installed and !self.evaluator_ok)
+            return "extension points at a test/non-product binary, not ryk";
         if (self.extension_installed) return "ryk extension installed; coverage unknown until live smoke";
         if (self.binary_detected) return "Pi detected; ryk extension not installed";
         return "Pi not detected";
+    }
+};
+
+pub const GrokStatus = struct {
+    binary_detected: bool = false,
+    hook_installed: bool = false,
+    evaluator_ok: bool = true,
+
+    pub fn detected(self: GrokStatus) bool {
+        return self.binary_detected or self.hook_installed;
+    }
+
+    pub fn wiredLabel(self: GrokStatus) []const u8 {
+        if (self.hook_installed and !self.evaluator_ok) return "broken";
+        if (self.hook_installed) return "yes";
+        if (self.binary_detected) return "no";
+        return "—";
     }
 };
 
@@ -138,6 +162,10 @@ pub fn shellGate(host: []const u8) []const u8 {
 pub fn failStance(host: []const u8, hermes_fail_open: bool, wired: []const u8) []const u8 {
     // RT-06: never claim fail-closed (or explicit Hermes fail-open) when unwired.
     // when the host hook is unwired — process-wrap alone is not shell mediation.
+    if (std.mem.eql(u8, wired, "broken")) {
+        if (std.mem.eql(u8, host, "grok")) return "hook not fail-closed";
+        return "evaluator not product ryk";
+    }
     const hook_wired = std.mem.eql(u8, wired, "yes") or std.mem.eql(u8, wired, "partial");
     if (std.mem.eql(u8, host, "hermes")) {
         if (!hook_wired) return "unwired (no fail-closed shell)";
@@ -164,6 +192,12 @@ pub fn formatFix(
             return try allocator.dupe(u8, "ryk doctor --fix  # Cursor writer ships in W3");
         }
         return try allocator.dupe(u8, "ryk doctor --fix  # Cursor auto-wire deferred to W3");
+    }
+    if (std.mem.eql(u8, wired, "broken")) {
+        if (std.mem.eql(u8, host, "grok")) {
+            return try allocator.dupe(u8, "ryk doctor --fix  # leftover or non-product Grok hook (127 fail-open until rewritten)");
+        }
+        return try allocator.dupe(u8, "ryk doctor --fix  # hook is a test/non-product binary, not ryk");
     }
     if (std.mem.eql(u8, host, "pi")) {
         if (std.mem.eql(u8, wired, "yes")) {
@@ -350,7 +384,6 @@ fn resolveSmokeBinary(io: std.Io, allocator: std.mem.Allocator) !?[]u8 {
     const self_exe = try std.process.executablePathAlloc(io, allocator);
     const base = std.fs.path.basename(self_exe);
     // Real CLI binaries are named `ryk` (or `ryk.exe`). The zig test harness is not.
-    const brand = @import("brand.zig");
     if (brand.isPrimaryInvocation(base)) {
         const owned = try allocator.dupe(u8, self_exe);
         allocator.free(self_exe);
@@ -538,11 +571,78 @@ pub fn inspectPi(io: std.Io, allocator: std.mem.Allocator) PiStatus {
     const home_owned = env_util.getOwnedHome(&env_map, allocator) catch return .{ .binary_detected = binary_detected };
     const home = home_owned orelse return .{ .binary_detected = binary_detected };
     defer allocator.free(home);
+    return inspectPiAtHome(io, allocator, home, binary_detected);
+}
+
+pub fn inspectPiAtHome(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    home: []const u8,
+    binary_detected: bool,
+) PiStatus {
+    const complete = pi_install.isCompleteAtHome(io, allocator, home) or
+        piExtensionInstalledAtHome(io, allocator, home);
+    const baked = pi_install.readBakedRykBinaryAtHome(io, allocator, home);
+    defer if (baked) |p| allocator.free(p);
+    const extension_installed = complete or baked != null;
+    const evaluator_ok = if (baked) |p|
+        brand.classifyEvaluator(p).isProduct()
+    else
+        true;
     return .{
         .binary_detected = binary_detected,
-        .extension_installed = pi_install.isCompleteAtHome(io, allocator, home) or
-            piExtensionInstalledAtHome(io, allocator, home),
+        .extension_installed = extension_installed,
+        .evaluator_ok = evaluator_ok,
     };
+}
+
+pub fn inspectGrok(io: std.Io, allocator: std.mem.Allocator) GrokStatus {
+    const binary_detected = binaryInPath(io, allocator, "grok");
+    var env_map = env_util.createProcessMap(allocator) catch return .{ .binary_detected = binary_detected };
+    defer env_map.deinit();
+    const home_owned = env_util.getOwnedHome(&env_map, allocator) catch return .{ .binary_detected = binary_detected };
+    const home = home_owned orelse return .{ .binary_detected = binary_detected };
+    defer allocator.free(home);
+    return inspectGrokAtHome(io, allocator, home, binary_detected);
+}
+
+pub fn inspectGrokAtHome(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    home: []const u8,
+    binary_detected: bool,
+) GrokStatus {
+    const baked = grok_install.readBakedRykBinaryAtHome(io, allocator, home);
+    defer if (baked) |p| allocator.free(p);
+    const fail_closed = grok_install.installedAtHome(io, allocator, home);
+    const hook_installed = fail_closed or baked != null;
+    const product_ok = if (baked) |p| brand.classifyEvaluator(p).isProduct() else true;
+    // Leftover `…/ryk hook grok PreToolUse` still 127-fail-opens. Product
+    // basename alone is not health — doctor must show broken until the wrapper.
+    const evaluator_ok = fail_closed and product_ok;
+    return .{
+        .binary_detected = binary_detected,
+        .hook_installed = hook_installed,
+        .evaluator_ok = evaluator_ok,
+    };
+}
+
+/// After `doctor --fix`, name a rebound or a leftover test-program bake.
+pub fn bakeRepairLine(host: []const u8, before_ok: bool, after_ok: bool, installed: bool) ?[]const u8 {
+    if (!installed) return null;
+    if (!before_ok and after_ok) {
+        if (std.mem.eql(u8, host, "pi")) return "Rebound Pi extension to product ryk.";
+        if (std.mem.eql(u8, host, "grok")) return "Rebound Grok hook to product ryk.";
+        return "Rebound host hook to product ryk.";
+    }
+    if (!after_ok) {
+        if (std.mem.eql(u8, host, "pi"))
+            return "Pi extension still points at a test/non-product binary. Run product `ryk doctor --fix` from a normal terminal, then restart Pi.";
+        if (std.mem.eql(u8, host, "grok"))
+            return "Grok hook still points at a test/non-product binary. Run product `ryk doctor --fix` from a normal terminal, then restart Grok.";
+        return "Host hook still points at a test/non-product binary. Run product `ryk doctor --fix` from a normal terminal.";
+    }
+    return null;
 }
 
 /// Compatibility helper for callers that only need to know whether any Pi surface exists.
@@ -895,6 +995,142 @@ test "Pi status distinguishes host detection from extension installation" {
 
     const absent = PiStatus{};
     try std.testing.expectEqualStrings("—", absent.wiredLabel());
+
+    const broken = PiStatus{ .binary_detected = true, .extension_installed = true, .evaluator_ok = false };
+    try std.testing.expectEqualStrings("broken", broken.wiredLabel());
+    try std.testing.expectEqualStrings("extension points at a test/non-product binary, not ryk", broken.detail());
+}
+
+test "formatFix and failStance name a test-program bake" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectEqualStrings("evaluator not product ryk", failStance("pi", false, "broken"));
+    try std.testing.expectEqualStrings("hook not fail-closed", failStance("grok", false, "broken"));
+
+    const pi_fix = try formatFix(allocator, "pi", "broken", .{}, false);
+    defer allocator.free(pi_fix);
+    try std.testing.expect(std.mem.indexOf(u8, pi_fix, "ryk doctor --fix") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pi_fix, "test/non-product") != null);
+
+    const grok_fix = try formatFix(allocator, "grok", "broken", .{}, false);
+    defer allocator.free(grok_fix);
+    try std.testing.expect(std.mem.indexOf(u8, grok_fix, "ryk doctor --fix") != null);
+    try std.testing.expect(std.mem.indexOf(u8, grok_fix, "127 fail-open") != null);
+}
+
+test "inspectPiAtHome marks a zig-cache rykBin as broken" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, pi_install.relative_install_dir);
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = pi_install.relative_install_dir ++ "/index.ts",
+        .data =
+        \\installRykExtension(pi, { rykBin: "/private/tmp/ryk-factory/.zig-cache/o/deadbeef/test" });
+        \\
+        ,
+    });
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(home);
+    const status = inspectPiAtHome(std.testing.io, std.testing.allocator, home, true);
+    try std.testing.expect(status.extension_installed);
+    try std.testing.expect(!status.evaluator_ok);
+    try std.testing.expectEqualStrings("broken", status.wiredLabel());
+}
+
+test "inspectPiAtHome without a baked path is not a test-program bake" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(home);
+    const status = inspectPiAtHome(std.testing.io, std.testing.allocator, home, true);
+    try std.testing.expect(!status.extension_installed);
+    try std.testing.expect(status.evaluator_ok);
+    try std.testing.expectEqualStrings("no", status.wiredLabel());
+}
+
+test "inspectGrokAtHome marks leftover product-direct hook as broken" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, grok_install.hooks_relative_dir);
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = grok_install.managed_hook_relative_path,
+        .data =
+        \\{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"/opt/ryk/bin/ryk hook grok PreToolUse","timeout":30}]}]}}
+        \\
+        ,
+    });
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(home);
+    const status = inspectGrokAtHome(std.testing.io, std.testing.allocator, home, true);
+    try std.testing.expect(status.hook_installed);
+    try std.testing.expect(!status.evaluator_ok);
+    try std.testing.expectEqualStrings("broken", status.wiredLabel());
+}
+
+test "inspectGrokAtHome marks product fail-closed wrapper as wired" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(home);
+    const result = try grok_install.installAtHome(std.testing.io, std.testing.allocator, home, "/opt/ryk/bin/ryk");
+    defer result.deinit(std.testing.allocator);
+    const status = inspectGrokAtHome(std.testing.io, std.testing.allocator, home, true);
+    try std.testing.expect(status.hook_installed);
+    try std.testing.expect(status.evaluator_ok);
+    try std.testing.expectEqualStrings("yes", status.wiredLabel());
+}
+
+test "inspectGrokAtHome marks a zig-cache hook as broken" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, grok_install.hooks_relative_dir);
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = grok_install.managed_hook_relative_path,
+        .data =
+        \\{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"/private/tmp/ryk-factory/.zig-cache/o/deadbeef/test hook grok PreToolUse","timeout":30}]}]}}
+        \\
+        ,
+    });
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(home);
+    const status = inspectGrokAtHome(std.testing.io, std.testing.allocator, home, true);
+    try std.testing.expect(status.hook_installed);
+    try std.testing.expect(!status.evaluator_ok);
+    try std.testing.expectEqualStrings("broken", status.wiredLabel());
+}
+
+test "inspectGrokAtHome marks a Zig compiler hook as broken" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, grok_install.hooks_relative_dir);
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = grok_install.managed_hook_relative_path,
+        .data =
+        \\{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"/Users/me/.local/zig/zig-aarch64-macos/zig hook grok PreToolUse","timeout":30}]}]}}
+        \\
+        ,
+    });
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(home);
+    const status = inspectGrokAtHome(std.testing.io, std.testing.allocator, home, true);
+    try std.testing.expect(status.hook_installed);
+    try std.testing.expect(!status.evaluator_ok);
+    try std.testing.expectEqualStrings("broken", status.wiredLabel());
+}
+
+test "bakeRepairLine names rebound and leftover test-program bakes" {
+    try std.testing.expectEqualStrings(
+        "Rebound Pi extension to product ryk.",
+        bakeRepairLine("pi", false, true, true).?,
+    );
+    try std.testing.expectEqualStrings(
+        "Rebound Grok hook to product ryk.",
+        bakeRepairLine("grok", false, true, true).?,
+    );
+    const leftover = bakeRepairLine("pi", false, false, true).?;
+    try std.testing.expect(std.mem.indexOf(u8, leftover, "ryk doctor --fix") != null);
+    try std.testing.expect(std.mem.indexOf(u8, leftover, "test/non-product") != null);
+    try std.testing.expect(bakeRepairLine("pi", true, true, true) == null);
+    try std.testing.expect(bakeRepairLine("pi", false, false, false) == null);
 }
 
 test "Pi extension installation requires registration and official package markers" {
@@ -1031,7 +1267,7 @@ test "binaryOnSearchPath finds a present file and ignores access failures" {
 
 test "inspectPi does not panic when Pi is missing from PATH" {
     const status = inspectPi(std.testing.io, std.testing.allocator);
-    if (!status.binary_detected) {
+    if (!status.detected()) {
         try std.testing.expectEqualStrings("—", status.wiredLabel());
         try std.testing.expectEqualStrings("Pi not detected", status.detail());
     }

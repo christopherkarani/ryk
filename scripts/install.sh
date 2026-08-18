@@ -14,7 +14,9 @@ set -eu
 #   RYK_SHARE_DIR     Runtime share root (default: ~/.local/share/ryk — kept in 5a)
 #   RYK_BASE_URL       Override release base URL
 #   RYK_ARTIFACT_DIR Offline install from a local dist/ folder
-#   RYK_INSTALL_FORCE=1 Allow overwriting a non-product file at the destination
+#   RYK_INSTALL_FORCE=1 Allow overwriting a non-ryk file at the destination
+#                       (`ryk update --force` sets this). A valid ryk binary is
+#                       overwrite-safe without FORCE.
 #   RYK_INSTALL_QUIET=1 Suppress non-error UI (still installs; no leftover homework)
 #   RYK_INSTALL_SKIP_ONBOARD=1  Skip post-install ensure
 #   RYK_RELEASE_PUBKEY   Override the release signing key (testing only)
@@ -200,7 +202,7 @@ SIGNATURE_STATE="unverified"
 # ── Version resolution ───────────────────────────────────────────────────────
 # cut-release rewrites INSTALL_FALLBACK_VERSION when shipping; do not hand-edit
 # without also updating VERSION / the release cutter.
-INSTALL_FALLBACK_VERSION="0.2.19"
+INSTALL_FALLBACK_VERSION="0.2.20"
 
 is_semver() {
   # Strict X.Y.Z only (installer artifact names depend on this shape).
@@ -359,7 +361,9 @@ cleanup() {
       rm -rf "$runtime_backup" 2>/dev/null || true
     fi
   fi
-  rm -rf "$TMP_DIR"
+  if [ -n "${TMP_DIR:-}" ]; then
+    rm -rf "$TMP_DIR"
+  fi
 }
 trap cleanup EXIT INT TERM
 
@@ -557,6 +561,31 @@ managed_runtime_version() {
   printf '%s\n' "$managed_version"
 }
 
+# Conservative product identity. Never executes dest (it may be attacker-controlled
+# and inherit the installer environment). Never follows a symlink. Regular files
+# named ryk/ryk.exe pass only when they are a native image (ELF/PE/Mach-O) and
+# contain the in-binary marker `safety_boundary_version` (real 0.2.18+). Unsure
+# dest → not a product binary (caller refuses + RYK_INSTALL_FORCE=1). Do not
+# treat every ELF as ryk, and do not treat a wrapper comment as identity.
+is_ryk_product_binary() {
+  _ryk_id_path="$1"
+  [ -n "$_ryk_id_path" ] || return 1
+  [ -L "$_ryk_id_path" ] && return 1
+  [ -f "$_ryk_id_path" ] || return 1
+  case "${_ryk_id_path##*/}" in
+    ryk|ryk.exe) ;;
+    *) return 1 ;;
+  esac
+  command -v dd >/dev/null 2>&1 || return 1
+  command -v od >/dev/null 2>&1 || return 1
+  _ryk_hdr=$(dd if="$_ryk_id_path" bs=4 count=1 2>/dev/null | od -An -tx1 | tr -d ' \n' | tr 'A-F' 'a-f')
+  case "$_ryk_hdr" in
+    7f454c46*|4d5a*|cffaedfe*|cefaedfe*|feedface*|feedfacf*|cafebabe*|bebafeca*) ;;
+    *) return 1 ;;
+  esac
+  grep -a -F -q 'safety_boundary_version' "$_ryk_id_path" 2>/dev/null
+}
+
 validate_binary_destination() {
   validate_destination="$1"
   reject_symlink_parents "$validate_destination" "binary destination"
@@ -574,10 +603,14 @@ validate_binary_destination() {
     [ -f "$validate_destination" ] ||
       fail "refusing non-file binary destination path: $validate_destination" \
         "Choose a path whose final target is a regular file or an existing ryk symlink."
-    if [ "${RYK_INSTALL_FORCE:-0}" != "1" ] && ! managed_runtime_version >/dev/null; then
-      fail "refusing to overwrite non-ryk file at $validate_destination" \
-        "Set RYK_INSTALL_FORCE=1 to replace it, or choose another install dir."
+    if [ "${RYK_INSTALL_FORCE:-0}" = "1" ]; then
+      return 0
     fi
+    if is_ryk_product_binary "$validate_destination"; then
+      return 0
+    fi
+    fail "refusing to overwrite non-ryk file at $validate_destination" \
+      "RYK_INSTALL_FORCE=1"
   fi
 }
 

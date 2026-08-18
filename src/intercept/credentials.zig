@@ -118,17 +118,25 @@ pub fn check(
     if (ref_name) |name| {
         const credential_ref = findCredentialRef(selected_policy.credentials, name) orelse return error.UnknownCredentialRef;
         const broker_config = findBrokerForRef(selected_policy.credentials, credential_ref) orelse defaultDummyConfig();
-        try statuses.append(allocator, try checkBrokerRef(allocator, broker_config, credential_ref, workspace_root));
+        const status = try checkBrokerRef(allocator, broker_config, credential_ref, workspace_root);
+        errdefer status.deinit(allocator);
+        try statuses.append(allocator, status);
     } else if (selected_policy.credentials.brokers.len == 0) {
-        try statuses.append(allocator, try makeStatus(allocator, "local-dummy", .local_dummy, .available, "built-in reference broker available"));
+        const status = try makeStatus(allocator, "local-dummy", .local_dummy, .available, "built-in reference broker available");
+        errdefer status.deinit(allocator);
+        try statuses.append(allocator, status);
     } else {
         for (selected_policy.credentials.brokers) |broker| {
-            try statuses.append(allocator, try checkBroker(io, allocator, broker, workspace_root));
+            const status = try checkBroker(io, allocator, broker, workspace_root);
+            errdefer status.deinit(allocator);
+            try statuses.append(allocator, status);
         }
     }
 
+    const owned_ref = if (ref_name) |name| try allocator.dupe(u8, name) else null;
+    errdefer if (owned_ref) |value| allocator.free(value);
     return .{
-        .ref_name = if (ref_name) |name| try allocator.dupe(u8, name) else null,
+        .ref_name = owned_ref,
         .statuses = try statuses.toOwnedSlice(allocator),
     };
 }
@@ -399,8 +407,10 @@ fn makeStatus(
     state: StatusState,
     message: []const u8,
 ) !BrokerStatus {
+    const name_owned = try allocator.dupe(u8, name);
+    errdefer allocator.free(name_owned);
     return .{
-        .name = try allocator.dupe(u8, name),
+        .name = name_owned,
         .kind = kind,
         .state = state,
         .message = try allocator.dupe(u8, message),
@@ -535,4 +545,114 @@ test "broker command error classes are redacted and specific" {
     try std.testing.expectEqualStrings("timeout", safeErrorClass(error.BrokerCommandTimeout));
     try std.testing.expectEqualStrings("login-required", safeErrorClass(error.BrokerLoginRequired));
     try std.testing.expectEqualStrings("missing-ref", safeErrorClass(error.CredentialRefNotFound));
+}
+
+fn dummyLocalBrokerPolicy() !policy_schema.Policy {
+    return @import("ryk_core").policy.load.parseFromSlice(std.testing.allocator,
+        \\version: 1
+        \\mode: strict
+        \\credentials:
+        \\  default_broker: local
+        \\  brokers:
+        \\    local:
+        \\      type: local-dummy
+        \\  refs:
+        \\    dummy_token:
+        \\      broker: local
+        \\      ref: TOKEN
+    , "credentials.yaml");
+}
+
+fn countCheckAllocs(policy: *const policy_schema.Policy) !usize {
+    var counter = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .resize_fail_index = 0,
+    });
+    var report = try check(std.testing.io, counter.allocator(), policy, ".", "dummy_token");
+    defer report.deinit(counter.allocator());
+    try std.testing.expect(report.ok());
+    try std.testing.expectEqual(StatusState.available, report.statuses[0].state);
+    try std.testing.expectEqualStrings("dummy_token", report.ref_name.?);
+    return counter.allocations;
+}
+
+// Finding 8: name dupe then message dupe. OOM after the first dupe must free
+// name; it must not return a fake available status.
+test "session oom-ownership: makeStatus" {
+    var saw_oom = false;
+    var saw_success = false;
+    var fail_at: usize = 0;
+    while (fail_at < 8) : (fail_at += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+            .fail_index = fail_at,
+        });
+        const status = makeStatus(
+            failing.allocator(),
+            "local-dummy",
+            .local_dummy,
+            .available,
+            "reference configured; local dummy does not resolve raw values",
+        ) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expect(failing.has_induced_failure);
+            try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+            saw_oom = true;
+            continue;
+        };
+        defer status.deinit(failing.allocator());
+        try std.testing.expectEqual(StatusState.available, status.state);
+        try std.testing.expectEqualStrings("local-dummy", status.name);
+        saw_success = true;
+        break;
+    }
+    try std.testing.expect(saw_oom);
+    try std.testing.expect(saw_success);
+}
+
+// Finding 8: non-null ref_name + dummy broker (null never reaches toOwnedSlice
+// after the ref_name dupe). Bind status then append; dupe ref_name after
+// toOwnedSlice (or errdefer-free it). Sweep includes the last alloc.
+test "session oom-ownership: check" {
+    var loaded = try dummyLocalBrokerPolicy();
+    defer loaded.deinit();
+
+    const alloc_count = try countCheckAllocs(&loaded);
+    // name, message, statuses.append grow, ref_name dupe, toOwnedSlice alloc.
+    try std.testing.expect(alloc_count >= 5);
+
+    // Pin the last alloc (toOwnedSlice after the ref_name dupe). A sweep that
+    // starts at 0 REDs on the earlier makeStatus name leak and never reaches
+    // this tail hole. Balanced last-alloc falls through to the remaining sweep.
+    last_alloc: {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+            .fail_index = alloc_count - 1,
+            .resize_fail_index = 0,
+        });
+        var report = check(std.testing.io, failing.allocator(), &loaded, ".", "dummy_token") catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expect(failing.has_induced_failure);
+            try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+            break :last_alloc;
+        };
+        report.deinit(failing.allocator());
+        return error.TestUnexpectedResult;
+    }
+
+    var saw_oom = false;
+    var fail_at: usize = 0;
+    while (fail_at < alloc_count) : (fail_at += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+            .fail_index = fail_at,
+            .resize_fail_index = 0,
+        });
+        var report = check(std.testing.io, failing.allocator(), &loaded, ".", "dummy_token") catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expect(failing.has_induced_failure);
+            try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+            saw_oom = true;
+            continue;
+        };
+        report.deinit(failing.allocator());
+        return error.TestUnexpectedResult;
+    }
+    try std.testing.expect(saw_oom);
 }

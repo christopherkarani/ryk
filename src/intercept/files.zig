@@ -82,6 +82,42 @@ pub const StagedEntry = struct {
         allocator.free(self.actor);
         self.* = undefined;
     }
+
+    fn initOwned(
+        allocator: std.mem.Allocator,
+        original_path: []const u8,
+        normalized_path: []const u8,
+        staged_path: []const u8,
+        original_hash: ?[]const u8,
+        staged_hash: ?[]const u8,
+        operation: Operation,
+        timestamp: []const u8,
+        actor: []const u8,
+    ) !StagedEntry {
+        const original_path_owned = try allocator.dupe(u8, original_path);
+        errdefer allocator.free(original_path_owned);
+        const normalized_path_owned = try allocator.dupe(u8, normalized_path);
+        errdefer allocator.free(normalized_path_owned);
+        const staged_path_owned = try allocator.dupe(u8, staged_path);
+        errdefer allocator.free(staged_path_owned);
+        const original_hash_owned = if (original_hash) |hash| try allocator.dupe(u8, hash) else null;
+        errdefer if (original_hash_owned) |hash| allocator.free(hash);
+        const staged_hash_owned = if (staged_hash) |hash| try allocator.dupe(u8, hash) else null;
+        errdefer if (staged_hash_owned) |hash| allocator.free(hash);
+        const timestamp_owned = try allocator.dupe(u8, timestamp);
+        errdefer allocator.free(timestamp_owned);
+        const actor_owned = try allocator.dupe(u8, actor);
+        return .{
+            .original_path = original_path_owned,
+            .normalized_path = normalized_path_owned,
+            .staged_path = staged_path_owned,
+            .original_hash = original_hash_owned,
+            .staged_hash = staged_hash_owned,
+            .operation = operation,
+            .timestamp = timestamp_owned,
+            .actor = actor_owned,
+        };
+    }
 };
 
 pub const StageResult = struct {
@@ -296,22 +332,41 @@ pub fn stageDelete(
 
     const original_bytes = try std.Io.Dir.cwd().readFileAlloc(io, normalized.resolved_path, allocator, .limited(max_staged_file_bytes));
     defer allocator.free(original_bytes);
-    const original_hash = try sha256HexAlloc(allocator, original_bytes);
-    errdefer allocator.free(original_hash);
+    var original_hash: ?[]u8 = try sha256HexAlloc(allocator, original_bytes);
+    errdefer if (original_hash) |hash| allocator.free(hash);
     try writeSessionRelFile(session_dir, "original", normalized.relative_path, original_bytes);
 
     var index = try loadIndex(io, allocator, workspace_root, session_dir);
     defer index.deinit();
-    try index.upsert(.{
-        .original_path = try allocator.dupe(u8, normalized.resolved_path),
-        .normalized_path = try allocator.dupe(u8, normalized.relative_path),
-        .staged_path = try stagedPathForEntry(allocator, session_dir, normalized.relative_path),
-        .original_hash = original_hash,
-        .staged_hash = null,
-        .operation = .delete,
-        .timestamp = try timestampNowAlloc(io, allocator),
-        .actor = try allocator.dupe(u8, "ryk"),
-    });
+    // Build the entry in a block so field errdefers cannot outlive transfer.
+    // After upsert, Index.deinit is the only owner (writeIndex/audit/clone may fail).
+    var new_entry = blk: {
+        const original_path_owned = try allocator.dupe(u8, normalized.resolved_path);
+        errdefer allocator.free(original_path_owned);
+        const normalized_path_owned = try allocator.dupe(u8, normalized.relative_path);
+        errdefer allocator.free(normalized_path_owned);
+        const staged_path_owned = try stagedPathForEntry(allocator, session_dir, normalized.relative_path);
+        errdefer allocator.free(staged_path_owned);
+        const timestamp_owned = try timestampNowAlloc(io, allocator);
+        errdefer allocator.free(timestamp_owned);
+        const actor_owned = try allocator.dupe(u8, "ryk");
+        const hash = original_hash;
+        original_hash = null;
+        break :blk StagedEntry{
+            .original_path = original_path_owned,
+            .normalized_path = normalized_path_owned,
+            .staged_path = staged_path_owned,
+            .original_hash = hash,
+            .staged_hash = null,
+            .operation = .delete,
+            .timestamp = timestamp_owned,
+            .actor = actor_owned,
+        };
+    };
+    var transferred = false;
+    errdefer if (!transferred) new_entry.deinit(allocator);
+    try index.upsert(new_entry);
+    transferred = true;
     try writeIndex(io, allocator, session_dir, session_id, index.entries.items);
     try auditFileEvent(audit_context, .file_write_staged, normalized.policy_path, .{
         .result = .stage,
@@ -515,25 +570,45 @@ fn stageBytes(
     }
 
     try writeSessionRelFile(session_dir, "staged", normalized.relative_path, bytes);
-    const staged_hash = try sha256HexAlloc(allocator, bytes);
-    errdefer allocator.free(staged_hash);
+    var staged_hash: ?[]u8 = try sha256HexAlloc(allocator, bytes);
+    errdefer if (staged_hash) |hash| allocator.free(hash);
 
-    const staged_path = try stagedPathForEntry(allocator, session_dir, normalized.relative_path);
-    errdefer allocator.free(staged_path);
+    var staged_path: ?[]u8 = try stagedPathForEntry(allocator, session_dir, normalized.relative_path);
+    errdefer if (staged_path) |path| allocator.free(path);
 
     var index = try loadIndex(io, allocator, workspace_root, session_dir);
     defer index.deinit();
-    try index.upsert(.{
-        .original_path = try allocator.dupe(u8, normalized.resolved_path),
-        .normalized_path = try allocator.dupe(u8, normalized.relative_path),
-        .staged_path = staged_path,
-        .original_hash = original_hash,
-        .staged_hash = staged_hash,
-        .operation = if (existed) .update else .create,
-        .timestamp = try timestampNowAlloc(io, allocator),
-        .actor = try allocator.dupe(u8, "ryk"),
-    });
-    original_hash = null;
+    // Build the entry in a block so field errdefers cannot outlive transfer.
+    // After upsert, Index.deinit is the only owner (writeIndex/audit/clone may fail).
+    var new_entry = blk: {
+        const original_path_owned = try allocator.dupe(u8, normalized.resolved_path);
+        errdefer allocator.free(original_path_owned);
+        const normalized_path_owned = try allocator.dupe(u8, normalized.relative_path);
+        errdefer allocator.free(normalized_path_owned);
+        const timestamp_owned = try timestampNowAlloc(io, allocator);
+        errdefer allocator.free(timestamp_owned);
+        const actor_owned = try allocator.dupe(u8, "ryk");
+        const path = staged_path;
+        const orig_hash = original_hash;
+        const new_hash = staged_hash;
+        staged_path = null;
+        original_hash = null;
+        staged_hash = null;
+        break :blk StagedEntry{
+            .original_path = original_path_owned,
+            .normalized_path = normalized_path_owned,
+            .staged_path = path.?,
+            .original_hash = orig_hash,
+            .staged_hash = new_hash,
+            .operation = if (existed) .update else .create,
+            .timestamp = timestamp_owned,
+            .actor = actor_owned,
+        };
+    };
+    var transferred = false;
+    errdefer if (!transferred) new_entry.deinit(allocator);
+    try index.upsert(new_entry);
+    transferred = true;
     try writeIndex(io, allocator, session_dir, session_id, index.entries.items);
 
     try auditFileEvent(audit_context, .file_write_staged, normalized.policy_path, .{
@@ -586,7 +661,9 @@ fn applyOrDiscard(
     for (index.entries.items) |entry| {
         const selected = if (normalized_filter) |filter| std.mem.eql(u8, filter, entry.normalized_path) else true;
         if (!selected) {
-            try remaining.append(allocator, try cloneEntry(allocator, entry));
+            var cloned = try cloneEntry(allocator, entry);
+            errdefer cloned.deinit(allocator);
+            try remaining.append(allocator, cloned);
             continue;
         }
 
@@ -746,7 +823,9 @@ const Index = struct {
                 return;
             }
         }
-        try self.entries.append(self.allocator, new_entry);
+        var owned = new_entry;
+        errdefer owned.deinit(self.allocator);
+        try self.entries.append(self.allocator, owned);
     }
 
     fn find(self: *Index, relative_path: []const u8) ?StagedEntry {
@@ -786,16 +865,22 @@ fn loadIndex(io: std.Io, allocator: std.mem.Allocator, workspace_root_raw: []con
         const normalized_path_text = try jsonString(entry_object.get("normalized_path") orelse return error.InvalidStagingIndex);
         const staged_path_text = try jsonString(entry_object.get("staged_path") orelse return error.InvalidStagingIndex);
         try validateLoadedIndexEntry(allocator, workspace_root, session_dir, original_path_text, normalized_path_text, staged_path_text);
-        var entry: StagedEntry = .{
-            .original_path = try allocator.dupe(u8, original_path_text),
-            .normalized_path = try allocator.dupe(u8, normalized_path_text),
-            .staged_path = try allocator.dupe(u8, staged_path_text),
-            .original_hash = try jsonNullableStringAlloc(allocator, entry_object.get("original_hash") orelse return error.InvalidStagingIndex),
-            .staged_hash = try jsonNullableStringAlloc(allocator, entry_object.get("staged_hash") orelse return error.InvalidStagingIndex),
-            .operation = Operation.parse(operation_text) orelse return error.InvalidStagingIndex,
-            .timestamp = try allocator.dupe(u8, try jsonString(entry_object.get("timestamp") orelse return error.InvalidStagingIndex)),
-            .actor = try allocator.dupe(u8, try jsonString(entry_object.get("actor") orelse return error.InvalidStagingIndex)),
-        };
+        const original_hash_text = try jsonNullableString(entry_object.get("original_hash") orelse return error.InvalidStagingIndex);
+        const staged_hash_text = try jsonNullableString(entry_object.get("staged_hash") orelse return error.InvalidStagingIndex);
+        const operation = Operation.parse(operation_text) orelse return error.InvalidStagingIndex;
+        const timestamp_text = try jsonString(entry_object.get("timestamp") orelse return error.InvalidStagingIndex);
+        const actor_text = try jsonString(entry_object.get("actor") orelse return error.InvalidStagingIndex);
+        var entry = try StagedEntry.initOwned(
+            allocator,
+            original_path_text,
+            normalized_path_text,
+            staged_path_text,
+            original_hash_text,
+            staged_hash_text,
+            operation,
+            timestamp_text,
+            actor_text,
+        );
         errdefer entry.deinit(allocator);
         try index.entries.append(allocator, entry);
     }
@@ -878,9 +963,9 @@ fn jsonString(value: std.json.Value) ![]const u8 {
     };
 }
 
-fn jsonNullableStringAlloc(allocator: std.mem.Allocator, value: std.json.Value) !?[]u8 {
+fn jsonNullableString(value: std.json.Value) !?[]const u8 {
     if (value == .null) return null;
-    return try allocator.dupe(u8, try jsonString(value));
+    return try jsonString(value);
 }
 
 fn validateSessionId(session_id: []const u8) !void {
@@ -913,16 +998,17 @@ fn validateLoadedIndexEntry(
 }
 
 fn cloneEntry(allocator: std.mem.Allocator, entry: StagedEntry) !StagedEntry {
-    return .{
-        .original_path = try allocator.dupe(u8, entry.original_path),
-        .normalized_path = try allocator.dupe(u8, entry.normalized_path),
-        .staged_path = try allocator.dupe(u8, entry.staged_path),
-        .original_hash = if (entry.original_hash) |hash| try allocator.dupe(u8, hash) else null,
-        .staged_hash = if (entry.staged_hash) |hash| try allocator.dupe(u8, hash) else null,
-        .operation = entry.operation,
-        .timestamp = try allocator.dupe(u8, entry.timestamp),
-        .actor = try allocator.dupe(u8, entry.actor),
-    };
+    return StagedEntry.initOwned(
+        allocator,
+        entry.original_path,
+        entry.normalized_path,
+        entry.staged_path,
+        entry.original_hash,
+        entry.staged_hash,
+        entry.operation,
+        entry.timestamp,
+        entry.actor,
+    );
 }
 
 fn auditFileEvent(audit_context: ?AuditContext, event_type: core.event.EventType, target: []const u8, decision: core.decision.Decision) !void {
@@ -1143,6 +1229,7 @@ fn resolveExistingPrefix(io: std.Io, allocator: std.mem.Allocator, absolute_path
             else => return err,
         };
         if (prefix) |resolved_prefix| {
+            errdefer allocator.free(resolved_prefix);
             if (suffix.items.len == 0) return resolved_prefix;
             var parts = try allocator.alloc([]const u8, suffix.items.len + 1);
             defer allocator.free(parts);
@@ -1155,7 +1242,11 @@ fn resolveExistingPrefix(io: std.Io, allocator: std.mem.Allocator, absolute_path
 
         const parent = std.fs.path.dirname(current) orelse return error.FileNotFound;
         const base = std.fs.path.basename(current);
-        try suffix.append(allocator, try allocator.dupe(u8, base));
+        {
+            const owned_base = try allocator.dupe(u8, base);
+            errdefer allocator.free(owned_base);
+            try suffix.append(allocator, owned_base);
+        }
         const next = try allocator.dupe(u8, parent);
         allocator.free(current);
         current = next;
@@ -1865,4 +1956,205 @@ test "filesystem audit events are emitted through session writer" {
     try std.testing.expect(std.mem.indexOf(u8, events, "file_write_staged") != null);
     try std.testing.expect(std.mem.indexOf(u8, events, "file_discard") != null);
     try std.testing.expect(std.mem.indexOf(u8, events, "fake_secret_value") == null);
+}
+
+test "stageBytes and stageDelete do not double-free after writeIndex fails" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, ".git");
+    try tmp.dir.writeFile(io, .{ .sub_path = "victim.txt", .data = "doomed\n" });
+    const root = try testAllocRealPath(io, tmp.dir, ".", allocator);
+    defer allocator.free(root);
+    var loaded = try policy.load.loadPreset(allocator, .strict);
+    defer loaded.deinit();
+    const session_id = "upsert-own-test";
+
+    var first = try stageCreate(io, allocator, &loaded, root, session_id, "keep.txt", "keep\n", null);
+    defer first.deinit(allocator);
+
+    const index_rel = ".ryk/sessions/upsert-own-test/staging-index.json";
+    try tmp.dir.setFilePermissions(io, index_rel, std.Io.File.Permissions.fromMode(0o444), .{});
+    defer tmp.dir.setFilePermissions(io, index_rel, std.Io.File.Permissions.fromMode(0o644), .{}) catch {};
+
+    if (stageCreate(io, allocator, &loaded, root, session_id, "second.txt", "second\n", null)) |ok_const| {
+        var ok = ok_const;
+        ok.deinit(allocator);
+        return error.TestExpectedError;
+    } else |err| {
+        try std.testing.expect(err == error.AccessDenied or err == error.PermissionDenied);
+    }
+
+    if (stageUpdate(io, allocator, &loaded, root, session_id, "victim.txt", "updated\n", null)) |ok_const| {
+        var ok = ok_const;
+        ok.deinit(allocator);
+        return error.TestExpectedError;
+    } else |err| {
+        try std.testing.expect(err == error.AccessDenied or err == error.PermissionDenied);
+    }
+
+    if (stageDelete(io, allocator, &loaded, root, session_id, "victim.txt", null)) |ok_const| {
+        var ok = ok_const;
+        ok.deinit(allocator);
+        return error.TestExpectedError;
+    } else |err| {
+        try std.testing.expect(err == error.AccessDenied or err == error.PermissionDenied);
+    }
+}
+
+test "upsert deinits new entry when append fails" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const index_allocator = failing.allocator();
+    var index: Index = .{ .allocator = index_allocator, .entries = .empty };
+    defer index.deinit();
+
+    const new_entry: StagedEntry = .{
+        .original_path = try std.testing.allocator.dupe(u8, "/tmp/a"),
+        .normalized_path = try std.testing.allocator.dupe(u8, "a"),
+        .staged_path = try std.testing.allocator.dupe(u8, "/tmp/s"),
+        .original_hash = try std.testing.allocator.dupe(u8, "aa"),
+        .staged_hash = try std.testing.allocator.dupe(u8, "bb"),
+        .operation = .create,
+        .timestamp = try std.testing.allocator.dupe(u8, "t"),
+        .actor = try std.testing.allocator.dupe(u8, "ryk"),
+    };
+    try std.testing.expectError(error.OutOfMemory, index.upsert(new_entry));
+}
+
+fn cloneEntryOomProbe(allocator: std.mem.Allocator, src: StagedEntry) !void {
+    var cloned = try cloneEntry(allocator, src);
+    cloned.deinit(allocator);
+}
+
+test "cloneEntry OOM ownership does not leak partial fields" {
+    const allocator = std.testing.allocator;
+    var src = StagedEntry{
+        .original_path = try allocator.dupe(u8, "/ws/src/a.txt"),
+        .normalized_path = try allocator.dupe(u8, "src/a.txt"),
+        .staged_path = try allocator.dupe(u8, "/ws/.ryk/sessions/s/staged/src/a.txt"),
+        .original_hash = try allocator.dupe(u8, "aa"),
+        .staged_hash = try allocator.dupe(u8, "bb"),
+        .operation = .update,
+        .timestamp = try allocator.dupe(u8, "2026-01-01T00:00:00Z"),
+        .actor = try allocator.dupe(u8, "ryk"),
+    };
+    defer src.deinit(allocator);
+    try std.testing.checkAllAllocationFailures(allocator, cloneEntryOomProbe, .{src});
+}
+
+fn oomExpectBalanced(failing: *std.testing.FailingAllocator) !void {
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+}
+
+fn oomExpectInducedAllocError(err: anyerror, failing: *std.testing.FailingAllocator) !void {
+    switch (err) {
+        error.OutOfMemory, error.WriteFailed => {},
+        else => return err,
+    }
+    try oomExpectBalanced(failing);
+}
+
+fn oomCountAllocs(failing: *std.testing.FailingAllocator) usize {
+    return failing.alloc_index;
+}
+
+test "files oom-ownership: applyOrDiscard" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, ".git");
+    const root = try testAllocRealPath(io, tmp.dir, ".", allocator);
+    defer allocator.free(root);
+    var loaded = try policy.load.loadPreset(allocator, .strict);
+    defer loaded.deinit();
+    const session_id = "oom-apply-disc";
+
+    var keep = try stageWrite(io, allocator, &loaded, root, session_id, "keep.txt", "keep\n", null);
+    defer keep.deinit(allocator);
+    var drop = try stageWrite(io, allocator, &loaded, root, session_id, "drop.txt", "drop\n", null);
+    defer drop.deinit(allocator);
+
+    var prefix: usize = 0;
+    var clone_n: usize = 0;
+    {
+        var prefix_counter = std.testing.FailingAllocator.init(allocator, .{});
+        const prefix_alloc = prefix_counter.allocator();
+        const counted_session_dir = try sessionDirPath(prefix_alloc, root, session_id);
+        defer prefix_alloc.free(counted_session_dir);
+        var counted_lock = try StagingIndexLock.acquire(io, prefix_alloc, counted_session_dir);
+        defer counted_lock.release(io);
+        var counted_index = try loadIndex(io, prefix_alloc, root, counted_session_dir);
+        defer counted_index.deinit();
+        var counted_norm = try normalizePath(io, prefix_alloc, root, "drop.txt");
+        defer counted_norm.deinit(prefix_alloc);
+        const counted_filter = try prefix_alloc.dupe(u8, counted_norm.relative_path);
+        defer prefix_alloc.free(counted_filter);
+        prefix = oomCountAllocs(&prefix_counter);
+        try std.testing.expect(counted_index.entries.items.len >= 2);
+        var clone_counter = std.testing.FailingAllocator.init(allocator, .{});
+        var cloned = try cloneEntry(clone_counter.allocator(), counted_index.entries.items[0]);
+        cloned.deinit(clone_counter.allocator());
+        clone_n = oomCountAllocs(&clone_counter);
+    }
+
+    var total_counter = std.testing.FailingAllocator.init(allocator, .{});
+    const discarded = try applyOrDiscard(io, total_counter.allocator(), root, session_id, "drop.txt", null, false, null);
+    try std.testing.expectEqual(@as(usize, 1), discarded.count);
+    const total = oomCountAllocs(&total_counter);
+
+    var write_counter = std.testing.FailingAllocator.init(allocator, .{});
+    try writeIndex(io, write_counter.allocator(), keep.session_dir, session_id, &.{keep.entry});
+    const write_n = oomCountAllocs(&write_counter);
+
+    var restaged = try stageWrite(io, allocator, &loaded, root, session_id, "drop.txt", "drop\n", null);
+    defer restaged.deinit(allocator);
+
+    const fail_from_prefix = prefix + clone_n;
+    const fail_from_tail = total - write_n - 1;
+    try std.testing.expectEqual(fail_from_prefix, fail_from_tail);
+
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = fail_from_prefix });
+    if (applyOrDiscard(io, failing.allocator(), root, session_id, "drop.txt", null, false, null)) |_| {
+        try std.testing.expect(false);
+    } else |err| {
+        try oomExpectInducedAllocError(err, &failing);
+    }
+}
+
+test "files oom-ownership: resolveExistingPrefix" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "present");
+    const present = try testAllocRealPath(io, tmp.dir, "present", allocator);
+    defer allocator.free(present);
+    const missing = try std.fs.path.join(allocator, &.{ present, "missing-dir", "leaf.txt" });
+    defer allocator.free(missing);
+
+    var counter = std.testing.FailingAllocator.init(allocator, .{});
+    const counted = try resolveExistingPrefix(io, counter.allocator(), missing);
+    try std.testing.expect(std.mem.endsWith(u8, counted, "leaf.txt"));
+    counter.allocator().free(counted);
+    const total = oomCountAllocs(&counter);
+    try std.testing.expect(total >= 2);
+
+    var induced: usize = 0;
+    var fail_at: usize = 0;
+    while (fail_at < total) : (fail_at += 1) {
+        var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = fail_at });
+        if (resolveExistingPrefix(io, failing.allocator(), missing)) |resolved| {
+            failing.allocator().free(resolved);
+            try std.testing.expect(false);
+        } else |err| {
+            try oomExpectInducedAllocError(err, &failing);
+            induced += 1;
+        }
+    }
+    try std.testing.expect(induced == total);
 }

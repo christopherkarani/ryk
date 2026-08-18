@@ -11,6 +11,11 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 cd "${REPO_ROOT}"
 
+# Two `zig build` process entries on purpose. Combining `test-fast` + `test`
+# in one graph is unsafe: `test` uses `run_core_engine_tests_only` so it does
+# not wait on the test-fast serial chain, and a default-`j` union would overlap
+# those run steps (the hang the chain exists to avoid). Forcing `-j1` on the
+# union would serialize the whole suite and undo that split.
 echo "[verify-pre-merge] Fast gate"
 ./scripts/test-fast.sh
 
@@ -37,6 +42,7 @@ echo "[verify-pre-merge] Homebrew formula contract"
 ./scripts/test-homebrew-formula.sh
 
 echo "[verify-pre-merge] First-user install and uninstall regressions"
+./scripts/install-overwrite-identity-test.sh
 ./scripts/install-first-user-regression-test.sh
 ./scripts/uninstall-first-user-regression-test.sh
 

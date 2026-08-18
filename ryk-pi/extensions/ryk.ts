@@ -262,7 +262,7 @@ export function shouldNameGateTool(toolName: string): boolean {
 
 /** Honest coverage string for doctor/status surfaces (not the ask card). */
 export function piCoverageLabel(): string {
-	return "bash + write + edit + read policy-protected; grep + find + ls approval-gated; Pi control tools (contact_supervisor/intercom/subagent) passthrough; other custom names gated via decide tool";
+	return "bash + write + edit + read policy-protected; grep + find + ls root-preflight; Pi control tools (contact_supervisor/intercom/subagent) passthrough; other custom names gated via decide tool";
 }
 
 /**
@@ -584,6 +584,7 @@ const DECIDE_EXIT_CODE = {
 	context_only: 0,
 	block: 3,
 	ask: 7,
+	stage: 7,
 	warn: 8,
 	error: 1,
 } as const;
@@ -885,7 +886,7 @@ async function runRykDecideOnce(
 	if (decision === "allow" || decision === "context_only") {
 		return { kind: "allow", response: parsed };
 	}
-	if (decision === "block") {
+	if (decision === "block" || decision === "stage") {
 		const normalized = normalizeDecideToEvaluateShape(parsed);
 		return {
 			kind: "deny",
@@ -968,7 +969,10 @@ function normalizeDecideToEvaluateShape(response: unknown): unknown {
 	const obj = response as Record<string, unknown>;
 	return {
 		...obj,
-		decision: obj.decision === "block" ? "deny" : obj.decision,
+		decision:
+			obj.decision === "block" || obj.decision === "stage"
+				? "deny"
+				: obj.decision,
 		rule_id: typeof obj.rule === "string" ? obj.rule : obj.rule_id,
 	};
 }
@@ -1033,11 +1037,27 @@ export function isSubagentSession(
  * noninteractive print/json/headless, or Pi subagent (parent-forward only).
  * Does not mean "always auto-deny" for subagents — they try parent first.
  */
+function envFlagTruthy(raw: string | undefined): boolean {
+	if (!raw) return false;
+	const value = raw.trim().toLowerCase();
+	return value === "1" || value === "true" || value === "yes" || value === "on";
+}
+
+/** Residual ask hardens to deny only when the operator set an unattended/CI flag. */
+export function isUnattendedEnv(env: NodeJS.ProcessEnv = process.env): boolean {
+	return (
+		envFlagTruthy(env.RYK_UNATTENDED) ||
+		envFlagTruthy(env.RYK_CI) ||
+		envFlagTruthy(env.RYK_NONINTERACTIVE) ||
+		envFlagTruthy(env.CI)
+	);
+}
+
 export function shouldAutoDenyPolicyAsk(
-	ctx: PiContext,
+	_ctx: PiContext,
 	env: NodeJS.ProcessEnv = process.env,
 ): boolean {
-	return isNoninteractiveSession(ctx) || isSubagentSession(env);
+	return isUnattendedEnv(env);
 }
 
 /** Local interactive select is only for main TUI sessions. */
@@ -1523,22 +1543,9 @@ export function installRykExtension(
 					decision.kind === "allow" &&
 					BROAD_DISCOVERY_TOOLS.has(event.toolName)
 				) {
-					return resolvePolicyAsk(
-						`ryk allowed the ${toolLabel} root, but this broad discovery action may traverse descendant files that were not individually evaluated. Explicit approval is required.`,
-						pi,
-						ctx,
-						toolLabel,
-						{ disableSession },
-						allowOnceBypassEnabled(runtime.env, unavailableMode),
-						runtime.env,
-						{
-							askRoot,
-							askFs,
-							askNow,
-							askSleep,
-							commandOrName: absPath,
-						},
-					);
+					// Root already passed decide-file. Residual leftover ask is
+					// permit; do not invent a second host approval gate.
+					return undefined;
 				}
 				return applyToolDecision(
 					decision,
@@ -1858,47 +1865,22 @@ async function applyToolDecision(
 }
 
 /**
- * Single entry for policy ask:
- * - subagent → parent-forward IPC (fail closed on timeout)
- * - noninteractive main → auto-deny with Why/Next copy
- * - interactive main → local ui.select
- * Never ask → allow without a choice.
+ * Unexpected `ask` after the coding-host enforcement wire rewrite.
+ * Leftover unused policy ask is rewritten by `ryk evaluate` / `ryk decide`
+ * before emit. A leaked `ask` is fail-closed deny.
+ * Staged writes, FM steward ask, SoftBlock, and explicit deny never become allow.
  */
 async function resolvePolicyAsk(
 	reason: string,
 	pi: PiAPI,
 	ctx: PiContext,
 	toolLabel: string,
-	actions: { disableSession: () => void },
-	allowOnce: boolean,
+	_actions: { disableSession: () => void },
+	_allowOnce: boolean,
 	env: NodeJS.ProcessEnv = process.env,
-	askIpc?: AskIpcContext,
+	_askIpc?: AskIpcContext,
 ): Promise<ToolCallResult> {
-	if (isSubagentSession(env)) {
-		return handlePolicyAskParentForward(
-			reason,
-			pi,
-			ctx,
-			toolLabel,
-			actions,
-			allowOnce,
-			env,
-			askIpc,
-		);
-	}
-	if (isNoninteractiveSession(ctx)) {
-		return handlePolicyAskAutoDeny(reason, pi, ctx, toolLabel, env);
-	}
-	return handlePolicyAsk(
-		reason,
-		pi,
-		ctx,
-		toolLabel,
-		actions,
-		allowOnce,
-		env,
-		askIpc,
-	);
+	return handlePolicyAskAutoDeny(reason, pi, ctx, toolLabel, env);
 }
 
 function recordOnceBypass(
@@ -2390,17 +2372,17 @@ async function handleUnavailable(
 	pi: PiAPI,
 	ctx: PiContext,
 	mode: EffectiveUnavailableMode,
-	actions: { disableSession: () => void },
+	_actions: { disableSession: () => void },
 	toolLabel = "bash",
-	allowOnce = true,
+	_allowOnce = true,
 	session?: SessionState,
-	env: NodeJS.ProcessEnv = process.env,
-	askIpc?: AskIpcContext,
+	_env: NodeJS.ProcessEnv = process.env,
+	_askIpc?: AskIpcContext,
 ): Promise<ToolCallResult> {
 	const repair = repairMessage(reason, toolLabel);
 	const failureClass = protocolFailureClassFromReason(reason);
 
-	// Sticky session recovery: prior block choice (or parent block) sticks for this session.
+	// Sticky session recovery: prior block sticks for this session.
 	if (session?.protocolRecovery === "block") {
 		const card = {
 			variant: "block" as const,
@@ -2411,8 +2393,8 @@ async function handleUnavailable(
 		return block(formatAgentBlockReason(card, toolLabel));
 	}
 
-	// allow-with-warning soft-allows only spawn_failed (binary missing).
-	// Protocol corruption / typed errors always fail closed (Phase 5).
+	// allow-with-warning remains an explicit opt-in mode (not the default).
+	// It soft-allows only spawn_failed. Protocol corruption always fail-closes.
 	if (
 		mode === "allow-with-warning" &&
 		allowWithWarningPermitsProtocolClass(failureClass)
@@ -2426,115 +2408,15 @@ async function handleUnavailable(
 		return undefined;
 	}
 
-	// Strict: hard block, no recovery ask.
-	if (mode === "strict") {
-		const card = {
-			variant: "block" as const,
-			title: DISPLAY_BRAND,
-			summary: repair,
-		};
-		showRykDecision(pi, ctx, card);
-		return block(formatAgentBlockReason(card, toolLabel));
-	}
-
-	// Subagent: parent-forward protocol recovery (child has no local recovery UI).
-	if (isSubagentSession(env)) {
-		const result = await handlePolicyAskParentForward(
-			`[protocol] ${repair}`,
-			pi,
-			ctx,
-			toolLabel,
-			{
-				disableSession: () => {
-					actions.disableSession();
-				},
-			},
-			allowOnce,
-			env,
-			askIpc,
-		);
-		// Sticky block on this child after parent blocks / times out.
-		if (result?.block && session) session.protocolRecovery = "block";
-		return result;
-	}
-
-	// Main noninteractive / residual allow-with-warning: hard block.
-	if (mode === "noninteractive-block" || mode === "allow-with-warning") {
-		const card = {
-			variant: "block" as const,
-			title: DISPLAY_BRAND,
-			summary: repair,
-		};
-		showRykDecision(pi, ctx, card);
-		return block(formatAgentBlockReason(card, toolLabel));
-	}
-
-	const card = buildRykAskCard(repair);
-	// Pi queues transcript messages during an active tool turn, so the temporary
-	// widget keeps ask context readable until the blocking select() resolves.
-	showRykWidget(ctx, card);
-	const choice = await ctx.ui?.select?.(
-		`${PRODUCT_NAME}: needs your decision`,
-		askOptionsFor("unavailable", allowOnce),
-		{ timeout: 60_000, signal: ctx.signal },
-	);
-	switch (choice) {
-		case PROTOCOL_SESSION_ALLOW_OPTION:
-		case LABEL_DISABLE_SESSION:
-		case "Disable ryk for this Pi session":
-			clearRykWidget(ctx);
-			actions.disableSession();
-			notify(
-				ctx,
-				`${PRODUCT_NAME} disabled for this session only. Use /ryk-start to re-enable.`,
-				"warning",
-			);
-			return undefined;
-		case LABEL_ALLOW_ONCE:
-		case "Run once anyway":
-			if (!allowOnce) {
-				clearRykWidget(ctx);
-				if (session) session.protocolRecovery = "block";
-				return block(
-					formatAgentBlockReason(
-						{
-							variant: "block",
-							title: DISPLAY_BRAND,
-							summary: repair,
-						},
-						toolLabel,
-					),
-				);
-			}
-			clearRykWidget(ctx);
-			if (!recordOnceBypass(pi, ctx, toolLabel, "unavailable")) {
-				return block(
-					"ryk blocked this once-bypass because a required transcript audit event could not be recorded.",
-				);
-			}
-			notify(
-				ctx,
-				`Allowed this ${toolLabel} action once without ryk evaluation.`,
-				"warning",
-			);
-			return undefined;
-		case PROTOCOL_BLOCK_OPTION:
-		case LABEL_DENY:
-		case "Block":
-		default:
-			clearRykWidget(ctx);
-			if (session) session.protocolRecovery = "block";
-			return block(
-				formatAgentBlockReason(
-					{
-						variant: "block",
-						title: DISPLAY_BRAND,
-						summary: repair,
-					},
-					toolLabel,
-				),
-			);
-	}
+	// No host ask. Protocol failure is fail-closed block.
+	if (session) session.protocolRecovery = "block";
+	const card = {
+		variant: "block" as const,
+		title: DISPLAY_BRAND,
+		summary: repair,
+	};
+	showRykDecision(pi, ctx, card);
+	return block(formatAgentBlockReason(card, toolLabel));
 }
 
 async function setupRyk(
@@ -3040,7 +2922,7 @@ function modeSummary(mode: UnavailableMode, sessionBypass: boolean): string {
 		`Session bypass: ${sessionBypass ? "on" : "off"}`,
 		`Coverage: ${piCoverageLabel()}`,
 		`Once-bypass: ${allowOnceBypassEnabled(process.env, mode) ? "allowed" : "disabled"} (RYK_PI_ALLOW_ONCE; strict disables by default)`,
-		"Default RYK_PI_MODE=auto (interactive ask; noninteractive block). Production: prefer strict. allow-with-warning is never the default.",
+		"Default RYK_PI_MODE=auto (protocol failure fail-closes; residual policy ask is permit). Production: prefer strict. allow-with-warning is never the default.",
 		"Modes: auto, ask, noninteractive-block, strict, allow-with-warning.",
 		"Process-level env/network/secretless requires: ryk run [--secretless] [--network …] -- pi …",
 	].join("\n");

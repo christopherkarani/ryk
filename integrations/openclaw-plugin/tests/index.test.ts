@@ -1,12 +1,13 @@
 import { describe, it, mock } from 'node:test';
 import assert from 'node:assert';
 import { createHash } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { delimiter, join } from 'node:path';
 import rykPlugin, {
   CANARY_BLOCK_PREFIX,
+  attestRykCandidate,
   findRyk,
   installerProvenanceValid,
   INERT_CANARY_TOOL,
@@ -59,6 +60,65 @@ function makeFakeRyk(
   );
   chmodSync(path, 0o700);
   return { path, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+}
+
+function writeProvenance(binary: string): string {
+  const receipt = join(binary, '..', '.ryk-provenance');
+  const digest = createHash('sha256').update(readFileSync(binary)).digest('hex');
+  writeFileSync(receipt, `ryk-provenance-v1\npath=${realpathSync(binary)}\nsha256=${digest}\n`);
+  return receipt;
+}
+
+function readProbeCount(countFile: string): number {
+  if (!existsSync(countFile)) return 0;
+  return Number(readFileSync(countFile, 'utf8').trim()) || 0;
+}
+
+function makeManagedRyk(hookScript = "printf '%s\\n' '{\"decision\":\"allow\"}'"): {
+  path: string;
+  dir: string;
+  countFile: string;
+  receipt: string;
+  cleanup: () => void;
+} {
+  const dir = join(
+    homedir(),
+    '.local',
+    'bin',
+    `ryk-openclaw-attest-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`
+  );
+  mkdirSync(dir, { recursive: true });
+  const path = join(dir, 'ryk');
+  const countFile = join(dir, 'version-count');
+  writeFileSync(
+    path,
+    `#!/bin/sh\nif [ "$1" = "version" ]; then\n  c=0\n  if [ -f '${countFile}' ]; then c=$(cat '${countFile}'); fi\n  echo $((c + 1)) > '${countFile}'\n  printf '%s\\n' '{"product":"ryk","version":"1.2.11"}'\n  exit 0\nfi\n${hookScript}\n`,
+    { mode: 0o700 }
+  );
+  chmodSync(path, 0o700);
+  const receipt = writeProvenance(path);
+  return {
+    path,
+    dir,
+    countFile,
+    receipt,
+    cleanup: () => rmSync(dir, { recursive: true, force: true }),
+  };
+}
+
+function withoutPins<T>(run: () => T): T {
+  const previousBin = process.env.RYK_BIN;
+  const previousWorkspace = process.env.RYK_ALLOW_WORKSPACE_BIN;
+  delete process.env.RYK_BIN;
+  delete process.env.RYK_ALLOW_WORKSPACE_BIN;
+  try {
+    return run();
+  } finally {
+    if (previousBin === undefined) delete process.env.RYK_BIN;
+    else process.env.RYK_BIN = previousBin;
+    if (previousWorkspace === undefined) delete process.env.RYK_ALLOW_WORKSPACE_BIN;
+    else process.env.RYK_ALLOW_WORKSPACE_BIN = previousWorkspace;
+  }
 }
 
 function withRykBin<T>(path: string, run: () => T): T {
@@ -317,24 +377,23 @@ describe('parseHookResponse (fail-closed blocking path)', () => {
     assert.strictEqual(r.reason, 'ryk_missing_decision');
   });
 
-  it('ask decision on blocking path → block', () => {
+  it('ask decision on blocking path is unexpected-ask deny', () => {
     const r = parseHookResponse(
       JSON.stringify({ decision: 'ask', reason: 'needs_approval' }),
       true
     );
     assert.strictEqual(r.decision, 'block');
-    assert.strictEqual(r.reason, 'ryk_ask_unsupported');
+    assert.strictEqual(r.reason, 'ryk_unexpected_ask');
   });
 
-  it('ask decision blocks until a live resumable approval contract is verified', () => {
+  it('ask decision is unexpected-ask deny and does not permit leftover unused policy ask', () => {
     const r = parseHookResponse(
       JSON.stringify({ decision: 'ask', reason: 'needs_approval', rule: 'policy.rule' }),
       true,
       {}
     );
     assert.strictEqual(r.decision, 'block');
-    assert.strictEqual(r.rule, 'policy.rule');
-    assert.strictEqual(r.reason, 'ryk_ask_unsupported');
+    assert.strictEqual(r.reason, 'ryk_unexpected_ask');
   });
 
   it('ask decision blocks immediately in unattended mode', () => {
@@ -345,6 +404,15 @@ describe('parseHookResponse (fail-closed blocking path)', () => {
     );
     assert.strictEqual(r.decision, 'block');
     assert.strictEqual(r.reason, 'ryk_unattended_ask');
+  });
+
+  it('stage decision is never leftover-ask permit', () => {
+    const r = parseHookResponse(
+      JSON.stringify({ decision: 'stage', reason: 'staged_write' }),
+      true
+    );
+    assert.strictEqual(r.decision, 'block');
+    assert.strictEqual(r.reason, 'ryk_unrecognized_decision');
   });
 
   it('unrecognized decision on blocking path → block', () => {
@@ -928,6 +996,237 @@ describe('rykPlugin', () => {
     } finally {
       if (prevBin === undefined) delete process.env.RYK_BIN;
       else process.env.RYK_BIN = prevBin;
+    }
+  });
+});
+
+describe('sticky managed attest', { concurrency: false }, () => {
+  it('first managed attest hashes the binary and execs version --json', () => {
+    if (process.platform === 'win32') return;
+    const fixture = makeManagedRyk();
+    try {
+      withoutPins(() => {
+        writeFileSync(fixture.receipt, `ryk-provenance-v1\npath=${realpathSync(fixture.path)}\nsha256=${'0'.repeat(64)}\n`);
+        assert.strictEqual(attestRykCandidate(fixture.path, process.cwd(), process.platform, false), false);
+        assert.strictEqual(readProbeCount(fixture.countFile), 0);
+
+        writeProvenance(fixture.path);
+        assert.strictEqual(attestRykCandidate(fixture.path, process.cwd(), process.platform, false), true);
+        assert.strictEqual(readProbeCount(fixture.countFile), 1);
+      });
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it('second attest with unchanged (dev,ino,size,mtime) skips hash and version --json', () => {
+    if (process.platform === 'win32') return;
+    const fixture = makeManagedRyk();
+    try {
+      withoutPins(() => {
+        assert.strictEqual(attestRykCandidate(fixture.path, process.cwd(), process.platform, false), true);
+        assert.strictEqual(readProbeCount(fixture.countFile), 1);
+
+        writeFileSync(fixture.receipt, `ryk-provenance-v1\npath=${realpathSync(fixture.path)}\nsha256=${'0'.repeat(64)}\n`);
+        assert.strictEqual(attestRykCandidate(fixture.path, process.cwd(), process.platform, false), true);
+        assert.strictEqual(
+          readProbeCount(fixture.countFile),
+          1,
+          'unchanged managed identity must not re-exec version --json'
+        );
+      });
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it('size change forces a full re-attest', () => {
+    if (process.platform === 'win32') return;
+    const fixture = makeManagedRyk();
+    try {
+      withoutPins(() => {
+        assert.strictEqual(attestRykCandidate(fixture.path, process.cwd(), process.platform, false), true);
+        assert.strictEqual(readProbeCount(fixture.countFile), 1);
+
+        const before = statSync(fixture.path);
+        writeFileSync(fixture.path, `${readFileSync(fixture.path, 'utf8')}\n# size-bump\n`, { mode: 0o700 });
+        chmodSync(fixture.path, 0o700);
+        assert.notStrictEqual(statSync(fixture.path).size, before.size);
+        writeProvenance(fixture.path);
+
+        assert.strictEqual(attestRykCandidate(fixture.path, process.cwd(), process.platform, false), true);
+        assert.strictEqual(readProbeCount(fixture.countFile), 2);
+      });
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it('mtime change forces a full re-attest', () => {
+    if (process.platform === 'win32') return;
+    const fixture = makeManagedRyk();
+    try {
+      withoutPins(() => {
+        assert.strictEqual(attestRykCandidate(fixture.path, process.cwd(), process.platform, false), true);
+        assert.strictEqual(readProbeCount(fixture.countFile), 1);
+
+        const before = statSync(fixture.path);
+        utimesSync(fixture.path, before.atime, new Date(before.mtimeMs + 5_000));
+        const after = statSync(fixture.path);
+        assert.ok(after.mtimeMs !== before.mtimeMs, 'mtime must change to force re-attest');
+
+        assert.strictEqual(attestRykCandidate(fixture.path, process.cwd(), process.platform, false), true);
+        assert.strictEqual(readProbeCount(fixture.countFile), 2);
+      });
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it('does not cache a failed attest for the same identity', () => {
+    if (process.platform === 'win32') return;
+    const fixture = makeManagedRyk();
+    try {
+      withoutPins(() => {
+        writeFileSync(fixture.receipt, `ryk-provenance-v1\npath=${realpathSync(fixture.path)}\nsha256=${'0'.repeat(64)}\n`);
+        assert.strictEqual(attestRykCandidate(fixture.path, process.cwd(), process.platform, false), false);
+        assert.strictEqual(readProbeCount(fixture.countFile), 0);
+
+        writeProvenance(fixture.path);
+        assert.strictEqual(attestRykCandidate(fixture.path, process.cwd(), process.platform, false), true);
+        assert.strictEqual(readProbeCount(fixture.countFile), 1);
+      });
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it('workspace override always full-probes version --json', () => {
+    if (process.platform === 'win32') return;
+    const fake = makeFakeRyk("printf '%s\\n' '{\"decision\":\"allow\"}'");
+    const countFile = join(fake.path, '..', 'version-count');
+    writeFileSync(
+      fake.path,
+      `#!/bin/sh\nif [ "$1" = "version" ]; then\n  c=0\n  if [ -f '${countFile}' ]; then c=$(cat '${countFile}'); fi\n  echo $((c + 1)) > '${countFile}'\n  printf '%s\\n' '{"product":"ryk","version":"1.2.11"}'\n  exit 0\nfi\nprintf '%s\\n' '{"decision":"allow"}'\n`,
+      { mode: 0o700 }
+    );
+    chmodSync(fake.path, 0o700);
+    const previousAllow = process.env.RYK_ALLOW_WORKSPACE_BIN;
+    const previousBin = process.env.RYK_BIN;
+    try {
+      process.env.RYK_ALLOW_WORKSPACE_BIN = '1';
+      delete process.env.RYK_BIN;
+      assert.strictEqual(attestRykCandidate(fake.path, process.cwd(), process.platform, true), true);
+      assert.strictEqual(attestRykCandidate(fake.path, process.cwd(), process.platform, true), true);
+      assert.strictEqual(readProbeCount(countFile), 2);
+    } finally {
+      if (previousAllow === undefined) delete process.env.RYK_ALLOW_WORKSPACE_BIN;
+      else process.env.RYK_ALLOW_WORKSPACE_BIN = previousAllow;
+      if (previousBin === undefined) delete process.env.RYK_BIN;
+      else process.env.RYK_BIN = previousBin;
+      fake.cleanup();
+    }
+  });
+
+  it('RYK_ALLOW_WORKSPACE_BIN on a managed path always full-probes', () => {
+    if (process.platform === 'win32') return;
+    const fixture = makeManagedRyk();
+    const previousAllow = process.env.RYK_ALLOW_WORKSPACE_BIN;
+    const previousBin = process.env.RYK_BIN;
+    try {
+      delete process.env.RYK_BIN;
+      process.env.RYK_ALLOW_WORKSPACE_BIN = '1';
+      assert.strictEqual(attestRykCandidate(fixture.path, process.cwd(), process.platform, true), true);
+      assert.strictEqual(attestRykCandidate(fixture.path, process.cwd(), process.platform, true), true);
+      assert.strictEqual(readProbeCount(fixture.countFile), 2);
+    } finally {
+      if (previousAllow === undefined) delete process.env.RYK_ALLOW_WORKSPACE_BIN;
+      else process.env.RYK_ALLOW_WORKSPACE_BIN = previousAllow;
+      if (previousBin === undefined) delete process.env.RYK_BIN;
+      else process.env.RYK_BIN = previousBin;
+      fixture.cleanup();
+    }
+  });
+
+  it('RYK_BIN pin always full-probes and never sticks a managed success', () => {
+    if (process.platform === 'win32') return;
+    const fixture = makeManagedRyk();
+    const previousAllow = process.env.RYK_ALLOW_WORKSPACE_BIN;
+    const previousBin = process.env.RYK_BIN;
+    try {
+      delete process.env.RYK_ALLOW_WORKSPACE_BIN;
+      process.env.RYK_BIN = fixture.path;
+      assert.strictEqual(attestRykCandidate(fixture.path, process.cwd(), process.platform, false), true);
+      assert.strictEqual(attestRykCandidate(fixture.path, process.cwd(), process.platform, false), true);
+      assert.strictEqual(readProbeCount(fixture.countFile), 2);
+
+      writeFileSync(fixture.receipt, `ryk-provenance-v1\npath=${realpathSync(fixture.path)}\nsha256=${'0'.repeat(64)}\n`);
+      assert.strictEqual(attestRykCandidate(fixture.path, process.cwd(), process.platform, false), false);
+      assert.strictEqual(readProbeCount(fixture.countFile), 2);
+    } finally {
+      if (previousAllow === undefined) delete process.env.RYK_ALLOW_WORKSPACE_BIN;
+      else process.env.RYK_ALLOW_WORKSPACE_BIN = previousAllow;
+      if (previousBin === undefined) delete process.env.RYK_BIN;
+      else process.env.RYK_BIN = previousBin;
+      fixture.cleanup();
+    }
+  });
+
+  it('re-checks mode and uid on every call after a sticky managed success', () => {
+    if (process.platform === 'win32') return;
+    const fixture = makeManagedRyk();
+    try {
+      withoutPins(() => {
+        assert.strictEqual(attestRykCandidate(fixture.path, process.cwd(), process.platform, false), true);
+        assert.strictEqual(readProbeCount(fixture.countFile), 1);
+
+        chmodSync(fixture.path, 0o722);
+        assert.strictEqual(attestRykCandidate(fixture.path, process.cwd(), process.platform, false), false);
+        assert.strictEqual(readProbeCount(fixture.countFile), 1);
+      });
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it('callRyk still re-attests path/mode every hook while skipping version after managed success', async () => {
+    if (process.platform === 'win32') return;
+    const fixture = makeManagedRyk();
+    const previousPath = process.env.PATH;
+    const previousBin = process.env.RYK_BIN;
+    const previousAllow = process.env.RYK_ALLOW_WORKSPACE_BIN;
+    try {
+      delete process.env.RYK_BIN;
+      delete process.env.RYK_ALLOW_WORKSPACE_BIN;
+      process.env.PATH = `${fixture.dir}${delimiter}${previousPath ?? ''}`;
+
+      const api = makeApi();
+      rykPlugin(api);
+      assert.strictEqual(readProbeCount(fixture.countFile), 1);
+
+      const beforeCall = (api.on as any).mock.calls.find(
+        (call: any) => call.arguments[0] === 'before_tool_call'
+      );
+      assert.strictEqual(
+        await beforeCall.arguments[1]({ toolName: 'exec', params: { command: 'git status' } }, {}),
+        undefined
+      );
+      assert.strictEqual(readProbeCount(fixture.countFile), 1);
+
+      chmodSync(fixture.path, 0o722);
+      const result = await beforeCall.arguments[1](
+        { toolName: 'exec', params: { command: 'git status' } },
+        {}
+      );
+      assert.strictEqual(result.block, true);
+      assert.match(String(result.blockReason), /attest|trust|provenance/i);
+    } finally {
+      process.env.PATH = previousPath;
+      if (previousBin === undefined) delete process.env.RYK_BIN;
+      else process.env.RYK_BIN = previousBin;
+      if (previousAllow === undefined) delete process.env.RYK_ALLOW_WORKSPACE_BIN;
+      else process.env.RYK_ALLOW_WORKSPACE_BIN = previousAllow;
+      fixture.cleanup();
     }
   });
 });

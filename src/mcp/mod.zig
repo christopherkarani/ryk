@@ -13,4 +13,5 @@ test {
     _ = transport;
     _ = manifests;
     _ = proxy;
+    _ = tools;
 }

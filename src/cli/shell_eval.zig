@@ -19,6 +19,7 @@ const pack_config = @import("pack_config.zig");
 const fm_steward_client = @import("fm_steward_client.zig");
 const telemetry = @import("../telemetry.zig");
 const supervisor = core.supervisor;
+const host_wire_rewrite = @import("host_wire_rewrite.zig");
 
 pub const ShellCommandEvent = struct {
     command: []const u8,
@@ -191,7 +192,7 @@ fn resolveAllowOnceJsonlPath(allocator: std.mem.Allocator) error{OutOfMemory}!?[
         const xdg = std.mem.span(xdg_z);
         if (xdg.len > 0) {
             return try std.fs.path.join(allocator, &.{
-                xdg, "ryk",
+                xdg,                                          "ryk",
                 shell_engine.allow_once.allow_once_file_name,
             });
         }
@@ -202,7 +203,8 @@ fn resolveAllowOnceJsonlPath(allocator: std.mem.Allocator) error{OutOfMemory}!?[
             return try std.fs.path.join(allocator, &.{
                 home,
                 ".local",
-                "share", "ryk",
+                "share",
+                "ryk",
                 shell_engine.allow_once.allow_once_file_name,
             });
         }
@@ -260,7 +262,10 @@ pub fn loadProductShellStores(
     const project_path = try std.fs.path.join(allocator, &.{ workspace_root, ".ryk", "allowlist.toml" });
     defer allocator.free(project_path);
 
+    // loadMerged caches raw layers only (deep copy). Re-apply M-10 and the
+    // os_sandbox_active gate on every product load — never cache allow_once_path.
     // loadMerged only fails on OOM; corrupt/missing → empty store (fail closed, no unlock).
+    // Cached on inode/size/mtime so a revocation rewrite cannot be served stale.
     const outcome = try shell_engine.allowlist_store.loadMerged(
         runtime_io,
         allocator,
@@ -443,6 +448,10 @@ pub const PluginDecision = enum {
         };
     }
 };
+
+/// Why a product `.ask` exists. Produced here; rewritten on the coding-host
+/// enforcement wire. No leftover default — missing origin is never-permit.
+pub const AskOrigin = host_wire_rewrite.AskOrigin;
 
 pub const RiskLevel = enum {
     low,
@@ -629,6 +638,9 @@ pub const AfterHardFenceDecision = struct {
 /// Full product decision from WP4 orchestration (includes sticky + fail-closed).
 pub const ShellWithPolicyDecision = struct {
     decision: PluginDecision,
+    /// Distinguishes leftover unused policy ask from SoftBlock / FM hold.
+    /// Null is missing origin (never-permit on the coding-host enforcement wire).
+    ask_origin: ?AskOrigin = null,
     /// Static reason for fail-closed / hard-fence / sticky / strict refuse; null for plain matrix.
     /// When `owned_reason` is set, prefer that (FM upgrade path).
     reason: ?[]const u8 = null,
@@ -912,6 +924,7 @@ pub fn decideShellWithPolicy(
     return .{
         .decision = after.decision,
         .reason = after.reason,
+        .ask_origin = if (after.decision == .ask) .leftover else null,
     };
 }
 
@@ -919,15 +932,119 @@ pub fn decideShellWithPolicy(
 // Process/session sticky store (hook/agent process lifetime; no disk)
 // ---------------------------------------------------------------------------
 
-var g_session_sticky: ?policy.sticky.Store = null;
+/// Cap session sticky buckets so a long-lived hook-serve cannot grow without bound.
+pub const session_sticky_map_cap: usize = 16;
 
-/// In-memory sticky store for the current hook/agent process. Lazy-init with
-/// page_allocator (process lifetime — not testing.allocator).
-pub fn getSessionStickyStore() *policy.sticky.Store {
-    if (g_session_sticky == null) {
-        g_session_sticky = policy.sticky.Store.init(std.heap.page_allocator);
+const SessionStickyEntry = struct {
+    session_id: []u8,
+    store: policy.sticky.Store,
+    last_used: u64,
+};
+
+const SessionStickyMap = struct {
+    entries: [session_sticky_map_cap]?SessionStickyEntry = [_]?SessionStickyEntry{null} ** session_sticky_map_cap,
+    clock: u64 = 0,
+
+    fn count(self: *const SessionStickyMap) usize {
+        var n: usize = 0;
+        for (self.entries) |entry| {
+            if (entry != null) n += 1;
+        }
+        return n;
     }
-    return &(g_session_sticky.?);
+
+    fn indexOf(self: *const SessionStickyMap, session_id: []const u8) ?usize {
+        for (self.entries, 0..) |entry, idx| {
+            if (entry) |item| {
+                if (std.mem.eql(u8, item.session_id, session_id)) return idx;
+            }
+        }
+        return null;
+    }
+
+    fn freeOrLru(self: *const SessionStickyMap) usize {
+        var oldest_idx: usize = 0;
+        var oldest_used: u64 = std.math.maxInt(u64);
+        for (self.entries, 0..) |entry, idx| {
+            if (entry == null) return idx;
+            if (entry.?.last_used < oldest_used) {
+                oldest_used = entry.?.last_used;
+                oldest_idx = idx;
+            }
+        }
+        return oldest_idx;
+    }
+
+    fn deinit(self: *SessionStickyMap) void {
+        for (&self.entries) |*slot| {
+            if (slot.*) |*entry| {
+                entry.store.deinit();
+                std.heap.page_allocator.free(entry.session_id);
+            }
+            slot.* = null;
+        }
+        self.clock = 0;
+    }
+
+    fn get(self: *SessionStickyMap, session_id: []const u8) *policy.sticky.Store {
+        const key = normalizeSessionStickyId(session_id);
+        self.clock += 1;
+        if (self.indexOf(key)) |idx| {
+            if (self.entries[idx]) |*entry| {
+                entry.last_used = self.clock;
+                return &entry.store;
+            }
+        }
+
+        const slot = self.freeOrLru();
+        if (self.entries[slot]) |*old| {
+            old.store.deinit();
+            std.heap.page_allocator.free(old.session_id);
+            self.entries[slot] = null;
+        }
+        const owned = sessionStickyKeyAllocator().dupe(u8, key) catch return denyOnlySessionStickyStore();
+        self.entries[slot] = .{
+            .session_id = owned,
+            .store = policy.sticky.Store.init(std.heap.page_allocator),
+            .last_used = self.clock,
+        };
+        return &self.entries[slot].?.store;
+    }
+};
+
+var g_session_sticky_map: SessionStickyMap = .{};
+var g_deny_only_session_sticky: ?policy.sticky.Store = null;
+var g_session_sticky_key_allocator: ?std.mem.Allocator = null;
+
+fn sessionStickyKeyAllocator() std.mem.Allocator {
+    return g_session_sticky_key_allocator orelse std.heap.page_allocator;
+}
+
+/// Empty store that is reset on every OOM fallback so session B cannot inherit
+/// session A's sticky allow. Never a shared writable fallback.
+fn denyOnlySessionStickyStore() *policy.sticky.Store {
+    if (g_deny_only_session_sticky) |*store| {
+        store.deinit();
+    }
+    g_deny_only_session_sticky = policy.sticky.Store.init(std.heap.page_allocator);
+    return &(g_deny_only_session_sticky.?);
+}
+
+fn normalizeSessionStickyId(session_id: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, session_id, " \t\r\n");
+    if (trimmed.len == 0) return brand.default_session_id;
+    return trimmed;
+}
+
+/// Default bucket (`ryk-shell`) for callers that have no host session id.
+pub fn getSessionStickyStore() *policy.sticky.Store {
+    return getSessionStickyStoreFor("");
+}
+
+/// In-memory sticky store keyed by host/launch session id. Lazy-init with
+/// page_allocator (process lifetime — not testing.allocator). Cap 16 LRU.
+pub fn getSessionStickyStoreFor(session_id: []const u8) *policy.sticky.Store {
+    return g_session_sticky_map.get(session_id);
 }
 
 /// Record sticky trust after host ask→allow. Uses `recordFromAsk` so **critical
@@ -991,10 +1108,12 @@ pub fn recordStickyFromAskWithHints(
 /// Test-only: tear down process sticky so tests do not leak page_allocator keys
 /// across cases that used `getSessionStickyStore`.
 pub fn resetSessionStickyStoreForTests() void {
-    if (g_session_sticky) |*store| {
+    g_session_sticky_map.deinit();
+    if (g_deny_only_session_sticky) |*store| {
         store.deinit();
-        g_session_sticky = null;
+        g_deny_only_session_sticky = null;
     }
+    g_session_sticky_key_allocator = null;
 }
 
 /// Optional policy context for daemon deny → product decision (WP4 + FM wire).
@@ -1047,6 +1166,9 @@ const OwnedRunDecision = struct {
     /// FM `ask_sticky_candidate` hints (allocator-owned when set). Free via `deinit`.
     suggested_sticky_scope: ?[]const u8 = null,
     suggested_effect_class: ?[]const u8 = null,
+    /// SoftBlock / FM ask must not ride the leftover-unused-ask permit wire.
+    /// Null is missing origin (never-permit on the coding-host enforcement wire).
+    ask_origin: ?AskOrigin = null,
 
     pub fn deinit(self: OwnedRunDecision, allocator: std.mem.Allocator) void {
         allocator.free(self.owned_reason);
@@ -1211,7 +1333,11 @@ pub fn decisionFromDaemonResultWithPolicy(
             const plugin_decision = pluginDecisionFromDaemonAllow(result).applyCiMode(ci_mode);
             var after_fm = try applyFmSoftSeatbelt(
                 allocator,
-                .{ .decision = plugin_decision, .reason = null },
+                .{
+                    .decision = plugin_decision,
+                    .reason = null,
+                    .ask_origin = if (plugin_decision == .ask) .soft_block else null,
+                },
                 fmContextFromOpts(opts),
             );
             // Re-apply CI after FM: steward may upgrade allow→ask; CI must harden ask/warn→block.
@@ -1251,6 +1377,7 @@ pub fn decisionFromDaemonResultWithPolicy(
                 .owned_reason = reason,
                 .suggested_sticky_scope = sticky_hints.scope,
                 .suggested_effect_class = sticky_hints.effect_class,
+                .ask_origin = after_fm.ask_origin,
             };
         },
         .deny => blk: {
@@ -1326,9 +1453,15 @@ pub fn decisionFromDaemonResultWithPolicy(
 
             // Mode softens a would-be deny (observe/ask/low-severity / sticky allow paths).
             const soft_reason: ?[]const u8 = if (decided) |d| d.reason else null;
+            const origin: ?AskOrigin = if (decided) |d|
+                d.ask_origin
+            else if (plugin_decision == .ask)
+                .leftover
+            else
+                null;
             var after_fm = try applyFmSoftSeatbelt(
                 allocator,
-                .{ .decision = plugin_decision, .reason = soft_reason },
+                .{ .decision = plugin_decision, .reason = soft_reason, .ask_origin = origin },
                 fmContextFromOpts(opts),
             );
             // Re-apply CI after FM: steward may upgrade allow/warn→ask; CI must harden to block.
@@ -1368,6 +1501,7 @@ pub fn decisionFromDaemonResultWithPolicy(
                 .owned_rule_id = rule,
                 .suggested_sticky_scope = sticky_hints.scope,
                 .suggested_effect_class = sticky_hints.effect_class,
+                .ask_origin = after_fm.ask_origin,
             };
         },
         // Engine Error / unexpected shapes are fail-closed via the typed flag on
@@ -1555,7 +1689,7 @@ pub fn evaluateCommand(
         .{
             .command = display,
             .permit = permit,
-            .sticky = getSessionStickyStore(),
+            .sticky = getSessionStickyStoreFor(card_session_id),
             .effect_class = null,
             .cwd = cwd,
             .session_id = card_session_id,
@@ -2679,6 +2813,56 @@ test "evaluateCommand strict permit refuse on-list and yolo no refuse" {
     }
 }
 
+test "session sticky dupe OOM does not share a writable fallback store" {
+    defer resetSessionStickyStoreForTests();
+    resetSessionStickyStoreForTests();
+    const cmd = "git push --force";
+    const fp = policy.sticky.fingerprintCommand(cmd, null);
+    try recordStickyFromAsk(getSessionStickyStoreFor("sess-a"), cmd, .session, .high);
+    try std.testing.expect(getSessionStickyStoreFor("sess-a").allows(fp));
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    g_session_sticky_key_allocator = failing.allocator();
+    const oom_store = getSessionStickyStoreFor("sess-b");
+    try std.testing.expect(!oom_store.allows(fp));
+    try recordStickyFromAsk(oom_store, cmd, .session, .high);
+    // Next OOM fallback resets the deny-only dummy; session B cannot keep a grant.
+    const oom_store_2 = getSessionStickyStoreFor("sess-c");
+    try std.testing.expect(!oom_store_2.allows(fp));
+    try std.testing.expect(oom_store == oom_store_2);
+    g_session_sticky_key_allocator = null;
+    try std.testing.expect(getSessionStickyStoreFor("sess-a").allows(fp));
+}
+
+test "session sticky stores are isolated by session id" {
+    defer resetSessionStickyStoreForTests();
+    resetSessionStickyStoreForTests();
+    const cmd = "git push --force";
+    const fp = policy.sticky.fingerprintCommand(cmd, null);
+    try recordStickyFromAsk(getSessionStickyStoreFor("sess-a"), cmd, .session, .high);
+    try std.testing.expect(getSessionStickyStoreFor("sess-a").allows(fp));
+    try std.testing.expect(!getSessionStickyStoreFor("sess-b").allows(fp));
+}
+
+test "session sticky map caps at 16 LRU entries" {
+    defer resetSessionStickyStoreForTests();
+    resetSessionStickyStoreForTests();
+    var i: usize = 0;
+    while (i < 18) : (i += 1) {
+        var name_buf: [16]u8 = undefined;
+        const id = try std.fmt.bufPrint(&name_buf, "sess-{d}", .{i});
+        _ = getSessionStickyStoreFor(id);
+    }
+    try std.testing.expectEqual(@as(usize, session_sticky_map_cap), g_session_sticky_map.count());
+}
+
+test "empty session id shares the default session sticky bucket" {
+    defer resetSessionStickyStoreForTests();
+    resetSessionStickyStoreForTests();
+    try std.testing.expect(getSessionStickyStore() == getSessionStickyStoreFor(""));
+    try std.testing.expect(getSessionStickyStore() == getSessionStickyStoreFor(brand.default_session_id));
+}
+
 test "evaluateCommand session sticky e2e skips re-ask once critical and ci" {
     const allocator = std.testing.allocator;
     defer resetSessionStickyStoreForTests();
@@ -3309,9 +3493,9 @@ test "Fm decisionFromDaemonResultWithPolicy timeout keeps allow" {
 
 // ---------------------------------------------------------------------------
 // s-product-wire — product loaders on zigEvaluator (hook/run/shim)
-// Locked INITIAL tests: RED until permanent + allow-once stores are wired into
-// EvaluateOptions (permanent_allowlist / allow_once_path / io / now_iso /
-// consume_allow_once) — never via options.allowlists / policy Layered.
+// Permanent + allow-once stores load via EvaluateOptions (permanent_allowlist /
+// allow_once_path / io / now_iso / consume_allow_once) — never via
+// options.allowlists / policy Layered.
 // ---------------------------------------------------------------------------
 
 const s_product_wire_now_seed = "2099-01-01T12:00:00Z";
@@ -3393,7 +3577,7 @@ fn sProductWireWriteUserCommandAllow(
     cmd_text: []const u8,
     reason: []const u8,
 ) !void {
-    const ryk_dir = try sProductWireJoin(&.{ xdg_config, "ryk"});
+    const ryk_dir = try sProductWireJoin(&.{ xdg_config, "ryk" });
     defer std.testing.allocator.free(ryk_dir);
     try std.Io.Dir.cwd().createDirPath(std.testing.io, ryk_dir);
     const path = try sProductWireJoin(&.{ xdg_config, "ryk", "allowlist.toml" });
@@ -3420,7 +3604,7 @@ fn sProductWireSeedAllowOnce(
     cwd: []const u8,
     reason: []const u8,
 ) !void {
-    const ryk_dir = try sProductWireJoin(&.{ xdg_data, "ryk"});
+    const ryk_dir = try sProductWireJoin(&.{ xdg_data, "ryk" });
     defer std.testing.allocator.free(ryk_dir);
     try std.Io.Dir.cwd().createDirPath(std.testing.io, ryk_dir);
     const pending_path = try sProductWireJoin(&.{ xdg_data, "ryk", shell_engine.allow_once.pending_file_name });
@@ -3585,6 +3769,63 @@ test "s-product-wire: loadProductShellStores strips project command keeps rule +
     try std.testing.expect(!saw_project_cmd);
     try std.testing.expect(saw_project_rule);
     try std.testing.expect(saw_user_cmd);
+}
+
+test "s-product-wire: loadProductShellStores twice still strips M-10 and leaves allow-once null" {
+    const allocator = std.testing.allocator;
+    var xdg = try sProductWireIsolateXdg();
+    defer xdg.deinit();
+    var ws = try sProductWireGitWorkspace();
+    defer ws.deinit();
+
+    try sProductWireWriteProjectCommandAllow(ws.root, "git reset --hard HEAD", "project-cmd-should-drop");
+    try sProductWireWriteProjectRuleAllow(ws.root, "core.git:reset-hard", "project-rule-keep");
+    try sProductWireWriteUserCommandAllow(xdg.config_root, "npm test", "user-cmd-keep");
+
+    var first: ProductShellStores = .{};
+    try loadProductShellStores(std.testing.io, allocator, ws.root, &first, false);
+    defer first.deinit(allocator);
+    var second: ProductShellStores = .{};
+    try loadProductShellStores(std.testing.io, allocator, ws.root, &second, false);
+    defer second.deinit(allocator);
+
+    try std.testing.expect(first.allow_once_path == null);
+    try std.testing.expect(second.allow_once_path == null);
+
+    var saw_project_cmd = false;
+    var saw_project_rule = false;
+    var saw_user_cmd = false;
+    for (second.permanent.entries) |e| {
+        if (e.layer == .project and e.kind == .command) saw_project_cmd = true;
+        if (e.layer == .project and e.kind == .rule) saw_project_rule = true;
+        if (e.layer == .user and e.kind == .command) saw_user_cmd = true;
+    }
+    try std.testing.expect(!saw_project_cmd);
+    try std.testing.expect(saw_project_rule);
+    try std.testing.expect(saw_user_cmd);
+}
+
+test "s-product-wire: loadProductShellStores allow_once_path follows current os_sandbox_active" {
+    const allocator = std.testing.allocator;
+    var xdg = try sProductWireIsolateXdg();
+    defer xdg.deinit();
+    var ws = try sProductWireGitWorkspace();
+    defer ws.deinit();
+
+    var off: ProductShellStores = .{};
+    try loadProductShellStores(std.testing.io, allocator, ws.root, &off, false);
+    defer off.deinit(allocator);
+    try std.testing.expect(off.allow_once_path == null);
+
+    var on: ProductShellStores = .{};
+    try loadProductShellStores(std.testing.io, allocator, ws.root, &on, true);
+    defer on.deinit(allocator);
+    try std.testing.expect(on.allow_once_path != null);
+
+    var off_again: ProductShellStores = .{};
+    try loadProductShellStores(std.testing.io, allocator, ws.root, &off_again, false);
+    defer off_again.deinit(allocator);
+    try std.testing.expect(off_again.allow_once_path == null);
 }
 
 test "s-product-wire: zigEvaluator loads user permanent allowlist from XDG_CONFIG_HOME" {

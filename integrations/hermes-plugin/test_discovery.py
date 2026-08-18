@@ -50,11 +50,50 @@ def _write_identity_ryk(path: Path, mode: int = 0o700) -> Path:
     return path
 
 
+def _non_tmp_parent() -> Path:
+    """Writable directory outside ryk tmp-plant roots (worktrees may live under /var/folders)."""
+    tmp_roots: list[Path] = []
+    for raw in (tempfile.gettempdir(), "/tmp", "/private/tmp"):
+        try:
+            tmp_roots.append(Path(raw).resolve())
+        except OSError:
+            continue
+
+    def under_tmp(path: Path) -> bool:
+        try:
+            resolved = path.resolve()
+        except OSError:
+            return True
+        for root in tmp_roots:
+            try:
+                resolved.relative_to(root)
+                return True
+            except ValueError:
+                continue
+        return False
+
+    for candidate in (
+        Path(__file__).resolve().parent,
+        Path.home() / ".cache" / "ryk-hermes-plugin-tests",
+        Path("/var/tmp") / "ryk-hermes-plugin-tests",
+    ):
+        if under_tmp(candidate):
+            continue
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            probe = candidate / ".write-probe"
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink()
+            return candidate
+        except OSError:
+            continue
+    raise RuntimeError("no writable non-tmp directory for source-build discovery tests")
+
+
 @contextlib.contextmanager
 def _non_tmp_dir():
     """Temp directory that is not under /tmp, so source-build trust can be tested."""
-    root = Path(__file__).resolve().parent
-    with tempfile.TemporaryDirectory(prefix="ryk-disc-", dir=root) as directory:
+    with tempfile.TemporaryDirectory(prefix="ryk-disc-", dir=_non_tmp_parent()) as directory:
         yield Path(directory)
 
 
@@ -62,6 +101,7 @@ class HermesPluginDiscoveryTests(unittest.TestCase):
     def setUp(self) -> None:
         _PLUGIN._ryk_cache_env = None
         _PLUGIN._ryk_cache_path = None
+        _PLUGIN._clear_sticky_attest()
 
     def test_fail_open_requires_explicit_configuration(self) -> None:
         with mock.patch.dict(os.environ, {}, clear=False):
@@ -556,8 +596,8 @@ class HermesPluginDiscoveryTests(unittest.TestCase):
                 result = handler(tool_name="terminal", args={"command": "git status"})
             self.assertEqual(result, {"action": "block", "message": "blocked by ryk"})
 
-    def test_pre_tool_call_ask_uses_native_approve_path(self) -> None:
-        """ryk ask must escalate to Hermes human gate, not permanent block-without-resume."""
+    def test_pre_tool_call_unexpected_ask_is_deny(self) -> None:
+        """Leaked ask after the Zig rewrite is fail-closed deny."""
         ctx = mock.Mock()
         _PLUGIN._register(ctx, "pre_tool_call")
         handler = ctx.register_hook.call_args.args[1]
@@ -580,14 +620,18 @@ class HermesPluginDiscoveryTests(unittest.TestCase):
                 },
             ):
                 result = handler(tool_name="terminal", args={"command": "rm -rf /tmp/x"})
-        self.assertIsInstance(result, dict)
-        assert result is not None
-        self.assertEqual(result.get("action"), "approve")
-        self.assertIn("approval required by ryk", result.get("message", ""))
-        rule_key = result.get("rule_key", "")
-        self.assertTrue(rule_key.startswith("ryk|"), rule_key)
-        self.assertIn("core.filesystem:destructive_rm", rule_key)
-        self.assertIn("|terminal|", f"|{rule_key}|")
+        self.assertEqual(result.get("action"), "block")
+        self.assertIn("approval required", result.get("message", "").lower())
+
+    def test_pre_tool_call_stage_never_permits(self) -> None:
+        """Staged writes are hold/deny, not leftover unused ask."""
+        blocked = _PLUGIN._mapping.map_pre_tool_call(
+            {"decision": "stage", "message": "staged write pending review"},
+            "write",
+            {"path": "src/main.ts"},
+            environ={},
+        )
+        self.assertEqual(blocked["action"], "block")
 
     def test_pre_tool_call_ask_hardens_to_block_in_ci(self) -> None:
         ctx = mock.Mock()
@@ -617,7 +661,7 @@ class HermesPluginDiscoveryTests(unittest.TestCase):
             ):
                 result = handler(tool_name="terminal", args={"command": "git push"})
         self.assertEqual(result.get("action"), "block")
-        self.assertIn("noninteractive", result.get("message", "").lower())
+        self.assertIn("approval required", result.get("message", "").lower())
 
     def test_unattended_marker_hardens_ask_to_block_with_env_cleared(self) -> None:
         """`.ryk_unattended` alone must drive ask→block even when CI env is absent."""
@@ -653,7 +697,7 @@ class HermesPluginDiscoveryTests(unittest.TestCase):
                 ):
                     result = handler(tool_name="terminal", args={"command": "git push"})
             self.assertEqual(result.get("action"), "block")
-            self.assertIn("noninteractive", result.get("message", "").lower())
+            self.assertIn("approval required", result.get("message", "").lower())
 
     def test_call_ryk_passes_ci_flag_when_unattended(self) -> None:
         """Unattended hooks must invoke `ryk hook hermes … --ci`."""
@@ -752,7 +796,7 @@ class HermesPluginDiscoveryTests(unittest.TestCase):
         for decision, expected in (
             ("allow", "proceed"),
             ("block", "hard_block"),
-            ("ask", "native_approve_and_resume"),
+            ("ask", "fail_closed_block"),
             ("warn", "advisory_log"),
         ):
             with self.subTest(decision=decision):
@@ -767,14 +811,21 @@ class HermesPluginDiscoveryTests(unittest.TestCase):
             {"decision": "block", "message": "no"}, "terminal", {}
         )
         self.assertEqual(blocked["action"], "block")
-        approved = _PLUGIN._mapping.map_pre_tool_call(
+        unexpected_ask = _PLUGIN._mapping.map_pre_tool_call(
             {"decision": "ask", "message": "need"},
             "terminal",
             {"command": "x"},
             environ={},
         )
-        self.assertEqual(approved["action"], "approve")
-        self.assertTrue(approved["rule_key"].startswith("ryk|"))
+        self.assertEqual(unexpected_ask["action"], "block")
+        staged = _PLUGIN._mapping.map_pre_tool_call(
+            {"decision": "stage", "message": "staged write"},
+            "terminal",
+            {"path": "src/main.ts"},
+            environ={},
+        )
+        self.assertEqual(staged["action"], "block")
+        self.assertEqual(_PLUGIN._mapping.tool_action_mode("stage"), "hard_block")
 
     def test_pre_tool_call_block_message_is_short_without_remediation(self) -> None:
         """Host block message is one short line: no Next/remediation wall, rule once."""
@@ -855,7 +906,7 @@ class HermesPluginDiscoveryTests(unittest.TestCase):
         self.assertIn("core.shell:network", rule_only)
         self.assertNotIn("\n", rule_only)
 
-    def test_ask_approve_message_is_short_with_stable_rule_key(self) -> None:
+    def test_attended_ask_is_unexpected_deny(self) -> None:
         mapping = _PLUGIN._mapping
         out = mapping.map_pre_tool_call(
             {
@@ -871,15 +922,8 @@ class HermesPluginDiscoveryTests(unittest.TestCase):
             {"command": "rm -rf /tmp/x"},
             environ={},
         )
-        assert out is not None
-        self.assertEqual(out["action"], "approve")
-        self.assertTrue(out["rule_key"].startswith("ryk|core.filesystem:destructive_rm|terminal|"))
-        message = out["message"]
-        self.assertIn("approval required", message.lower())
-        self.assertNotIn("Recourse", message)
-        self.assertNotIn("Next:", message)
-        self.assertNotIn("\n", message)
-        self.assertLessEqual(len(message), 200)
+        self.assertEqual(out["action"], "block")
+        self.assertNotIn("Recourse", out["message"])
 
     def test_ci_ask_block_message_is_short_single_line(self) -> None:
         mapping = _PLUGIN._mapping
@@ -898,7 +942,6 @@ class HermesPluginDiscoveryTests(unittest.TestCase):
         self.assertEqual(out["action"], "block")
         message = out["message"]
         self.assertIn("approval required", message.lower())
-        self.assertIn("noninteractive", message.lower())
         self.assertNotIn("Recourse", message)
         self.assertNotIn("Next:", message)
         self.assertNotIn("\n", message)
@@ -985,7 +1028,7 @@ class HermesPluginDiscoveryTests(unittest.TestCase):
         self.assertFalse(message.endswith("...[truncated]"))
 
     def test_ci_ask_block_message_respects_host_char_cap(self) -> None:
-        """CI harden clause must still fit Hermes host message budget."""
+        """Unexpected ask still fits Hermes host message budget."""
         mapping = _PLUGIN._mapping
         out = mapping.map_pre_tool_call(
             {
@@ -1004,7 +1047,6 @@ class HermesPluginDiscoveryTests(unittest.TestCase):
         message = out["message"]
         self.assertLessEqual(len(message), 200)
         self.assertNotIn("\n", message)
-        self.assertIn("noninteractive", message.lower())
         self.assertNotIn("Recourse", message)
 
     def test_pre_tool_call_allows_only_explicit_allow(self) -> None:

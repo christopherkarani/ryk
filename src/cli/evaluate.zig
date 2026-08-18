@@ -1,6 +1,10 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const gpa_mod = @import("gpa.zig");
 const build_options = @import("build_options");
+
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 
 const core = @import("ryk_core").core;
 const core_api = @import("ryk_core").api;
@@ -14,6 +18,9 @@ const feed_writer = @import("feed_writer.zig");
 const help = @import("help.zig");
 const rust_visibility = @import("feed_visibility.zig");
 const telemetry = @import("../telemetry.zig");
+const hook_client = @import("hook_client.zig");
+const hook_ipc = @import("hook_ipc.zig");
+const host_wire_rewrite = @import("host_wire_rewrite.zig");
 
 const max_payload_len = 256 * 1024;
 const api_schema_version: i64 = 1;
@@ -21,8 +28,6 @@ const daemon_protocol_version: i64 = 1;
 const event_source_evaluate = "evaluate";
 
 pub const exit_allowed: u8 = 0;
-/// Machine `decision: "ask"` also uses exit 0 (reason is in JSON; Pi maps decision).
-pub const exit_ask: u8 = 0;
 pub const exit_denied: u8 = 2;
 pub const exit_evaluator_error: u8 = 3;
 pub const exit_invalid_input: u8 = 64;
@@ -39,6 +44,12 @@ const EvaluateWireOpts = struct {
     fm_client: ?fm_steward_client.Client = null,
     /// Skip FM soft seatbelt (tests that need pure WP4 matrix only).
     disable_fm: bool = false,
+    /// Server workspace cache hit. Caller owns the policy; do not deinit.
+    cached_policy: ?*const core_api.LoadedPolicy = null,
+    /// Client asked to raise leftover ask → deny (`RYK_MODE=ci` / `--ci`).
+    raise_ci: bool = false,
+    /// Test inject. Null → `--ci` OR process unattended keys.
+    unattended_override: ?bool = null,
 };
 
 pub const EvaluateRequest = struct {
@@ -76,6 +87,7 @@ const ErrorCode = enum {
     daemon_incompatible,
     daemon_timeout,
     protocol_error,
+    policy_load_failed,
     internal_error,
 
     fn toString(self: ErrorCode) []const u8 {
@@ -175,7 +187,80 @@ fn commandWithEvaluator(io: std.Io, argv: []const []const u8, stdout: anytype, s
     };
     defer allocator.free(payload);
 
+    if (try tryHookServer(io, allocator, payload, stdout, stderr)) |code| {
+        return code;
+    }
+
     return evaluatePayload(io, allocator, payload, stdout, evaluator, .process_home, .{});
+}
+
+/// Served evaluate must match in-process `evaluatePayload` (FM on).
+fn serverEvaluateWire(cached_policy: ?*const core_api.LoadedPolicy) EvaluateWireOpts {
+    return .{ .cached_policy = cached_policy };
+}
+
+fn tryHookServer(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    payload: []const u8,
+    stdout: anytype,
+    stderr: anytype,
+) !?u8 {
+    if (!hook_client.shouldTry()) return null;
+    const bin = std.process.executablePathAlloc(io, allocator) catch "";
+    defer if (bin.len > 0) allocator.free(bin);
+    const cwd_z = hook_client.resolveClientWorkspace(io, allocator) orelse return null;
+    defer allocator.free(cwd_z);
+
+    var owned = hook_client.tryServe(io, allocator, .{
+        .id = 1,
+        .method = "evaluate",
+        .bin = bin,
+        .version = build_options.version,
+        // Client folds CI / RYK_CI / RYK_NONINTERACTIVE / RYK_UNATTENDED; hook-serve must not getenvUnattended.
+        .ci = hook_client.clientUnattendedCi(resolveEvaluateMode(.strict) == .ci),
+        .workspace = cwd_z,
+        .cwd = cwd_z,
+        .payload_json = payload,
+    }) catch |err| switch (err) {
+        error.Unavailable => return null,
+        error.BrokenSession, error.OutOfMemory => {
+            try writeResponseJson(stdout, .{
+                .request_id = null,
+                .decision = "deny",
+                .reason = if (err == error.OutOfMemory)
+                    "hook server ran out of memory"
+                else
+                    "hook server session ended before a decision",
+                .daemon_status = .unknown,
+                .daemon_compatible = false,
+            });
+            return exit_denied;
+        },
+    };
+    defer owned.deinit(allocator);
+    try stdout.writeAll(owned.response().stdout);
+    try stderr.writeAll(owned.response().stderr);
+    return owned.response().exit;
+}
+
+pub fn evaluateForServer(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    payload: []const u8,
+    cached_policy: ?*const core_api.LoadedPolicy,
+    raise_ci: bool,
+) !hook_ipc.HostEmit {
+    var stdout_buf: std.Io.Writer.Allocating = .init(allocator);
+    errdefer stdout_buf.deinit();
+    var wire = serverEvaluateWire(cached_policy);
+    wire.raise_ci = raise_ci;
+    const code = try evaluatePayload(io, allocator, payload, &stdout_buf.writer, shellEvalBridge, .process_home, wire);
+    return .{
+        .exit = code,
+        .stdout = try stdout_buf.toOwnedSlice(),
+        .stderr = try allocator.dupe(u8, ""),
+    };
 }
 
 fn evaluatePayload(
@@ -373,14 +458,19 @@ fn persistEvaluationRecordBestEffort(
     record: rust_visibility.RustShellFeedRecord,
     destination: FeedDestination,
 ) void {
-    feed_writer.appendRecord(io, allocator, record.workspace_root, record) catch {};
+    const opts = feed_writer.AppendOptions{
+        .sync = false,
+        .update_registry = !std.mem.eql(u8, record.decision, "allow") and
+            !std.mem.eql(u8, record.decision, "context_only"),
+    };
+    feed_writer.appendRecordWithOptions(io, allocator, record.workspace_root, record, opts) catch {};
     const dashboard_root = switch (destination) {
         .disabled => return,
         .process_home => if (feed_writer.processGlobalWritesDisabled()) return else feed_writer.resolveGlobalDashboardRoot(allocator) catch return,
         .explicit => |root| allocator.dupe(u8, root) catch return,
     };
     defer allocator.free(dashboard_root);
-    feed_writer.appendGlobalRecord(io, allocator, dashboard_root, record) catch {};
+    feed_writer.appendGlobalRecordWithOptions(io, allocator, dashboard_root, record, opts) catch {};
 }
 
 const RequestParseError = error{
@@ -494,10 +584,9 @@ fn requestIdBestEffort(allocator: std.mem.Allocator, payload: []const u8) !?[]co
 
 /// Map product WP4+FM decision to machine JSON for Pi evaluate.
 ///
-/// Exit codes (stable contract):
-/// - allow / observe → exit 0, decision "allow"
-/// - ask → exit 0, decision "ask" (host maps JSON; do not invent a new exit)
-/// - deny / redact / stage / broker → exit 2, decision "deny"
+/// Exit codes (coding-host enforcement wire):
+/// - allow / observe / leftover unused policy ask → exit 0, decision "allow"
+/// - never-permit ask / deny / stage → exit 2, decision "deny"
 /// - evaluator fail-closed / protocol → exit 3, decision "error"
 fn writeEvaluationResponse(
     io: std.Io,
@@ -526,20 +615,53 @@ fn writeEvaluationResponse(
 
     var loaded_opt: ?core_api.LoadedPolicy = null;
     defer if (loaded_opt) |*loaded| loaded.deinit();
-    if (wire.mode_override == null or wire.commands_allow_override == null) {
-        loaded_opt = core_api.discoverPolicy(io, allocator, null, workspace_root) catch null;
+    if (wire.cached_policy == null and (wire.mode_override == null or wire.commands_allow_override == null)) {
+        loaded_opt = core_api.discoverPolicy(io, allocator, null, workspace_root) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => {
+                // discover() already falls back to builtin on FileNotFound.
+                // Any other load error (invalid/empty/unreadable) must fail closed.
+                telemetry.recordReliability("evaluate", "evaluator_error", "evaluate");
+                const message = "ryk evaluate: failed to load policy; ryk blocked it before evaluation.";
+                recordProductEvaluationBestEffort(
+                    io,
+                    allocator,
+                    request,
+                    "error",
+                    message,
+                    null,
+                    null,
+                    null,
+                    null,
+                    feed_destination,
+                );
+                try writePolicyLoadError(stdout, request.request_id, message);
+                return exit_evaluator_error;
+            },
+        };
     }
 
-    const mode: policy.schema.Mode = if (wire.mode_override) |m|
+    const discovered: ?*const core_api.LoadedPolicy = if (wire.cached_policy) |cached|
+        cached
+    else if (loaded_opt) |*loaded|
+        loaded
+    else
+        null;
+
+    const resolved: policy.schema.Mode = if (wire.mode_override) |m|
         m
-    else if (loaded_opt) |loaded|
+    else if (discovered) |loaded|
         resolveEvaluateMode(loaded.mode())
     else
         resolveEvaluateMode(.strict);
+    const mode: policy.schema.Mode = if (wire.raise_ci)
+        moreRestrictiveMode(resolved, .ci)
+    else
+        resolved;
 
     const commands_allow: []const []const u8 = if (wire.commands_allow_override) |a|
         a
-    else if (loaded_opt) |loaded|
+    else if (discovered) |loaded|
         loaded.innerPtr().commands.allow
     else
         &.{};
@@ -554,7 +676,7 @@ fn writeEvaluationResponse(
         .{
             .command = request.command,
             .permit = permit,
-            .sticky = shell_eval.getSessionStickyStore(),
+            .sticky = shell_eval.getSessionStickyStoreFor(request.session_id orelse brand.default_session_id),
             .effect_class = null,
             .session_id = request.session_id orelse brand.default_session_id,
             .tool = "bash",
@@ -602,10 +724,18 @@ fn writeEvaluationResponse(
         null;
     defer if (safe_remediation) |text| allocator.free(text);
 
-    const decision_tag: []const u8 = switch (owned.decision.result) {
+    const unattended = wire.unattended_override orelse host_wire_rewrite.unattendedFromEnv(wire.raise_ci);
+    const wire_policy: host_wire_rewrite.PolicyDecisionForWire = switch (owned.decision.result) {
+        .allow => .allow,
+        .observe => .observe,
+        .ask => .{ .ask = host_wire_rewrite.fromAskOrigin(owned.ask_origin) },
+        .stage => .stage,
+        .deny, .redact, .broker => .deny,
+    };
+    const wire_outcome = host_wire_rewrite.rewrite(wire_policy, unattended);
+    const decision_tag: []const u8 = switch (wire_outcome) {
         .allow, .observe => "allow",
-        .ask => "ask",
-        .deny, .redact, .stage, .broker => "deny",
+        .deny, .stage => "deny",
     };
 
     recordProductEvaluationBestEffort(
@@ -621,7 +751,7 @@ fn writeEvaluationResponse(
         feed_destination,
     );
 
-    return switch (owned.decision.result) {
+    return switch (wire_outcome) {
         .allow, .observe => {
             const response = MachineResponse{
                 .request_id = request.request_id,
@@ -637,23 +767,7 @@ fn writeEvaluationResponse(
             try writeResponseJson(stdout, response);
             return exit_allowed;
         },
-        .ask => {
-            // Prefer product reason (WP4 softened / FM explain). Emit redacted.
-            const response = MachineResponse{
-                .request_id = request.request_id,
-                .decision = "ask",
-                .reason = safe_reason,
-                .severity = severity,
-                .pack_id = pack_id,
-                .pattern_name = pattern_name,
-                .rule_id = owned.owned_rule_id,
-                .daemon_status = .healthy,
-                .daemon_compatible = true,
-            };
-            try writeResponseJson(stdout, response);
-            return exit_ask;
-        },
-        .deny, .redact, .stage, .broker => {
+        .deny, .stage => {
             const remediation_items = if (safe_remediation) |text|
                 &[_]Remediation{.{ .description = text }}
             else
@@ -733,6 +847,18 @@ fn writeProtocolError(stdout: anytype, request_id: ?[]const u8, message: []const
         .daemon_status = .unknown,
         .daemon_compatible = false,
         .error_info = .{ .code = .protocol_error, .message = message },
+    });
+}
+
+fn writePolicyLoadError(stdout: anytype, request_id: ?[]const u8, message: []const u8) !void {
+    try writeErrorResponse(stdout, .{
+        .request_id = request_id,
+        .decision = "error",
+        .reason = message,
+        .daemon_protocol_version = null,
+        .daemon_status = .unknown,
+        .daemon_compatible = false,
+        .error_info = .{ .code = .policy_load_failed, .message = message },
     });
 }
 
@@ -1115,7 +1241,7 @@ test "evaluate records Pi decisions in workspace and global feeds" {
     try std.Io.Dir.cwd().access(std.testing.io, global_events, .{});
 }
 
-test "evaluate feed records product ask after FM upgrades engine allow" {
+test "evaluate feed records deny after FM steward ask on the host wire" {
     defer shell_eval.resetSessionStickyStoreForTests();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1144,8 +1270,8 @@ test "evaluate feed records product ask after FM upgrades engine allow" {
         .commands_allow_override = &.{},
         .fm_client = client,
     });
-    try std.testing.expectEqual(exit_ask, code);
-    try std.testing.expect(std.mem.indexOf(u8, stdout.buffered(), "\"decision\": \"ask\"") != null);
+    try std.testing.expectEqual(exit_denied, code);
+    try std.testing.expect(std.mem.indexOf(u8, stdout.buffered(), "\"decision\": \"deny\"") != null);
 
     const workspace_records = try feed_writer.loadRecent(std.testing.io, std.testing.allocator, root, 4);
     defer {
@@ -1153,8 +1279,8 @@ test "evaluate feed records product ask after FM upgrades engine allow" {
         std.testing.allocator.free(workspace_records);
     }
     try std.testing.expectEqual(@as(usize, 1), workspace_records.len);
-    // Critical: feed must reflect product ask, not raw engine Allow.
-    try std.testing.expectEqualStrings("ask", workspace_records[0].record.decision);
+    // FM steward ask is never-permit: feed records the host-wire outcome, not engine Allow.
+    try std.testing.expectEqualStrings("deny", workspace_records[0].record.decision);
     try std.testing.expectEqualStrings(event_source_evaluate, workspace_records[0].record.event_source);
     try std.testing.expect(std.mem.indexOf(u8, workspace_records[0].record.reason, "hard-danger") != null);
 }
@@ -1195,10 +1321,11 @@ test "evaluate daemon failures map to JSON error exit 3" {
 }
 
 // ---------------------------------------------------------------------------
-// WP4 + FM product path (Phase 4 WP4a) — evaluate emits decision=ask
+// WP4 + FM product path (Phase 4 WP4a) — leftover unused ask → allow;
+// never-permit (SoftBlock / FM) → deny
 // ---------------------------------------------------------------------------
 
-test "evaluate ask mode high-severity deny emits decision ask exit 0" {
+test "evaluate ask mode high-severity leftover unused policy ask emits allow" {
     const allocator = std.testing.allocator;
     defer shell_eval.resetSessionStickyStoreForTests();
     const cwd = try testCwd(allocator);
@@ -1212,13 +1339,13 @@ test "evaluate ask mode high-severity deny emits decision ask exit 0" {
         .mode_override = .ask,
         .commands_allow_override = &.{},
         .disable_fm = true,
+        .unattended_override = false,
     });
-    try std.testing.expectEqual(exit_ask, code);
-    try std.testing.expectEqual(exit_allowed, code); // ask shares exit 0 with allow
+    try std.testing.expectEqual(exit_allowed, code);
     const output = stdout.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"ask\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"allow\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"ask\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, output, "\"severity\": \"high\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "requires approval") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "\"error\": null") != null);
 }
 
@@ -1244,10 +1371,10 @@ test "evaluate FM hard-danger residual upgrades allow to ask with reason" {
         .commands_allow_override = &.{},
         .fm_client = client,
     });
-    try std.testing.expectEqual(exit_ask, code);
+    try std.testing.expectEqual(exit_denied, code);
     try std.testing.expectEqual(@as(u32, 1), state.call_count);
     const output = stdout.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"ask\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"deny\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "curl | sh is hard-danger shaped") != null);
 }
 
@@ -1274,9 +1401,9 @@ test "evaluate FM reason with secret-shaped text is redacted in JSON" {
         .commands_allow_override = &.{},
         .fm_client = client,
     });
-    try std.testing.expectEqual(exit_ask, code);
+    try std.testing.expectEqual(exit_denied, code);
     const output = stdout.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"ask\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"deny\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "sk-fakeSyntheticOpenAIKey1234567890") == null);
     try std.testing.expect(std.mem.indexOf(u8, output, "[REDACTED]") != null);
 }
@@ -1339,4 +1466,149 @@ test "evaluate FM timeout keeps soft allow without inventing ask" {
     const output = stdout.buffered();
     try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"allow\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"ask\"") == null);
+}
+
+test "evaluate fail-closes when workspace policy is invalid" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, ".git", .default_dir);
+    try tmp.dir.createDir(std.testing.io, ".ryk", .default_dir);
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = ".ryk/policy.yaml",
+        .data = "mode: not-a-real-mode\n",
+    });
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    const payload = try validPayload(allocator, "echo hello", root);
+    defer allocator.free(payload);
+    var stdout_buf: [4096]u8 = undefined;
+    var stdout: std.Io.Writer = .fixed(&stdout_buf);
+
+    const code = try evaluatePayload(std.testing.io, allocator, payload, &stdout, mockAllow, .disabled, .{
+        .disable_fm = true,
+    });
+    try std.testing.expectEqual(exit_evaluator_error, code);
+    const output = stdout.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"error\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "policy_load_failed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"allow\"") == null);
+}
+
+test "evaluate fail-closes when workspace policy is empty" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, ".git", .default_dir);
+    try tmp.dir.createDir(std.testing.io, ".ryk", .default_dir);
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = ".ryk/policy.yaml",
+        .data = "",
+    });
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    const payload = try validPayload(allocator, "echo hello", root);
+    defer allocator.free(payload);
+    var stdout_buf: [4096]u8 = undefined;
+    var stdout: std.Io.Writer = .fixed(&stdout_buf);
+
+    const code = try evaluatePayload(std.testing.io, allocator, payload, &stdout, mockAllow, .disabled, .{
+        .disable_fm = true,
+    });
+    try std.testing.expectEqual(exit_evaluator_error, code);
+    const output = stdout.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"error\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "policy_load_failed") != null);
+}
+
+test "evaluate fail-closes when workspace policy is unreadable" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, ".git", .default_dir);
+    try tmp.dir.createDir(std.testing.io, ".ryk", .default_dir);
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = ".ryk/policy.yaml",
+        .data = "version: 1\nmode: strict\n",
+    });
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    const policy_path = try std.fs.path.join(allocator, &.{ root, ".ryk", "policy.yaml" });
+    defer allocator.free(policy_path);
+    const policy_z = try allocator.dupeZ(u8, policy_path);
+    defer allocator.free(policy_z);
+    if (std.c.chmod(policy_z.ptr, 0) != 0) return error.SkipZigTest;
+    defer _ = std.c.chmod(policy_z.ptr, 0o644);
+    if (std.Io.Dir.cwd().readFileAlloc(std.testing.io, policy_path, allocator, .limited(4096))) |leaked| {
+        allocator.free(leaked);
+        return error.SkipZigTest;
+    } else |_| {}
+
+    const payload = try validPayload(allocator, "echo hello", root);
+    defer allocator.free(payload);
+    var stdout_buf: [4096]u8 = undefined;
+    var stdout: std.Io.Writer = .fixed(&stdout_buf);
+
+    const code = try evaluatePayload(std.testing.io, allocator, payload, &stdout, mockAllow, .disabled, .{
+        .disable_fm = true,
+    });
+    try std.testing.expectEqual(exit_evaluator_error, code);
+    const output = stdout.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"error\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "policy_load_failed") != null);
+}
+
+test "evaluate hook-serve keeps FM enabled like in-process" {
+    try std.testing.expect(!serverEvaluateWire(null).disable_fm);
+    const in_process = EvaluateWireOpts{};
+    try std.testing.expect(!in_process.disable_fm);
+}
+
+test "evaluate hook-serve OOM is fail-closed like a broken session" {
+    try std.testing.expect(hook_client.serveErrorIsFailClosed(error.OutOfMemory));
+    try std.testing.expect(hook_client.serveErrorIsFailClosed(error.BrokenSession));
+    try std.testing.expect(!hook_client.serveErrorIsFailClosed(error.Unavailable));
+}
+
+test "evaluate missing workspace policy still uses builtin strict" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, ".git", .default_dir);
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+
+    var home_tmp = std.testing.tmpDir(.{});
+    defer home_tmp.cleanup();
+    const home = try home_tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(home);
+    const home_z = try allocator.dupeZ(u8, home);
+    defer allocator.free(home_z);
+    const prev_home = if (std.c.getenv("HOME")) |value| try allocator.dupeZ(u8, std.mem.span(value)) else null;
+    defer if (prev_home) |value| allocator.free(value);
+    try std.testing.expectEqual(@as(c_int, 0), setenv("HOME", home_z.ptr, 1));
+    defer {
+        if (prev_home) |value| {
+            _ = setenv("HOME", value.ptr, 1);
+        } else {
+            _ = unsetenv("HOME");
+        }
+    }
+
+    const payload = try validPayload(allocator, "echo hello", root);
+    defer allocator.free(payload);
+    var stdout_buf: [4096]u8 = undefined;
+    var stdout: std.Io.Writer = .fixed(&stdout_buf);
+
+    const code = try evaluatePayload(std.testing.io, allocator, payload, &stdout, mockAllow, .disabled, .{
+        .disable_fm = true,
+    });
+    try std.testing.expectEqual(exit_allowed, code);
+    const output = stdout.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"allow\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "policy_load_failed") == null);
 }

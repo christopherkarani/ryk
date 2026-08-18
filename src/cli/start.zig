@@ -11,6 +11,8 @@ const onboarding = @import("onboarding.zig");
 const ensure = @import("ensure.zig");
 const pack_state = @import("pack_state.zig");
 const plugin = @import("plugin.zig");
+const host_ask_resume = @import("host_ask_resume.zig");
+const hook_client = @import("hook_client.zig");
 const shell_eval = @import("shell_eval.zig");
 const build_options = @import("build_options");
 const env_util = @import("../env_util.zig");
@@ -260,6 +262,7 @@ pub fn runStart(
         ensure_outcome.policy_created,
     );
     setup_succeeded = true;
+    hook_client.prewarmBestEffort(io, allocator);
     return exit_codes.success;
 }
 
@@ -319,6 +322,12 @@ const SelectedHosts = struct {
     owned: bool,
 };
 
+fn appendOwnedCopy(allocator: std.mem.Allocator, list: *std.ArrayList([]const u8), bytes: []const u8) !void {
+    const owned = try allocator.dupe(u8, bytes);
+    errdefer allocator.free(owned);
+    try list.append(allocator, owned);
+}
+
 fn resolveSelectedHosts(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -338,7 +347,7 @@ fn resolveSelectedHosts(
         }
         for (host_statuses) |status| {
             if (!shouldAutoSelectHost(status.name, status.detected)) continue;
-            try list.append(allocator, try allocator.dupe(u8, status.name));
+            try appendOwnedCopy(allocator, &list, status.name);
         }
         return .{ .items = try list.toOwnedSlice(allocator), .owned = true };
     }
@@ -354,26 +363,30 @@ fn resolveSelectedHosts(
     }
 
     var options = try allocator.alloc(tui.prompt.SelectionOption, detected_count);
-    defer allocator.free(options);
+    var filled: usize = 0;
+    defer {
+        for (options[0..filled]) |opt| {
+            allocator.free(opt.label);
+            if (opt.id) |id| allocator.free(id);
+        }
+        allocator.free(options);
+    }
 
-    var visible_idx: usize = 0;
     for (host_statuses) |status| {
         if (!status.detected) continue;
         const marker = if (status.installed) " (installed)" else "";
         var label_buf: [64]u8 = undefined;
-        const label = std.fmt.bufPrint(&label_buf, "{s}{s}", .{ status.name, marker }) catch status.name;
-        options[visible_idx] = .{
-            .label = try allocator.dupe(u8, label),
+        const label_text = std.fmt.bufPrint(&label_buf, "{s}{s}", .{ status.name, marker }) catch status.name;
+        const label = try allocator.dupe(u8, label_text);
+        errdefer allocator.free(label);
+        const id = try allocator.dupe(u8, status.name);
+        errdefer allocator.free(id);
+        options[filled] = .{
+            .label = label,
             .checked = !std.mem.eql(u8, status.name, "cursor"),
-            .id = try allocator.dupe(u8, status.name),
+            .id = id,
         };
-        visible_idx += 1;
-    }
-    defer {
-        for (options) |opt| {
-            allocator.free(opt.label);
-            if (opt.id) |id| allocator.free(id);
-        }
+        filled += 1;
     }
 
     const confirmed = try tui.prompt.multiSelect(io, allocator, stdout, options, "Select agent hosts to integrate", null);
@@ -390,7 +403,7 @@ fn resolveSelectedHosts(
     for (options) |item| {
         if (!item.checked) continue;
         const host_name = item.id orelse item.label;
-        try list.append(allocator, try allocator.dupe(u8, host_name));
+        try appendOwnedCopy(allocator, &list, host_name);
     }
     return .{ .items = try list.toOwnedSlice(allocator), .owned = true };
 }
@@ -588,9 +601,9 @@ fn writeSuccessEndCard(
     } else if (verification) |outcome| {
         if (outcome.host_evidence == .not_applicable and selected_hosts.len == 0) {
             const body = if (policy_created)
-                "Policy written. Verify passed."
+                "Policy written. Policy check passed."
             else
-                "Policy unchanged. Verify passed.";
+                "Policy unchanged. Policy check passed.";
             try tui.render.callout(io, stdout, .success, "Setup complete", body);
         } else if (outcome.host_evidence == .not_applicable) {
             const body = if (policy_created)
@@ -616,7 +629,7 @@ fn writeSuccessEndCard(
         else if (v.host_evidence == .native)
             "passed"
         else if (v.host_evidence == .not_applicable)
-            if (selected_hosts.len == 0) "passed" else "deferred"
+            if (selected_hosts.len == 0) "policy check" else "deferred"
         else
             v.host_evidence.label()
     else
@@ -690,6 +703,12 @@ fn writeSuccessEndCard(
             try stdout.writeAll(line);
             try stdout.writeAll("\n");
         }
+        try stdout.writeAll("\n");
+    }
+
+    if (try host_ask_resume.formatWarn(allocator, selected_hosts)) |ask_warn| {
+        defer allocator.free(ask_warn);
+        try tui.render.callout(io, stdout, .warn, "Ask resume", ask_warn);
         try stdout.writeAll("\n");
     }
 
@@ -904,13 +923,14 @@ test "start first-run create copy names what happened without leftover jargon" {
     const output = stdout_writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, output, "Creating .ryk/policy.yaml") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Policy created.") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "Policy written. Verify passed.") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "Verify       passed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Policy written. Policy check passed.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Verify       policy check") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Setup complete") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Engine       in-process") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Daemon       healthy") == null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Next: ryk <agent>") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Reinstall the complete ryk release") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Verify passed") == null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Existing policy files are kept") == null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Existing policy is preserved") == null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Existing policy preserved.") == null);
@@ -1098,7 +1118,7 @@ test "start verified firewall-only completion states mediated-session scope" {
     try std.testing.expect(std.mem.indexOf(u8, flat, "now protected") == null);
 }
 
-test "start OpenClaw completion is explicit about wrapper-required evidence" {
+test "host_ask_resume start OpenClaw completion warns about no ask resume" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
@@ -1140,6 +1160,9 @@ test "start OpenClaw completion is explicit about wrapper-required evidence" {
     try std.testing.expect(std.mem.indexOf(u8, written, "Verify passed") == null);
     try std.testing.expect(std.mem.indexOf(u8, written, "Setup complete") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "ryk run -- openclaw") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "Ask resume") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "ask resume is partial (hook-grade)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "host-decision-mapping.md") != null);
 }
 
 test "start leave-alone empty-host card says policy unchanged after verify" {
@@ -1177,8 +1200,9 @@ test "start leave-alone empty-host card says policy unchanged after verify" {
     );
 
     const written = output.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, written, "Policy unchanged. Verify passed.") != null);
-    try std.testing.expect(std.mem.indexOf(u8, written, "Verify       passed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "Policy unchanged. Policy check passed.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "Verify       policy check") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "Verify passed") == null);
     try std.testing.expect(std.mem.indexOf(u8, written, "activation evidence pending") == null);
     try std.testing.expect(std.mem.indexOf(u8, written, "not applicable") == null);
 }
@@ -1286,6 +1310,55 @@ test "start auto-select skips detect-only cursor" {
     try std.testing.expect(shouldAutoSelectHost("claude", true));
     try std.testing.expect(!shouldAutoSelectHost("cursor", true));
     try std.testing.expect(!shouldAutoSelectHost("claude", false));
+}
+
+fn hostsListOomResolveSelectedHostsAutoProbe(allocator: std.mem.Allocator) !void {
+    var stdout_buf: [256]u8 = undefined;
+    var stdout: std.Io.Writer = .fixed(&stdout_buf);
+    // At least one detected non-cursor host; cursor stays auto-skipped.
+    const statuses = [_]onboarding.HostStatus{
+        .{ .name = "codex", .detected = true, .installed = false },
+        .{ .name = "cursor", .detected = true, .installed = false },
+        .{ .name = "hermes", .detected = true, .installed = false },
+    };
+    const selected = try resolveSelectedHosts(
+        std.testing.io,
+        allocator,
+        .{ .auto = true },
+        &statuses,
+        &stdout,
+    );
+    defer if (selected.owned) onboarding.deinitHostList(allocator, selected.items);
+    try std.testing.expect(selected.owned);
+    try std.testing.expectEqual(@as(usize, 2), selected.items.len);
+    try std.testing.expectEqualStrings("codex", selected.items[0]);
+    try std.testing.expectEqualStrings("hermes", selected.items[1]);
+}
+
+test "HostsListOom resolveSelectedHosts auto OOM ownership" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        hostsListOomResolveSelectedHostsAutoProbe,
+        .{},
+    );
+}
+
+test "start picker filled-prefix cleanup mid-loop OOM and cursor default-unchecked" {
+    // fail_index 3: options alloc + first label + first id stored; next dupe OOMs.
+    // Do not CAAF this path — success would enter TUI multiSelect.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 3 });
+    var stdout_buf: [512]u8 = undefined;
+    var stdout: std.Io.Writer = .fixed(&stdout_buf);
+    const statuses = [_]onboarding.HostStatus{
+        .{ .name = "codex", .detected = true, .installed = false },
+        .{ .name = "cursor", .detected = true, .installed = false },
+        .{ .name = "hermes", .detected = true, .installed = false },
+    };
+    try std.testing.expectError(
+        error.OutOfMemory,
+        resolveSelectedHosts(std.testing.io, failing.allocator(), .{}, &statuses, &stdout),
+    );
+    try std.testing.expect(failing.has_induced_failure);
 }
 
 test "start packs-or-verify receipt only when those steps actually failed" {
@@ -1621,9 +1694,7 @@ test "start auto default path has no protection grade menu jargon in stdout" {
     try std.testing.expect(std.mem.indexOf(u8, output, "Setup path: strict") != null);
 }
 
-// ---------------------------------------------------------------------------
 // AINA P3 S5 — start/init discovery refresh (DIS-1 / DIS-7 / A-P3-2 / A-P3-3)
-// Spec: planning/2026-08-02-agent-inference-network-allow-spec.md
 
 // AINA P3 discovery refresh is covered thoroughly in init.zig and
 // policy/network_discovered.zig. start re-exports the shared seam only.

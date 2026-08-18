@@ -309,6 +309,29 @@ test "completions hide internal commands and expose global no-rich flag" {
     }
 }
 
+test "completions do not advertise a fake env --agent flag" {
+    const cases = [_]struct {
+        shell: []const u8,
+        forbidden: []const u8,
+    }{
+        .{ .shell = "bash", .forbidden = "env) has_command=true; flags=\"${flags} --agent\"" },
+        .{ .shell = "zsh", .forbidden = "env) has_command=true; flags+=( '--agent'" },
+        .{ .shell = "fish", .forbidden = "__fish_seen_subcommand_from env' -l agent" },
+        .{ .shell = "powershell", .forbidden = "'env' { $hasCommand = $true; $flags += @('--agent')" },
+    };
+    for (cases) |case| {
+        var stdout_buf: [32 * 1024]u8 = undefined;
+        var stderr_buf: [512]u8 = undefined;
+        var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+        var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+
+        const code = try command(std.testing.io, &.{case.shell}, &stdout_writer, &stderr_writer);
+        try std.testing.expectEqual(exit_codes.success, code);
+        try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), case.forbidden) == null);
+        try std.testing.expectEqualStrings("", stderr_writer.buffered());
+    }
+}
+
 test "completions include command-specific dashboard flags" {
     // packs is P0-hidden until Slice 4 lands; only assert live command flags here.
     const shells = [_][]const u8{ "bash", "zsh", "fish", "powershell" };
@@ -366,7 +389,7 @@ test "completions scope flags to their owning command" {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 1 TDD: completions must stay in sync with help.commands (written FIRST)
+// Completions must stay in sync with help.commands.
 // ---------------------------------------------------------------------------
 
 test "completions include every public help command" {

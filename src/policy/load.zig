@@ -1,9 +1,157 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 const core = @import("../core/public.zig");
 const presets = @import("presets.zig");
 const schema = @import("schema.zig");
 const validate = @import("validate.zig");
+
+// Process-local policy file byte cache (#393).
+// Identity: path + inode + size + mtime.toNanoseconds().
+// open → fstat(fd) → read that fd → fstat again; cache only if both stats match.
+// Coarse mtime (nsec % 1s == 0) is never stored. Unlink / unreadable / identity
+// change take the live error — never last-good bytes. Parse still uses the caller
+// allocator. Process-owned slot uses page_allocator so tests can hit the cache.
+const PolicyFileCache = struct {
+    var mu: std.Io.Mutex = .init;
+    var path_buf: [4096]u8 = undefined;
+    var path_len: usize = 0;
+    var inode: std.Io.File.INode = 0;
+    var size: u64 = 0;
+    var mtime_ns: i96 = 0;
+    var text: ?[]u8 = null;
+
+    fn isCoarseMtime(ns: i96) bool {
+        return @mod(ns, std.time.ns_per_s) == 0;
+    }
+
+    fn clearLocked() void {
+        if (text) |t| std.heap.page_allocator.free(t);
+        text = null;
+        path_len = 0;
+        inode = 0;
+        size = 0;
+        mtime_ns = 0;
+    }
+
+    fn reset(io: std.Io) void {
+        mu.lockUncancelable(io);
+        defer mu.unlock(io);
+        clearLocked();
+    }
+
+    /// Copy cached bytes under the lock. Caller owns the result (must free).
+    fn getCopy(
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        path: []const u8,
+        st_inode: std.Io.File.INode,
+        st_size: u64,
+        st_mtime_ns: i96,
+    ) ?[]u8 {
+        if (isCoarseMtime(st_mtime_ns)) return null;
+        mu.lockUncancelable(io);
+        defer mu.unlock(io);
+        if (text == null) return null;
+        if (path_len != path.len) return null;
+        if (!std.mem.eql(u8, path_buf[0..path_len], path)) return null;
+        if (inode != st_inode or size != st_size or mtime_ns != st_mtime_ns) return null;
+        return allocator.dupe(u8, text.?) catch null;
+    }
+
+    fn put(
+        io: std.Io,
+        path: []const u8,
+        st_inode: std.Io.File.INode,
+        st_size: u64,
+        st_mtime_ns: i96,
+        body: []const u8,
+    ) void {
+        if (isCoarseMtime(st_mtime_ns)) return;
+        if (path.len == 0 or path.len > path_buf.len) return;
+        mu.lockUncancelable(io);
+        defer mu.unlock(io);
+        const owned = std.heap.page_allocator.dupe(u8, body) catch return;
+        clearLocked();
+        @memcpy(path_buf[0..path.len], path);
+        path_len = path.len;
+        inode = st_inode;
+        size = st_size;
+        mtime_ns = st_mtime_ns;
+        text = owned;
+    }
+};
+
+// FileNotFound-only negative cache (absolute path keys). Always re-stat.
+// Never records AccessDenied, parse errors, or other IO as a miss.
+const PolicyMissCache = struct {
+    var mu: std.Io.Mutex = .init;
+    const max_entries = 16;
+    const max_path = 4096;
+    var slots: [max_entries][max_path]u8 = undefined;
+    var lens: [max_entries]usize = [_]usize{0} ** max_entries;
+
+    fn remember(io: std.Io, path: []const u8) void {
+        if (!std.fs.path.isAbsolute(path)) return;
+        if (path.len == 0 or path.len > max_path) return;
+        mu.lockUncancelable(io);
+        defer mu.unlock(io);
+        if (indexLocked(path) != null) return;
+        var empty: ?usize = null;
+        for (lens, 0..) |len, i| {
+            if (len == 0) {
+                empty = i;
+                break;
+            }
+        }
+        const i = empty orelse max_entries - 1;
+        @memcpy(slots[i][0..path.len], path);
+        lens[i] = path.len;
+    }
+
+    fn forget(io: std.Io, path: []const u8) void {
+        if (path.len == 0) return;
+        mu.lockUncancelable(io);
+        defer mu.unlock(io);
+        if (indexLocked(path)) |i| {
+            lens[i] = 0;
+        }
+    }
+
+    fn contains(io: std.Io, path: []const u8) bool {
+        mu.lockUncancelable(io);
+        defer mu.unlock(io);
+        return indexLocked(path) != null;
+    }
+
+    fn indexLocked(path: []const u8) ?usize {
+        for (lens, 0..) |len, i| {
+            if (len != path.len) continue;
+            if (std.mem.eql(u8, slots[i][0..len], path)) return i;
+        }
+        return null;
+    }
+};
+
+var testing_read_file_alloc_count: u32 = 0;
+
+pub const testing = if (builtin.is_test) struct {
+    pub fn resetReadFileAllocCount() void {
+        testing_read_file_alloc_count = 0;
+    }
+
+    pub fn readFileAllocCount() u32 {
+        return testing_read_file_alloc_count;
+    }
+
+    pub fn resetFileCache(io: std.Io) void {
+        PolicyFileCache.reset(io);
+    }
+
+    pub fn remembersMissingPath(io: std.Io, path: []const u8) bool {
+        return PolicyMissCache.contains(io, path);
+    }
+} else struct {};
 
 pub const PolicyParseError = error{
     InvalidPolicy,
@@ -572,10 +720,43 @@ pub fn parseFromSlice(allocator: std.mem.Allocator, text: []const u8, source_pat
 }
 
 pub fn loadFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !schema.Policy {
-    const text = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, std.Io.Limit.limited(core.limits.max_policy_file_len + 1));
-    defer allocator.free(text);
-    if (text.len > core.limits.max_policy_file_len) return error.PolicyFileTooLarge;
-    return parseFromSlice(allocator, text, path);
+    // open → fstat(fd) → read that fd → fstat again. Never last-good after
+    // unlink / unreadable / identity change. Miss cache is FileNotFound-only.
+    const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| switch (err) {
+        error.FileNotFound => {
+            PolicyMissCache.remember(io, path);
+            return error.FileNotFound;
+        },
+        else => {
+            PolicyMissCache.forget(io, path);
+            return err;
+        },
+    };
+    defer file.close(io);
+    PolicyMissCache.forget(io, path);
+
+    const first = try file.stat(io);
+    const first_ns = first.mtime.toNanoseconds();
+    if (PolicyFileCache.getCopy(io, allocator, path, first.inode, first.size, first_ns)) |cached| {
+        defer allocator.free(cached);
+        if (cached.len > core.limits.max_policy_file_len) return error.PolicyFileTooLarge;
+        return parseFromSlice(allocator, cached, path);
+    }
+
+    if (builtin.is_test) testing_read_file_alloc_count += 1;
+    var file_reader = file.reader(io, &.{});
+    const file_text = file_reader.interface.allocRemaining(allocator, std.Io.Limit.limited(core.limits.max_policy_file_len + 1)) catch |err| switch (err) {
+        error.ReadFailed => return file_reader.err.?,
+        error.OutOfMemory, error.StreamTooLong => |e| return e,
+    };
+    defer allocator.free(file_text);
+    if (file_text.len > core.limits.max_policy_file_len) return error.PolicyFileTooLarge;
+
+    const second = try file.stat(io);
+    if (first.inode == second.inode and first.size == second.size and first_ns == second.mtime.toNanoseconds()) {
+        PolicyFileCache.put(io, path, first.inode, first.size, first_ns, file_text);
+    }
+    return parseFromSlice(allocator, file_text, path);
 }
 
 pub fn loadPreset(allocator: std.mem.Allocator, preset: presets.Preset) !schema.Policy {
@@ -1458,6 +1639,413 @@ test "policy discovery falls back to HOME .ryk policy before builtin strict" {
     try std.testing.expectEqual(@as(usize, 0), loaded.policy.commands.allow.len);
 }
 
+const DiscoverHomeGuard = struct {
+    allocator: std.mem.Allocator,
+    prev: ?[:0]u8,
+
+    fn push(allocator: std.mem.Allocator, home: []const u8) !DiscoverHomeGuard {
+        const prev: ?[:0]u8 = if (std.c.getenv("HOME")) |v| try allocator.dupeZ(u8, std.mem.span(v)) else null;
+        errdefer if (prev) |p| allocator.free(p);
+        const home_z = try allocator.dupeZ(u8, home);
+        defer allocator.free(home_z);
+        try std.testing.expectEqual(@as(c_int, 0), setenv("HOME", home_z.ptr, 1));
+        return .{ .allocator = allocator, .prev = prev };
+    }
+
+    fn pop(self: *DiscoverHomeGuard) void {
+        if (self.prev) |p| {
+            _ = setenv("HOME", p.ptr, 1);
+            self.allocator.free(p);
+            self.prev = null;
+        } else {
+            _ = unsetenv("HOME");
+        }
+    }
+};
+
+test "policy discovery does not readFileAlloc a missing workspace policy" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+
+    var home_tmp = std.testing.tmpDir(.{});
+    defer home_tmp.cleanup();
+    var project_tmp = std.testing.tmpDir(.{});
+    defer project_tmp.cleanup();
+
+    const home_abs = try home_tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(home_abs);
+    const project_abs = try project_tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(project_abs);
+
+    var home_guard = try DiscoverHomeGuard.push(allocator, home_abs);
+    defer home_guard.pop();
+
+    testing.resetReadFileAllocCount();
+    var loaded = try discover(io, allocator, null, project_abs);
+    defer loaded.deinit();
+    try std.testing.expectEqual(schema.LoadSource.builtin, loaded.source);
+    try std.testing.expectEqualStrings("builtin:strict", loaded.path);
+    try std.testing.expectEqual(@as(u32, 0), testing.readFileAllocCount());
+
+    var loaded_again = try discover(io, allocator, null, project_abs);
+    defer loaded_again.deinit();
+    try std.testing.expectEqual(schema.LoadSource.builtin, loaded_again.source);
+    try std.testing.expectEqual(@as(u32, 0), testing.readFileAllocCount());
+}
+
+test "policy discovery remembers FileNotFound misses by absolute path" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+
+    var home_tmp = std.testing.tmpDir(.{});
+    defer home_tmp.cleanup();
+    var project_tmp = std.testing.tmpDir(.{});
+    defer project_tmp.cleanup();
+
+    const home_abs = try home_tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(home_abs);
+    const project_abs = try project_tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(project_abs);
+
+    var home_guard = try DiscoverHomeGuard.push(allocator, home_abs);
+    defer home_guard.pop();
+
+    var loaded = try discover(io, allocator, null, project_abs);
+    defer loaded.deinit();
+    try std.testing.expectEqual(schema.LoadSource.builtin, loaded.source);
+
+    const workspace_path = try std.fs.path.join(allocator, &.{ project_abs, ".ryk", "policy.yaml" });
+    defer allocator.free(workspace_path);
+    const user_path = try std.fs.path.join(allocator, &.{ home_abs, ".config", "ryk", "policy.yaml" });
+    defer allocator.free(user_path);
+    const legacy_path = try std.fs.path.join(allocator, &.{ home_abs, ".ryk", "policy.yaml" });
+    defer allocator.free(legacy_path);
+
+    try std.testing.expect(testing.remembersMissingPath(io, workspace_path));
+    try std.testing.expect(testing.remembersMissingPath(io, user_path));
+    try std.testing.expect(testing.remembersMissingPath(io, legacy_path));
+}
+
+test "policy discovery loads a valid workspace policy created after a miss" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+
+    var home_tmp = std.testing.tmpDir(.{});
+    defer home_tmp.cleanup();
+    var project_tmp = std.testing.tmpDir(.{});
+    defer project_tmp.cleanup();
+
+    const home_abs = try home_tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(home_abs);
+    const project_abs = try project_tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(project_abs);
+
+    var home_guard = try DiscoverHomeGuard.push(allocator, home_abs);
+    defer home_guard.pop();
+
+    {
+        var loaded = try discover(io, allocator, null, project_abs);
+        defer loaded.deinit();
+        try std.testing.expectEqual(schema.LoadSource.builtin, loaded.source);
+    }
+
+    try project_tmp.dir.createDirPath(io, ".ryk");
+    {
+        const file = try project_tmp.dir.createFile(io, ".ryk/policy.yaml", .{});
+        defer file.close(io);
+        try file.writeStreamingAll(io, presets.text(.observe));
+    }
+
+    var loaded = try discover(io, allocator, null, project_abs);
+    defer loaded.deinit();
+    try std.testing.expectEqual(schema.LoadSource.workspace, loaded.source);
+    try std.testing.expectEqual(schema.Mode.observe, loaded.policy.mode);
+}
+
+test "policy discovery fail-closes invalid policies created after a miss" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+
+    var home_tmp = std.testing.tmpDir(.{});
+    defer home_tmp.cleanup();
+    var project_tmp = std.testing.tmpDir(.{});
+    defer project_tmp.cleanup();
+
+    const home_abs = try home_tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(home_abs);
+    const project_abs = try project_tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(project_abs);
+
+    var home_guard = try DiscoverHomeGuard.push(allocator, home_abs);
+    defer home_guard.pop();
+
+    {
+        var loaded = try discover(io, allocator, null, project_abs);
+        defer loaded.deinit();
+        try std.testing.expectEqual(schema.LoadSource.builtin, loaded.source);
+    }
+
+    try project_tmp.dir.createDirPath(io, ".ryk");
+    {
+        const file = try project_tmp.dir.createFile(io, ".ryk/policy.yaml", .{});
+        defer file.close(io);
+        try file.writeStreamingAll(io, "version: 1\nmode: loose\n");
+    }
+
+    try std.testing.expectError(error.UnsupportedPolicyMode, discover(io, allocator, null, project_abs));
+}
+
+test "policy discovery fail-closes AccessDenied existing policy not a miss" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+
+    var home_tmp = std.testing.tmpDir(.{});
+    defer home_tmp.cleanup();
+    var project_tmp = std.testing.tmpDir(.{});
+    defer project_tmp.cleanup();
+
+    const home_abs = try home_tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(home_abs);
+    const project_abs = try project_tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(project_abs);
+
+    var home_guard = try DiscoverHomeGuard.push(allocator, home_abs);
+    defer home_guard.pop();
+
+    {
+        var loaded = try discover(io, allocator, null, project_abs);
+        defer loaded.deinit();
+        try std.testing.expectEqual(schema.LoadSource.builtin, loaded.source);
+    }
+
+    try project_tmp.dir.createDirPath(io, ".ryk");
+    {
+        const file = try project_tmp.dir.createFile(io, ".ryk/policy.yaml", .{});
+        defer file.close(io);
+        try file.writeStreamingAll(io, presets.text(.observe));
+    }
+
+    const workspace_path = try std.fs.path.join(allocator, &.{ project_abs, ".ryk", "policy.yaml" });
+    defer allocator.free(workspace_path);
+    const workspace_z = try allocator.dupeZ(u8, workspace_path);
+    defer allocator.free(workspace_z);
+    if (std.c.chmod(workspace_z.ptr, 0o000) != 0) return error.SkipZigTest;
+    defer _ = std.c.chmod(workspace_z.ptr, 0o644);
+
+    if (discover(io, allocator, null, project_abs)) |loaded_ok| {
+        var loaded = loaded_ok;
+        const source = loaded.source;
+        loaded.deinit();
+        try std.testing.expect(source != .builtin);
+        return error.SkipZigTest;
+    } else |err| {
+        try std.testing.expect(err != error.FileNotFound);
+    }
+    try std.testing.expect(!testing.remembersMissingPath(io, workspace_path));
+}
+
+const cache_observe_yaml = "version: 1\nmode: observe\n";
+const cache_strict_same_size_yaml = "version: 1\nmode: strict\n\n";
+
+fn writePolicyFile(io: std.Io, dir: std.Io.Dir, sub_path: []const u8, body: []const u8) !void {
+    const file = try dir.createFile(io, sub_path, .{});
+    defer file.close(io);
+    try file.writeStreamingAll(io, body);
+}
+
+fn forceFineMtime(io: std.Io, path: []const u8) !void {
+    const st = try std.Io.Dir.cwd().statFile(io, path, .{});
+    const ns = st.mtime.toNanoseconds();
+    if (@mod(ns, std.time.ns_per_s) != 0) return;
+    const fine = std.Io.Timestamp.fromNanoseconds(ns + 1);
+    const file = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    try file.setTimestamps(io, .{
+        .access_timestamp = .{ .new = fine },
+        .modify_timestamp = .{ .new = fine },
+    });
+}
+
+test "policy discovery loadFile cache skips second read of unchanged identity" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writePolicyFile(io, tmp.dir, "policy.yaml", cache_observe_yaml);
+    const path = try tmp.dir.realPathFileAlloc(io, "policy.yaml", allocator);
+    defer allocator.free(path);
+    try forceFineMtime(io, path);
+
+    testing.resetFileCache(io);
+    testing.resetReadFileAllocCount();
+    {
+        var first = try loadFile(io, allocator, path);
+        defer first.deinit();
+        try std.testing.expectEqual(schema.Mode.observe, first.mode);
+    }
+    try std.testing.expectEqual(@as(u32, 1), testing.readFileAllocCount());
+
+    {
+        var second = try loadFile(io, allocator, path);
+        defer second.deinit();
+        try std.testing.expectEqual(schema.Mode.observe, second.mode);
+    }
+    try std.testing.expectEqual(@as(u32, 1), testing.readFileAllocCount());
+}
+
+test "policy discovery loadFile cache reloads after size mtime or inode change" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writePolicyFile(io, tmp.dir, "policy.yaml", cache_observe_yaml);
+    const path = try tmp.dir.realPathFileAlloc(io, "policy.yaml", allocator);
+    defer allocator.free(path);
+    try forceFineMtime(io, path);
+
+    testing.resetFileCache(io);
+    testing.resetReadFileAllocCount();
+    {
+        var first = try loadFile(io, allocator, path);
+        defer first.deinit();
+        try std.testing.expectEqual(schema.Mode.observe, first.mode);
+    }
+    try std.testing.expectEqual(@as(u32, 1), testing.readFileAllocCount());
+
+    try writePolicyFile(io, tmp.dir, "policy.yaml", "version: 1\nmode: strict\nworkspace:\n  root: \".\"\n");
+    {
+        var grown = try loadFile(io, allocator, path);
+        defer grown.deinit();
+        try std.testing.expectEqual(schema.Mode.strict, grown.mode);
+    }
+    try std.testing.expectEqual(@as(u32, 2), testing.readFileAllocCount());
+
+    try tmp.dir.deleteFile(io, "policy.yaml");
+    try writePolicyFile(io, tmp.dir, "policy.yaml", cache_observe_yaml);
+    try forceFineMtime(io, path);
+    {
+        var recreated = try loadFile(io, allocator, path);
+        defer recreated.deinit();
+        try std.testing.expectEqual(schema.Mode.observe, recreated.mode);
+    }
+    try std.testing.expectEqual(@as(u32, 3), testing.readFileAllocCount());
+}
+
+test "policy discovery loadFile cache unlink or unreadable is live error not last-good" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writePolicyFile(io, tmp.dir, "policy.yaml", cache_observe_yaml);
+    const path = try tmp.dir.realPathFileAlloc(io, "policy.yaml", allocator);
+    defer allocator.free(path);
+    try forceFineMtime(io, path);
+
+    testing.resetFileCache(io);
+    {
+        var first = try loadFile(io, allocator, path);
+        defer first.deinit();
+        try std.testing.expectEqual(schema.Mode.observe, first.mode);
+    }
+
+    try tmp.dir.deleteFile(io, "policy.yaml");
+    try std.testing.expectError(error.FileNotFound, loadFile(io, allocator, path));
+
+    try writePolicyFile(io, tmp.dir, "policy.yaml", cache_observe_yaml);
+    try forceFineMtime(io, path);
+    {
+        var again = try loadFile(io, allocator, path);
+        defer again.deinit();
+        try std.testing.expectEqual(schema.Mode.observe, again.mode);
+    }
+
+    if (builtin.os.tag == .windows) return;
+
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+    if (std.c.chmod(path_z.ptr, 0o000) != 0) return error.SkipZigTest;
+    defer _ = std.c.chmod(path_z.ptr, 0o644);
+
+    if (loadFile(io, allocator, path)) |ok| {
+        var loaded = ok;
+        loaded.deinit();
+        return error.SkipZigTest;
+    } else |err| {
+        try std.testing.expect(err != error.FileNotFound);
+    }
+}
+
+fn forceCoarseMtime(io: std.Io, path: []const u8) !i96 {
+    const st = try std.Io.Dir.cwd().statFile(io, path, .{});
+    const coarse_ns = @as(i96, st.mtime.toSeconds()) * std.time.ns_per_s;
+    const coarse = std.Io.Timestamp.fromNanoseconds(coarse_ns);
+    const file = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    try file.setTimestamps(io, .{
+        .access_timestamp = .{ .new = coarse },
+        .modify_timestamp = .{ .new = coarse },
+    });
+    const after = try std.Io.Dir.cwd().statFile(io, path, .{});
+    if (@mod(after.mtime.toNanoseconds(), std.time.ns_per_s) != 0) return error.SkipZigTest;
+    return after.mtime.toNanoseconds();
+}
+
+test "policy discovery loadFile cache skips coarse mtime same-size restored rewrite" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+
+    comptime std.debug.assert(cache_observe_yaml.len == cache_strict_same_size_yaml.len);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writePolicyFile(io, tmp.dir, "policy.yaml", cache_observe_yaml);
+    const path = try tmp.dir.realPathFileAlloc(io, "policy.yaml", allocator);
+    defer allocator.free(path);
+    const coarse_ns = try forceCoarseMtime(io, path);
+
+    testing.resetFileCache(io);
+    testing.resetReadFileAllocCount();
+    {
+        var first = try loadFile(io, allocator, path);
+        defer first.deinit();
+        try std.testing.expectEqual(schema.Mode.observe, first.mode);
+    }
+    try std.testing.expectEqual(@as(u32, 1), testing.readFileAllocCount());
+
+    {
+        var second = try loadFile(io, allocator, path);
+        defer second.deinit();
+        try std.testing.expectEqual(schema.Mode.observe, second.mode);
+    }
+    try std.testing.expectEqual(@as(u32, 2), testing.readFileAllocCount());
+
+    try writePolicyFile(io, tmp.dir, "policy.yaml", cache_strict_same_size_yaml);
+    const coarse = std.Io.Timestamp.fromNanoseconds(coarse_ns);
+    {
+        const file = try std.Io.Dir.cwd().openFile(io, path, .{});
+        defer file.close(io);
+        try file.setTimestamps(io, .{
+            .access_timestamp = .{ .new = coarse },
+            .modify_timestamp = .{ .new = coarse },
+        });
+    }
+    const restored = try std.Io.Dir.cwd().statFile(io, path, .{});
+    try std.testing.expectEqual(coarse_ns, restored.mtime.toNanoseconds());
+    try std.testing.expectEqual(@as(u64, cache_strict_same_size_yaml.len), restored.size);
+
+    {
+        var rewritten = try loadFile(io, allocator, path);
+        defer rewritten.deinit();
+        try std.testing.expectEqual(schema.Mode.strict, rewritten.mode);
+    }
+    try std.testing.expectEqual(@as(u32, 3), testing.readFileAllocCount());
+}
+
 test "JSON policies reject unknown keys instead of silently changing policy meaning" {
     try std.testing.expectError(error.InvalidPolicy, parseFromSlice(std.testing.allocator,
         \\{"version":1,"mode":"strict","commands":{"denny":["rm -rf *"]}}
@@ -1801,6 +2389,7 @@ fn parsePolicyAllocationFailureProbe(allocator: std.mem.Allocator) !void {
 }
 
 fn discoverPolicyAllocationFailureProbe(allocator: std.mem.Allocator, policy_path: []const u8, root: []const u8) !void {
+    testing.resetFileCache(std.testing.io);
     var loaded = try discover(std.testing.io, allocator, policy_path, root);
     defer loaded.deinit();
 }

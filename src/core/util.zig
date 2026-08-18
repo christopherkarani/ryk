@@ -1,4 +1,4 @@
-//! Shared Phase 03 utilities.
+//! Shared cross-module utilities for CLI and core.
 //!
 //! Allocation conventions:
 //! - CLI command lifetime data should use a command arena owned by CLI dispatch.

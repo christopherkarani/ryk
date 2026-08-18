@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# First-user / curl-door regression (D86) for w1-install-handoff.
-# Executes scripts/install.sh against a mock product binary. After co-migration
-# the primary post-binary door is `"$DESTINATION" doctor --fix --from-install`.
-# When the mock advertises doctor --fix, start --auto is poison (must not green).
+# First-user / curl-door regression for scripts/install.sh.
+# Executes install.sh against a mock product binary. After co-migration the
+# primary post-binary door is `"$DESTINATION" doctor --fix --from-install`.
+# When the mock advertises doctor --fix, start --auto must not be the install path.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -196,12 +196,15 @@ grep -qF "${install_dir}" "${onboard_log}" ||
   fail "onboarding PATH did not contain the installed binary directory"
 
 # Reinstalling must update the managed blocks instead of appending duplicates.
+# Dest is this harness's shebang mock, not a product ELF/PE/Mach-O with
+# safety_boundary_version. After #209, overwrite requires FORCE.
 HOME="${home}" \
 SHELL=/bin/sh \
 RYK_VERSION="${VERSION}" \
 RYK_ARTIFACT_DIR="${artifact_dir}" \
 RYK_INSTALL_DIR="${install_dir}" \
 RYK_SHARE_DIR="${share_dir}" \
+RYK_INSTALL_FORCE=1 \
 RYK_TEST_ONBOARD_LOG="${onboard_log}" \
 sh "${INSTALL_SH}" >/dev/null
 [[ "$(grep -c '^# Added by ryk installer$' "${home}/.profile")" == 1 ]] || fail "reinstall duplicated the PATH block"
@@ -229,6 +232,7 @@ RYK_VERSION="${VERSION}" \
 RYK_ARTIFACT_DIR="${artifact_dir}" \
 RYK_INSTALL_DIR="${install_dir}" \
 RYK_SHARE_DIR="${share_dir}" \
+RYK_INSTALL_FORCE=1 \
 RYK_TEST_ONBOARD_LOG="${onboard_log}" \
 sh "${INSTALL_SH}" >/dev/null ||
   fail "install failed when replacing an existing current→version symlink (mv-into-dir skew)"
@@ -291,6 +295,7 @@ quiet_output="$(
   RYK_INSTALL_DIR="${install_dir}" \
   RYK_SHARE_DIR="${share_dir}" \
   RYK_INSTALL_QUIET=1 \
+  RYK_INSTALL_FORCE=1 \
   RYK_TEST_ONBOARD_LOG="${onboard_log}" \
   sh "${INSTALL_SH}" 2>/dev/null
 )"
@@ -322,6 +327,7 @@ if HOME="${home}" \
   RYK_ARTIFACT_DIR="${artifact_dir}" \
   RYK_INSTALL_DIR="${install_dir}" \
   RYK_SHARE_DIR="${share_dir}" \
+  RYK_INSTALL_FORCE=1 \
   RYK_TEST_ONBOARD_LOG="${onboard_log}" \
   RYK_TEST_DOCTOR_EXIT=17 \
   sh "${INSTALL_SH}" >"${failed_output}" 2>&1; then
@@ -350,6 +356,7 @@ RYK_VERSION="${VERSION}" \
 RYK_ARTIFACT_DIR="${artifact_dir}" \
 RYK_INSTALL_DIR="${install_dir}" \
 RYK_SHARE_DIR="${share_dir}" \
+RYK_INSTALL_FORCE=1 \
 RYK_TEST_ONBOARD_LOG="${onboard_log}" \
 RYK_TEST_DOCTOR_PARTIAL=1 \
 sh "${INSTALL_SH}" >"${partial_output}" 2>&1 ||
@@ -377,6 +384,7 @@ skip_onboard_output="$(
   RYK_INSTALL_DIR="${install_dir}" \
   RYK_SHARE_DIR="${share_dir}" \
   RYK_INSTALL_SKIP_ONBOARD=1 \
+  RYK_INSTALL_FORCE=1 \
   RYK_TEST_ONBOARD_LOG="${onboard_log}" \
   sh "${INSTALL_SH}"
 )"
@@ -400,6 +408,7 @@ RYK_ARTIFACT_DIR="${artifact_dir}" \
 RYK_INSTALL_DIR="${install_dir}" \
 RYK_SHARE_DIR="${share_dir}" \
 RYK_INSTALL_SKIP_ONBOARD=1 \
+RYK_INSTALL_FORCE=1 \
 RYK_TEST_ONBOARD_LOG="${onboard_log}" \
 sh "${INSTALL_SH}" >/dev/null
 [[ ! -s "${onboard_log}" ]] ||

@@ -5,7 +5,7 @@
 
 ## Overview
 
-`ryk hook` receives host lifecycle events from Codex and Claude Code plugins, normalizes the payload, evaluates the event against existing ryk policy and redaction logic, then returns a host-valid decision object.
+`ryk hook` receives host lifecycle events from Codex and Claude Code plugins, plus the Grok managed hook, normalizes the payload, evaluates the event against existing ryk policy and redaction logic, then returns a host-valid decision object.
 
 The hook is additive only. It does not replace `ryk run`. Claude tool-gating events emit native `permissionDecision` JSON so the host can veto tools when it honors that contract; grade remains **hook**, not OS-enforced sandbox.
 
@@ -15,6 +15,7 @@ The hook is additive only. It does not replace `ryk run`. Claude tool-gating eve
 |---|---|
 | Codex | `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PermissionRequest`, `PostToolUse`, `Stop` |
 | Claude | `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PermissionRequest`, `PostToolUse`, `SessionEnd` |
+| Grok | `PreToolUse` (managed matchers: Bash / Read). Native deny is `{"decision":"deny","reason":…}` + exit 2. Ask is hardened to deny (no resume). Missing `ryk` is wrapped to the same deny. |
 
 ## Event to Decision Mapping
 
@@ -73,10 +74,10 @@ Claude only. Informational allow.
 |---|---|---|
 | `allow` | `allow` | Policy allows |
 | `deny` | `block` | Policy denies |
-| `ask` | `ask` | Needs user confirmation |
+| leftover unused policy `ask` | `allow` when attended; `block` when unattended | Rewritten on the coding-host enforcement wire. Never emitted as `decision: ask`. Stage, FM steward ask, and SoftBlock never become allow. Explicit deny is unchanged. |
 | `observe` | `context_only` | Log only |
 | `redact` | `warn` | Secrets detected |
-| `stage` | `ask` | Staged write pending review |
+| `stage` | hold (`ask` on Claude `permissionDecision`) or `stage`/`block` on generic hook JSON; never `allow` | Staged write pending review. Unattended/`--ci` hardens to `block`. |
 | `broker` | `error` | Evaluation failure |
 
 ## Risk Level Reference
@@ -112,7 +113,7 @@ Most hosts and Claude informational events (`SessionStart`, `UserPromptSubmit`, 
 | Field | Required | Notes |
 |---|---|---|
 | `version` | yes | Always `1` |
-| `decision` | yes | `allow`, `block`, `warn`, `ask`, `context_only`, `error` |
+| `decision` | yes | `allow`, `block`, `warn`, `stage`, `context_only`, `error`. Leftover unused policy ask is rewritten to `allow`/`block` and is not a host-wire `decision`. |
 | `risk` | yes | `low`, `medium`, `high`, `critical`, `unknown` |
 | `category` | yes | `command`, `file`, `prompt`, `tool`, `network`, `mcp`, `unknown` before normalization |
 | `reason` | yes | Machine-readable string |
@@ -139,7 +140,7 @@ Claude Code expects native host JSON so blocks surface as real permission denial
 | Field | Notes |
 |---|---|
 | `hookSpecificOutput.hookEventName` | Matches the event (`PreToolUse` or `PermissionRequest`) |
-| `hookSpecificOutput.permissionDecision` | `allow` \| `deny` \| `ask` |
+| `hookSpecificOutput.permissionDecision` | `allow` \| `deny` |
 | `hookSpecificOutput.permissionDecisionReason` | Short one-line reason; no Recourse/Next walls; no redeemable allow-once codes |
 | `systemMessage` | Optional short notice on deny/ask (UX only; not a substitute for `permissionDecision`) |
 
@@ -148,7 +149,7 @@ Claude Code expects native host JSON so blocks surface as real permission denial
 | ryk hook decision | Claude `permissionDecision` | Notes |
 |---|---|---|
 | `block` / `error` | `deny` | Hard veto |
-| `ask` | `ask` | Interactive; under `--ci` ryk hardens `ask`→`block` before emit → `deny` |
+| leftover unused policy `ask` | `allow` | Rewritten by `ryk hook`. Attended leftover is permit; `--ci` / unattended → `deny`. Never emitted as `decision: ask`. |
 | `allow` / `context_only` | `allow` | Proceed |
 | `warn` | `allow` | Warn is not a hard veto on this surface (documented proceed; not a silent silent-allow of blocked tools) |
 
@@ -217,12 +218,12 @@ This is still **hook-grade** enforcement: strongest boundary remains `ryk claude
 }
 ```
 
-### ask
+### stage
 
 ```json
 {
   "version": 1,
-  "decision": "ask",
+  "decision": "stage",
   "risk": "medium",
   "category": "file.write",
   "reason": "file.staged_review_required",
@@ -286,7 +287,7 @@ For headless runs, ryk should report the CI limitation directly instead of prete
 
 ## Cross-host decision mapping
 
-The living multi-host matrix (Hermes native approve-and-resume, OpenClaw/OpenCode ask→block limitations, prompt-path honesty) lives in:
+The living multi-host matrix (leftover unused policy ask is rewritten by the coding-host enforcement wire; a leaked `ask` is fail-closed deny; prompt-path honesty) lives in:
 
 - `docs/integrations/host-decision-mapping.md`
 - `integrations/common/schemas/host-decision-mapping-v1.json`

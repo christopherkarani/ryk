@@ -37,6 +37,10 @@ const Options = struct {
     page: usize = 1,
     page_size: usize = 25,
     machine_json: bool = false,
+    explicit_page: bool = false,
+    explicit_page_size: bool = false,
+    /// `--plain` is the explicit linear catalog dump, not the default summary.
+    plain: bool = false,
 };
 
 const ShowOptions = struct {
@@ -399,6 +403,7 @@ fn parseListOptions(argv: []const []const u8, stderr: anytype) !Options {
             options.machine_json = true;
         } else if (std.mem.eql(u8, arg, "--plain")) {
             // Linear list escape (disables TUI via shouldEnterTui / argvDisablesTui).
+            options.plain = true;
         } else if (std.mem.eql(u8, arg, "--no-rich")) {
             // Global hatch may still appear on argv in some call paths; accept as linear.
         } else if (std.mem.eql(u8, arg, "--format") or std.mem.eql(u8, arg, "-f")) {
@@ -423,11 +428,13 @@ fn parseListOptions(argv: []const []const u8, stderr: anytype) !Options {
             if (i >= argv.len) return usageError(stderr, "--page requires a positive integer");
             options.page = std.fmt.parseInt(usize, argv[i], 10) catch return usageError(stderr, "--page requires a positive integer");
             if (options.page == 0) return usageError(stderr, "--page requires a positive integer");
+            options.explicit_page = true;
         } else if (std.mem.eql(u8, arg, "--page-size")) {
             i += 1;
             if (i >= argv.len) return usageError(stderr, "--page-size requires a positive integer");
             options.page_size = std.fmt.parseInt(usize, argv[i], 10) catch return usageError(stderr, "--page-size requires a positive integer");
             if (options.page_size == 0) return usageError(stderr, "--page-size requires a positive integer");
+            options.explicit_page_size = true;
         } else {
             suggestions.writeUnknownOption(stderr, "ryk packs", arg, &.{
                 "--installed", "--enabled", "--filter", "--page", "--page-size", "--json", "--format", "--plain",
@@ -872,6 +879,20 @@ fn renderHuman(
         return exit_codes.success;
     }
 
+    // Default linear (empty argv, no list-shaping flags): count + one next.
+    // `--plain` stays on the existing catalog dump; TTY browse is decided earlier.
+    if (options.filter == null and !options.installed and !options.explicit_page and
+        !options.explicit_page_size and !options.plain)
+    {
+        var enabled_count: usize = 0;
+        for (selected.items) |pack| {
+            if (pack.enabled) enabled_count += 1;
+        }
+        try stdout.print("{d} packs ({d} enabled)\n", .{ selected.items.len, enabled_count });
+        try stdout.writeAll("Next: ryk packs --enabled\n");
+        return exit_codes.success;
+    }
+
     const total_pages = 1 + (selected.items.len - 1) / options.page_size;
     if (options.page > total_pages) {
         return usageExit(stderr, "--page is beyond the available filtered results");
@@ -1017,6 +1038,23 @@ fn sliceContainsId(ids: []const []const u8, want: []const u8) bool {
     return false;
 }
 
+fn stdoutHasDigit(text: []const u8) bool {
+    for (text) |byte| {
+        if (byte >= '0' and byte <= '9') return true;
+    }
+    return false;
+}
+
+fn countSubstring(haystack: []const u8, needle: []const u8) usize {
+    var count: usize = 0;
+    var rest = haystack;
+    while (std.mem.indexOf(u8, rest, needle)) |idx| {
+        count += 1;
+        rest = rest[idx + needle.len ..];
+    }
+    return count;
+}
+
 // Parse list `--json` output and return the `enabled` flag for `pack_id`.
 fn jsonPackEnabledFlag(raw: []const u8, pack_id: []const u8) !bool {
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{});
@@ -1066,18 +1104,11 @@ test "s-packs: list real packs without daemon includes core.git enabled" {
     try std.testing.expectEqualStrings("", stderr_writer.buffered());
 
     const out = stdout_writer.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, out, "core.git") != null);
-    // Baseline pack must show as enabled (default oracle set).
-    try std.testing.expect(std.mem.indexOf(u8, out, "[enabled]") != null);
-    // Non-trivial registry: many packs, not a single fake row.
-    var pack_dots: usize = 0;
-    var i: usize = 0;
-    while (i + 1 < out.len) : (i += 1) {
-        // rough signal: dotted pack ids appear more than once (core.*, containers.*, …)
-        if (out[i] == '.' and ((out[i - 1] >= 'a' and out[i - 1] <= 'z') or (out[i - 1] >= '0' and out[i - 1] <= '9')))
-            pack_dots += 1;
-    }
-    try std.testing.expect(pack_dots >= 10);
+    try std.testing.expect(stdoutHasDigit(out));
+    try std.testing.expect(std.mem.indexOf(u8, out, "pack") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Next: ryk packs --enabled") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "[enabled]") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Page 1 of") == null);
 }
 
 test "s-packs: list --json stable schema with schema_version packs and counts" {
@@ -1597,6 +1628,26 @@ test "s-packs: --plain is accepted and stays on linear list path" {
     const out = stdout_writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, out, "core.git") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "[enabled]") != null);
+}
+
+test "s-packs: default linear list is count + one next" {
+    var stdout_buf: [64 * 1024]u8 = undefined;
+    var stderr_buf: [1024]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+
+    const code = try commandWithExecutor(failIfCalled, std.testing.io, &.{}, &stdout_writer, &stderr_writer);
+    try std.testing.expectEqual(exit_codes.success, code);
+    try std.testing.expectEqualStrings("", stderr_writer.buffered());
+
+    const out = stdout_writer.buffered();
+    try std.testing.expect(stdoutHasDigit(out));
+    try std.testing.expect(std.mem.indexOf(u8, out, "pack") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Next: ryk packs --enabled") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Page ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "[available]") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "containers.docker") == null);
+    try std.testing.expectEqual(@as(usize, 1), countSubstring(out, "Next:"));
 }
 
 test "s-packs: packs list TUI entry uses shared shouldEnterTui gate" {

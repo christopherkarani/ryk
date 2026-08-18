@@ -10,6 +10,10 @@ const ParsedInbound = protocol.ParsedInbound;
 pub const AuditKind = types.AuditKind;
 pub const AuditEvent = types.AuditEvent;
 
+/// Cap in-memory provider-gateway audit trail (#371). Older events dropped FIFO.
+/// Mirrors intercept proxy max_audit_events — not a durability store.
+const max_audit_events: usize = 256;
+
 const ProviderConfig = struct {
     logical_host: []const u8,
     env_var: []const u8,
@@ -77,10 +81,10 @@ pub const Runtime = struct {
         const io = self.state.threaded.io();
         try self.state.audit_mutex.lock(io);
         defer self.state.audit_mutex.unlock(io);
-        return try allocator.dupe(AuditEvent, self.state.audit_events.items);
+        return try cloneAuditEvents(allocator, self.state.audit_events.items);
     }
     pub fn freeAuditEvents(_: Runtime, allocator: std.mem.Allocator, events: []AuditEvent) void {
-        allocator.free(events);
+        freeClonedAuditEvents(allocator, events);
     }
     pub fn deinit(self: *Runtime) void {
         const state = self.state;
@@ -148,6 +152,10 @@ const State = struct {
         const io = self.threaded.io();
         try self.audit_mutex.lock(io);
         defer self.audit_mutex.unlock(io);
+        // #371: bound in-memory trail (FIFO), same pattern as intercept proxy max_audit_events.
+        while (self.audit_events.items.len >= max_audit_events) {
+            _ = self.audit_events.orderedRemove(0);
+        }
         try self.audit_events.append(self.allocator, .{
             .kind = kind,
             .provider = self.provider,
@@ -652,4 +660,69 @@ fn wake(io: std.Io, port: u16) void {
     const address = std.Io.net.IpAddress.parse("127.0.0.1", port) catch return;
     var stream = address.connect(io, .{ .mode = .stream }) catch return;
     stream.close(io);
+}
+
+fn cloneAuditEvents(allocator: std.mem.Allocator, items: []const AuditEvent) ![]AuditEvent {
+    const out = try allocator.alloc(AuditEvent, items.len);
+    var copied: usize = 0;
+    errdefer {
+        for (out[0..copied]) |ev| {
+            allocator.free(ev.env_var);
+            allocator.free(ev.reason_code);
+        }
+        allocator.free(out);
+    }
+    for (items) |ev| {
+        const env_var = try allocator.dupe(u8, ev.env_var);
+        errdefer allocator.free(env_var);
+        const reason_code = try allocator.dupe(u8, ev.reason_code);
+        out[copied] = .{
+            .kind = ev.kind,
+            .provider = ev.provider,
+            .env_var = env_var,
+            .reason_code = reason_code,
+        };
+        copied += 1;
+    }
+    return out;
+}
+
+fn freeClonedAuditEvents(allocator: std.mem.Allocator, events: []AuditEvent) void {
+    for (events) |ev| {
+        allocator.free(ev.env_var);
+        allocator.free(ev.reason_code);
+    }
+    allocator.free(events);
+}
+
+fn cloneAuditEventsOomProbe(allocator: std.mem.Allocator, src: []const AuditEvent) !void {
+    const cloned = try cloneAuditEvents(allocator, src);
+    freeClonedAuditEvents(allocator, cloned);
+}
+
+test "gateway audit snapshot owns env_var and reason_code" {
+    var env_buf = "ANTHROPIC_API_KEY".*;
+    var reason_buf = "authorized".*;
+    const src = [_]AuditEvent{.{
+        .kind = .phantom_swap,
+        .provider = .anthropic,
+        .env_var = &env_buf,
+        .reason_code = &reason_buf,
+    }};
+    const cloned = try cloneAuditEvents(std.testing.allocator, &src);
+    defer freeClonedAuditEvents(std.testing.allocator, cloned);
+    env_buf = "XXXXXXXXXXXXXXXXX".*;
+    reason_buf = "XXXXXXXXXX".*;
+    try std.testing.expectEqualStrings("ANTHROPIC_API_KEY", cloned[0].env_var);
+    try std.testing.expectEqualStrings("authorized", cloned[0].reason_code);
+}
+
+test "gateway audit snapshot OOM does not leak partial fields" {
+    const src = [_]AuditEvent{.{
+        .kind = .phantom_denied,
+        .provider = .openai,
+        .env_var = "OPENAI_API_KEY",
+        .reason_code = "unminted",
+    }};
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, cloneAuditEventsOomProbe, .{&src});
 }

@@ -151,7 +151,7 @@ Hooks call `ryk hook openclaw <event>` with a JSON payload on stdin. The followi
 | `after_tool_call` | `tool.after` | Post-tool acknowledgment and logging | 10s |
 | `session_end` | `session.end` | Session end handling | 10s |
 
-`before_tool_call` is the enforcement hook. The adapter currently maps every ryk `ask` to a hard block because the installed host contract is not a verified resumable approval surface. In unattended mode this is mandatory: no tool waits for an absent operator. Metadata/discovery and legacy passes do not enforce because their `api.on` is not proven live; use `ryk run -- openclaw` until the host reports an explicit full runtime and a live approval contract is validated.
+`before_tool_call` is the enforcement hook. Leftover unused policy `ask` is rewritten by `ryk hook` (attended → permit, unattended → deny). A leaked `ask` is fail-closed deny. Stage, SoftBlock, and FM steward ask never become allow. Metadata/discovery and legacy passes do not enforce because their `api.on` is not proven live; use `ryk run -- openclaw` for the wrapper boundary.
 
 ### How hooks call ryk
 
