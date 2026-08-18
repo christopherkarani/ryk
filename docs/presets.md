@@ -11,7 +11,7 @@ ryk policy check .ryk/policy.yaml
 
 Available presets:
 
-- `generic-agent`: coding-agent day-to-day baseline (the default for `ryk init --preset` and `ryk start` / `start --auto`). **DCG-style:** `mode: strict` with an **empty** `commands.allow` (matrix-only — no `strict: not on allowlist` refuse) and `commands.default: allow` so normal shell work is not approval-gated. Packs + hard fence **block** high/critical danger; catastrophe deny patterns stay on. Network defaults to deny with a narrow allowlist; secret read denys remain expanded. Not ask-on-risk.
+- `generic-agent`: coding-agent day-to-day baseline (the default for `ryk init --preset` and `ryk start` / `start --auto`). **DCG-style:** `mode: strict` with an **empty** `commands.allow` (matrix-only — no `strict: not on allowlist` refuse) and `commands.default: allow` so normal shell work is not approval-gated. Packs + hard fence **block** high/critical danger; catastrophe deny patterns stay on. Network defaults to deny with a narrow allowlist; secret read denys are exact (`.env`, `~/.ssh`, `credentials.json`) — not substring `*token*` / `*secret*` globs that block source. Default Grok hooks gate shell + secret reads only; Write/Edit stay off that hook wire. Claude/Codex plugins still match all tools. Maximum protection is `ryk <agent>`. Not ask-on-risk.
 - `claude-code`, `codex`, `cursor-agent`, `opencode`, `cline-roo`, `solo-dev`, `mcp-dev`: same coding DCG body as `generic-agent` (host/product labels differ; mcp-dev notes stdio MCP manifest binding still required).
 - `no-external-comms`: strict-local baseline plus effect-class denials for messaging, social publish, and payments (`comms.message`, `comms.publish`, `money.transfer`).
 - `github-actions`: non-interactive CI baseline.

@@ -1993,6 +1993,38 @@ test "evaluateCommand allows git status" {
     try std.testing.expect(eval.decision == .allow);
 }
 
+test "evaluateCommand allows git branch -f as force-update not force-delete" {
+    var eval = try evaluateCommand(std.testing.allocator, "git branch -f main", .{});
+    defer eval.deinit(std.testing.allocator);
+    try std.testing.expect(eval.decision == .allow);
+}
+
+test "evaluateCommand allows git branch --force as force-update not force-delete" {
+    var eval = try evaluateCommand(std.testing.allocator, "git branch --force main", .{});
+    defer eval.deinit(std.testing.allocator);
+    try std.testing.expect(eval.decision == .allow);
+}
+
+test "evaluateCommand still denies git branch -D" {
+    var eval = try evaluateCommand(std.testing.allocator, "git branch -D feature-branch", .{});
+    defer eval.deinit(std.testing.allocator);
+    try std.testing.expect(eval.decision == .deny);
+    try std.testing.expect(std.mem.indexOf(u8, eval.rule_id.?, "branch-force-delete") != null);
+}
+
+test "evaluateCommand allows git stash drop" {
+    var eval = try evaluateCommand(std.testing.allocator, "git stash drop", .{});
+    defer eval.deinit(std.testing.allocator);
+    try std.testing.expect(eval.decision == .allow);
+}
+
+test "evaluateCommand still denies git stash clear" {
+    var eval = try evaluateCommand(std.testing.allocator, "git stash clear", .{});
+    defer eval.deinit(std.testing.allocator);
+    try std.testing.expect(eval.decision == .deny);
+    try std.testing.expect(std.mem.indexOf(u8, eval.rule_id.?, "stash-clear") != null);
+}
+
 test "evaluateCommand denies git reset --hard" {
     var eval = try evaluateCommand(std.testing.allocator, "git reset --hard", .{});
     defer eval.deinit(std.testing.allocator);

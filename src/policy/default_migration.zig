@@ -29,18 +29,25 @@ pub const Classification = enum {
 };
 
 /// SHA-256 hex of every generic-agent default body shipped before the current
-/// one (current = c65f0f6f…, shipped v1.2.14–v1.2.17). Reconstructed per tag:
+/// one (embedded `agentPresetText(.generic_agent)`, not the on-disk YAML).
+/// Reconstructed per tag:
 ///   - 2dbf4c02… plugins-v1.0.0 / v1.0.2 / v1.1.0 (Aegis-era ask default)
 ///   - 0a885ae1… v1.1.1 / v1.1.4 / v1.1.5
 ///   - dce92836… v1.2.0 – v1.2.9
 ///   - 5d072e47… v1.2.10 – v1.2.12
 ///   - 1e231762… v1.2.13 (last pre-DCG ask-mode default)
+///   - 7a275948… v1.2.14–v0.2.20 first coding DCG bodies
+///   - c7b18804… origin/main / v0.2.21 coding DCG with *token*/*secret*/*credential* globs
+///   - 62b8b025… pre remapper-secrets (token globs dropped; workspace-only .env)
 pub const legacy_generic_agent_sha256_hex = [_][]const u8{
     "2dbf4c02f21a12fbc70f039794d0948bfeca7a648137aad00a59bd0f8b1dfbf4",
     "0a885ae1f1b976545182034e743e5b7823760328ccea7de4fcdf7b1f68c93950",
     "dce9283649bda4097cdec4ae0df0e9c886798fc4d17d8040495c802b25073ea2",
     "5d072e477c4e981b57b17f2e61aa928eb849df4c2a9db05b47cdbe8201a702a8",
     "1e2317625c539ccbd9687289063c3302416cfda2b18a09f65d993283036997f4",
+    "7a275948b7bfb0e85edbef571d6fe1e01f18172335617cc150757fee02a294b8",
+    "c7b188043631a498623293988b324c4a6e5b09f83f89d763b5205dd1eba7f57a",
+    "62b8b025df50fed126d382efae867635a890a8f3946eb8672cc6e2b3f504927d",
 };
 
 pub fn sha256Hex(content: []const u8) [64]u8 {
@@ -152,4 +159,21 @@ test "corrupted policy classifies as invalid (fail closed, never rewritten)" {
 test "sha256Hex matches known vector" {
     const hex = sha256Hex("");
     try std.testing.expectEqualStrings("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", &hex);
+}
+
+test "outgoing generic-agent body before remapper-secrets classifies as legacy_default" {
+    const allocator = std.testing.allocator;
+    const body = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        "tests/fixtures/policy-migration/generic-agent-pr533-pre-remapper-secrets.yaml",
+        allocator,
+        .limited(1024 * 1024),
+    );
+    defer allocator.free(body);
+    try std.testing.expectEqualStrings(
+        "62b8b025df50fed126d382efae867635a890a8f3946eb8672cc6e2b3f504927d",
+        &sha256Hex(body),
+    );
+    try std.testing.expectEqual(Classification.legacy_default, classify(allocator, body));
+    try std.testing.expect(!isCurrentDefault(body));
 }

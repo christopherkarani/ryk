@@ -145,7 +145,7 @@ fn pathIsUnder(root: []const u8, path: []const u8) bool {
     return sep == '/' or sep == '\\';
 }
 
-fn tryResolveExistingPath(
+pub fn tryResolveExistingPath(
     io: std.Io,
     allocator: std.mem.Allocator,
     workspace_root_raw: []const u8,

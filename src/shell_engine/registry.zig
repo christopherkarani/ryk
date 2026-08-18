@@ -610,7 +610,7 @@ pub fn severityForRuleId(rule_id: []const u8) Severity {
 }
 
 /// Embedded oracle pattern totals (must match extract from historical frozen oracle packs).
-pub const expected_destructive_patterns: usize = 794;
+pub const expected_destructive_patterns: usize = 793;
 pub const expected_safe_patterns: usize = 830;
 
 fn parseOnePattern(pat: PatternJson) CompiledPattern {

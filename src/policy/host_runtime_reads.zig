@@ -1,18 +1,21 @@
-//! Host-runtime file-read catalog (skills + instruction files).
+//! Host-runtime file-read catalog (skills + instruction + support files).
 //!
-//! Coding DCG `files.read.allow` is workspace `./**`. Hosts load skills and
-//! walk `AGENTS.md` / `CLAUDE.md` outside the workspace. This leaf classifies
-//! those paths so evaluate can allow after explicit deny, before ask.
+//! Coding DCG `files.read.allow` is workspace `./**`. Hosts load skills,
+//! walk `AGENTS.md` / `CLAUDE.md`, and read host docs/rules/observations
+//! outside the workspace. This leaf classifies those paths so evaluate can
+//! allow after explicit deny, before ask.
 //!
-//! Not sandbox host-config RW. Not leftover unused ask. Reads only.
+//! Not sandbox host-config RW. Not leftover unused ask. Not whole `~/.grok`.
+//! Reads only.
 
 const std = @import("std");
 const matchers = @import("matchers.zig");
 
 pub const host_skill_read_allow_id = "builtin.files.read.allow[host_skill]";
 pub const host_instruction_read_allow_id = "builtin.files.read.allow[host_instruction]";
+pub const host_support_read_allow_id = "builtin.files.read.allow[host_support]";
 
-pub const MatchKind = enum { none, skill, instruction };
+pub const MatchKind = enum { none, skill, instruction, support };
 
 pub const EnvPair = struct {
     key: []const u8,
@@ -90,6 +93,22 @@ const skill_roots = [_]SkillRoot{
     },
 };
 
+/// Host working files agents must read (docs, rules, observation logs).
+/// Not whole `~/.grok`. Secret basenames and segments still reject.
+const support_roots = [_]SkillRoot{
+    .{
+        .default_home_rel = ".grok",
+        .suffixes = &.{
+            "docs",
+            "docs/**",
+            "rules",
+            "rules/**",
+            "skill-observations",
+            "skill-observations/**",
+        },
+    },
+};
+
 const instruction_basenames = [_][]const u8{
     "AGENTS.md",
     "AGENTS.MD",
@@ -98,6 +117,33 @@ const instruction_basenames = [_][]const u8{
 };
 
 const secret_segments = [_][]const u8{ ".ssh", ".gnupg", ".aws" };
+
+/// Exact secret file names shared with leftover remapper and DCG deny lists.
+/// Not substring globs (`*token*` / `*secret*` / `*credential*`).
+const secret_basenames = [_][]const u8{
+    ".env",
+    "auth.json",
+    ".credentials.json",
+    "credentials.json",
+    "id_ed25519",
+    "id_rsa",
+    "secrets.json",
+    "secrets.yaml",
+    "secrets.yml",
+    ".secrets",
+    "application_default_credentials.json",
+    "service_account.json",
+    ".npmrc",
+    ".netrc",
+    ".pypirc",
+    ".git-credentials",
+    "credentials",
+    ".envrc",
+    "id_dsa",
+    "id_ecdsa",
+    "id_ecdsa_sk",
+    "id_ed25519_sk",
+};
 
 pub fn classify(path: []const u8) MatchKind {
     var pairs: [5]EnvPair = undefined;
@@ -123,9 +169,9 @@ pub fn isHostRuntimeReadPath(path: []const u8) bool {
 
 pub fn classifyWithEnv(path: []const u8, env: []const EnvPair) MatchKind {
     if (pathHasDotDotSegment(path)) return .none;
-    if (isSecretBasename(std.fs.path.basename(path))) return .none;
-    if (pathHasSecretSegment(path)) return .none;
+    if (isSecretReadPath(path)) return .none;
     if (isSkillRead(path, env)) return .skill;
+    if (isSupportRead(path, env)) return .support;
     if (isInstructionRead(path, envGet(env, "HOME") orelse "")) return .instruction;
     return .none;
 }
@@ -224,6 +270,17 @@ fn joinPattern(buf: []u8, parts: []const []const u8) ?[]const u8 {
     return buf[0..i];
 }
 
+fn isSupportRead(path: []const u8, env: []const EnvPair) bool {
+    const home = envGet(env, "HOME") orelse "";
+    for (support_roots) |root| {
+        if (matchRootSuffixes(path, "~", root.default_home_rel, root.suffixes)) return true;
+        if (home.len > 0 and std.fs.path.isAbsolute(home) and
+            matchRootSuffixes(path, home, root.default_home_rel, root.suffixes))
+            return true;
+    }
+    return false;
+}
+
 fn isInstructionRead(path: []const u8, home: []const u8) bool {
     if (pathHasSecretSegment(path)) return false;
     if (!isInstructionBasename(std.fs.path.basename(path))) return false;
@@ -231,14 +288,33 @@ fn isInstructionRead(path: []const u8, home: []const u8) bool {
     return isUnderHome(path, home);
 }
 
-fn isSecretBasename(name: []const u8) bool {
-    if (std.ascii.eqlIgnoreCase(name, ".env")) return true;
-    if (std.ascii.startsWithIgnoreCase(name, ".env.")) return true;
-    if (std.ascii.eqlIgnoreCase(name, "auth.json")) return true;
-    if (std.ascii.eqlIgnoreCase(name, ".credentials.json")) return true;
-    if (std.ascii.eqlIgnoreCase(name, "credentials.json")) return true;
-    if (std.ascii.eqlIgnoreCase(name, "id_ed25519")) return true;
+pub fn isSecretReadPath(path: []const u8) bool {
+    if (path.len == 0) return false;
+    if (isSecretBasename(policyBasename(path))) return true;
+    if (pathHasSecretSegment(path)) return true;
+    if (isDockerConfigJson(path)) return true;
     return false;
+}
+
+pub fn isSecretBasename(name: []const u8) bool {
+    if (std.ascii.startsWithIgnoreCase(name, ".env.")) return true;
+    for (secret_basenames) |banned| {
+        if (std.ascii.eqlIgnoreCase(name, banned)) return true;
+    }
+    return false;
+}
+
+fn policyBasename(path: []const u8) []const u8 {
+    var start: usize = 0;
+    for (path, 0..) |ch, i| {
+        if (ch == '/' or ch == '\\') start = i + 1;
+    }
+    return path[start..];
+}
+
+fn isDockerConfigJson(path: []const u8) bool {
+    if (!std.ascii.eqlIgnoreCase(policyBasename(path), "config.json")) return false;
+    return pathHasNamedSegment(path, "docker") or pathHasNamedSegment(path, ".docker");
 }
 
 fn isInstructionBasename(name: []const u8) bool {
@@ -276,6 +352,18 @@ fn pathHasSecretSegment(path: []const u8) bool {
     var win = std.mem.splitScalar(u8, path, '\\');
     while (win.next()) |seg| {
         if (isSecretSegment(seg)) return true;
+    }
+    return false;
+}
+
+fn pathHasNamedSegment(path: []const u8, name: []const u8) bool {
+    var unix = std.mem.splitScalar(u8, path, '/');
+    while (unix.next()) |seg| {
+        if (std.ascii.eqlIgnoreCase(seg, name)) return true;
+    }
+    var win = std.mem.splitScalar(u8, path, '\\');
+    while (win.next()) |seg| {
+        if (std.ascii.eqlIgnoreCase(seg, name)) return true;
     }
     return false;
 }
@@ -319,6 +407,31 @@ fn testEnv(extra: []const EnvPair) [6]EnvPair {
         pairs[i + 1] = pair;
     }
     return pairs;
+}
+
+test "host support catalog allows grok docs rules and observations" {
+    const env = testEnv(&.{});
+    const allowed = [_][]const u8{
+        test_home ++ "/.grok/docs/user-guide/hooks.md",
+        test_home ++ "/.grok/docs",
+        test_home ++ "/.grok/rules/wax.md",
+        test_home ++ "/.grok/skill-observations/log.md",
+        "~/.grok/docs/user-guide/hooks.md",
+        "~/.grok/rules/wax.md",
+        "~/.grok/skill-observations/log.md",
+    };
+    for (allowed) |path| {
+        try std.testing.expectEqual(MatchKind.support, classifyWithEnv(path, env[0..1]));
+    }
+
+    try std.testing.expectEqual(MatchKind.none, classifyWithEnv(test_home ++ "/.grok/auth.json", env[0..1]));
+    try std.testing.expectEqual(MatchKind.none, classifyWithEnv(test_home ++ "/.grok/config.toml", env[0..1]));
+    try std.testing.expectEqual(MatchKind.none, classifyWithEnv(test_home ++ "/.grok/docs/user-guide/.env", env[0..1]));
+    try std.testing.expectEqual(MatchKind.none, classifyWithEnv(test_home ++ "/.grok/docs/.netrc", env[0..1]));
+    try std.testing.expectEqual(MatchKind.none, classifyWithEnv(test_home ++ "/.grok/docs/secrets.json", env[0..1]));
+    try std.testing.expectEqual(MatchKind.none, classifyWithEnv(test_home ++ "/.grok/skill-observations/secrets.json", env[0..1]));
+    try std.testing.expectEqual(MatchKind.none, classifyWithEnv(test_home ++ "/.grok/docs/id_rsa", env[0..1]));
+    try std.testing.expectEqual(MatchKind.none, classifyWithEnv("~/.grok/**", env[0..1]));
 }
 
 test "host skill catalog allows first-class skill trees under synthetic HOME" {
@@ -423,6 +536,9 @@ test "host runtime catalog rejects secrets traversal and non-catalog paths" {
         test_home ++ "/.grok/skills/x/.ENV",
         test_home ++ "/.grok/skills/x/AUTH.json",
         test_home ++ "/.grok/skills/x/.ENV.local",
+        test_home ++ "/.grok/docs/.netrc",
+        test_home ++ "/.grok/third-party/pkg/.npmrc",
+        test_home ++ "/.grok/docs/.docker/config.json",
         test_home ++ "/.grok/skills/x/ID_ED25519",
         test_home ++ "/.grok/third-party/pkg/.env.local",
         test_home ++ "/.grok/third-party/pkg/.ssh/config",
@@ -452,6 +568,22 @@ test "host skill catalog rejects case-folded secrets and ssh segments" {
     try std.testing.expectEqual(MatchKind.none, classifyWithEnv(test_home ++ "/.grok/third-party/pkg/.ssh/config", env[0..1]));
     try std.testing.expectEqual(MatchKind.none, classifyWithEnv("~/.SSH/AGENTS.md", env[0..1]));
     try std.testing.expectEqual(MatchKind.skill, classifyWithEnv(test_home ++ "/.grok/third-party/hallmark/SKILL.md", env[0..1]));
+}
+
+test "host runtime catalog rejects npmrc netrc and docker config.json" {
+    const env = testEnv(&.{});
+    try std.testing.expectEqual(MatchKind.none, classifyWithEnv(test_home ++ "/.grok/docs/.netrc", env[0..1]));
+    try std.testing.expectEqual(MatchKind.none, classifyWithEnv(test_home ++ "/.grok/third-party/hallmark/.npmrc", env[0..1]));
+    try std.testing.expectEqual(MatchKind.none, classifyWithEnv(test_home ++ "/.grok/docs/.docker/config.json", env[0..1]));
+    try std.testing.expect(isSecretReadPath(test_home ++ "/.docker/config.json"));
+    try std.testing.expect(isSecretReadPath("~/.npmrc"));
+    try std.testing.expect(isSecretReadPath("~/.netrc"));
+    try std.testing.expect(isSecretReadPath("./.git-credentials"));
+    try std.testing.expect(isSecretReadPath("./credentials"));
+    try std.testing.expect(isSecretReadPath("/tmp/other/.envrc"));
+    try std.testing.expect(isSecretReadPath("./id_ecdsa"));
+    try std.testing.expect(!isSecretReadPath("./src/auth/token.zig"));
+    try std.testing.expect(!isSecretReadPath(test_home ++ "/.grok/docs/user-guide/hooks.md"));
 }
 
 test "skill tree wins over instruction basename inside a skill dir" {
