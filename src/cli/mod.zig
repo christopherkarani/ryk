@@ -192,9 +192,8 @@ fn suggestCommand(unknown: []const u8) ?[]const u8 {
 const always_machine_commands = [_][]const u8{
     "evaluate", "hook", "hook-serve", "shim", "completions", "env", "dashboard", "cloud", "telemetry", "--print-install-env",
     // Zig-native shell tools (formerly daemon-proxied): keep machine/banner-free.
-    // `explain` is human pretty by default (DCG-class colors); machine only via
-    // `--format json` (isMachineArgv). Own header is `RYK EXPLAIN` (no brand banner).
-    "test",
+    // `explain` / `test` are human pretty by default; machine only via
+    // `--format json` (isMachineArgv). Banner stays off in shouldShowBanner.
 };
 
 fn isAlwaysMachineCommand(command: []const u8) bool {
