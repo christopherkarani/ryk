@@ -1646,6 +1646,9 @@ test "decide tool returns valid JSON" {
         try std.testing.expectEqual(exit_codes.success, code);
     } else if (std.mem.eql(u8, decision, "ask")) {
         try std.testing.expectEqual(exit_codes.ask, code);
+    } else if (std.mem.eql(u8, decision, "deny") or std.mem.eql(u8, decision, "block")) {
+        // Unattended / CI hardens leftover unused ask → deny. Still valid JSON.
+        try std.testing.expectEqual(exit_codes.denial, code);
     } else {
         try std.testing.expect(false);
     }
