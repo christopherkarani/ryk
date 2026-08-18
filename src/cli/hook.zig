@@ -389,7 +389,7 @@ fn hookCommand(io: std.Io, host: Host, event: Event, original_event_name: []cons
         return code;
     }
 
-    return evaluateFromPayload(io, allocator, host, event, original_event_name, payload_text, ci_mode, null, null, stdout, stderr);
+    return evaluateFromPayload(io, allocator, host, event, original_event_name, payload_text, ci_mode, true, null, null, stdout, stderr);
 }
 
 fn tryHookServer(
@@ -417,7 +417,8 @@ fn tryHookServer(
         .version = build_options.version,
         .host = @tagName(host),
         .event = event_name,
-        .ci = ci,
+        // Client folds `--ci` with process unattended keys; hook-serve must not getenvUnattended.
+        .ci = hook_client.clientUnattendedCi(ci),
         .probe = probe,
         .workspace = cwd_z,
         .cwd = cwd_z,
@@ -475,6 +476,7 @@ pub fn evaluateForServer(
         event_name,
         payload_text,
         ci,
+        false,
         workspace_override,
         cached_policy,
         &stdout_buf.writer,
@@ -522,6 +524,7 @@ fn evaluateFromPayload(
     original_event_name: []const u8,
     payload_text: []const u8,
     ci_mode: bool,
+    fold_process_unattended: bool,
     workspace_override: ?[]const u8,
     cached_policy: ?*const core_api.LoadedPolicy,
     stdout: anytype,
@@ -794,7 +797,8 @@ fn evaluateFromPayload(
     // Leftover unused policy ask is permit on attended coding hosts. Stage,
     // SoftBlock, and FM steward ask never become allow. Unattended / --ci
     // still hardens leftover ask (and hold outcomes) to block.
-    const unattended = ci_mode or env_util.getenvUnattended();
+    // Client folds `--ci` with process unattended; hook-serve must not getenvUnattended.
+    const unattended = ci_mode or (fold_process_unattended and env_util.getenvUnattended());
     if (result.decision == .stage and unattended) {
         result.decision = .block;
     } else if (result.ask_origin.mayPermitOnCodingHost()) {
@@ -6882,6 +6886,57 @@ test "unattended env lookup hardens coding-host residual ask" {
     try std.testing.expectEqual(PluginDecision.block, wireCodingHostAsk(.ask, from_ci));
     const attended = env_util.unattendedFromLookup(Lookup{ .key = "CI", .value = "0" });
     try std.testing.expectEqual(PluginDecision.allow, wireCodingHostAsk(.ask, attended));
+}
+
+test "evaluateForServer leftover unused ask ignores process CI" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, ".ryk");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = ".ryk/policy.yaml",
+        .data = policy.presets.ask_policy,
+    });
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+
+    const prev_ci = try sOnceCliHookDupEnvZ("CI");
+    defer sOnceCliHookRestoreEnv("CI", prev_ci);
+    try std.testing.expectEqual(@as(c_int, 0), setenv("CI", "true", 1));
+    try std.testing.expect(env_util.getenvUnattended());
+
+    const leftover_payload =
+        \\{"hookEventName":"pre_tool_use","sessionId":"ryk-fixture","cwd":"/tmp","workspaceRoot":"/tmp","toolName":"run_terminal_cmd","toolUseId":"fixture-ask","toolInput":{"command":"git restore README.md"},"toolInputTruncated":false}
+    ;
+
+    var attended = try evaluateForServer(
+        std.testing.io,
+        allocator,
+        "grok",
+        "PreToolUse",
+        leftover_payload,
+        false,
+        false,
+        root,
+        null,
+    );
+    defer attended.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), attended.exit);
+    try std.testing.expect(std.mem.indexOf(u8, attended.stdout, "\"decision\": \"allow\"") != null);
+
+    var unattended = try evaluateForServer(
+        std.testing.io,
+        allocator,
+        "grok",
+        "PreToolUse",
+        leftover_payload,
+        true,
+        false,
+        root,
+        null,
+    );
+    defer unattended.deinit(allocator);
+    try std.testing.expectEqual(codex_deny_exit_code, unattended.exit);
 }
 
 test "hook emit after wire rewrite is allow for attended Hermes" {

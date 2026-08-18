@@ -67,6 +67,12 @@ pub fn serveErrorIsFailClosed(err: ClientError) bool {
     };
 }
 
+/// Fold `--ci` / mode=ci with process unattended keys into hook-serve `req.ci`.
+/// hook-serve must not getenvUnattended itself — the client sends the fold.
+pub fn clientUnattendedCi(explicit_ci: bool) bool {
+    return explicit_ci or env_util.getenvUnattended();
+}
+
 /// Absolute client cwd for a hook-serve request. Null means skip the server
 /// so callers never stamp workspace/cwd as "".
 ///
@@ -357,6 +363,10 @@ fn flagMeansDisabled(raw: []const u8) bool {
         std.ascii.eqlIgnoreCase(raw, "false") or
         std.ascii.eqlIgnoreCase(raw, "no") or
         std.ascii.eqlIgnoreCase(raw, "off");
+}
+
+test "clientUnattendedCi is true when explicit_ci is true" {
+    try std.testing.expect(clientUnattendedCi(true));
 }
 
 test "hook serve OOM and broken session are fail-closed; Unavailable is not" {

@@ -1270,7 +1270,7 @@ fn isDeleteRefspec(tok: []const u8) bool {
 }
 
 fn isNonPrivilegeWrapperBasename(base: []const u8) bool {
-    const wrappers = [_][]const u8{ "env", "command", "nice", "nohup", "time", "builtin" };
+    const wrappers = [_][]const u8{ "env", "command", "nice", "nohup", "time", "builtin", "exec", "xargs" };
     for (wrappers) |w| {
         if (std.ascii.eqlIgnoreCase(base, w)) return true;
     }
@@ -1281,13 +1281,12 @@ fn skipOneNonPrivilegeWrapper(stage: []const u8) ?[]const u8 {
     var rest = skipLeadingAssignments(stage);
     const word = pipeStageFirstWord(rest);
     if (word.len == 0) return null;
-    const base = firstTokenBasename(word);
+    const base = firstTokenBasename(unwrapGitToken(word));
     if (!isNonPrivilegeWrapperBasename(base)) return null;
 
     rest = std.mem.trimStart(u8, rest[word.len..], " \t");
     const is_command = std.ascii.eqlIgnoreCase(base, "command");
     const is_env = std.ascii.eqlIgnoreCase(base, "env");
-    const is_nice = std.ascii.eqlIgnoreCase(base, "nice");
 
     while (rest.len > 0) {
         const fw = pipeStageFirstWord(rest);
@@ -1301,11 +1300,13 @@ fn skipOneNonPrivilegeWrapper(stage: []const u8) ?[]const u8 {
         const is_env_assign = is_env and std.mem.indexOfScalar(u8, fw, '=') != null;
         if (!is_flag and !is_env_assign) break;
 
-        const takes_val = (is_nice and (std.mem.eql(u8, fw, "-n") or std.mem.startsWith(u8, fw, "-n"))) or
+        // Exact `-n` / `--adjustment` take the next token; combined `-n10` does not.
+        const takes_val = std.mem.eql(u8, fw, "-n") or
+            std.mem.eql(u8, fw, "--adjustment") or
             (is_env and (std.mem.eql(u8, fw, "-u") or std.mem.eql(u8, fw, "-C")));
 
         rest = std.mem.trimStart(u8, rest[fw.len..], " \t");
-        if (takes_val and !std.mem.startsWith(u8, fw, "-n") and rest.len > 0 and rest[0] != '-') {
+        if (takes_val and rest.len > 0 and rest[0] != '-') {
             const val = pipeStageFirstWord(rest);
             rest = std.mem.trimStart(u8, rest[val.len..], " \t");
         }
@@ -1313,30 +1314,31 @@ fn skipOneNonPrivilegeWrapper(stage: []const u8) ?[]const u8 {
     return rest;
 }
 
-fn unwrapNonPrivilegeWrappers(stage: []const u8) []const u8 {
-    var rest = std.mem.trim(u8, stage, " \t\r\n");
-    var i: u8 = 0;
-    while (i < 8) : (i += 1) {
-        const next = skipOneNonPrivilegeWrapper(rest) orelse break;
-        if (next.len == 0 or next.ptr == rest.ptr) break;
-        rest = next;
-    }
-    return rest;
-}
-
 fn isPrivilegeEscalationBasename(base: []const u8) bool {
     return std.ascii.eqlIgnoreCase(base, "sudo") or
         std.ascii.eqlIgnoreCase(base, "su") or
-        std.ascii.eqlIgnoreCase(base, "doas");
+        std.ascii.eqlIgnoreCase(base, "doas") or
+        std.ascii.eqlIgnoreCase(base, "sudoedit");
 }
 
-/// True when an executing command word is sudo/su/doas (after env/command/nice
-/// wrappers only — sudo itself is the fence, not a strip). Comments / echo data
-/// stay allow because they are not argv0.
+/// True when an executing command word is sudo/su/doas/sudoedit after
+/// env/command/nice/nohup/time/builtin/exec/xargs wrappers. `timeout` is a
+/// documented residual and is not unwrapped. Comments / echo data stay allow
+/// because they are not argv0.
 fn isPrivilegeEscalationCommand(cmd: []const u8) bool {
-    const rest = unwrapNonPrivilegeWrappers(cmd);
-    if (rest.len == 0) return false;
-    return isPrivilegeEscalationBasename(firstTokenBasename(rest));
+    var rest = std.mem.trim(u8, cmd, " \t\r\n");
+    var i: u8 = 0;
+    while (i < 8) : (i += 1) {
+        rest = skipLeadingAssignments(rest);
+        const word = pipeStageFirstWord(rest);
+        if (word.len == 0) return false;
+        const base = firstTokenBasename(unwrapGitToken(word));
+        if (isPrivilegeEscalationBasename(base)) return true;
+        const next = skipOneNonPrivilegeWrapper(rest) orelse return false;
+        if (next.len == 0 or next.ptr == rest.ptr) return false;
+        rest = next;
+    }
+    return false;
 }
 
 fn commandHasPrivilegeEscalation(trimmed: []const u8, candidates: []const []const u8) bool {
@@ -2361,6 +2363,33 @@ test "evaluateCommand denies su and doas privilege escalation" {
         try std.testing.expect(eval.rule_id != null);
         try std.testing.expect(std.mem.startsWith(u8, eval.rule_id.?, "zig.shell:"));
     }
+}
+
+test "evaluateCommand unwraps wrappers onto privilege fence" {
+    const cases = [_][]const u8{
+        "nice -n 10 sudo true",
+        "nice -n10 sudo true",
+        "env sudo true",
+        "'sudo' true",
+        "\"/usr/bin/sudo\" true",
+        "exec sudo true",
+        "sudoedit /etc/passwd",
+        "xargs sudo true",
+    };
+    for (cases) |cmd| {
+        var eval = try evaluateCommand(std.testing.allocator, cmd, .{});
+        defer eval.deinit(std.testing.allocator);
+        try std.testing.expect(eval.decision == .deny);
+        try std.testing.expect(eval.severity == .critical);
+        try std.testing.expect(eval.rule_id != null);
+        try std.testing.expectEqualStrings("zig.shell:privilege-escalation", eval.rule_id.?);
+    }
+}
+
+test "evaluateCommand leaves timeout-wrapped sudo as residual allow" {
+    var eval = try evaluateCommand(std.testing.allocator, "timeout 1 sudo true", .{});
+    defer eval.deinit(std.testing.allocator);
+    try std.testing.expect(eval.decision == .allow);
 }
 
 test "evaluateCommand sudo git reset --hard still hits core.git reset-hard" {

@@ -413,6 +413,23 @@ fn zigEvaluator(
     return synthesizeDaemonResponseFromZig(allocator, eval);
 }
 
+/// Map network_eval.evaluate errors: OOM stays OOM; everything else dest-deny.
+fn destFenceFromNetworkEvalError(
+    allocator: std.mem.Allocator,
+    current: *shell_engine.Evaluation,
+    err: anyerror,
+) error{OutOfMemory}!shell_engine.Evaluation {
+    current.deinit(allocator);
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => denyNetworkDestination(
+            "zig.shell:network-destination",
+            "network-destination",
+            "Network destination could not be evaluated (fail-closed). This command will NOT be executed.",
+        ),
+    };
+}
+
 fn denyNetworkDestination(rule_id: []const u8, pattern: []const u8, reason: []const u8) shell_engine.Evaluation {
     return .{
         .decision = .deny,
@@ -443,6 +460,14 @@ fn applyCurlDestinationFence(
             current.deinit(allocator);
             return error.OutOfMemory;
         },
+        error.UnreadableCurlConfig => {
+            current.deinit(allocator);
+            return denyNetworkDestination(
+                "zig.shell:network-destination",
+                "network-destination",
+                "Curl config file destination cannot be parsed (fail-closed). This command will NOT be executed.",
+            );
+        },
     };
     defer policy.effects.shell_bypass.freeCurlLikeHosts(allocator, hosts);
     if (hosts.len == 0) return current;
@@ -465,13 +490,8 @@ fn applyCurlDestinationFence(
 
     const mode = loaded.mode();
     for (hosts) |host| {
-        var net = policy.network_eval.evaluate(allocator, loaded.innerPtr(), mode, host, .{}) catch {
-            current.deinit(allocator);
-            return denyNetworkDestination(
-                "zig.shell:network-destination",
-                "network-destination",
-                "Network destination could not be evaluated (fail-closed). This command will NOT be executed.",
-            );
+        var net = policy.network_eval.evaluate(allocator, loaded.innerPtr(), mode, host, .{}) catch |err| {
+            return destFenceFromNetworkEvalError(allocator, &current, err);
         };
         defer net.deinit(allocator);
         if (net.decision.result == .deny) {
@@ -2704,6 +2724,200 @@ test "shell_eval coding DCG does not destination-deny api.github.com curl" {
     );
     defer allowed.deinit(std.testing.allocator);
     try std.testing.expectEqual(core.decision.DecisionResult.allow, allowed.decision.result);
+}
+
+test "shell_eval coding DCG denies bash -c unmatched curl destination" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try seedCodingDcgWorkspace(&tmp);
+    defer std.testing.allocator.free(root);
+    const audit = ShellAuditOptions{
+        .io = std.testing.io,
+        .workspace_root = root,
+        .event_source = "test",
+    };
+
+    var denied = try evaluateCommand(
+        std.testing.allocator,
+        .strict,
+        &.{ "bash", "-c", "curl https://example.invalid/" },
+        root,
+        null,
+        null,
+        audit,
+        &.{},
+    );
+    defer denied.deinit(std.testing.allocator);
+    try std.testing.expectEqual(core.decision.DecisionResult.deny, denied.decision.result);
+    try std.testing.expect(denied.owned_rule_id != null);
+    try std.testing.expectEqualStrings("zig.shell:network-destination", denied.owned_rule_id.?);
+}
+
+test "shell_eval coding DCG denies curl --proxy unmatched destination" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try seedCodingDcgWorkspace(&tmp);
+    defer std.testing.allocator.free(root);
+    const audit = ShellAuditOptions{
+        .io = std.testing.io,
+        .workspace_root = root,
+        .event_source = "test",
+    };
+
+    var denied = try evaluateCommand(
+        std.testing.allocator,
+        .strict,
+        &.{ "curl", "-x", "http://example.invalid", "https://api.github.com/" },
+        root,
+        null,
+        null,
+        audit,
+        &.{},
+    );
+    defer denied.deinit(std.testing.allocator);
+    try std.testing.expectEqual(core.decision.DecisionResult.deny, denied.decision.result);
+    try std.testing.expect(denied.owned_rule_id != null);
+    try std.testing.expectEqualStrings("zig.shell:network-destination", denied.owned_rule_id.?);
+}
+
+test "shell_eval coding DCG denies curl --connect-to unmatched ADDR hop" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try seedCodingDcgWorkspace(&tmp);
+    defer std.testing.allocator.free(root);
+    const audit = ShellAuditOptions{
+        .io = std.testing.io,
+        .workspace_root = root,
+        .event_source = "test",
+    };
+
+    var denied = try evaluateCommand(
+        std.testing.allocator,
+        .strict,
+        &.{ "curl", "--connect-to", "api.github.com:443:example.invalid:443", "https://api.github.com/" },
+        root,
+        null,
+        null,
+        audit,
+        &.{},
+    );
+    defer denied.deinit(std.testing.allocator);
+    try std.testing.expectEqual(core.decision.DecisionResult.deny, denied.decision.result);
+    try std.testing.expect(denied.owned_rule_id != null);
+    try std.testing.expectEqualStrings("zig.shell:network-destination", denied.owned_rule_id.?);
+}
+
+test "shell_eval coding DCG denies curl --config without inline URL" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try seedCodingDcgWorkspace(&tmp);
+    defer std.testing.allocator.free(root);
+    const audit = ShellAuditOptions{
+        .io = std.testing.io,
+        .workspace_root = root,
+        .event_source = "test",
+    };
+
+    var denied = try evaluateCommand(
+        std.testing.allocator,
+        .strict,
+        &.{ "curl", "--config", "curlrc" },
+        root,
+        null,
+        null,
+        audit,
+        &.{},
+    );
+    defer denied.deinit(std.testing.allocator);
+    try std.testing.expectEqual(core.decision.DecisionResult.deny, denied.decision.result);
+    try std.testing.expect(denied.owned_rule_id != null);
+    try std.testing.expectEqualStrings("zig.shell:network-destination", denied.owned_rule_id.?);
+}
+
+test "shell_eval coding DCG does not destination-deny network.ask curl host" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try seedCodingDcgWorkspace(&tmp);
+    defer std.testing.allocator.free(root);
+    const audit = ShellAuditOptions{
+        .io = std.testing.io,
+        .workspace_root = root,
+        .event_source = "test",
+    };
+
+    var allowed = try evaluateCommand(
+        std.testing.allocator,
+        .strict,
+        &.{ "curl", "https://raw.githubusercontent.com/octocat/Hello-World/master/README" },
+        root,
+        null,
+        null,
+        audit,
+        &.{},
+    );
+    defer allowed.deinit(std.testing.allocator);
+    try std.testing.expectEqual(core.decision.DecisionResult.allow, allowed.decision.result);
+}
+
+test "shell_eval coding DCG does not destination-deny scheme-less curl localhost" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try seedCodingDcgWorkspace(&tmp);
+    defer std.testing.allocator.free(root);
+    const audit = ShellAuditOptions{
+        .io = std.testing.io,
+        .workspace_root = root,
+        .event_source = "test",
+    };
+
+    var allowed = try evaluateCommand(
+        std.testing.allocator,
+        .strict,
+        &.{ "curl", "localhost" },
+        root,
+        null,
+        null,
+        audit,
+        &.{},
+    );
+    defer allowed.deinit(std.testing.allocator);
+    try std.testing.expectEqual(core.decision.DecisionResult.allow, allowed.decision.result);
+}
+
+test "applyCurlDestinationFence propagates OutOfMemory from extract" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const eval = shell_engine.Evaluation{
+        .decision = .allow,
+        .reason = "ok",
+        .owned = false,
+    };
+    try std.testing.expectError(
+        error.OutOfMemory,
+        applyCurlDestinationFence(failing.allocator(), std.testing.io, ".", "curl https://example.invalid/", eval),
+    );
+}
+
+test "applyCurlDestinationFence maps non-OOM network eval errors to dest-deny" {
+    var eval = shell_engine.Evaluation{
+        .decision = .allow,
+        .reason = "ok",
+        .owned = false,
+    };
+    const denied = try destFenceFromNetworkEvalError(std.testing.allocator, &eval, error.InvalidNetworkDestination);
+    try std.testing.expect(denied.decision == .deny);
+    try std.testing.expectEqualStrings("zig.shell:network-destination", denied.rule_id.?);
+}
+
+test "applyCurlDestinationFence does not map OutOfMemory to dest-deny" {
+    var eval = shell_engine.Evaluation{
+        .decision = .allow,
+        .reason = "ok",
+        .owned = false,
+    };
+    try std.testing.expectError(
+        error.OutOfMemory,
+        destFenceFromNetworkEvalError(std.testing.allocator, &eval, error.OutOfMemory),
+    );
 }
 
 test "shell_eval curl piped to sh still denies network-pipe-to-shell" {
