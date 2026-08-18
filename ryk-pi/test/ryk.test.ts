@@ -1800,10 +1800,11 @@ test("policy ask auto-deny still blocks when audit is unavailable", async () => 
 	});
 });
 
-test("bash policy unexpected ask denies noninteractive sessions", async () => {
+test("bash leftover remapped allow is permit on noninteractive sessions", async () => {
 	await withClearedUnattendedEnv(async () => {
 		const { pi, handlers } = makePi();
-		const { spawn } = makeSpawn([{ code: 0, stdout: askJson() }]);
+		// ryk evaluate remaps leftover unused ask to allow before the plugin.
+		const { spawn } = makeSpawn([{ code: 0, stdout: allowJson() }]);
 		installRykExtension(pi, { spawn, rykBin: "ryk" });
 		const { ctx } = makeCtx({ hasUI: false, mode: "print" });
 		let selectCalled = false;
@@ -2776,7 +2777,7 @@ test("no shell interpolation is used when invoking ryk", async () => {
 	assert.equal(request.source.host, "pi");
 });
 
-test("runRykEvaluate maps decision ask exit 0 to kind ask", async () => {
+test("runRykEvaluate unexpected leftover ask is fail-closed", async () => {
 	const { spawn } = makeSpawn([{ code: 0, stdout: askJson() }]);
 	const decision = await runRykEvaluate(
 		buildEvaluateRequest("git push --force", {
@@ -2790,9 +2791,9 @@ test("runRykEvaluate maps decision ask exit 0 to kind ask", async () => {
 		},
 	);
 
-	assert.equal(decision.kind, "ask");
-	if (decision.kind === "ask") {
-		assert.match(decision.reason, /requires approval/i);
+	assert.equal(decision.kind, "deny");
+	if (decision.kind === "deny") {
+		assert.match(decision.reason, /requires approval|not remapped|fail-closed/i);
 		assert.equal(
 			(decision.response as { decision?: string }).decision,
 			"ask",

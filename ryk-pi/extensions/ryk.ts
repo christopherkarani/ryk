@@ -735,11 +735,15 @@ async function runRykEvaluateOnce(
 	if (decision === "allow" && result.code === 0) {
 		return { kind: "allow", response: parsed };
 	}
-	// evaluate ask uses exit 0 with decision "ask" (allow/deny exit contract preserved).
+	// Leftover unused ask is remapped by ryk evaluate. Unexpected evaluate
+	// ask is fail-closed. SoftBlock/FM/stage arrive as deny/stage and never
+	// become allow. Decide-file leftover unused ask is handled in
+	// runRykDecideOnce → resolvePolicyAsk (attended permit).
 	if (decision === "ask" && (result.code === 0 || result.code === null)) {
 		return {
-			kind: "ask",
-			reason: sanitizeVisibleText(getDecisionReason(parsed)),
+			kind: "deny",
+			reason: sanitizeVisibleText(getDecisionReason(parsed)) ||
+				"ryk leftover unused ask was not remapped; blocked fail-closed.",
 			response: parsed,
 		};
 	}
