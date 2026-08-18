@@ -2,6 +2,7 @@ const std = @import("std");
 
 const core = @import("ryk_core").core;
 const core_api = @import("ryk_core").api;
+const redact_bridge = @import("ryk_core").audit.redact_bridge;
 const daemon = @import("daemon.zig");
 pub const decision_source_rust = "rust-daemon";
 pub const decision_source_zig = "zig-native";
@@ -563,7 +564,14 @@ pub fn writeFeedRecordJson(writer: anytype, record: RustShellFeedRecord) !void {
     try writer.writeByte(',');
     try writeJsonField(writer, "target_summary", record.target_summary);
     try writer.writeByte(',');
-    try writeJsonFieldNullable(writer, "session_id", record.session_id);
+    // session_id is a path key. Do not run redactStringBounded (high-entropy /
+    // JWT would collapse Codex rollout stems and UUID v4s).
+    try writer.writeAll("\"session_id\":");
+    if (record.session_id) |sid| {
+        try core.util.writeJsonString(writer, redact_bridge.pathSafeSessionId(sid));
+    } else {
+        try writer.writeAll("null");
+    }
     try writer.writeAll(",\"verified\":");
     try writer.writeAll(if (record.verified) "true" else "false");
     try writer.writeByte('}');

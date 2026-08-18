@@ -53,7 +53,7 @@ Machine-wide mode reads ryk's local workspace registry and global decision feed.
 - `ryk cloud --demo` / `ryk dashboard --view terminal --demo` / `?demo=1` load a labeled fixture stream only. Demo is never loaded because the feed is empty or `/api/status` failed.
 - Machine-wide daemon health
 
-Decision writers continue to store the existing per-workspace feed and also append a redacted record to `$HOME/.ryk/dashboard/events.jsonl`. `$HOME/.ryk/dashboard/workspaces.json` indexes recently active workspaces for session aggregation. Feed writes are best-effort and do not change hook, run, or evaluate exit behavior. Crafted feed `session_id` or `workspace_root` values (`..`, extra separators) are skipped before any filesystem join; that is a loader skip, not a fail-closed policy deny.
+Decision writers continue to store the existing per-workspace feed and also append a redacted record to `$HOME/.ryk/dashboard/events.jsonl`. `$HOME/.ryk/dashboard/workspaces.json` indexes recently active workspaces for session aggregation. Feed writes are best-effort and do not change hook, run, or evaluate exit behavior. Crafted feed `session_id` or `workspace_root` values (`..`, extra separators) are skipped before any filesystem join; that is a loader skip, not a fail-closed policy deny. A session id that embeds a structured provider or vendor token is rewritten to the path-safe literal `redacted` (not `[REDACTED]`) so the dashboard Session field stays a valid path key.
 
 Machine-wide mode exposes only the global action `ryk doctor`. Policy, replay, report, CI, credential, proxy, and integration actions stay hidden and are rejected server-side until the dashboard is started with an explicit workspace. This prevents ambiguous uses of `last` from `~`.
 

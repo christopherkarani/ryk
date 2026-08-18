@@ -43,6 +43,107 @@ pub fn redactAlloc(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
     return out.toOwnedSlice(allocator);
 }
 
+pub const path_safe_session_id = "redacted";
+
+/// Session-id path key: keep the input, or return `path_safe_session_id`.
+/// Structured provider tokens / AWS keys redact; high-entropy / JWT do not.
+pub fn pathSafeSessionId(sid: []const u8) []const u8 {
+    return if (sessionIdContainsStructuredSecret(sid)) path_safe_session_id else sid;
+}
+
+/// True when a session-id should become `path_safe_session_id`.
+/// Hits: `findStructuredSecret` at a session-id boundary, vendor prefixes
+/// (`xoxb-`, `sk_live_`, `glpat-`, `hf_`, …) at those same boundaries, or an
+/// `AKIA`/`ASIA` key. Does **not** treat high-entropy / JWT blobs as secrets.
+/// Callers must use `pathSafeSessionId`.
+fn sessionIdContainsStructuredSecret(value: []const u8) bool {
+    // Session ids are path keys. `findStructuredSecret` is a free-text scanner
+    // and matches `sk-` at every byte, so `task-<uuid>` / `ask-followup-1`
+    // would collapse onto `redacted`. Accept a hit only when the previous
+    // byte is non-alnum (`-` / `_` / `.` count). Do not change the scanner
+    // itself — glued `blockedsk-…` in commands must still redact.
+    var from: usize = 0;
+    while (findStructuredSecret(value, from)) |span| {
+        // Session ids allow `_` as a separator (`sess_…`, OpenCode `ses_…`).
+        // Env-var `isKeyStart` treats `_` as interior, which would keep
+        // `sess_ghp_…`. Alnum-only interior still rejects `task-` / `ask-`.
+        if (isSessionIdTokenBoundary(value, span.start)) return true;
+        from = span.start + 1;
+    }
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    if (looksLikeAwsAccessKey(trimmed)) return true;
+    var i: usize = 0;
+    while (i < value.len) : (i += 1) {
+        if (!isSessionIdTokenBoundary(value, i)) continue;
+        if (i + 20 <= value.len) {
+            const cand = value[i .. i + 20];
+            if (looksLikeAwsAccessKey(cand) and
+                (i + 20 == value.len or !std.ascii.isAlphanumeric(value[i + 20])))
+                return true;
+        }
+        // Vendor prefixes inside findStructuredSecret use isStructuredTokenBoundary,
+        // which treats `_` as interior — so sess_xoxb- / sess_sk_live_ never emit
+        // a span. Scan them here at session-id boundaries only.
+        for (vendor_token_prefixes) |vendor| {
+            if (!startsWithIgnoreCase(value[i..], vendor.prefix)) continue;
+            var end = i + vendor.prefix.len;
+            while (end < value.len and isTokenChar(value[end])) : (end += 1) {}
+            if (end >= i + vendor.prefix.len + vendor.min_after) return true;
+        }
+    }
+    return false;
+}
+
+fn isSessionIdTokenBoundary(value: []const u8, i: usize) bool {
+    return i == 0 or !std.ascii.isAlphanumeric(value[i - 1]);
+}
+
+test "pathSafeSessionId keeps host ids and redacts structured tokens" {
+    const Case = struct { sid: []const u8, want: []const u8 };
+    const cases = [_]Case{
+        .{ .sid = "", .want = "" },
+        .{ .sid = "task-a1b2c3d4-e5f6-7890-abcd-ef1234567890", .want = "task-a1b2c3d4-e5f6-7890-abcd-ef1234567890" },
+        .{ .sid = "ask-followup-1", .want = "ask-followup-1" },
+        .{ .sid = "a1b2c3d4-e5f6-7890-abcd-ef1234567890", .want = "a1b2c3d4-e5f6-7890-abcd-ef1234567890" },
+        .{ .sid = "rollout-2026-07-30T21-25-08-019fb445-e7a9-7612-bf1a-8fe20ff9e69b", .want = "rollout-2026-07-30T21-25-08-019fb445-e7a9-7612-bf1a-8fe20ff9e69b" },
+        .{ .sid = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJmYWtlIn0.c2lnbmF0dXJl", .want = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJmYWtlIn0.c2lnbmF0dXJl" },
+        .{ .sid = "ghp_fakeSyntheticTokenValue1234567890", .want = path_safe_session_id },
+        .{ .sid = "sess-sk-abcdefghijklmnop", .want = path_safe_session_id },
+        .{ .sid = "sess_ghp_fakeSyntheticTokenValue1234567890", .want = path_safe_session_id },
+        .{ .sid = "sess.ghp_fakeSyntheticTokenValue1234567890", .want = path_safe_session_id },
+        .{ .sid = "GHP_0123456789AB", .want = path_safe_session_id },
+        .{ .sid = "sess_AKIAIOSFODNN7EXAMPLE", .want = path_safe_session_id },
+        .{ .sid = "sess_xoxb-abcdefghijkl", .want = path_safe_session_id },
+        .{ .sid = "sess-xoxb-abcdefghijkl", .want = path_safe_session_id },
+        .{ .sid = "sess_sk_live_abcdefgh", .want = path_safe_session_id },
+        .{ .sid = "sess-glpat-abcdefghijkl", .want = path_safe_session_id },
+        .{ .sid = "sess_hf_abcdefghijklmnopqrst", .want = path_safe_session_id },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqualStrings(case.want, pathSafeSessionId(case.sid));
+    }
+}
+
+const vendor_token_prefixes = [_]struct { prefix: []const u8, min_after: usize }{
+    .{ .prefix = "xoxb-", .min_after = 12 },
+    .{ .prefix = "xoxp-", .min_after = 12 },
+    .{ .prefix = "xoxa-", .min_after = 12 },
+    .{ .prefix = "xoxs-", .min_after = 12 },
+    .{ .prefix = "xoxe-", .min_after = 12 },
+    .{ .prefix = "xoxc-", .min_after = 12 },
+    .{ .prefix = "sk_live_", .min_after = 8 },
+    .{ .prefix = "sk_test_", .min_after = 8 },
+    .{ .prefix = "rk_live_", .min_after = 8 },
+    .{ .prefix = "rk_test_", .min_after = 8 },
+    .{ .prefix = "pk_live_", .min_after = 8 },
+    .{ .prefix = "pk_test_", .min_after = 8 },
+    .{ .prefix = "glpat-", .min_after = 12 },
+    .{ .prefix = "gldt-", .min_after = 12 },
+    // 20 after `hf_` (23 total) sits under real HF tokens (~34) and
+    // above common HF_* identifiers (`HF_HUB_OFFLINE`, `hf_home_directory`).
+    .{ .prefix = "hf_", .min_after = 20 },
+};
+
 const SecretSpan = struct { start: usize, end: usize };
 
 fn findStructuredSecret(value: []const u8, from: usize) ?SecretSpan {
@@ -92,29 +193,10 @@ fn findStructuredSecret(value: []const u8, from: usize) ?SecretSpan {
         // Vendor prefixes use per-shape floors so Stripe `sk_live_`/`sk_test_`
         // (underscore) never collide with OpenAI `sk-`, and short false friends
         // (`xox`, `hf`, `HF_HUB_OFFLINE`, `glpat`) stay unclassified.
-        const vendor_prefixes = [_]struct { prefix: []const u8, min_after: usize }{
-            .{ .prefix = "xoxb-", .min_after = 12 },
-            .{ .prefix = "xoxp-", .min_after = 12 },
-            .{ .prefix = "xoxa-", .min_after = 12 },
-            .{ .prefix = "xoxs-", .min_after = 12 },
-            .{ .prefix = "xoxe-", .min_after = 12 },
-            .{ .prefix = "xoxc-", .min_after = 12 },
-            .{ .prefix = "sk_live_", .min_after = 8 },
-            .{ .prefix = "sk_test_", .min_after = 8 },
-            .{ .prefix = "rk_live_", .min_after = 8 },
-            .{ .prefix = "rk_test_", .min_after = 8 },
-            .{ .prefix = "pk_live_", .min_after = 8 },
-            .{ .prefix = "pk_test_", .min_after = 8 },
-            .{ .prefix = "glpat-", .min_after = 12 },
-            .{ .prefix = "gldt-", .min_after = 12 },
-            // 20 after `hf_` (23 total) sits under real HF tokens (~34) and
-            // above common HF_* identifiers (`HF_HUB_OFFLINE`, `hf_home_directory`).
-            .{ .prefix = "hf_", .min_after = 20 },
-        };
         // Token-char left boundary so mid-base64url `hf_` / `xoxb-` inside a
         // JWT or high-entropy blob does not punch a hole and skip classify.
         if (isStructuredTokenBoundary(value, i)) {
-            for (vendor_prefixes) |vendor| {
+            for (vendor_token_prefixes) |vendor| {
                 if (startsWithIgnoreCase(value[i..], vendor.prefix)) {
                     var end = i + vendor.prefix.len;
                     while (end < value.len and isTokenChar(value[end])) : (end += 1) {}
