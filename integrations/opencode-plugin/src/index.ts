@@ -115,8 +115,8 @@ type PluginHooks = {
   ) => Promise<void>;
 };
 
-/** Decisions that may pass through on a blocking path. Residual ask is permit unless unattended. */
-const ALLOW_DECISIONS = new Set(['allow', 'warn', 'context_only', 'ask']);
+/** Decisions that may pass through on a blocking path. Leftover unused ask is remapped by ryk. */
+const ALLOW_DECISIONS = new Set(['allow', 'warn', 'context_only']);
 
 /** Decisions that do not veto tool.execute.before after parsing. */
 const BLOCKING_PASS_THROUGH = new Set(['allow', 'warn', 'context_only']);
@@ -280,8 +280,8 @@ function parseOptionalStringArray(value: unknown): string[] | undefined {
  * Parse ryk hook stdout into a decision.
  * Non-blocking: soft-allow on empty/malformed.
  * Blocking: fail closed on empty/whitespace, parse errors, missing/non-string decision,
- * `error`, and unrecognized decisions. `ask` is preserved for OpenCode permission.ask UX;
- * tool.execute.before still hard-blocks ask via applyBlockingDecision.
+ * `error`, unexpected leftover `ask`, and unrecognized decisions. Leftover unused
+ * ask is remapped by ryk hook before emit.
  */
 function parseHookResponse(stdout: string, blocking: boolean): RykResponse {
   const fail = (reason: string, blockMsg: string, softMsg: string): RykResponse =>
@@ -822,12 +822,8 @@ async function applyBlockingDecision(
     return;
   }
 
-  // Residual ask is permit so coding agents can work. Unattended hardens to deny.
-  if (response.decision === 'ask' && !isUnattendedEnv()) {
-    return;
-  }
-
-  // block, unattended ask, error, unrecognized → veto tool execution
+  // Unexpected leftover ask is fail-closed (ryk remaps leftover unused ask first).
+  // block, ask, error, unrecognized → veto tool execution
   await hardBlockWithToast(
     ctx,
     formatShortBlock(response, context),
@@ -839,7 +835,7 @@ async function applyBlockingDecision(
 const PERMISSION_STATUS: Record<string, PermissionAskOutput['status']> = {
   block: 'deny',
   error: 'deny',
-  ask: 'allow',
+  ask: 'deny',
   allow: 'allow',
   context_only: 'allow',
   // Advisory: proceed. No host ask UI.
@@ -847,10 +843,6 @@ const PERMISSION_STATUS: Record<string, PermissionAskOutput['status']> = {
 };
 
 function applyPermissionDecision(response: RykResponse, output: PermissionAskOutput): void {
-  if (response.decision === 'ask' && isUnattendedEnv()) {
-    output.status = 'deny';
-    return;
-  }
   const status = PERMISSION_STATUS[response.decision];
   if (!status) {
     const msg = response.message || response.reason || 'ryk returned an invalid permission decision';

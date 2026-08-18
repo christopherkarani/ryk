@@ -735,11 +735,12 @@ async function runRykEvaluateOnce(
 	if (decision === "allow" && result.code === 0) {
 		return { kind: "allow", response: parsed };
 	}
-	// evaluate ask uses exit 0 with decision "ask" (allow/deny exit contract preserved).
+	// Leftover unused ask is remapped by ryk evaluate. Unexpected ask is fail-closed.
 	if (decision === "ask" && (result.code === 0 || result.code === null)) {
 		return {
-			kind: "ask",
-			reason: sanitizeVisibleText(getDecisionReason(parsed)),
+			kind: "deny",
+			reason: sanitizeVisibleText(getDecisionReason(parsed)) ||
+				"ryk leftover unused ask was not remapped; blocked fail-closed.",
 			response: parsed,
 		};
 	}
@@ -1543,8 +1544,8 @@ export function installRykExtension(
 					decision.kind === "allow" &&
 					BROAD_DISCOVERY_TOOLS.has(event.toolName)
 				) {
-					// Root already passed decide-file. Residual leftover ask is
-					// permit; do not invent a second host approval gate.
+					// Root already passed decide-file. Leftover unused ask is
+					// remapped by ryk; do not invent a second host approval gate.
 					return undefined;
 				}
 				return applyToolDecision(
@@ -1865,10 +1866,9 @@ async function applyToolDecision(
 }
 
 /**
- * Single entry for leftover unused policy ask:
- * - unattended / CI → auto-deny
- * - otherwise leftover unused policy ask is permit so coding agents can work
- * Staged writes, FM steward ask, SoftBlock, and explicit deny never reach here.
+ * Unexpected leftover unused policy ask on the plugin wire:
+ * - fail-closed deny (ryk hook/evaluate remaps leftover unused ask first)
+ * Staged writes, FM steward ask, SoftBlock, and explicit deny never become allow.
  */
 async function resolvePolicyAsk(
 	reason: string,
@@ -1883,7 +1883,13 @@ async function resolvePolicyAsk(
 	if (isUnattendedEnv(env)) {
 		return handlePolicyAskAutoDeny(reason, pi, ctx, toolLabel, env);
 	}
-	return undefined;
+	return handlePolicyAskAutoDeny(
+		reason || "ryk leftover unused ask was not remapped; blocked fail-closed.",
+		pi,
+		ctx,
+		toolLabel,
+		env,
+	);
 }
 
 function recordOnceBypass(

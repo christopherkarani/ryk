@@ -12,7 +12,7 @@ ryk decisions are host-agnostic:
 |---|---|
 | `allow` | Proceed |
 | `block` | Hard deny |
-| `ask` | Leftover unused policy ask only. Coding hosts permit that leftover so agents can work. Unattended/CI hardens to deny. Not a host approval UI. Not stage, FM steward ask, or SoftBlock. |
+| `ask` | Leftover unused policy ask only. `ryk decide` still emits leftover unused `ask`. Coding-host doors (`ryk hook`, stdin hook, evaluate JSON) remap attended leftover unused ask to allow before plugins see it. Unattended/CI hardens to deny. Not a host approval UI. Not stage, FM steward ask, or SoftBlock. |
 | `stage` | Hold-for-review or deny. Never allow. Default `write_mode: staged` file writes. Unattended/`--ci` hardens to block. |
 | `warn` | Advisory; do not silently treat as hard deny unless documented |
 | `context_only` | Observe / inject context only |
@@ -37,7 +37,7 @@ host `--ci`):
 
 | Host | Event | `allow` | `block` | `ask` | `warn` | Resume? | Notes |
 |---|---|---|---|---|---|---|---|
-| **Hermes** | `pre_tool_call` | proceed | `action: block` | **allow** (unattended → block) | log + proceed | No | Residual ask is permit. No Hermes approve UI. CI / unattended hardens `ask`→`block`. |
+| **Hermes** | `pre_tool_call` | proceed | `action: block` | leftover remapped to allow by ryk; unexpected `ask` fail-closed | log + proceed | No | Leftover unused ask is remapped by ryk hook before emit. No Hermes approve UI. |
 | **OpenClaw** | `tool.before` | proceed | block | **allow** (unattended → block) | log + allow | **No** | Residual unused ask is permit. Unknown/legacy/metadata registration is unprotected; use the wrapper for the hard boundary. |
 | **OpenCode** | `tool.execute.before` | proceed | throw/block | **allow** (unattended → block) | log + allow | No | Residual ask is permit so agents can work. |
 | **OpenCode** | `command.execute.before` | proceed | throw/block | **allow** (unattended → block) | log + allow | No | Slash/custom commands; payload uses command name as tool. |

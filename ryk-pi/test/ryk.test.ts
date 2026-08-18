@@ -1070,11 +1070,11 @@ test("ls tool denies sensitive directory via decide file read", async () => {
 	assert.equal(payload.operation, "read");
 });
 
-test("file-policy residual ask is permit without a prompt", async () => {
+test("file-policy leftover remapped allow is permit without a prompt", async () => {
 	await withClearedUnattendedEnv(async () => {
 		const { pi, handlers } = makePi();
 		const { spawn } = makeSpawn([
-			{ code: 7, stdout: decideJson("ask", "file.write") },
+			{ code: 0, stdout: decideJson("allow", "file.write") },
 		]);
 		installRykExtension(pi, { spawn, rykBin: "ryk" });
 		const { ctx } = makeCtx();
@@ -1093,6 +1093,25 @@ test("file-policy residual ask is permit without a prompt", async () => {
 		);
 		assert.equal(result, undefined);
 		assert.equal(offered.length, 0);
+	});
+});
+
+test("unexpected leftover ask on decide-file is fail-closed", async () => {
+	await withClearedUnattendedEnv(async () => {
+		const { pi, handlers } = makePi();
+		const { spawn } = makeSpawn([
+			{ code: 7, stdout: decideJson("ask", "file.write") },
+		]);
+		installRykExtension(pi, { spawn, rykBin: "ryk" });
+		const { ctx } = makeCtx();
+		const result = await fireToolCall(
+			handlers.get("tool_call")![0],
+			ctx,
+			"",
+			"write",
+			{ path: "src/main.ts", content: "x" },
+		);
+		assert.equal(result?.block, true);
 	});
 });
 
@@ -1164,7 +1183,7 @@ test("strict mode residual ask is permit without a prompt", async () => {
 	await withClearedUnattendedEnv(async () => {
 		const { pi, handlers, commands } = makePi();
 		const { spawn } = makeSpawn([
-			{ code: 7, stdout: decideJson("ask", "file.write") },
+			{ code: 0, stdout: decideJson("allow", "file.write") },
 		]);
 		installRykExtension(pi, { spawn, rykBin: "ryk" });
 		const { ctx } = makeCtx();
@@ -1191,7 +1210,7 @@ test("residual ask does not open once-bypass UI", async () => {
 	await withClearedUnattendedEnv(async () => {
 		const { pi, handlers, messages } = makePi();
 		const { spawn } = makeSpawn([
-			{ code: 7, stdout: decideJson("ask", "file.write") },
+			{ code: 0, stdout: decideJson("allow", "file.write") },
 		]);
 		installRykExtension(pi, { spawn, rykBin: "ryk" });
 		const syntheticSecret = "AKIASYNTHETICONLY1234";
@@ -1222,7 +1241,7 @@ test("residual ask still permits when transcript auditing is unavailable", async
 		const { pi, handlers, messages } = makePi();
 		delete (pi as { sendMessage?: unknown }).sendMessage;
 		const { spawn } = makeSpawn([
-			{ code: 7, stdout: decideJson("ask", "file.write") },
+			{ code: 0, stdout: decideJson("allow", "file.write") },
 		]);
 		installRykExtension(pi, { spawn, rykBin: "ryk" });
 		const { ctx, notifications } = makeCtx();
@@ -1340,7 +1359,7 @@ test("policy ask permits noninteractive sessions so agents can work", async () =
 	await withClearedUnattendedEnv(async () => {
 		const { pi, handlers, messages } = makePi();
 		const { spawn } = makeSpawn([
-			{ code: 7, stdout: decideJson("ask", "file.write") },
+			{ code: 0, stdout: decideJson("allow", "file.write") },
 		]);
 		installRykExtension(pi, { spawn, rykBin: "ryk" });
 		const { ctx } = makeCtx({ hasUI: false, mode: "print" });
@@ -1373,7 +1392,7 @@ test("policy ask auto-denies when RYK_UNATTENDED is set", async () => {
 	try {
 		const { pi, handlers, messages } = makePi();
 		const { spawn } = makeSpawn([
-			{ code: 7, stdout: decideJson("ask", "file.write") },
+			{ code: 0, stdout: decideJson("allow", "file.write") },
 		]);
 		installRykExtension(pi, { spawn, rykBin: "ryk" });
 		const { ctx } = makeCtx({ hasUI: false, mode: "print" });
@@ -1402,7 +1421,7 @@ test("policy ask permits print mode even when hasUI is true", async () => {
 	await withClearedUnattendedEnv(async () => {
 		const { pi, handlers } = makePi();
 		const { spawn } = makeSpawn([
-			{ code: 7, stdout: decideJson("ask", "file.write") },
+			{ code: 0, stdout: decideJson("allow", "file.write") },
 		]);
 		installRykExtension(pi, { spawn, rykBin: "ryk" });
 		const { ctx } = makeCtx({ hasUI: true, mode: "print" });
@@ -1437,7 +1456,7 @@ test("policy ask subagent permits residual ask without parent wait", async () =>
 	try {
 		const { pi, handlers, messages } = makePi();
 		const { spawn } = makeSpawn([
-			{ code: 7, stdout: decideJson("ask", "file.write") },
+			{ code: 0, stdout: decideJson("allow", "file.write") },
 		]);
 		installRykExtension(pi, { spawn, rykBin: "ryk" });
 		installRykExtension(pi, {
@@ -1497,7 +1516,7 @@ test("policy ask subagent permits residual ask without parent IPC", async () => 
 	try {
 		const { pi, handlers, messages } = makePi();
 		const { spawn } = makeSpawn([
-			{ code: 7, stdout: decideJson("ask", "file.write") },
+			{ code: 0, stdout: decideJson("allow", "file.write") },
 		]);
 	installRykExtension(pi, {
 			spawn,
@@ -1560,7 +1579,7 @@ test("policy ask subagent does not wait for a parent block", async () => {
 	try {
 		const { pi, handlers } = makePi();
 		const { spawn } = makeSpawn([
-			{ code: 7, stdout: decideJson("ask", "file.write") },
+			{ code: 0, stdout: decideJson("allow", "file.write") },
 		]);
 		installRykExtension(pi, {
 			spawn,
@@ -1728,7 +1747,7 @@ test("policy ask permits residual ask in interactive parent TUI", async () => {
 		try {
 			const { pi, handlers } = makePi();
 			const { spawn } = makeSpawn([
-				{ code: 7, stdout: decideJson("ask", "file.write") },
+				{ code: 0, stdout: decideJson("allow", "file.write") },
 			]);
 			installRykExtension(pi, { spawn, rykBin: "ryk" });
 			const { ctx } = makeCtx({ hasUI: true, mode: "tui" });
@@ -1762,7 +1781,7 @@ test("policy ask auto-deny still blocks when audit is unavailable", async () => 
 		const { pi, handlers, messages } = makePi();
 		delete (pi as { sendMessage?: unknown }).sendMessage;
 		const { spawn } = makeSpawn([
-			{ code: 7, stdout: decideJson("ask", "file.write") },
+			{ code: 0, stdout: decideJson("allow", "file.write") },
 		]);
 		installRykExtension(pi, { spawn, rykBin: "ryk" });
 		const { ctx } = makeCtx({ hasUI: false, mode: "print" });
@@ -1819,7 +1838,7 @@ test("interactive policy ask permits residual ask without select", async () => {
 		try {
 			const { pi, handlers } = makePi();
 			const { spawn } = makeSpawn([
-				{ code: 7, stdout: decideJson("ask", "file.write") },
+				{ code: 0, stdout: decideJson("allow", "file.write") },
 			]);
 			installRykExtension(pi, { spawn, rykBin: "ryk" });
 			const { ctx } = makeCtx({ hasUI: true, mode: "tui" });
@@ -3192,7 +3211,7 @@ test("subagent residual ask permits when parent-ask FS is EPERM", async () => {
 	try {
 		const { pi, handlers } = makePi();
 		const { spawn } = makeSpawn([
-			{ code: 7, stdout: decideJson("ask", "file.write") },
+			{ code: 0, stdout: decideJson("allow", "file.write") },
 		]);
 		installRykExtension(pi, {
 			spawn,

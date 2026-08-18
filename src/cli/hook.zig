@@ -20,6 +20,7 @@ const grok_deny_reason = @import("grok_deny_reason.zig");
 const hook_client = @import("hook_client.zig");
 const hook_ipc = @import("hook_ipc.zig");
 const env_util = @import("../env_util.zig");
+const leftover_ask = @import("leftover_ask.zig");
 
 // Maximum JSON payload size to prevent memory exhaustion from hostile hosts.
 const max_payload_len = 256 * 1024; // 256 KiB
@@ -796,12 +797,14 @@ fn evaluateFromPayload(
     const unattended = ci_mode or env_util.getenvUnattended();
     if (result.decision == .stage and unattended) {
         result.decision = .block;
-    } else if (result.ask_origin.mayPermitOnCodingHost()) {
-        result.decision = wireCodingHostAsk(result.decision, unattended);
-    } else if (result.decision == .ask) {
-        // SoftBlock / FM: OpenCode and Hermes treat leftover ask as proceed,
-        // so the hook wire denies instead of emitting ask.
-        result.decision = .block;
+    } else switch (leftover_ask.codingHostAskOutcome(
+        result.decision == .ask,
+        result.ask_origin,
+        unattended,
+    )) {
+        .allow => result.decision = .allow,
+        .deny => result.decision = .block,
+        .unchanged => {},
     }
 
     telemetry.recordEnforcement(
@@ -965,8 +968,11 @@ fn isCodexDenyOutput(host: Host, decision: PluginDecision) bool {
 /// (every `Host` value) permit leftover unused ask so agents can work.
 /// Stage, SoftBlock, and FM steward ask never enter this helper.
 fn wireCodingHostAsk(decision: PluginDecision, unattended: bool) PluginDecision {
-    if (decision != .ask) return decision;
-    return if (unattended) .block else .allow;
+    return switch (leftover_ask.codingHostAskOutcome(decision == .ask, .leftover, unattended)) {
+        .allow => .allow,
+        .deny => if (decision == .ask) .block else decision,
+        .unchanged => decision,
+    };
 }
 
 fn usesExitTwoDenyOutput(host: Host, decision: PluginDecision) bool {
