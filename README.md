@@ -27,7 +27,7 @@ Run Claude Code, Codex, Pi, OpenCode, Hermes, OpenClaw, or Grok through one loca
   <img src="docs/assets/ryk-deny-demo.gif" alt="ryk denying an OpenCode rm -rf / command" width="720">
 </p>
 
-<p align="center"><em>Agent tries <code>rm -rf</code>. ryk denies it. Session stays on your laptop.</em></p>
+<p align="center"><em>Agent tries <code>rm -rf /</code> (or <code>rm -rf ./build</code>). ryk denies the recursive force-delete. Session stays on your laptop.</em></p>
 
 ## Install
 

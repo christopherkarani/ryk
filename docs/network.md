@@ -20,7 +20,7 @@ ryk includes a network decision engine and wrapper/proxy-mediated hooks.
 
 ## Agent host defaults
 
-Host aliases (`ryk pi`, `ryk claude`, `ryk codex`, `ryk opencode`, `ryk openclaw`, `ryk hermes`) default to **mediated** network:
+Host aliases (`ryk pi`, `ryk claude`, `ryk codex`, `ryk opencode`, `ryk openclaw`, `ryk hermes`, `ryk grok`) default to **mediated** network:
 
 1. Policy mode **allowlist** (when `--network` is omitted)
 2. Network **backend = proxy**
@@ -111,7 +111,7 @@ The `credentials.use` value is a reference name for policy, audit, and external 
 
 - **UDP / QUIC / WebRTC** are not day-one route-forced on either platform (Landlock leaves UDP unrestricted; Seatbelt proxy-port rules are TCP-oriented).
 - Pre-existing connections outside the child process are out of scope.
-- Tools that ignore `HTTP(S)_PROXY` still cannot dial arbitrary TCP hosts when route-force is active; absolute `/usr/bin/curl` is covered by OS rules, not shim theater.
+- Tools that ignore `HTTP(S)_PROXY` still cannot dial arbitrary TCP hosts when route-force is active; absolute `/usr/bin/curl` is covered by OS rules, not shim theater. The `curl` PATH shim mediates the command through `shell_eval` (engine + destination allowlist); it is **not** itself the network allowlist.
 
 ## Exfiltration Heuristics
 

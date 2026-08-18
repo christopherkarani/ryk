@@ -113,7 +113,15 @@ fn replaySession(
             if (options.fallback_to_list) {
                 return listSessions(io, allocator, workspace_root, stdout, options.json);
             }
+            if (looksLikeHostConversationId(options.session)) {
+                try writeHostConversationIdError(stderr);
+                return exit_codes.general;
+            }
             try stderr.writeAll("ryk replay: session not found.\n");
+            return exit_codes.general;
+        },
+        error.HostConversationIdNotARykSession => {
+            try writeHostConversationIdError(stderr);
             return exit_codes.general;
         },
         error.HashVerificationFailed => {
@@ -585,6 +593,25 @@ fn argvHasOnlyTuiFlags(argv: []const []const u8) bool {
         return false;
     }
     return true;
+}
+
+fn looksLikeHostConversationId(value: []const u8) bool {
+    if (value.len != 36) return false;
+    for (value, 0..) |char, index| {
+        switch (index) {
+            8, 13, 18, 23 => if (char != '-') return false,
+            else => if (!std.ascii.isHex(char)) return false,
+        }
+    }
+    return true;
+}
+
+fn writeHostConversationIdError(stderr: anytype) !void {
+    try stderr.writeAll(
+        \\ryk replay: that looks like a host conversation id, not a ryk session id.
+        \\Host conversation ids (36-char UUIDs) are a different namespace from ryk session ids (timestamp_hex such as 2026-05-05T12-12-10Z_abcd).
+        \\
+    );
 }
 
 fn sessionDirPathForError(io: std.Io, allocator: std.mem.Allocator, workspace_root: []const u8, requested: []const u8) ![]u8 {
@@ -1138,6 +1165,71 @@ fn writeReplayDenyFixture(io: std.Io, allocator: std.mem.Allocator, workspace_ro
         .product_label = brand.product_display,
     });
     return allocator.dupe(u8, audit_writer.session_id.slice());
+}
+
+const host_conversation_id_fixture = "00000000-0000-0000-0000-000000000000";
+
+test "replay --session host UUID that is not a ryk session is a distinct error" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, ".ryk");
+    {
+        const policy_file = try tmp.dir.createFile(std.testing.io, ".ryk/policy.yaml", .{});
+        defer policy_file.close(std.testing.io);
+        try policy_file.writeStreamingAll(std.testing.io, "version: 1\nmode: observe\n");
+    }
+
+    const prev_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(prev_cwd);
+    try std.process.setCurrentDir(std.testing.io, tmp.dir);
+    defer std.process.setCurrentPath(std.testing.io, prev_cwd) catch {};
+
+    var stdout_buf: [512]u8 = undefined;
+    var stderr_buf: [1024]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+
+    const code = try command(std.testing.io, &.{ "--session", host_conversation_id_fixture }, &stdout_writer, &stderr_writer);
+    try std.testing.expect(code != exit_codes.success);
+    const err = stderr_writer.buffered();
+    try std.testing.expect(!std.mem.eql(u8, err, "ryk replay: session not found.\n"));
+    try std.testing.expect(std.mem.indexOf(u8, err, "host conversation") != null);
+    try std.testing.expect(std.mem.indexOf(u8, err, "ryk session") != null);
+}
+
+test "replay host UUID is not aliased onto an existing ryk session" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    try tmp.dir.createDirPath(std.testing.io, ".ryk");
+    {
+        const policy_file = try tmp.dir.createFile(std.testing.io, ".ryk/policy.yaml", .{});
+        defer policy_file.close(std.testing.io);
+        try policy_file.writeStreamingAll(std.testing.io, "version: 1\nmode: strict\n");
+    }
+    const session_id = try writeReplayTimelineFixture(std.testing.io, std.testing.allocator, root);
+    defer std.testing.allocator.free(session_id);
+
+    const prev_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(prev_cwd);
+    try std.process.setCurrentDir(std.testing.io, tmp.dir);
+    defer std.process.setCurrentPath(std.testing.io, prev_cwd) catch {};
+
+    var stdout_buf: [4096]u8 = undefined;
+    var stderr_buf: [1024]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+
+    const code = try command(std.testing.io, &.{ "--session", host_conversation_id_fixture }, &stdout_writer, &stderr_writer);
+    try std.testing.expect(code != exit_codes.success);
+    const out = stdout_writer.buffered();
+    const err = stderr_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, session_id) == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "echo ok") == null);
+    try std.testing.expect(!std.mem.eql(u8, err, "ryk replay: session not found.\n"));
+    try std.testing.expect(std.mem.indexOf(u8, err, "host conversation") != null);
+    try std.testing.expect(std.mem.indexOf(u8, err, "ryk session") != null);
 }
 
 test "replay human timeline collapses repeated redactions and json remains exact" {

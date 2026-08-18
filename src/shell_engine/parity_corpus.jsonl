@@ -205,7 +205,7 @@
 {"command": "git remote -v", "expected": "allow", "rule_id": null, "source": "false_positives/git_safe.toml", "description": "git remote is safe"}
 {"command": "git show HEAD", "expected": "allow", "rule_id": null, "source": "false_positives/git_safe.toml", "description": "git show is safe"}
 {"command": "git tag v1.0.0", "expected": "allow", "rule_id": null, "source": "false_positives/git_safe.toml", "description": "git tag is safe"}
-{"command": "sudo git status", "expected": "allow", "rule_id": null, "source": "false_positives/git_safe.toml", "description": "sudo git status is safe (wrapper prefix)"}
+{"command": "sudo git status", "expected": "deny", "rule_id": "zig.shell:privilege-escalation", "source": "false_positives/git_safe.toml", "description": "sudo is a privilege fence even when the inner command is safe"}
 {"command": "env FOO=1 git status", "expected": "allow", "rule_id": null, "source": "false_positives/git_safe.toml", "description": "env prefix with git status is safe"}
 {"command": "command git status", "expected": "allow", "rule_id": null, "source": "false_positives/git_safe.toml", "description": "command wrapper with git status is safe"}
 {"command": "\\git status", "expected": "allow", "rule_id": null, "source": "false_positives/git_safe.toml", "description": "backslash-escaped git status is safe"}

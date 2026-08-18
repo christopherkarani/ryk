@@ -69,7 +69,7 @@ pub fn serveErrorIsFailClosed(err: ClientError) bool {
 }
 
 /// Fold `--ci` / mode=ci with process unattended keys into hook-serve `req.ci`.
-/// hook-serve must not call `getenvUnattended` (prewarm env is stripped).
+/// hook-serve must not getenvUnattended (prewarm env is stripped; client sends the fold).
 pub fn clientUnattendedCi(explicit_ci: bool) bool {
     return host_wire_rewrite.unattendedFromEnv(explicit_ci);
 }

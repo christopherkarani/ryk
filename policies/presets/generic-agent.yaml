@@ -85,6 +85,10 @@ files:
       - ".git/**"
       - "./.ryk/**"
       - ".ryk/**"
+      - "./.env"
+      - "./.env.*"
+      - "**/.env"
+      - "**/.env.*"
     mode: staged
 
 commands:
