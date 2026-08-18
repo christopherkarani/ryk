@@ -62,6 +62,7 @@ fn envTokenTruthy(raw: []const u8) bool {
 
 const unattended_env_keys = [_][]const u8{
     "RYK_UNATTENDED",
+    "RYK_OPENCLAW_UNATTENDED",
     "RYK_CI",
     "RYK_NONINTERACTIVE",
     "CI",
@@ -90,7 +91,8 @@ const LibcEnvLookup = struct {
 
 /// Residual `ask` hardens to deny when the operator asked for unattended/CI.
 /// Coding hosts otherwise permit residual ask so agents can work; explicit deny
-/// is unchanged. Signals: `RYK_UNATTENDED`, `RYK_CI`, `RYK_NONINTERACTIVE`, `CI`.
+/// is unchanged. Signals: `RYK_UNATTENDED`, `RYK_OPENCLAW_UNATTENDED`,
+/// `RYK_CI`, `RYK_NONINTERACTIVE`, `CI`.
 pub fn getenvUnattended() bool {
     return unattendedFromLookup(LibcEnvLookup{});
 }
@@ -127,12 +129,14 @@ const TestEnvLookup = struct {
 };
 
 test "unattendedFromLookup each key truthy, falsy, or unset" {
-    const keys = [_][]const u8{ "RYK_UNATTENDED", "RYK_CI", "RYK_NONINTERACTIVE", "CI" };
+    const keys = [_][]const u8{ "RYK_UNATTENDED", "RYK_OPENCLAW_UNATTENDED", "RYK_CI", "RYK_NONINTERACTIVE", "CI" };
     try std.testing.expect(!unattendedFromLookup(TestEnvLookup{ .pairs = &.{} }));
 
     const truthy = [_][]const u8{ "1", "true", "yes", "on" };
-    for (keys, truthy) |key, value| {
-        try std.testing.expect(unattendedFromLookup(TestEnvLookup{ .pairs = &.{.{ key, value }} }));
+    for (keys) |key| {
+        for (truthy) |value| {
+            try std.testing.expect(unattendedFromLookup(TestEnvLookup{ .pairs = &.{.{ key, value }} }));
+        }
     }
 
     const falsy = [_][]const u8{ "0", "false", "" };
@@ -145,6 +149,18 @@ test "unattendedFromLookup each key truthy, falsy, or unset" {
     // OR: a falsy first key does not mask a later truthy signal.
     try std.testing.expect(unattendedFromLookup(TestEnvLookup{
         .pairs = &.{ .{ "RYK_UNATTENDED", "0" }, .{ "CI", "1" } },
+    }));
+}
+
+test "unattendedFromLookup is true for RYK_OPENCLAW_UNATTENDED" {
+    try std.testing.expect(unattendedFromLookup(TestEnvLookup{
+        .pairs = &.{.{ "RYK_OPENCLAW_UNATTENDED", "1" }},
+    }));
+    try std.testing.expect(unattendedFromLookup(TestEnvLookup{
+        .pairs = &.{.{ "RYK_OPENCLAW_UNATTENDED", "true" }},
+    }));
+    try std.testing.expect(!unattendedFromLookup(TestEnvLookup{
+        .pairs = &.{.{ "RYK_OPENCLAW_UNATTENDED", "0" }},
     }));
 }
 

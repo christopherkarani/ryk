@@ -194,11 +194,13 @@ def map_pre_tool_call(
 
     - allow → None (proceed)
     - block → {"action": "block", ...}
-    - leftover unused ask → None (proceed) or block under CI / unattended marker
+    - leftover unused ask is rewritten by ryk hook before emit
+    - unexpected ask → block (fail-closed)
     - stage → block (hold/deny; never proceed)
     - warn → log advisory + None (not collapsed to block)
     - other → fail-closed block
     """
+    _ = (environ, unattended_marker)
     decision = response.get("decision")
     if decision == "allow":
         return None
@@ -213,21 +215,14 @@ def map_pre_tool_call(
             "message": format_tool_message(response, default="blocked by ryk"),
         }
     if decision == "ask":
-        if ci_mode(environ, unattended_marker=unattended_marker):
-            # Keep one host line: reserve room for the CI clause inside the 200 budget.
-            message = format_tool_message(response, default="approval required by ryk")
-            ci_suffix = (
-                " (CI/noninteractive: ryk ask hardened to block; "
-                "no approval prompt available)"
-            )
-            base_limit = max(1, _MAX_HOST_MESSAGE_CHARS - len(ci_suffix))
-            base = _bounded_text(message, "blocked by ryk", base_limit)
-            return {
-                "action": "block",
-                "message": f"{base}{ci_suffix}",
-            }
-        # Residual ask is permit so agents can work. No Hermes approve UI.
-        return None
+        # Leftover unused policy ask is rewritten by ryk hook. A leaked ask
+        # is unexpected: fail-closed deny. Do not reimplement leftover permit.
+        return {
+            "action": "block",
+            "message": format_tool_message(
+                response, default="ryk returned an unexpected ask; blocked fail-closed."
+            ),
+        }
     return {
         "action": "block",
         "message": "ryk returned an invalid tool decision; blocked fail-closed.",
@@ -239,7 +234,7 @@ def tool_action_mode(decision: str) -> str:
     return {
         "allow": "proceed",
         "block": "hard_block",
-        "ask": "proceed",
+        "ask": "fail_closed_block",
         "stage": "hard_block",
         "warn": "advisory_log",
         "error": "fail_closed_block",
