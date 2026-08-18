@@ -158,6 +158,11 @@ jobs:
             exit 1
           fi
           echo "Dashboard build verified: dark Next.js dashboard present with _next/static/ output."
+      - name: OpenClaw committed dist freshness
+        if: env.SKIP_RELEASE != '1'
+        run: |
+          (cd integrations/openclaw-plugin && npm ci)
+          ./scripts/test-openclaw-release-assets.sh
       - name: Test before release
         if: env.SKIP_RELEASE != '1'
         run: ./scripts/zig build test
