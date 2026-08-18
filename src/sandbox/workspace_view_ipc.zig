@@ -873,6 +873,7 @@ test "request frame round trips every bootstrap field" {
     const control_roots = [_][]const u8{ "/work/.ryk", "/run/ryk-control" };
     const exec_paths = [_][]const u8{ "/home/user/.local/bin/agent", "/home/user/.local/bin/agent-real" };
     const ro_paths = [_][]const u8{ "/home/user/.local/share/agent", "/etc/agent/config" };
+    const ro_file_paths = [_][]const u8{"/home/user/AGENTS.md"};
     const host_rw_paths = [_][]const u8{"/home/user/.config/agent"};
     const argv = [_][]const u8{ "/usr/bin/agent", "--mode", "safe" };
     const environ = [_][]const u8{ "PATH=/usr/bin:/bin", "RYK_SESSION_ID=session-test" };
@@ -888,6 +889,7 @@ test "request frame round trips every bootstrap field" {
             .control_roots = &control_roots,
             .exec_paths = &exec_paths,
             .ro_paths = &ro_paths,
+            .ro_file_paths = &ro_file_paths,
             .host_rw_paths = &host_rw_paths,
             .network_proxy_port = 43123,
             .require_network_route_forcing = true,
@@ -910,6 +912,7 @@ test "request frame round trips every bootstrap field" {
     try expectStringListsEqual(request.profile.control_roots, decoded.profile.control_roots);
     try expectStringListsEqual(request.profile.exec_paths, decoded.profile.exec_paths);
     try expectStringListsEqual(request.profile.ro_paths, decoded.profile.ro_paths);
+    try expectStringListsEqual(request.profile.ro_file_paths, decoded.profile.ro_file_paths);
     try expectStringListsEqual(request.profile.host_rw_paths, decoded.profile.host_rw_paths);
     try std.testing.expectEqual(request.profile.include_tmp, decoded.profile.include_tmp);
     try std.testing.expectEqual(request.profile.network_proxy_port, decoded.profile.network_proxy_port);

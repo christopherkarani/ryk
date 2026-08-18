@@ -2118,8 +2118,6 @@ test "applyBeforeExec collect_usual stamps ancestor instruction as file" {
     });
     defer result.deinit();
 
-    if (!result.profile_compiled) return;
-
     switch (result.materials) {
         .seatbelt => |s| {
             const needle_lit = try std.fmt.allocPrint(allocator, "(literal \"{s}\")", .{parent_agents});
@@ -2133,13 +2131,14 @@ test "applyBeforeExec collect_usual stamps ancestor instruction as file" {
             try std.testing.expect(std.mem.indexOf(u8, s.sbpl_z, parent_sub) == null);
         },
         .landlock => |ll| {
+            try std.testing.expect(pathsContain(ll.ro_file_paths, parent_agents));
             try std.testing.expect(ll.compiled.hasGrantWithKind(parent_agents, .ro, .file));
             try std.testing.expect(!ll.compiled.hasGrant(parent_dir, .ro));
             const secret = try std.fmt.allocPrint(allocator, "{s}/secret.env", .{parent_dir});
             defer allocator.free(secret);
             try std.testing.expect(!ll.compiled.isGrantedReadable(secret));
         },
-        .none => {},
+        .none => return error.SkipZigTest,
     }
 }
 

@@ -18,12 +18,8 @@ pub const OsGrant = struct {
     kind: GrantKind,
 };
 
-/// Launch-only extras. Kind defaults to folder so a pack tree is not reduced to one file.
-pub const ExtraGrant = struct {
-    path: []const u8,
-    mode: profile.AccessMode = .ro,
-    kind: GrantKind = .folder,
-};
+/// Launch-only extras. Same shape as compile extras (folder default).
+pub const ExtraGrant = profile.ExtraGrant;
 
 pub const CollectInput = struct {
     workspace_root: []const u8,
@@ -49,18 +45,6 @@ pub const CollectedGrants = struct {
             if (std.mem.eql(u8, g.path, path)) return g;
         }
         return null;
-    }
-
-    /// Views into owned paths for `compileProfile` extra_grants.
-    pub fn extraGrants(
-        self: *const CollectedGrants,
-        buf: []profile.ExtraGrant,
-    ) error{TooManyGrants}![]const profile.ExtraGrant {
-        if (self.grants.len > buf.len) return error.TooManyGrants;
-        for (self.grants, 0..) |g, i| {
-            buf[i] = .{ .path = g.path, .mode = g.mode, .kind = g.kind };
-        }
-        return buf[0..self.grants.len];
     }
 
     pub fn extraGrantsAlloc(self: *const CollectedGrants) error{OutOfMemory}![]profile.ExtraGrant {
@@ -112,9 +96,18 @@ pub fn collectUsualGrants(
             input.home,
         );
         defer host_config_grants.freeHostConfigPaths(allocator, host_rw);
-        const drop_default_codex = extrasReplaceDefaultCodex(input);
+        const default_codex_root: ?[]u8 = if (std.mem.eql(u8, input.host, "codex") and
+            input.home.len > 0 and std.fs.path.isAbsolute(input.home))
+            try std.fs.path.join(allocator, &.{ input.home, ".codex" })
+        else
+            null;
+        defer if (default_codex_root) |root| allocator.free(root);
+        const drop_default_codex = if (default_codex_root) |root|
+            extrasReplaceDefaultCodex(input, root)
+        else
+            false;
         for (host_rw) |path| {
-            if (drop_default_codex and isDefaultCodexHome(path, input.home)) continue;
+            if (drop_default_codex and isDefaultCodexHome(path, default_codex_root.?)) continue;
             try appendGrant(&list, allocator, path, .rw, .folder);
         }
     }
@@ -128,7 +121,7 @@ pub fn collectUsualGrants(
     for (toolchain) |path| {
         try appendGrant(&list, allocator, path, .ro, .folder);
     }
-    pinDeveloperDir(input.env_map, toolchain);
+    try pinDeveloperDir(input.env_map, toolchain);
 
     const ancestor = try host_config_grants.collectAncestorInstructionRoPaths(
         io,
@@ -162,10 +155,11 @@ fn appendGrant(
     mode: profile.AccessMode,
     kind: GrantKind,
 ) error{OutOfMemory}!void {
-    for (list.items) |g| {
+    for (list.items) |*g| {
         if (std.mem.eql(u8, g.path, path) and g.mode == mode) {
-            // Never upgrade file → folder.
+            // Never upgrade file → folder. Folder → file keeps file (compile merge).
             if (g.kind == .file and kind == .folder) return;
+            if (g.kind == .folder and kind == .file) g.kind = .file;
             return;
         }
     }
@@ -181,7 +175,7 @@ fn grantPathIsDirectory(io: std.Io, path: []const u8) bool {
     } else |_| return false;
 }
 
-fn pinDeveloperDir(env_map: ?*std.process.Environ.Map, toolchain: []const []const u8) void {
+fn pinDeveloperDir(env_map: ?*std.process.Environ.Map, toolchain: []const []const u8) error{OutOfMemory}!void {
     if (builtin.os.tag != .macos) return;
     const map = env_map orelse return;
     const existing = map.get("DEVELOPER_DIR");
@@ -191,31 +185,49 @@ fn pinDeveloperDir(env_map: ?*std.process.Environ.Map, toolchain: []const []cons
         false;
     if (existing_ok) return;
     if (host_config_grants.preferredMacosDeveloperDir(toolchain)) |preferred| {
-        map.put("DEVELOPER_DIR", preferred) catch {};
+        try map.put("DEVELOPER_DIR", preferred);
     }
 }
 
-fn extrasReplaceDefaultCodex(input: CollectInput) bool {
+/// Strip macOS Data-volume firmlink prefix so `/System/Volumes/Data/Users/…` → `/Users/…`.
+/// Local twin of `run_os_sandbox.normalizeMacosUsersPath` (no cross-module import).
+fn normalizeMacosUsersPath(path: []const u8) []const u8 {
+    const data_prefix = "/System/Volumes/Data";
+    if (std.mem.startsWith(u8, path, data_prefix) and path.len > data_prefix.len and
+        path[data_prefix.len] == '/' and std.mem.startsWith(u8, path[data_prefix.len..], "/Users/"))
+    {
+        return path[data_prefix.len..];
+    }
+    return path;
+}
+
+fn trimTrailingSlashes(path: []const u8) []const u8 {
+    var p = path;
+    while (p.len > 1 and p[p.len - 1] == '/') p = p[0 .. p.len - 1];
+    return p;
+}
+
+fn extrasReplaceDefaultCodex(input: CollectInput, default_root: []const u8) bool {
     if (!std.mem.eql(u8, input.host, "codex")) return false;
     if (input.home.len == 0 or !std.fs.path.isAbsolute(input.home)) return false;
     for (input.extras) |extra| {
         if (extra.mode != .rw) continue;
-        if (isDefaultCodexHome(extra.path, input.home)) continue;
+        if (isDefaultCodexHome(extra.path, default_root)) continue;
         if (looksLikeCodexHome(extra.path, input.home)) return true;
     }
     return false;
 }
 
-fn isDefaultCodexHome(path: []const u8, home: []const u8) bool {
-    if (home.len == 0 or path.len <= home.len + 1) return false;
-    if (!std.mem.startsWith(u8, path, home) or path[home.len] != '/') return false;
-    return std.mem.eql(u8, path[home.len + 1 ..], ".codex");
+fn isDefaultCodexHome(path: []const u8, default_root: []const u8) bool {
+    return std.mem.eql(u8, normalizeMacosUsersPath(path), normalizeMacosUsersPath(default_root));
 }
 
 fn looksLikeCodexHome(path: []const u8, home: []const u8) bool {
-    if (home.len == 0 or path.len <= home.len + 1) return false;
-    if (!std.mem.startsWith(u8, path, home) or path[home.len] != '/') return false;
-    const relative = path[home.len + 1 ..];
+    const norm_path = normalizeMacosUsersPath(path);
+    const norm_home = trimTrailingSlashes(normalizeMacosUsersPath(home));
+    if (norm_home.len == 0 or norm_path.len <= norm_home.len + 1) return false;
+    if (!std.mem.startsWith(u8, norm_path, norm_home) or norm_path[norm_home.len] != '/') return false;
+    const relative = norm_path[norm_home.len + 1 ..];
     return std.mem.eql(u8, relative, ".codex") or
         std.mem.startsWith(u8, relative, ".codex-") or
         std.mem.eql(u8, relative, ".config/codex");
@@ -362,22 +374,144 @@ test "launch extras default to OS grant kind folder" {
     try std.testing.expectEqual(GrantKind.folder, extra.kind);
 }
 
+test "appendGrant keeps file when a later file grant arrives over folder" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var ws_tmp = std.testing.tmpDir(.{});
+    defer ws_tmp.cleanup();
+    const workspace = try ws_tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(workspace);
+    try ws_tmp.dir.writeFile(io, .{ .sub_path = "AGENTS.md", .data = "# ws\n" });
+    const agents = try std.fs.path.join(allocator, &.{ workspace, "AGENTS.md" });
+    defer allocator.free(agents);
+
+    var collected = try collectUsualGrants(io, allocator, .{
+        .workspace_root = workspace,
+        .home = workspace,
+        .extras = &.{
+            .{ .path = agents, .mode = .ro, .kind = .folder },
+            .{ .path = agents, .mode = .ro, .kind = .file },
+        },
+    });
+    defer collected.deinit();
+
+    const grant = collected.find(agents) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(GrantKind.file, grant.kind);
+}
+
 /// Drop file-kind grants whose path is now a directory. Never upgrades to folder.
 pub fn skipFileGrantsThatAreDirectories(io: std.Io, collected: *CollectedGrants) error{OutOfMemory}!void {
-    var kept: std.ArrayList(OsGrant) = .empty;
-    errdefer {
-        for (kept.items) |g| collected.allocator.free(g.path);
-        kept.deinit(collected.allocator);
-    }
-
+    var write: usize = 0;
     for (collected.grants) |g| {
         if (g.kind == .file and grantPathIsDirectory(io, g.path)) {
             collected.allocator.free(g.path);
             continue;
         }
-        try kept.append(collected.allocator, g);
+        collected.grants[write] = g;
+        write += 1;
     }
+    if (write == collected.grants.len) return;
+    if (collected.allocator.resize(collected.grants, write)) {
+        collected.grants.len = write;
+        return;
+    }
+    collected.grants = collected.allocator.realloc(collected.grants, write) catch {
+        // Shrink failed after compact. Keep the original allocation so deinit
+        // size matches; blank the tail so leftover keeper copies are not freed twice.
+        for (collected.grants[write..]) |*g| {
+            g.* = .{ .path = &.{}, .mode = .ro, .kind = .file };
+        }
+        return;
+    };
+}
 
-    collected.allocator.free(collected.grants);
-    collected.grants = try kept.toOwnedSlice(collected.allocator);
+test "collectUsualGrants drops default ~/.codex when a custom Codex extra is present" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var home_tmp = std.testing.tmpDir(.{});
+    defer home_tmp.cleanup();
+    const home = try home_tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(home);
+
+    try home_tmp.dir.createDirPath(io, "ws");
+    try home_tmp.dir.createDirPath(io, ".codex");
+    try home_tmp.dir.createDirPath(io, ".agents");
+    try home_tmp.dir.createDirPath(io, ".codex-work");
+    try home_tmp.dir.writeFile(io, .{
+        .sub_path = ".codex/auth.json",
+        .data = "{}\n",
+    });
+
+    const workspace = try std.fs.path.join(allocator, &.{ home, "ws" });
+    defer allocator.free(workspace);
+    const default_codex = try std.fs.path.join(allocator, &.{ home, ".codex" });
+    defer allocator.free(default_codex);
+    const agents = try std.fs.path.join(allocator, &.{ home, ".agents" });
+    defer allocator.free(agents);
+    const custom = try std.fs.path.join(allocator, &.{ home, ".codex-work" });
+    defer allocator.free(custom);
+    const home_slash = try std.fmt.allocPrint(allocator, "{s}/", .{home});
+    defer allocator.free(home_slash);
+
+    var collected = try collectUsualGrants(io, allocator, .{
+        .workspace_root = workspace,
+        .host = "codex",
+        .home = home_slash,
+        .extras = &.{.{ .path = custom, .mode = .rw }},
+    });
+    defer collected.deinit();
+
+    try std.testing.expect(collected.find(default_codex) == null);
+    const agents_grant = collected.find(agents) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(profile.AccessMode.rw, agents_grant.mode);
+    const custom_grant = collected.find(custom) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(profile.AccessMode.rw, custom_grant.mode);
+}
+
+test "collectUsualGrants drops Data-form default ~/.codex for a Users-form HOME" {
+    const allocator = std.testing.allocator;
+    const home = "/Users/u";
+    const data_default = "/System/Volumes/Data/Users/u/.codex";
+    const users_default = "/Users/u/.codex";
+    const custom = "/Users/u/.codex-work";
+    const data_custom = "/System/Volumes/Data/Users/u/.codex-work";
+    const agents = "/System/Volumes/Data/Users/u/.agents";
+
+    const default_root = try std.fs.path.join(allocator, &.{ home, ".codex" });
+    defer allocator.free(default_root);
+
+    const input: CollectInput = .{
+        .workspace_root = "/Users/u/ws",
+        .host = "codex",
+        .home = home,
+        .extras = &.{.{ .path = custom, .mode = .rw }},
+    };
+    try std.testing.expect(extrasReplaceDefaultCodex(input, default_root));
+    try std.testing.expect(isDefaultCodexHome(data_default, default_root));
+    try std.testing.expect(isDefaultCodexHome(users_default, default_root));
+    try std.testing.expect(!isDefaultCodexHome(agents, default_root));
+    try std.testing.expect(!isDefaultCodexHome(custom, default_root));
+
+    const slash_root = try std.fs.path.join(allocator, &.{ "/Users/u/", ".codex" });
+    defer allocator.free(slash_root);
+    const slash_input: CollectInput = .{
+        .workspace_root = "/Users/u/ws",
+        .host = "codex",
+        .home = "/Users/u/",
+        .extras = &.{.{ .path = custom, .mode = .rw }},
+    };
+    try std.testing.expect(extrasReplaceDefaultCodex(slash_input, slash_root));
+    try std.testing.expect(isDefaultCodexHome(data_default, slash_root));
+
+    const data_extra_input: CollectInput = .{
+        .workspace_root = "/Users/u/ws",
+        .host = "codex",
+        .home = home,
+        .extras = &.{.{ .path = data_custom, .mode = .rw }},
+    };
+    try std.testing.expect(extrasReplaceDefaultCodex(data_extra_input, default_root));
+    try std.testing.expect(looksLikeCodexHome(data_custom, home));
+    try std.testing.expect(looksLikeCodexHome(custom, "/Users/u/"));
 }
