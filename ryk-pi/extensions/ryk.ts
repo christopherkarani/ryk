@@ -1547,8 +1547,8 @@ export function installRykExtension(
 					decision.kind === "allow" &&
 					BROAD_DISCOVERY_TOOLS.has(event.toolName)
 				) {
-					// Root already passed decide-file. Leftover unused ask is
-					// remapped by ryk; do not invent a second host approval gate.
+					// Root already passed decide-file. Residual leftover ask is
+					// permit; do not invent a second host approval gate.
 					return undefined;
 				}
 				return applyToolDecision(
@@ -1869,11 +1869,10 @@ async function applyToolDecision(
 }
 
 /**
- * Leftover unused policy ask on the plugin wire:
- * - hook/evaluate remaps leftover unused ask to allow first
- * - `ryk decide` still emits leftover unused ask — permit on attended Pi
+ * Unexpected `ask` after the coding-host enforcement wire rewrite.
+ * Leftover unused policy ask is rewritten by `ryk evaluate` / `ryk decide`
+ * before emit. A leaked `ask` is fail-closed deny.
  * Staged writes, FM steward ask, SoftBlock, and explicit deny never become allow.
- * Unattended (`CI` / `RYK_CI` / `RYK_NONINTERACTIVE` / `RYK_UNATTENDED`) still denies.
  */
 async function resolvePolicyAsk(
 	reason: string,
@@ -1885,10 +1884,7 @@ async function resolvePolicyAsk(
 	env: NodeJS.ProcessEnv = process.env,
 	_askIpc?: AskIpcContext,
 ): Promise<ToolCallResult> {
-	if (isUnattendedEnv(env)) {
-		return handlePolicyAskAutoDeny(reason, pi, ctx, toolLabel, env);
-	}
-	return undefined;
+	return handlePolicyAskAutoDeny(reason, pi, ctx, toolLabel, env);
 }
 
 function recordOnceBypass(

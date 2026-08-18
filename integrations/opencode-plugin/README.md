@@ -95,7 +95,7 @@ The plugin registers lifecycle hooks that call `ryk hook opencode <event>`:
 | `session.created` | At the start of an OpenCode session | Informational (readiness log) |
 | `tool.execute.before` | Before OpenCode invokes a tool | **Blocking** — ryk can prevent the tool call |
 | `tool.execute.after` | After OpenCode finishes using a tool | Informational (audit only) |
-| `permission.ask` → `permission.asked` | When OpenCode requests user permission | ryk `block`/`error` → deny; leftover unused ask is remapped by ryk; unexpected `ask` is fail-closed |
+| `permission.ask` → `permission.asked` | When OpenCode requests user permission | ryk `block`/`error`/leaked `ask` → deny; leftover unused policy ask is rewritten by `ryk hook` |
 | `command.execute.before` | Before a slash/custom command runs | **Blocking** — evaluated as a tool name |
 | `file.edited` | When a file is edited by OpenCode | Informational (audit only) |
 | `command.executed` | When a shell command is executed | Informational (audit only) |

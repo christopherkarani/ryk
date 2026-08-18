@@ -19,6 +19,7 @@ const pack_config = @import("pack_config.zig");
 const fm_steward_client = @import("fm_steward_client.zig");
 const telemetry = @import("../telemetry.zig");
 const supervisor = core.supervisor;
+const host_wire_rewrite = @import("host_wire_rewrite.zig");
 
 pub const ShellCommandEvent = struct {
     command: []const u8,
@@ -448,17 +449,9 @@ pub const PluginDecision = enum {
     }
 };
 
-/// Why a product `.ask` exists. Leftover unused policy ask may be permitted on
-/// attended coding hosts. SoftBlock and FM steward ask must never become allow.
-pub const AskOrigin = enum {
-    leftover,
-    soft_block,
-    fm,
-
-    pub fn mayPermitOnCodingHost(self: AskOrigin) bool {
-        return self == .leftover;
-    }
-};
+/// Why a product `.ask` exists. Produced here; rewritten on the coding-host
+/// enforcement wire. No leftover default — missing origin is never-permit.
+pub const AskOrigin = host_wire_rewrite.AskOrigin;
 
 pub const RiskLevel = enum {
     low,
@@ -646,7 +639,8 @@ pub const AfterHardFenceDecision = struct {
 pub const ShellWithPolicyDecision = struct {
     decision: PluginDecision,
     /// Distinguishes leftover unused policy ask from SoftBlock / FM hold.
-    ask_origin: AskOrigin = .leftover,
+    /// Null is missing origin (never-permit on the coding-host enforcement wire).
+    ask_origin: ?AskOrigin = null,
     /// Static reason for fail-closed / hard-fence / sticky / strict refuse; null for plain matrix.
     /// When `owned_reason` is set, prefer that (FM upgrade path).
     reason: ?[]const u8 = null,
@@ -930,6 +924,7 @@ pub fn decideShellWithPolicy(
     return .{
         .decision = after.decision,
         .reason = after.reason,
+        .ask_origin = if (after.decision == .ask) .leftover else null,
     };
 }
 
@@ -1172,7 +1167,8 @@ const OwnedRunDecision = struct {
     suggested_sticky_scope: ?[]const u8 = null,
     suggested_effect_class: ?[]const u8 = null,
     /// SoftBlock / FM ask must not ride the leftover-unused-ask permit wire.
-    ask_origin: AskOrigin = .leftover,
+    /// Null is missing origin (never-permit on the coding-host enforcement wire).
+    ask_origin: ?AskOrigin = null,
 
     pub fn deinit(self: OwnedRunDecision, allocator: std.mem.Allocator) void {
         allocator.free(self.owned_reason);
@@ -1340,7 +1336,7 @@ pub fn decisionFromDaemonResultWithPolicy(
                 .{
                     .decision = plugin_decision,
                     .reason = null,
-                    .ask_origin = if (plugin_decision == .ask) .soft_block else .leftover,
+                    .ask_origin = if (plugin_decision == .ask) .soft_block else null,
                 },
                 fmContextFromOpts(opts),
             );
@@ -1457,9 +1453,15 @@ pub fn decisionFromDaemonResultWithPolicy(
 
             // Mode softens a would-be deny (observe/ask/low-severity / sticky allow paths).
             const soft_reason: ?[]const u8 = if (decided) |d| d.reason else null;
+            const origin: ?AskOrigin = if (decided) |d|
+                d.ask_origin
+            else if (plugin_decision == .ask)
+                .leftover
+            else
+                null;
             var after_fm = try applyFmSoftSeatbelt(
                 allocator,
-                .{ .decision = plugin_decision, .reason = soft_reason },
+                .{ .decision = plugin_decision, .reason = soft_reason, .ask_origin = origin },
                 fmContextFromOpts(opts),
             );
             // Re-apply CI after FM: steward may upgrade allow/warn→ask; CI must harden to block.

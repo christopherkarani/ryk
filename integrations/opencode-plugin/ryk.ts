@@ -115,7 +115,7 @@ type PluginHooks = {
   ) => Promise<void>;
 };
 
-/** Decisions that may pass through on a blocking path. Leftover unused ask is remapped by ryk. */
+/** Decisions that may pass through on a blocking path. Unexpected `ask` is deny. */
 const ALLOW_DECISIONS = new Set(['allow', 'warn', 'context_only']);
 
 /** Decisions that do not veto tool.execute.before after parsing. */
@@ -127,7 +127,7 @@ function envFlagTruthy(raw: string | undefined): boolean {
   return value === '1' || value === 'true' || value === 'yes' || value === 'on';
 }
 
-/** Residual ask hardens to deny only when the operator set an unattended/CI flag. */
+/** Shared unattended keys. Leftover unused policy ask is rewritten by ryk hook. */
 function isUnattendedEnv(env: NodeJS.ProcessEnv = process.env): boolean {
   return (
     envFlagTruthy(env.RYK_UNATTENDED) ||
@@ -280,8 +280,8 @@ function parseOptionalStringArray(value: unknown): string[] | undefined {
  * Parse ryk hook stdout into a decision.
  * Non-blocking: soft-allow on empty/malformed.
  * Blocking: fail closed on empty/whitespace, parse errors, missing/non-string decision,
- * `error`, unexpected leftover `ask`, and unrecognized decisions. Leftover unused
- * ask is remapped by ryk hook before emit.
+ * `error`, and unrecognized decisions. `ask` is preserved for OpenCode permission.ask UX;
+ * tool.execute.before still hard-blocks ask via applyBlockingDecision.
  */
 function parseHookResponse(stdout: string, blocking: boolean): RykResponse {
   const fail = (reason: string, blockMsg: string, softMsg: string): RykResponse =>
@@ -554,7 +554,9 @@ function callRyk(
 
   try {
     // argv array — no shell interpolation of rykBin or event
-    const stdout = execFileSync(rykBin, ['hook', 'opencode', event], {
+    const hookArgs = ['hook', 'opencode', event];
+    if (isUnattendedEnv()) hookArgs.push('--ci');
+    const stdout = execFileSync(rykBin, hookArgs, {
       input: payloadJson,
       encoding: 'utf-8',
       timeout: blocking ? 15000 : 10000,
@@ -822,8 +824,10 @@ async function applyBlockingDecision(
     return;
   }
 
-  // Unexpected leftover ask is fail-closed (ryk remaps leftover unused ask first).
-  // block, ask, error, unrecognized → veto tool execution
+  // Leftover unused policy ask is rewritten by ryk hook before emit.
+  // A leaked `ask` is unexpected: fail-closed deny.
+
+  // block, unexpected ask, error, unrecognized → veto tool execution
   await hardBlockWithToast(
     ctx,
     formatShortBlock(response, context),

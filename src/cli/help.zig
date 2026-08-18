@@ -1003,9 +1003,9 @@ pub fn writeWithMode(io: std.Io, writer: anytype, mode: WriteMode) !void {
         },
     }
 
-    // Global options (Phase 7 discoverability): surface the --no-rich /
-    // RYK_NO_RICH escape hatch at the top level so users can find it without
-    // reading the source. --json/--robot are per-command machine flags.
+    // Global options: --no-rich / RYK_NO_RICH is the only true prefix.
+    // --json is per-command (`ryk help <command>` / `ryk version --json`);
+    // it is not a working `ryk --json <cmd>` switch.
     try writer.writeAll("  ");
     try tui.theme.paintBold(io, writer, .brand, "Global options");
     try writer.writeAll("\n");
@@ -1013,7 +1013,9 @@ pub fn writeWithMode(io: std.Io, writer: anytype, mode: WriteMode) !void {
     try tui.theme.paint(io, writer, .muted, "Also RYK_NO_RICH=1.");
     try writer.writeAll("\n");
     try writer.writeAll("                 Use this for piping, scripting, or terminals that mis-render colour.\n");
-    try writer.writeAll("    --json      Per-command machine output (byte-stable). See `ryk help <command>`.\n");
+    try writer.writeAll("  ");
+    try tui.theme.paint(io, writer, .muted, "--json is per-command (`ryk help <command>` / `ryk version --json`), not a global prefix.");
+    try writer.writeAll("\n");
     try writer.writeAll("\n");
 
     // Try-next hint.
