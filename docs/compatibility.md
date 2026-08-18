@@ -32,8 +32,14 @@ Doctor / platform reports are **not** a second taxonomy. Map them to grades:
 | `ryk start` default (**generic-agent / DCG strict**) | multi-grade aspirational (`hook` + `wrapper` when available) | Public path has no `--protection` flag; wires host hooks + policy; not `OS-enforced` from doctor probes alone |
 | Host hooks that fire and honor veto | primarily `hook` (+ daemon for shell eval) | Depends on host install path; hooks alone are not process wrap. The per-user Zig hook server is best-effort speed, not a new enforcement grade. |
 | Host aliases / advanced run engine / PATH shims | primarily `wrapper` | Not kernel firewall; absolute paths may bypass |
+| session `strong-mediated` (`RYK_SESSION_SANDBOX_GRADE`) | `OS-enforced` (FS + network route-force, that session) | Banner `Session grade:` / env. Not a doctor capability. See [commands.md](commands.md#session-sandbox-grade). |
+| session `fs-attached` | `OS-enforced` (FS only, that session) | Attach without route-force. Not a doctor capability. |
+| session `wrapper-only` | `wrapper` | No OS attach this session. Distinct from doctor capability `wrapper-only` (PATH shims / command guard). |
+| session `unrestricted-escape` | no `OS-enforced` claim | `--network open` or `RYK_AGENT_NETWORK_DEFAULT=legacy`. Do not market as mediated. |
 
 Reserve marketing “firewall” / “maximum protection” for a **verified** multi-grade or **`OS-enforced`** posture. See also [threat-model.md](threat-model.md).
+
+Session tokens (`RYK_SESSION_SANDBOX_GRADE`: `strong-mediated`, `fs-attached`, `wrapper-only`, `unrestricted-escape`) are **this-run residuals**, not doctor capability labels. Doctor probes never mint these tokens. The authoritative table is [commands.md — Session sandbox grade](commands.md#session-sandbox-grade). Doctor capability vocab stays `active|partial|wrapper-only|observe-only|limited|unavailable|unsupported`.
 
 ---
 
@@ -68,6 +74,8 @@ Reserve marketing “firewall” / “maximum protection” for a **verified** m
 **Probe vs session-attach:** Doctor and platform matrices may report sandbox **capability** (`partial` / API present). That is not a live session `active` claim. Trust **`OS-enforced`** filesystem isolation only for a protected agent session that completed child apply-before-exec attach (profile hash present). Use advanced `ryk run --os-sandbox on` to fail closed when attach cannot complete.
 
 **DNS rebinding fence (proxy grade):** after a hostname passes policy, the intercept proxy re-checks every resolved address before connecting and pins the validated address (no re-resolution). Answers in loopback, RFC1918/private, link-local, or cloud-metadata classes are refused unless `network.allow` explicitly lists the class token (`localhost`, `private`, `metadata`) or the exact IP; the attempt is denied with a `network_connect_denied` audit event. A hostname allow therefore covers public-unicast answers only.
+
+**Intercept proxy upstream dial bound (proxy grade):** Zig 0.16 Threaded `ConnectOptions.timeout` panics (`TODO implement netConnectIpPosix with timeout`), so the intercept proxy uses a poll-bounded nonblocking TCP dial (`upstream_dial_timeout_ms`, matching the 5s deinit reclaim budget). This is not OS `ConnectOptions.timeout` and is not OS-enforced; the protection grade remains `proxy`.
 
 **In-shim audit under OS attach (evidence honesty):** when a session attaches Seatbelt/Landlock, the control root (`.ryk`) is write-denied to the child *by design*, so PATH shims cannot append to the session audit log. The parent records this as an `audit_degraded` event at session end, and `ryk replay` / `ryk doctor` surface degraded sessions. If a shim instead finds the audit file unwritable while the control root is writable (tamper-shaped, e.g. `chmod 000 events.jsonl`), the shim **fails closed**: the allowed exec is denied rather than run unaudited.
 

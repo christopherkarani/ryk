@@ -48,7 +48,23 @@ JSON includes a top-level `provenance` object, for example:
 
 ## CI Mode
 
-`--ci` is non-interactive and exits non-zero if a required fixture fails or is unsupported. Use it to gate **engine regressions**, not “current policy is safe.”
+`--ci` is non-interactive. Use it to gate **engine regressions**, not “current policy is safe.”
+
+```sh
+./scripts/zig build
+./zig-out/bin/ryk redteam --ci
+```
+
+`--json` is optional (see [JSON Output](#json-output)); it does not change the exit codes.
+
+| Code | Name | Meaning |
+|------|------|---------|
+| 0 | `success` | suite ran; with `--ci`, every required fixture passed |
+| 1 | `general` | fixtures missing / discover or run failed |
+| 2 | `usage` | bad flags or missing `--fixture` argument |
+| 6 | `redteam_failure` | `--ci` and a required fixture failed or is unsupported |
+
+Without `--ci`, required-fixture failures still exit 0. `--ci` is what turns a required fixture failure or unsupported skip into exit 6.
 
 ## Adding Fixtures
 

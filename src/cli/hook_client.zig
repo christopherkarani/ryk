@@ -10,6 +10,7 @@ const build_options = @import("build_options");
 const daemon_uds = @import("daemon_uds.zig");
 const env_util = @import("../env_util.zig");
 const hook_ipc = @import("hook_ipc.zig");
+const host_wire_rewrite = @import("host_wire_rewrite.zig");
 const fd_scrub = @import("../sandbox/fd_scrub.zig");
 
 pub const ClientError = error{
@@ -65,6 +66,12 @@ pub fn serveErrorIsFailClosed(err: ClientError) bool {
         error.Unavailable => false,
         error.BrokenSession, error.OutOfMemory => true,
     };
+}
+
+/// Fold `--ci` / mode=ci with process unattended keys into hook-serve `req.ci`.
+/// hook-serve must not getenvUnattended (prewarm env is stripped; client sends the fold).
+pub fn clientUnattendedCi(explicit_ci: bool) bool {
+    return host_wire_rewrite.unattendedFromEnv(explicit_ci);
 }
 
 /// Absolute client cwd for a hook-serve request. Null means skip the server
@@ -363,6 +370,12 @@ test "hook serve OOM and broken session are fail-closed; Unavailable is not" {
     try std.testing.expect(serveErrorIsFailClosed(error.OutOfMemory));
     try std.testing.expect(serveErrorIsFailClosed(error.BrokenSession));
     try std.testing.expect(!serveErrorIsFailClosed(error.Unavailable));
+}
+
+test "clientUnattendedCi is true when explicit_ci is true" {
+    // Process env may also flip false → true (CI / RYK_CI / …). Do not assert
+    // clientUnattendedCi(false) here — leftover-allow tests pin attended.
+    try std.testing.expect(clientUnattendedCi(true));
 }
 
 test "hook-serve env allowlist drops mode bits and keeps runtime keys" {

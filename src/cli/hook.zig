@@ -20,6 +20,11 @@ const grok_deny_reason = @import("grok_deny_reason.zig");
 const hook_client = @import("hook_client.zig");
 const hook_ipc = @import("hook_ipc.zig");
 const env_util = @import("../env_util.zig");
+const host_wire_rewrite = @import("host_wire_rewrite.zig");
+
+/// Test inject. Null → `--ci` OR process unattended keys.
+/// Leftover-allow tests must pin `false` so live `CI` cannot flip them.
+pub var test_unattended_override: ?bool = null;
 
 // Maximum JSON payload size to prevent memory exhaustion from hostile hosts.
 const max_payload_len = 256 * 1024; // 256 KiB
@@ -172,8 +177,9 @@ fn grokHookPayload(value: std.json.Value, event: Event) GrokHookPayloadError!std
         {
             return error.InvalidGrokHookPayload;
         }
-        // Phase 3: shell or file-read tools only. Unknown tools stay unsupported.
-        if (!isShellTool(tool_name) and !isFileReadTool(tool_name)) return error.UnsupportedGrokPreToolUse;
+        // Shell, file-read, and file-write tools. Unknown tools stay unsupported.
+        if (!isShellTool(tool_name) and !isFileReadTool(tool_name) and !isFileWriteTool(tool_name))
+            return error.UnsupportedGrokPreToolUse;
     }
 
     return value;
@@ -388,7 +394,7 @@ fn hookCommand(io: std.Io, host: Host, event: Event, original_event_name: []cons
         return code;
     }
 
-    return evaluateFromPayload(io, allocator, host, event, original_event_name, payload_text, ci_mode, null, null, stdout, stderr);
+    return evaluateFromPayload(io, allocator, host, event, original_event_name, payload_text, ci_mode, true, null, null, stdout, stderr);
 }
 
 fn tryHookServer(
@@ -416,7 +422,8 @@ fn tryHookServer(
         .version = build_options.version,
         .host = @tagName(host),
         .event = event_name,
-        .ci = ci,
+        // Client folds `--ci` with process unattended keys; hook-serve must not getenvUnattended.
+        .ci = hook_client.clientUnattendedCi(ci),
         .probe = probe,
         .workspace = cwd_z,
         .cwd = cwd_z,
@@ -474,6 +481,7 @@ pub fn evaluateForServer(
         event_name,
         payload_text,
         ci,
+        false,
         workspace_override,
         cached_policy,
         &stdout_buf.writer,
@@ -521,6 +529,7 @@ fn evaluateFromPayload(
     original_event_name: []const u8,
     payload_text: []const u8,
     ci_mode: bool,
+    fold_process_unattended: bool,
     workspace_override: ?[]const u8,
     cached_policy: ?*const core_api.LoadedPolicy,
     stdout: anytype,
@@ -790,19 +799,16 @@ fn evaluateFromPayload(
     };
     defer result.deinit(allocator);
 
-    // Leftover unused policy ask is permit on attended coding hosts. Stage,
-    // SoftBlock, and FM steward ask never become allow. Unattended / --ci
-    // still hardens leftover ask (and hold outcomes) to block.
-    const unattended = ci_mode or env_util.getenvUnattended();
-    if (result.decision == .stage and unattended) {
-        result.decision = .block;
-    } else if (result.ask_origin.mayPermitOnCodingHost()) {
-        result.decision = wireCodingHostAsk(result.decision, unattended);
-    } else if (result.decision == .ask) {
-        // SoftBlock / FM: OpenCode and Hermes treat leftover ask as proceed,
-        // so the hook wire denies instead of emitting ask.
-        result.decision = .block;
-    }
+    // Host-wire rewrite: leftover unused policy ask, never-permit ask,
+    // missing origin, unattended stage. Emit adapters only format.
+    // Client folds `--ci` with process unattended; hook-serve must not getenvUnattended.
+    const unattended = test_unattended_override orelse
+        (ci_mode or (fold_process_unattended and env_util.getenvUnattended()));
+    result.decision = applyHostWireRewrite(
+        result.decision,
+        result.ask_origin,
+        unattended,
+    );
 
     telemetry.recordEnforcement(
         "hook",
@@ -960,13 +966,24 @@ fn isCodexDenyOutput(host: Host, decision: PluginDecision) bool {
     return host == .codex and decision == .block;
 }
 
-/// Wire leftover unused policy `ask` only. `.stage`, `.block`, and `.allow`
-/// are unchanged. Unattended / CI: leftover ask → block. Attended hook hosts
-/// (every `Host` value) permit leftover unused ask so agents can work.
-/// Stage, SoftBlock, and FM steward ask never enter this helper.
-fn wireCodingHostAsk(decision: PluginDecision, unattended: bool) PluginDecision {
-    if (decision != .ask) return decision;
-    return if (unattended) .block else .allow;
+/// Map hook plugin vocab through the host-wire rewrite.
+/// `warn` / `err` stay adapter-local (not a policy decision on this seam).
+fn applyHostWireRewrite(decision: PluginDecision, origin: ?shell_eval.AskOrigin, unattended: bool) PluginDecision {
+    const for_wire: host_wire_rewrite.PolicyDecisionForWire = switch (decision) {
+        .allow => .allow,
+        .ask => .{ .ask = host_wire_rewrite.fromAskOrigin(origin) },
+        .block => .deny,
+        .warn => return decision,
+        .context_only => .observe,
+        .stage => .stage,
+        .err => return decision,
+    };
+    return switch (host_wire_rewrite.rewrite(for_wire, unattended)) {
+        .allow => .allow,
+        .deny => .block,
+        .observe => .context_only,
+        .stage => .stage,
+    };
 }
 
 fn usesExitTwoDenyOutput(host: Host, decision: PluginDecision) bool {
@@ -1267,7 +1284,8 @@ const HookResponse = struct {
     suggestions: [][]const u8 = &.{},
     remediation_commands: [][]const u8 = &.{},
     /// SoftBlock / FM ask must not ride the leftover-unused-ask permit wire.
-    ask_origin: shell_eval.AskOrigin = .leftover,
+    /// Null is missing origin (never-permit).
+    ask_origin: ?shell_eval.AskOrigin = null,
 
     fn deinit(self: *HookResponse, allocator: std.mem.Allocator) void {
         allocator.free(self.reason);
@@ -1294,7 +1312,7 @@ const HookResponse = struct {
             reason: []const u8,
             rule: ?[]const u8 = null,
             message: []const u8,
-            ask_origin: shell_eval.AskOrigin = .leftover,
+            ask_origin: ?shell_eval.AskOrigin = null,
         },
         redactions: *std.ArrayList(RedactionEntry),
         limitations: *std.ArrayList([]const u8),
@@ -1317,7 +1335,13 @@ const HookResponse = struct {
             .message = message,
             .redactions = lists.redactions,
             .host_limitations = lists.host_limitations,
-            .ask_origin = fields.ask_origin,
+            // Policy ask with no tagged origin is leftover unused policy ask.
+            // SoftBlock / FM must set origin at the producer. Missing origin
+            // is never-permit only when the caller passes ask + null after tagging.
+            .ask_origin = if (fields.decision == .ask)
+                fields.ask_origin orelse .leftover
+            else
+                fields.ask_origin,
         };
     }
 };
@@ -2093,7 +2117,7 @@ fn buildAgentVisibleDaemonDeny(
     message: []const u8,
     suggestions: [][]const u8,
     remediation_commands: [][]const u8,
-    ask_origin: shell_eval.AskOrigin = .leftover,
+    ask_origin: ?shell_eval.AskOrigin = null,
 } {
     if (daemon.responseStringField(result, "matched_text_preview")) |_| {
         try appendOwnedRedaction(
@@ -2486,7 +2510,7 @@ fn hookResponseFromDaemonEvaluate(
             var after_fm: shell_eval.ShellWithPolicyDecision = .{
                 .decision = shell_plugin,
                 .reason = null,
-                .ask_origin = if (shell_plugin == .ask) .soft_block else .leftover,
+                .ask_origin = if (shell_plugin == .ask) .soft_block else null,
             };
             if (shell_command) |cmd| {
                 after_fm = try shell_eval.applyFmSoftSeatbelt(
@@ -3386,7 +3410,7 @@ test "hook recognizes Grok as a PreToolUse host with exit-two deny semantics" {
     try std.testing.expectEqual(Host.grok, Host.parse("grok").?);
     try std.testing.expect(shouldFailClosedOnPreEval(.grok, .PreToolUse));
     try std.testing.expectEqual(codex_deny_exit_code, hookExitCode(.grok, .block, false));
-    // Raw leftover `.ask` must not reach emit: wireCodingHostAsk remaps it first.
+    // Raw leftover `.ask` must not reach emit: applyHostWireRewrite remaps it first.
     try std.testing.expectEqual(codex_deny_exit_code, hookExitCode(.grok, .ask, false));
     try std.testing.expectEqual(codex_deny_exit_code, hookExitCode(.grok, .err, false));
     try std.testing.expectEqual(exit_codes.success, hookExitCode(.grok, .allow, false));
@@ -3500,6 +3524,45 @@ test "hook Grok PreToolUse rejects web_search as unsupported" {
     try std.testing.expectError(error.UnsupportedGrokPreToolUse, grokHookPayload(web_search.value, .PreToolUse));
 }
 
+test "hook Grok PreToolUse accepts write edit write_file create_file with target_file" {
+    const allocator = std.testing.allocator;
+    const tools = [_][]const u8{ "write", "edit", "write_file", "create_file" };
+    for (tools) |tool_name| {
+        const json = try std.fmt.allocPrint(
+            allocator,
+            "{{\"hookEventName\":\"pre_tool_use\",\"cwd\":\"/tmp/project\",\"toolName\":\"{s}\",\"toolInput\":{{\"target_file\":\".env\"}}}}",
+            .{tool_name},
+        );
+        defer allocator.free(json);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+        defer parsed.deinit();
+        _ = try grokHookPayload(parsed.value, .PreToolUse);
+    }
+}
+
+test "hook Grok PreToolUse rejects future_tool and web_search as unsupported" {
+    const allocator = std.testing.allocator;
+    var future_tool = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        \\{"hook_event_name":"PreToolUse","cwd":"/tmp/project","tool_name":"future_tool","tool_input":{}}
+    ,
+        .{},
+    );
+    defer future_tool.deinit();
+    try std.testing.expectError(error.UnsupportedGrokPreToolUse, grokHookPayload(future_tool.value, .PreToolUse));
+
+    var web_search = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        \\{"hookEventName":"pre_tool_use","cwd":"/tmp/project","toolName":"web_search","toolInput":{"query":"x"}}
+    ,
+        .{},
+    );
+    defer web_search.deinit();
+    try std.testing.expectError(error.UnsupportedGrokPreToolUse, grokHookPayload(web_search.value, .PreToolUse));
+}
+
 test "hook extractFilePath finds camelCase toolInput.target_file and snake file_path" {
     const allocator = std.testing.allocator;
     var camel = try std.json.parseFromSlice(
@@ -3601,6 +3664,257 @@ test "hook PreToolUse file_read allows README.md" {
 
     try std.testing.expectEqual(PluginDecision.allow, result.decision);
     try std.testing.expectEqualStrings("file.read", result.category);
+}
+
+test "hook PreToolUse file_read allows Grok host skill path" {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const allocator = gpa_state.allocator();
+
+    const home_c = std.c.getenv("HOME") orelse return error.SkipZigTest;
+    const home = std.mem.sliceTo(home_c, 0);
+    const skill_path = try std.fmt.allocPrint(allocator, "{s}/.grok/skills/task-observer/SKILL.md", .{home});
+    defer allocator.free(skill_path);
+    const payload_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"toolName\":\"Read\",\"toolInput\":{{\"target_file\":\"{s}\"}}}}",
+        .{skill_path},
+    );
+    defer allocator.free(payload_json);
+
+    var policy_obj = try core_api.loadPolicyPreset(allocator, .strict);
+    defer policy_obj.deinit();
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload_json, .{});
+    defer parsed.deinit();
+
+    var result = try evaluateHookForTest(allocator, @ptrCast(@alignCast(policy_obj)), .grok, .PreToolUse, parsed.value, false);
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqual(PluginDecision.allow, result.decision);
+    try std.testing.expectEqualStrings("file.read", result.category);
+    try std.testing.expect(result.rule != null);
+    try std.testing.expectEqualStrings("builtin.files.read.allow[host_skill]", result.rule.?);
+}
+
+test "hook PreToolUse file_read allows Claude host skill path" {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const allocator = gpa_state.allocator();
+
+    const home_c = std.c.getenv("HOME") orelse return error.SkipZigTest;
+    const home = std.mem.sliceTo(home_c, 0);
+    const skill_path = try std.fmt.allocPrint(allocator, "{s}/.claude/skills/doctor/SKILL.md", .{home});
+    defer allocator.free(skill_path);
+    const payload_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"toolName\":\"Read\",\"toolInput\":{{\"target_file\":\"{s}\"}}}}",
+        .{skill_path},
+    );
+    defer allocator.free(payload_json);
+
+    var policy_obj = try core_api.loadPolicyPreset(allocator, .strict);
+    defer policy_obj.deinit();
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload_json, .{});
+    defer parsed.deinit();
+
+    var result = try evaluateHookForTest(allocator, @ptrCast(@alignCast(policy_obj)), .claude, .PreToolUse, parsed.value, false);
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqual(PluginDecision.allow, result.decision);
+    try std.testing.expectEqualStrings("file.read", result.category);
+    try std.testing.expect(result.rule != null);
+    try std.testing.expectEqualStrings("builtin.files.read.allow[host_skill]", result.rule.?);
+}
+
+test "hook PreToolUse file_read allows home AGENTS.md" {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const allocator = gpa_state.allocator();
+
+    const home_c = std.c.getenv("HOME") orelse return error.SkipZigTest;
+    const home = std.mem.sliceTo(home_c, 0);
+    const instruction_path = try std.fmt.allocPrint(allocator, "{s}/AGENTS.md", .{home});
+    defer allocator.free(instruction_path);
+    const payload_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"toolName\":\"Read\",\"toolInput\":{{\"target_file\":\"{s}\"}}}}",
+        .{instruction_path},
+    );
+    defer allocator.free(payload_json);
+
+    var policy_obj = try core_api.loadPolicyPreset(allocator, .strict);
+    defer policy_obj.deinit();
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload_json, .{});
+    defer parsed.deinit();
+
+    var result = try evaluateHookForTest(allocator, @ptrCast(@alignCast(policy_obj)), .grok, .PreToolUse, parsed.value, false);
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqual(PluginDecision.allow, result.decision);
+    try std.testing.expectEqualStrings("file.read", result.category);
+    try std.testing.expect(result.rule != null);
+    try std.testing.expectEqualStrings("builtin.files.read.allow[host_instruction]", result.rule.?);
+}
+
+test "hook PreToolUse file_read allows workspace symlink to host skill" {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const allocator = gpa_state.allocator();
+    const io = std.testing.io;
+
+    const home_c = std.c.getenv("HOME") orelse return error.SkipZigTest;
+    const home = std.mem.sliceTo(home_c, 0);
+    const target = try std.fmt.allocPrint(allocator, "{s}/.grok/skills/task-observer/SKILL.md", .{home});
+    defer allocator.free(target);
+    std.Io.Dir.cwd().access(io, target, .{}) catch return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "workspace/.grok/skills");
+    const root = try tmp.dir.realPathFileAlloc(io, "workspace", allocator);
+    defer allocator.free(root);
+    const alias = try std.fs.path.join(allocator, &.{ root, ".grok/skills/task-observer" });
+    defer allocator.free(alias);
+    std.Io.Dir.cwd().symLink(io, target, alias, .{}) catch |err| switch (err) {
+        error.PermissionDenied => return error.SkipZigTest,
+        else => return err,
+    };
+
+    const payload_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"toolName\":\"Read\",\"toolInput\":{{\"target_file\":\"{s}\"}}}}",
+        .{alias},
+    );
+    defer allocator.free(payload_json);
+
+    var policy_obj = try core_api.loadPolicyPreset(allocator, .strict);
+    defer policy_obj.deinit();
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload_json, .{});
+    defer parsed.deinit();
+
+    var result = try evaluateHookForTestWithOptions(
+        allocator,
+        root,
+        @ptrCast(@alignCast(policy_obj)),
+        .grok,
+        .PreToolUse,
+        parsed.value,
+        false,
+        null,
+    );
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqual(PluginDecision.allow, result.decision);
+    try std.testing.expectEqualStrings("file.read", result.category);
+    try std.testing.expect(result.rule != null);
+    try std.testing.expectEqualStrings("builtin.files.read.allow[host_skill]", result.rule.?);
+}
+
+test "hook classifies Write target_file as file_write not file_read" {
+    const allocator = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        \\{"toolName":"Write","toolInput":{"target_file":".env"}}
+    ,
+        .{},
+    );
+    defer parsed.deinit();
+
+    const classification = classifyHookEvent(.PreToolUse, parsed.value);
+    try std.testing.expectEqual(HookEventClassification.non_shell, std.meta.activeTag(classification));
+    try std.testing.expectEqual(NonShellHookEvent.file_write, classification.non_shell);
+    try std.testing.expect(classification.non_shell != .file_read);
+    try std.testing.expect(classification.non_shell != .generic_tool);
+}
+
+test "hook PreToolUse Write blocks .env via files.write.deny" {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const allocator = gpa_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".env", .data = "TOKEN=fake_secret_value\n" });
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+
+    var policy_obj = try policy.load.loadAgentPreset(allocator, .generic_agent);
+    defer policy_obj.deinit();
+
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        \\{"toolName":"Write","toolInput":{"target_file":".env"}}
+    ,
+        .{},
+    );
+    defer parsed.deinit();
+
+    var result = try evaluateHookForTestWithOptions(
+        allocator,
+        root,
+        &policy_obj,
+        .grok,
+        .PreToolUse,
+        parsed.value,
+        false,
+        null,
+    );
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqual(PluginDecision.block, result.decision);
+    try std.testing.expectEqualStrings("file.write", result.category);
+    try std.testing.expect(result.rule != null);
+    try std.testing.expect(std.mem.startsWith(u8, result.rule.?, "files.write.deny["));
+    try std.testing.expect(!std.mem.startsWith(u8, result.rule.?, "builtin."));
+}
+
+test "hook Grok Bash PreToolUse denies unmatched curl destination" {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const allocator = gpa_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, ".ryk");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = ".ryk/policy.yaml",
+        .data = policy.presets.coding_dcg_policy,
+    });
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+
+    var policy_obj = try policy.load.loadAgentPreset(allocator, .generic_agent);
+    defer policy_obj.deinit();
+
+    const payload_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"hookEventName\":\"pre_tool_use\",\"cwd\":\"{s}\",\"toolName\":\"Bash\",\"toolInput\":{{\"command\":\"curl https://example.invalid/\"}}}}",
+        .{root},
+    );
+    defer allocator.free(payload_json);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload_json, .{});
+    defer parsed.deinit();
+
+    var result = try evaluateHookForTestWithOptions(
+        allocator,
+        root,
+        &policy_obj,
+        .grok,
+        .PreToolUse,
+        parsed.value,
+        false,
+        null,
+    );
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqual(PluginDecision.block, result.decision);
+    try std.testing.expect(result.decision != .allow);
 }
 
 test "hook PreToolUse Read alias blocks .env via files.read.deny" {
@@ -6555,19 +6869,21 @@ test "hook Claude maps residual ask to permissionDecision allow never deny" {
 }
 
 test "coding hosts permit residual ask unless unattended" {
-    try std.testing.expectEqual(PluginDecision.allow, wireCodingHostAsk(.ask, false));
-    try std.testing.expectEqual(PluginDecision.block, wireCodingHostAsk(.ask, true));
-    try std.testing.expectEqual(PluginDecision.block, wireCodingHostAsk(.block, false));
-    try std.testing.expectEqual(PluginDecision.allow, wireCodingHostAsk(.allow, true));
+    try std.testing.expectEqual(PluginDecision.allow, applyHostWireRewrite(.ask, .leftover, false));
+    try std.testing.expectEqual(PluginDecision.block, applyHostWireRewrite(.ask, .leftover, true));
+    try std.testing.expectEqual(PluginDecision.block, applyHostWireRewrite(.block, null, false));
+    try std.testing.expectEqual(PluginDecision.allow, applyHostWireRewrite(.allow, null, true));
+    try std.testing.expectEqual(PluginDecision.block, applyHostWireRewrite(.ask, null, false));
 }
 
-test "fromDecisionResult stage plus wireCodingHostAsk is not allow" {
+test "fromDecisionResult stage plus host-wire rewrite is not allow" {
     const staged = PluginDecision.fromDecisionResult(.stage, false);
     try std.testing.expectEqual(PluginDecision.stage, staged);
-    try std.testing.expect(wireCodingHostAsk(staged, false) != .allow);
-    try std.testing.expectEqual(PluginDecision.stage, wireCodingHostAsk(staged, false));
+    try std.testing.expect(applyHostWireRewrite(staged, null, false) != .allow);
+    try std.testing.expectEqual(PluginDecision.stage, applyHostWireRewrite(staged, null, false));
     try std.testing.expectEqual(PluginDecision.block, PluginDecision.fromDecisionResult(.stage, true));
-    try std.testing.expectEqual(PluginDecision.block, wireCodingHostAsk(.block, false));
+    try std.testing.expectEqual(PluginDecision.block, applyHostWireRewrite(.stage, null, true));
+    try std.testing.expectEqual(PluginDecision.block, applyHostWireRewrite(.block, null, false));
     try std.testing.expectEqualStrings("ask", claudePermissionDecisionString(.stage));
     try std.testing.expect(!std.mem.eql(u8, claudePermissionDecisionString(.stage), "allow"));
 }
@@ -6581,13 +6897,64 @@ test "unattended env lookup hardens coding-host residual ask" {
         }
     };
     const from_ci = env_util.unattendedFromLookup(Lookup{ .key = "CI", .value = "1" });
-    try std.testing.expectEqual(PluginDecision.block, wireCodingHostAsk(.ask, from_ci));
+    try std.testing.expectEqual(PluginDecision.block, applyHostWireRewrite(.ask, .leftover, from_ci));
     const attended = env_util.unattendedFromLookup(Lookup{ .key = "CI", .value = "0" });
-    try std.testing.expectEqual(PluginDecision.allow, wireCodingHostAsk(.ask, attended));
+    try std.testing.expectEqual(PluginDecision.allow, applyHostWireRewrite(.ask, .leftover, attended));
+}
+
+test "evaluateForServer leftover unused ask ignores process CI" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, ".ryk");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = ".ryk/policy.yaml",
+        .data = policy.presets.ask_policy,
+    });
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+
+    const prev_ci = try sOnceCliHookDupEnvZ("CI");
+    defer sOnceCliHookRestoreEnv("CI", prev_ci);
+    try std.testing.expectEqual(@as(c_int, 0), setenv("CI", "true", 1));
+    try std.testing.expect(env_util.getenvUnattended());
+
+    const leftover_payload =
+        \\{"hookEventName":"pre_tool_use","sessionId":"ryk-fixture","cwd":"/tmp","workspaceRoot":"/tmp","toolName":"run_terminal_cmd","toolUseId":"fixture-ask","toolInput":{"command":"git restore README.md"},"toolInputTruncated":false}
+    ;
+
+    var attended = try evaluateForServer(
+        std.testing.io,
+        allocator,
+        "grok",
+        "PreToolUse",
+        leftover_payload,
+        false,
+        false,
+        root,
+        null,
+    );
+    defer attended.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), attended.exit);
+    try std.testing.expect(std.mem.indexOf(u8, attended.stdout, "\"decision\": \"allow\"") != null);
+
+    var unattended = try evaluateForServer(
+        std.testing.io,
+        allocator,
+        "grok",
+        "PreToolUse",
+        leftover_payload,
+        true,
+        false,
+        root,
+        null,
+    );
+    defer unattended.deinit(allocator);
+    try std.testing.expectEqual(codex_deny_exit_code, unattended.exit);
 }
 
 test "hook emit after wire rewrite is allow for attended Hermes" {
-    const wired = wireCodingHostAsk(.ask, false);
+    const wired = applyHostWireRewrite(.ask, .leftover, false);
     try std.testing.expectEqual(PluginDecision.allow, wired);
     const result = HookResponse{
         .decision = wired,
@@ -6608,7 +6975,7 @@ test "hook emit after wire rewrite is allow for attended Hermes" {
 }
 
 test "hook emit after wire rewrite is allow for attended Grok and OpenClaw" {
-    const attended = wireCodingHostAsk(.ask, false);
+    const attended = applyHostWireRewrite(.ask, .leftover, false);
     try std.testing.expectEqual(PluginDecision.allow, attended);
     try std.testing.expectEqual(exit_codes.success, hookExitCode(.grok, attended, false));
     try std.testing.expectEqual(exit_codes.success, hookExitCode(.openclaw, attended, false));
@@ -6636,7 +7003,7 @@ test "hook emit after wire rewrite is allow for attended Grok and OpenClaw" {
     try std.testing.expect(std.mem.indexOf(u8, oc_json, "\"decision\": \"ask\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, oc_json, "\"decision\": \"block\"") == null);
 
-    const ci = wireCodingHostAsk(.ask, true);
+    const ci = applyHostWireRewrite(.ask, .leftover, true);
     try std.testing.expectEqual(PluginDecision.block, ci);
     try std.testing.expectEqual(codex_deny_exit_code, hookExitCode(.grok, ci, true));
     try std.testing.expectEqual(AgentEmitShape.grok_deny_json, agentEmitShape(.grok, .PreToolUse, ci));
@@ -6645,7 +7012,7 @@ test "hook emit after wire rewrite is allow for attended Grok and OpenClaw" {
 
 test "hook emit after wire does not allow staged writes" {
     const staged = PluginDecision.fromDecisionResult(.stage, false);
-    const wired_claude = wireCodingHostAsk(staged, false);
+    const wired_claude = applyHostWireRewrite(staged, null, false);
     try std.testing.expect(wired_claude != .allow);
     try std.testing.expectEqualStrings("ask", claudePermissionDecisionString(wired_claude));
 
@@ -6664,7 +7031,7 @@ test "hook emit after wire does not allow staged writes" {
     try std.testing.expect(std.mem.indexOf(u8, claude_json, "\"permissionDecision\":\"allow\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, claude_json, "\"permissionDecision\":\"ask\"") != null);
 
-    const wired_hermes = wireCodingHostAsk(staged, false);
+    const wired_hermes = applyHostWireRewrite(staged, null, false);
     try std.testing.expect(wired_hermes != .allow);
     const hermes_result = HookResponse{
         .decision = wired_hermes,

@@ -735,11 +735,15 @@ async function runRykEvaluateOnce(
 	if (decision === "allow" && result.code === 0) {
 		return { kind: "allow", response: parsed };
 	}
-	// evaluate ask uses exit 0 with decision "ask" (allow/deny exit contract preserved).
+	// Leftover unused ask is remapped by ryk evaluate. Unexpected evaluate
+	// ask is fail-closed. SoftBlock/FM/stage arrive as deny/stage and never
+	// become allow. Decide-file leftover unused ask is handled in
+	// runRykDecideOnce → resolvePolicyAsk (attended permit).
 	if (decision === "ask" && (result.code === 0 || result.code === null)) {
 		return {
-			kind: "ask",
-			reason: sanitizeVisibleText(getDecisionReason(parsed)),
+			kind: "deny",
+			reason: sanitizeVisibleText(getDecisionReason(parsed)) ||
+				"ryk leftover unused ask was not remapped; blocked fail-closed.",
 			response: parsed,
 		};
 	}
@@ -1865,10 +1869,10 @@ async function applyToolDecision(
 }
 
 /**
- * Single entry for leftover unused policy ask:
- * - unattended / CI → auto-deny
- * - otherwise leftover unused policy ask is permit so coding agents can work
- * Staged writes, FM steward ask, SoftBlock, and explicit deny never reach here.
+ * Unexpected `ask` after the coding-host enforcement wire rewrite.
+ * Leftover unused policy ask is rewritten by `ryk evaluate` / `ryk decide`
+ * before emit. A leaked `ask` is fail-closed deny.
+ * Staged writes, FM steward ask, SoftBlock, and explicit deny never become allow.
  */
 async function resolvePolicyAsk(
 	reason: string,
@@ -1880,10 +1884,7 @@ async function resolvePolicyAsk(
 	env: NodeJS.ProcessEnv = process.env,
 	_askIpc?: AskIpcContext,
 ): Promise<ToolCallResult> {
-	if (isUnattendedEnv(env)) {
-		return handlePolicyAskAutoDeny(reason, pi, ctx, toolLabel, env);
-	}
-	return undefined;
+	return handlePolicyAskAutoDeny(reason, pi, ctx, toolLabel, env);
 }
 
 function recordOnceBypass(

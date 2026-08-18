@@ -20,6 +20,7 @@ const rust_visibility = @import("feed_visibility.zig");
 const telemetry = @import("../telemetry.zig");
 const hook_client = @import("hook_client.zig");
 const hook_ipc = @import("hook_ipc.zig");
+const host_wire_rewrite = @import("host_wire_rewrite.zig");
 
 const max_payload_len = 256 * 1024;
 const api_schema_version: i64 = 1;
@@ -27,8 +28,6 @@ const daemon_protocol_version: i64 = 1;
 const event_source_evaluate = "evaluate";
 
 pub const exit_allowed: u8 = 0;
-/// Machine `decision: "ask"` also uses exit 0 (reason is in JSON; Pi maps decision).
-pub const exit_ask: u8 = 0;
 pub const exit_denied: u8 = 2;
 pub const exit_evaluator_error: u8 = 3;
 pub const exit_invalid_input: u8 = 64;
@@ -49,6 +48,8 @@ const EvaluateWireOpts = struct {
     cached_policy: ?*const core_api.LoadedPolicy = null,
     /// Client asked to raise leftover ask → deny (`RYK_MODE=ci` / `--ci`).
     raise_ci: bool = false,
+    /// Test inject. Null → `--ci` OR process unattended keys.
+    unattended_override: ?bool = null,
 };
 
 pub const EvaluateRequest = struct {
@@ -216,7 +217,8 @@ fn tryHookServer(
         .method = "evaluate",
         .bin = bin,
         .version = build_options.version,
-        .ci = resolveEvaluateMode(.strict) == .ci,
+        // Client folds CI / RYK_CI / RYK_NONINTERACTIVE / RYK_UNATTENDED; hook-serve must not getenvUnattended.
+        .ci = hook_client.clientUnattendedCi(resolveEvaluateMode(.strict) == .ci),
         .workspace = cwd_z,
         .cwd = cwd_z,
         .payload_json = payload,
@@ -582,10 +584,9 @@ fn requestIdBestEffort(allocator: std.mem.Allocator, payload: []const u8) !?[]co
 
 /// Map product WP4+FM decision to machine JSON for Pi evaluate.
 ///
-/// Exit codes (stable contract):
-/// - allow / observe → exit 0, decision "allow"
-/// - ask → exit 0, decision "ask" (host maps JSON; do not invent a new exit)
-/// - deny / redact / stage / broker → exit 2, decision "deny"
+/// Exit codes (coding-host enforcement wire):
+/// - allow / observe / leftover unused policy ask → exit 0, decision "allow"
+/// - never-permit ask / deny / stage → exit 2, decision "deny"
 /// - evaluator fail-closed / protocol → exit 3, decision "error"
 fn writeEvaluationResponse(
     io: std.Io,
@@ -723,10 +724,18 @@ fn writeEvaluationResponse(
         null;
     defer if (safe_remediation) |text| allocator.free(text);
 
-    const decision_tag: []const u8 = switch (owned.decision.result) {
+    const unattended = wire.unattended_override orelse host_wire_rewrite.unattendedFromEnv(wire.raise_ci);
+    const wire_policy: host_wire_rewrite.PolicyDecisionForWire = switch (owned.decision.result) {
+        .allow => .allow,
+        .observe => .observe,
+        .ask => .{ .ask = host_wire_rewrite.fromAskOrigin(owned.ask_origin) },
+        .stage => .stage,
+        .deny, .redact, .broker => .deny,
+    };
+    const wire_outcome = host_wire_rewrite.rewrite(wire_policy, unattended);
+    const decision_tag: []const u8 = switch (wire_outcome) {
         .allow, .observe => "allow",
-        .ask => "ask",
-        .deny, .redact, .stage, .broker => "deny",
+        .deny, .stage => "deny",
     };
 
     recordProductEvaluationBestEffort(
@@ -742,7 +751,7 @@ fn writeEvaluationResponse(
         feed_destination,
     );
 
-    return switch (owned.decision.result) {
+    return switch (wire_outcome) {
         .allow, .observe => {
             const response = MachineResponse{
                 .request_id = request.request_id,
@@ -758,23 +767,7 @@ fn writeEvaluationResponse(
             try writeResponseJson(stdout, response);
             return exit_allowed;
         },
-        .ask => {
-            // Prefer product reason (WP4 softened / FM explain). Emit redacted.
-            const response = MachineResponse{
-                .request_id = request.request_id,
-                .decision = "ask",
-                .reason = safe_reason,
-                .severity = severity,
-                .pack_id = pack_id,
-                .pattern_name = pattern_name,
-                .rule_id = owned.owned_rule_id,
-                .daemon_status = .healthy,
-                .daemon_compatible = true,
-            };
-            try writeResponseJson(stdout, response);
-            return exit_ask;
-        },
-        .deny, .redact, .stage, .broker => {
+        .deny, .stage => {
             const remediation_items = if (safe_remediation) |text|
                 &[_]Remediation{.{ .description = text }}
             else
@@ -1248,7 +1241,7 @@ test "evaluate records Pi decisions in workspace and global feeds" {
     try std.Io.Dir.cwd().access(std.testing.io, global_events, .{});
 }
 
-test "evaluate feed records product ask after FM upgrades engine allow" {
+test "evaluate feed records deny after FM steward ask on the host wire" {
     defer shell_eval.resetSessionStickyStoreForTests();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1277,8 +1270,8 @@ test "evaluate feed records product ask after FM upgrades engine allow" {
         .commands_allow_override = &.{},
         .fm_client = client,
     });
-    try std.testing.expectEqual(exit_ask, code);
-    try std.testing.expect(std.mem.indexOf(u8, stdout.buffered(), "\"decision\": \"ask\"") != null);
+    try std.testing.expectEqual(exit_denied, code);
+    try std.testing.expect(std.mem.indexOf(u8, stdout.buffered(), "\"decision\": \"deny\"") != null);
 
     const workspace_records = try feed_writer.loadRecent(std.testing.io, std.testing.allocator, root, 4);
     defer {
@@ -1286,8 +1279,8 @@ test "evaluate feed records product ask after FM upgrades engine allow" {
         std.testing.allocator.free(workspace_records);
     }
     try std.testing.expectEqual(@as(usize, 1), workspace_records.len);
-    // Critical: feed must reflect product ask, not raw engine Allow.
-    try std.testing.expectEqualStrings("ask", workspace_records[0].record.decision);
+    // FM steward ask is never-permit: feed records the host-wire outcome, not engine Allow.
+    try std.testing.expectEqualStrings("deny", workspace_records[0].record.decision);
     try std.testing.expectEqualStrings(event_source_evaluate, workspace_records[0].record.event_source);
     try std.testing.expect(std.mem.indexOf(u8, workspace_records[0].record.reason, "hard-danger") != null);
 }
@@ -1328,10 +1321,11 @@ test "evaluate daemon failures map to JSON error exit 3" {
 }
 
 // ---------------------------------------------------------------------------
-// WP4 + FM product path (Phase 4 WP4a) — evaluate emits decision=ask
+// WP4 + FM product path (Phase 4 WP4a) — leftover unused ask → allow;
+// never-permit (SoftBlock / FM) → deny
 // ---------------------------------------------------------------------------
 
-test "evaluate ask mode high-severity deny emits decision ask exit 0" {
+test "evaluate ask mode high-severity leftover unused policy ask emits allow" {
     const allocator = std.testing.allocator;
     defer shell_eval.resetSessionStickyStoreForTests();
     const cwd = try testCwd(allocator);
@@ -1345,13 +1339,13 @@ test "evaluate ask mode high-severity deny emits decision ask exit 0" {
         .mode_override = .ask,
         .commands_allow_override = &.{},
         .disable_fm = true,
+        .unattended_override = false,
     });
-    try std.testing.expectEqual(exit_ask, code);
-    try std.testing.expectEqual(exit_allowed, code); // ask shares exit 0 with allow
+    try std.testing.expectEqual(exit_allowed, code);
     const output = stdout.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"ask\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"allow\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"ask\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, output, "\"severity\": \"high\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "requires approval") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "\"error\": null") != null);
 }
 
@@ -1377,10 +1371,10 @@ test "evaluate FM hard-danger residual upgrades allow to ask with reason" {
         .commands_allow_override = &.{},
         .fm_client = client,
     });
-    try std.testing.expectEqual(exit_ask, code);
+    try std.testing.expectEqual(exit_denied, code);
     try std.testing.expectEqual(@as(u32, 1), state.call_count);
     const output = stdout.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"ask\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"deny\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "curl | sh is hard-danger shaped") != null);
 }
 
@@ -1407,9 +1401,9 @@ test "evaluate FM reason with secret-shaped text is redacted in JSON" {
         .commands_allow_override = &.{},
         .fm_client = client,
     });
-    try std.testing.expectEqual(exit_ask, code);
+    try std.testing.expectEqual(exit_denied, code);
     const output = stdout.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"ask\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"decision\": \"deny\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "sk-fakeSyntheticOpenAIKey1234567890") == null);
     try std.testing.expect(std.mem.indexOf(u8, output, "[REDACTED]") != null);
 }

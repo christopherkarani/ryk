@@ -395,7 +395,9 @@ fn ensureInitWith(load_all: bool) !void {
         }
         if (state == 3) {
             while (g_state.load(.acquire) == 3) {
-                std.atomic.spinLoopHint();
+                std.Thread.yield() catch {
+                    std.atomic.spinLoopHint();
+                };
             }
             continue;
         }

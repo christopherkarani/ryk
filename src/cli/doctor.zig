@@ -291,7 +291,7 @@ fn writeCheckReceipt(stdout: anytype, assessment: readiness.Assessment, context:
         return;
     }
     try stdout.print("not ready · {s}\n", .{receipt});
-    if (context.daemon_health != .compatible) {
+    if (!context.daemon_health.evaluationReady() and context.daemon_binary_exists) {
         try stdout.writeAll("Next: ryk doctor --fix\n");
     } else if (!context.policy_present) {
         try stdout.writeAll("Next: ryk doctor --fix\n");
@@ -385,7 +385,7 @@ fn runDoctorTui(
     }
 
     const next: doctor_tui.NextStepFacts = .{
-        .daemon_health_compatible = context.daemon_health == .compatible,
+        .daemon_health_compatible = context.daemon_health.evaluationReady(),
         .daemon_detail = redacted_daemon_detail,
         .daemon_binary_untrusted = context.daemon_binary_untrusted,
         .daemon_binary_exists = context.daemon_binary_exists,
@@ -562,6 +562,7 @@ fn countCapabilitySummary(os: core.platform.Os, backend_report: sandbox.backend.
 fn daemonStatusSummary(status: onboarding.DaemonHealthStatus) []const u8 {
     return switch (status) {
         .compatible => "daemon compatible",
+        .in_process => "engine in-process",
         .unavailable => "daemon unavailable",
         .incompatible => "daemon incompatible",
         .degraded => "daemon degraded",
@@ -889,7 +890,10 @@ fn writeDefaultPanels(
     const health_lines = [_][]const u8{
         try std.fmt.bufPrint(&health_storage[0], "Platform       {s}", .{os.toString()}),
         try std.fmt.bufPrint(&health_storage[1], "Policy         {s}", .{policy_status}),
-        try std.fmt.bufPrint(&health_storage[2], "Daemon         {s}", .{daemonStatusSummary(context.daemon_health)}),
+        if (context.daemon_health == .in_process)
+            try std.fmt.bufPrint(&health_storage[2], "Engine         in-process", .{})
+        else
+            try std.fmt.bufPrint(&health_storage[2], "Daemon         {s}", .{daemonStatusSummary(context.daemon_health)}),
         try std.fmt.bufPrint(&health_storage[3], "Capabilities   {d} active · {d} limited", .{ counts.active, counts.limited }),
         try std.fmt.bufPrint(&health_storage[4], "Unavailable    {d}", .{counts.unavailable}),
         try std.fmt.bufPrint(&health_storage[5], "Secret boundary {s}", .{secretBoundaryCapability(backend_report)}),
@@ -976,9 +980,13 @@ fn writeMcpSetupReport(io: std.Io, stdout: anytype, context: IntegrationContext)
     try stdout.writeByte('\n');
 }
 
+const last_session_audit_degraded_needle = "\"type\":\"audit_degraded\"";
+const last_session_audit_scan_chunk_len = 4096;
+
 /// P1-1: true when the most recent session recorded an `audit_degraded` event
 /// (shim execs ran without in-shim audit evidence). Best-effort: any read
 /// failure reports as not degraded — doctor must not fail on missing evidence.
+/// Stream-scans events.jsonl (capped at max_audit_log_len); does not allocate the file.
 fn lastSessionAuditDegraded(io: std.Io, allocator: std.mem.Allocator, workspace_root: []const u8) bool {
     const last_path = std.fs.path.join(allocator, &.{ workspace_root, ".ryk", "last" }) catch return false;
     defer allocator.free(last_path);
@@ -988,9 +996,41 @@ fn lastSessionAuditDegraded(io: std.Io, allocator: std.mem.Allocator, workspace_
     if (session_id.len == 0) return false;
     const events_path = std.fs.path.join(allocator, &.{ workspace_root, ".ryk", "sessions", session_id, "events.jsonl" }) catch return false;
     defer allocator.free(events_path);
-    const events = std.Io.Dir.cwd().readFileAlloc(io, events_path, allocator, .limited(core.limits.max_audit_log_len)) catch return false;
-    defer allocator.free(events);
-    return std.mem.indexOf(u8, events, "\"type\":\"audit_degraded\"") != null;
+
+    const file = std.Io.Dir.cwd().openFile(io, events_path, .{}) catch return false;
+    defer file.close(io);
+
+    const needle = last_session_audit_degraded_needle;
+    const overlap = needle.len - 1;
+    var buf: [last_session_audit_scan_chunk_len]u8 = undefined;
+    var carry: usize = 0;
+    var scanned: usize = 0;
+
+    while (scanned < core.limits.max_audit_log_len) {
+        const room = buf.len - carry;
+        const remaining = core.limits.max_audit_log_len - scanned;
+        const want = @min(room, remaining);
+        if (want == 0) break;
+
+        const dest = buf[carry..][0..want];
+        const n = file.readStreaming(io, &.{dest}) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return false,
+        };
+        if (n == 0) break;
+
+        const view_len = carry + n;
+        if (std.mem.indexOf(u8, buf[0..view_len], needle) != null) return true;
+
+        scanned += n;
+        if (view_len <= overlap) {
+            carry = view_len;
+        } else {
+            @memmove(buf[0..overlap], buf[view_len - overlap .. view_len]);
+            carry = overlap;
+        }
+    }
+    return false;
 }
 
 fn writeIntegrationReport(io: std.Io, stdout: anytype, context: IntegrationContext) !void {
@@ -1259,17 +1299,19 @@ fn hermesFailOpenFromEnv() bool {
     return host_status.hermesFailOpenFromEnv();
 }
 
+fn companionNeedsRemediation(context: IntegrationContext) bool {
+    // Missing companion is CLI-only / first-run, not a broken install.
+    return !context.daemon_health.evaluationReady() and context.daemon_binary_exists;
+}
+
 fn writeRecommendations(stdout: anytype, context: IntegrationContext) !void {
     try stdout.writeAll("\nRecommended next step:\n");
-    if (context.daemon_health != .compatible) {
+    if (companionNeedsRemediation(context)) {
         try writeDynamicLine(context.allocator, stdout, "  Daemon health issue: ", context.daemon_detail, "\n");
         if (context.daemon_binary_untrusted) {
             try stdout.writeAll("  Remove the untrusted legacy companion override, then re-run `ryk doctor`.\n");
-        } else if (context.daemon_binary_exists and !context.daemon_binary_executable) {
+        } else if (!context.daemon_binary_executable) {
             try stdout.writeAll("  Restore companion-service execute permission or reinstall ryk, then re-run `ryk doctor`.\n");
-        } else if (!context.daemon_binary_exists) {
-            try stdout.writeAll("  Reinstall the complete ryk release, then re-run `ryk doctor`.\n");
-            try stdout.writeAll("  Source checkout: `./scripts/zig build`.\n");
         } else {
             try stdout.writeAll("  Reinstall ryk or rebuild with `./scripts/build-all.sh`, then re-run `ryk doctor`.\n");
         }
@@ -1333,8 +1375,22 @@ fn collectIntegrationContextAt(io: std.Io, allocator: std.mem.Allocator, workspa
     defer if (daemon_paths) |value| cli.daemon.freeRuntimePaths(allocator, value);
     // Shared onboarding health path (same as status/quickstart). Probe paths pass
     // ensure_running=false so --check never mutates daemon runtime.
+    // CLI-only: missing companion is the in-process Zig shell_engine, not a broken install.
+    const binary_missing = if (daemon_inspection) |value| !value.exists else true;
     const daemon_health: DaemonHealth = blk: {
+        if (binary_missing) {
+            break :blk .{
+                .status = .in_process,
+                .detail = try allocator.dupe(u8, onboarding.in_process_engine_detail),
+            };
+        }
         const check = onboarding.checkDaemonHealth(allocator, ensure_running, null) catch |err| {
+            if (err == error.DaemonBinaryNotFound) {
+                break :blk .{
+                    .status = .in_process,
+                    .detail = try allocator.dupe(u8, onboarding.in_process_engine_detail),
+                };
+            }
             break :blk try daemonDetailFromError(allocator, err);
         };
         break :blk .{
@@ -1428,7 +1484,7 @@ fn collectHostDoctorRows(io: std.Io, allocator: std.mem.Allocator) !HostDoctorSn
 
     for (host_status.managed_hosts) |host_name| {
         const installed = plugin.hostPluginInstalledFromReport(host_name, doctor_report);
-        const detected = plugin.binaryInPath(io, allocator, host_name);
+        const detected = plugin.hostBinaryDetectedFromReport(host_name, doctor_report);
         if (std.mem.eql(u8, host_name, "hermes") and installed) hermes_installed = true;
 
         const wired: []const u8 = if (installed) "yes" else if (detected) "no" else "—";
@@ -2000,6 +2056,44 @@ test "doctor summary includes daemon availability" {
     try std.testing.expect(std.mem.indexOf(u8, written, "no running daemon answered on the expected socket") != null);
 }
 
+test "doctor summary names in-process engine when companion is not required" {
+    var stdout_buf: [32768]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    const report = sandbox.backend.detect(.linux);
+    var context = try testContext(std.testing.allocator, .{
+        .daemon_binary_exists = false,
+        .daemon_health = .in_process,
+        .daemon_detail = onboarding.in_process_engine_detail,
+    });
+    defer context.deinit();
+
+    try writeReport(std.testing.io, &stdout_writer, .linux, report, context, false);
+    const written = stdout_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "engine in-process") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "Engine         in-process") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "daemon unavailable") == null);
+}
+
+test "doctor recommendations skip reinstall when companion binary is missing" {
+    var stdout_buf: [32768]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    const report = sandbox.backend.detect(.linux);
+    var context = try testContext(std.testing.allocator, .{
+        .daemon_binary_exists = false,
+        .daemon_health = .unavailable,
+        .daemon_detail = "The ryk companion service was not found.",
+    });
+    defer context.deinit();
+
+    try writeReport(std.testing.io, &stdout_writer, .linux, report, context, false);
+    const written = stdout_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "Reinstall the complete ryk release") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "The ryk companion service was not found.") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "install is incomplete") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "Daemon health issue:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "ryk redteam --ci") != null);
+}
+
 test "doctor integration report includes daemon health details" {
     var stdout_buf: [32768]u8 = undefined;
     var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
@@ -2076,6 +2170,26 @@ test "doctor packs section stays known when daemon is unavailable" {
             std.mem.indexOf(u8, written, "Packs") != null,
     );
     try std.testing.expect(std.mem.indexOf(u8, written, "shell evaluation fails closed") == null);
+}
+
+test "collectHostDoctorRows reuses plugin report host_binaries without binaryInPath" {
+    // #448: default host-row collect must use the plugin-report PATH snapshot.
+    // Managed hosts must not re-walk PATH via plugin.binaryInPath / binaryInPath(.
+    const src = @embedFile("doctor.zig");
+    const start = std.mem.indexOf(u8, src, "fn collectHostDoctorRows(") orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    const after = src[start..];
+    const end_rel = std.mem.indexOf(u8, after[1..], "\nfn ") orelse after.len - 1;
+    const fn_src = after[0 .. 1 + end_rel];
+
+    try std.testing.expect(std.mem.indexOf(u8, fn_src, "hostBinaryDetectedFromReport") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fn_src, "hostPluginInstalledFromReport") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fn_src, "collectPluginDoctorReportWithHermesSmoke") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fn_src, "inspectPi") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fn_src, "inspectGrok") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fn_src, "binaryInPath") == null);
 }
 
 test "doctor host table lists managed hosts and shell gates" {
@@ -3244,4 +3358,73 @@ test "lastSessionAuditDegraded detects audit_degraded in the pointed-at session"
         .data = "{\"type\":\"session_start\"}\n{\"type\":\"command_allowed\"}\n",
     });
     try std.testing.expect(!lastSessionAuditDegraded(io, allocator, root));
+}
+
+test "lastSessionAuditDegraded is false for empty last pointer or missing events" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+
+    try tmp.dir.createDirPath(io, ".ryk");
+    try tmp.dir.writeFile(io, .{ .sub_path = ".ryk/last", .data = "" });
+    try std.testing.expect(!lastSessionAuditDegraded(io, allocator, root));
+
+    try tmp.dir.writeFile(io, .{ .sub_path = ".ryk/last", .data = "   \n\t" });
+    try std.testing.expect(!lastSessionAuditDegraded(io, allocator, root));
+
+    try tmp.dir.createDirPath(io, ".ryk/sessions/sess-no-events");
+    try tmp.dir.writeFile(io, .{ .sub_path = ".ryk/last", .data = "sess-no-events\n" });
+    try std.testing.expect(!lastSessionAuditDegraded(io, allocator, root));
+}
+
+test "lastSessionAuditDegraded finds audit_degraded past the stream window" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(allocator);
+    const pad_line = "{\"type\":\"session_start\"}\n";
+    while (payload.items.len < 12 * 1024) {
+        try payload.appendSlice(allocator, pad_line);
+    }
+    try payload.appendSlice(allocator, "{\"type\":\"audit_degraded\"}\n");
+
+    try tmp.dir.createDirPath(io, ".ryk/sessions/sess-late");
+    try tmp.dir.writeFile(io, .{ .sub_path = ".ryk/last", .data = "sess-late\n" });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = ".ryk/sessions/sess-late/events.jsonl",
+        .data = payload.items,
+    });
+    try std.testing.expect(lastSessionAuditDegraded(io, allocator, root));
+}
+
+test "lastSessionAuditDegraded finds audit_degraded split across a stream chunk" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+
+    const needle = last_session_audit_degraded_needle;
+    const prefix_len = last_session_audit_scan_chunk_len - (needle.len / 2);
+    const payload = try allocator.alloc(u8, prefix_len + needle.len);
+    defer allocator.free(payload);
+    @memset(payload[0..prefix_len], '.');
+    @memcpy(payload[prefix_len..], needle);
+
+    try tmp.dir.createDirPath(io, ".ryk/sessions/sess-split");
+    try tmp.dir.writeFile(io, .{ .sub_path = ".ryk/last", .data = "sess-split\n" });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = ".ryk/sessions/sess-split/events.jsonl",
+        .data = payload,
+    });
+    try std.testing.expect(lastSessionAuditDegraded(io, allocator, root));
 }

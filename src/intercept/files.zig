@@ -185,6 +185,10 @@ const read_rules = [_]BuiltinRule{
 const write_rules = [_]BuiltinRule{
     .{ .id = "builtin.files.write.deny[0]", .pattern = "./.git/**" },
     .{ .id = "builtin.files.write.deny[1]", .pattern = "./.ryk/**" },
+    .{ .id = "builtin.files.write.deny[2]", .pattern = "./.env" },
+    .{ .id = "builtin.files.write.deny[3]", .pattern = "./.env.*" },
+    .{ .id = "builtin.files.write.deny[4]", .pattern = "**/.env" },
+    .{ .id = "builtin.files.write.deny[5]", .pattern = "**/.env.*" },
 };
 
 pub fn normalizePath(io: std.Io, allocator: std.mem.Allocator, workspace_root_raw: []const u8, raw_path: []const u8) !NormalizedPath {
@@ -1439,6 +1443,61 @@ test "symlink escape to protected path is blocked" {
     };
 
     try std.testing.expectError(error.SymlinkEscapesWorkspace, normalizePath(io, std.testing.allocator, root, "linked_key"));
+}
+
+test "decideWrite denies .env on coding DCG and builtin write_rules" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".env", .data = "TOKEN=fake_secret_value\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".env.local", .data = "TOKEN=fake_secret_value\n" });
+    try tmp.dir.createDirPath(std.testing.io, "src");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "src/.env", .data = "TOKEN=fake_secret_value\n" });
+    const root = try testAllocRealPath(std.testing.io, tmp.dir, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+
+    var coding = try policy.load.loadAgentPreset(std.testing.allocator, .generic_agent);
+    defer coding.deinit();
+    var strict = try policy.load.loadPreset(std.testing.allocator, .strict);
+    defer strict.deinit();
+
+    const cases = [_][]const u8{ ".env", "./.env", ".env.local", "src/.env" };
+    for (cases) |raw_path| {
+        var coding_decision = try decideWrite(io, std.testing.allocator, &coding, root, raw_path);
+        defer coding_decision.deinit(std.testing.allocator);
+        try std.testing.expectEqual(core.decision.DecisionResult.deny, coding_decision.decision.result);
+
+        var strict_decision = try decideWrite(io, std.testing.allocator, &strict, root, raw_path);
+        defer strict_decision.deinit(std.testing.allocator);
+        try std.testing.expectEqual(core.decision.DecisionResult.deny, strict_decision.decision.result);
+        try std.testing.expect(strict_decision.decision.rule_id != null);
+        try std.testing.expect(std.mem.startsWith(u8, strict_decision.decision.rule_id.?, "builtin.files.write.deny"));
+    }
+}
+
+test "decideWrite allows workspace src/ok.zig under coding DCG and strict" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "src");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "src/ok.zig", .data = "pub fn ok() void {}\n" });
+    const root = try testAllocRealPath(std.testing.io, tmp.dir, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+
+    var coding = try policy.load.loadAgentPreset(std.testing.allocator, .generic_agent);
+    defer coding.deinit();
+    var strict = try policy.load.loadPreset(std.testing.allocator, .strict);
+    defer strict.deinit();
+
+    var coding_decision = try decideWrite(io, std.testing.allocator, &coding, root, "./src/ok.zig");
+    defer coding_decision.deinit(std.testing.allocator);
+    try std.testing.expect(coding_decision.decision.result == .allow or coding_decision.decision.result == .stage);
+    try std.testing.expect(coding_decision.decision.result != .deny);
+
+    var strict_decision = try decideWrite(io, std.testing.allocator, &strict, root, "./src/ok.zig");
+    defer strict_decision.deinit(std.testing.allocator);
+    try std.testing.expect(strict_decision.decision.result == .allow or strict_decision.decision.result == .stage);
+    try std.testing.expect(strict_decision.decision.result != .deny);
 }
 
 test "default sensitive read decisions deny env and fake ssh key" {

@@ -67,11 +67,31 @@ pub const ReplaySession = struct {
     }
 };
 
+/// Host conversation ids are 36-char UUIDs (`8-4-4-4-12` hex). Ryk session ids
+/// are `timestamp_hex` (e.g. `2026-05-05T12-12-10Z_abcd`). Different namespace.
+pub fn looksLikeHostConversationId(value: []const u8) bool {
+    if (value.len != 36) return false;
+    for (value, 0..) |char, index| {
+        switch (index) {
+            8, 13, 18, 23 => if (char != '-') return false,
+            else => if (!std.ascii.isHex(char)) return false,
+        }
+    }
+    return true;
+}
+
 pub fn load(io: std.Io, allocator: std.mem.Allocator, workspace_root: []const u8, options: ReplayOptions) !ReplaySession {
     const session_id = try resolveSessionId(io, allocator, workspace_root, options.session, options.audit_dir_name);
     errdefer allocator.free(session_id);
     const session_dir_path = try std.fs.path.join(allocator, &.{ workspace_root, options.audit_dir_name, "sessions", session_id });
     errdefer allocator.free(session_dir_path);
+
+    if (looksLikeHostConversationId(session_id)) {
+        std.Io.Dir.cwd().access(io, session_dir_path, .{}) catch |err| switch (err) {
+            error.FileNotFound => return error.HostConversationIdNotARykSession,
+            else => return err,
+        };
+    }
 
     const verify_result = try verifySessionDir(io, allocator, session_dir_path);
     defer verify_result.deinit(allocator);
@@ -82,7 +102,15 @@ pub fn load(io: std.Io, allocator: std.mem.Allocator, workspace_root: []const u8
         for (events) |ev| ev.deinit(allocator);
         allocator.free(events);
     }
-    const summary = try readSummaryFields(io, allocator, session_dir_path);
+    // In-progress sessions have events.jsonl + `.ryk/last` before summary.json exists.
+    const summary = readSummaryFields(io, allocator, session_dir_path) catch |err| switch (err) {
+        error.FileNotFound => SummaryFields{
+            .command_display = try allocator.dupe(u8, "-"),
+            .policy = try allocator.dupe(u8, "-"),
+            .status_display = try allocator.dupe(u8, "-"),
+        },
+        else => return err,
+    };
     errdefer summary.deinit(allocator);
 
     return .{
@@ -1049,6 +1077,34 @@ test "replay rejects session ids with path traversal" {
         try file.writeStreamingAll(std.testing.io, "..\n");
     }
     try std.testing.expectError(error.InvalidSessionId, load(std.testing.io, std.testing.allocator, root, .{ .session = "last" }));
+}
+
+test "looksLikeHostConversationId accepts UUID and rejects ryk session ids" {
+    try std.testing.expect(looksLikeHostConversationId("00000000-0000-0000-0000-000000000000"));
+    try std.testing.expect(looksLikeHostConversationId("ABCDEFAB-CDEF-ABCD-ABCD-ABCDEFABCDEF"));
+    try std.testing.expect(!looksLikeHostConversationId("2026-05-05T12-12-10Z_abcd"));
+    try std.testing.expect(!looksLikeHostConversationId(""));
+    try std.testing.expect(!looksLikeHostConversationId("last"));
+    try std.testing.expect(!looksLikeHostConversationId("00000000-0000-0000-0000-00000000000"));
+    try std.testing.expect(!looksLikeHostConversationId("000000000000000000000000000000000000"));
+}
+
+test "replay load of missing host UUID is distinct and does not alias a ryk session" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    try writeValidReplayFixture(root, "2026-05-05T12-12-10Z_abcd");
+
+    const host_id = "00000000-0000-0000-0000-000000000000";
+    try std.testing.expectError(
+        error.HostConversationIdNotARykSession,
+        load(std.testing.io, std.testing.allocator, root, .{ .session = host_id }),
+    );
+
+    var loaded = try load(std.testing.io, std.testing.allocator, root, .{ .session = "2026-05-05T12-12-10Z_abcd" });
+    defer loaded.deinit();
+    try std.testing.expectEqualStrings("2026-05-05T12-12-10Z_abcd", loaded.session_id);
 }
 
 fn loadReplayAllocationFailureProbe(allocator: std.mem.Allocator, root: []const u8, session_id: []const u8) !void {
