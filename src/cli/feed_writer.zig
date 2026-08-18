@@ -572,15 +572,6 @@ fn loadRecentFromPath(
     };
 }
 
-fn redactOwnedAlloc(allocator: std.mem.Allocator, owned: []u8) ![]u8 {
-    defer allocator.free(owned);
-    return core_api.redactAlloc(allocator, owned);
-}
-
-fn redactOwnedAllocOptional(allocator: std.mem.Allocator, owned: ?[]u8) !?[]u8 {
-    return if (owned) |value| try redactOwnedAlloc(allocator, value) else null;
-}
-
 fn loadOwnedFeedLine(
     allocator: std.mem.Allocator,
     line: []const u8,
@@ -643,34 +634,29 @@ fn parseFeedRecord(allocator: std.mem.Allocator, line: []const u8, fallback_work
     errdefer allocator.free(decision_source);
     const event_source = try allocator.dupe(u8, v.event_source);
     errdefer allocator.free(event_source);
-    const host = try redactOwnedAllocOptional(allocator, try dupeOptional(allocator, v.host));
+    const host = if (v.host) |text| try core_api.redactAlloc(allocator, text) else null;
     errdefer if (host) |value| allocator.free(value);
     const daemon_status = try allocator.dupe(u8, v.daemon_status);
     errdefer allocator.free(daemon_status);
-    const pack_id = try redactOwnedAllocOptional(allocator, try dupeOptional(allocator, v.pack_id));
+    const pack_id = if (v.pack_id) |text| try core_api.redactAlloc(allocator, text) else null;
     errdefer if (pack_id) |value| allocator.free(value);
-    const rule = try redactOwnedAllocOptional(allocator, try dupeOptional(allocator, v.rule));
+    const rule = if (v.rule) |text| try core_api.redactAlloc(allocator, text) else null;
     errdefer if (rule) |value| allocator.free(value);
-    const severity = try redactOwnedAllocOptional(allocator, try dupeOptional(allocator, v.severity));
+    const severity = if (v.severity) |text| try core_api.redactAlloc(allocator, text) else null;
     errdefer if (severity) |value| allocator.free(value);
-    const reason = try redactOwnedAlloc(allocator, try allocator.dupe(u8, v.reason));
+    const reason = try core_api.redactAlloc(allocator, v.reason);
     errdefer allocator.free(reason);
-    const remediation = try redactOwnedAllocOptional(allocator, try dupeOptional(allocator, v.remediation));
+    const remediation = if (v.remediation) |text| try core_api.redactAlloc(allocator, text) else null;
     errdefer if (remediation) |value| allocator.free(value);
-    const target_summary = try redactOwnedAlloc(allocator, try allocator.dupe(u8, v.target_summary));
+    const target_summary = try core_api.redactAlloc(allocator, v.target_summary);
     errdefer allocator.free(target_summary);
-    var session_id = try dupeOptional(allocator, v.session_id);
+    var session_id: ?[]u8 = null;
     errdefer if (session_id) |value| allocator.free(value);
-    if (session_id) |value| {
+    if (v.session_id) |sid| {
         // Reject path segments before aggregate joins session_id into a filesystem
         // path (directory-existence oracle via ../). Same alphabet as audit writers.
-        core.session.validateSessionIdText(value) catch return error.InvalidFeedRecord;
-        const safe = redact_bridge.pathSafeSessionId(value);
-        if (safe.ptr != value.ptr) {
-            const placeholder = try allocator.dupe(u8, safe);
-            allocator.free(value);
-            session_id = placeholder;
-        }
+        core.session.validateSessionIdText(sid) catch return error.InvalidFeedRecord;
+        session_id = try allocator.dupe(u8, redact_bridge.pathSafeSessionId(sid));
     }
     return .{
         .timestamp = timestamp,
@@ -690,11 +676,6 @@ fn parseFeedRecord(allocator: std.mem.Allocator, line: []const u8, fallback_work
         .session_id = session_id,
         .verified = v.verified,
     };
-}
-
-fn dupeOptional(allocator: std.mem.Allocator, value: ?[]const u8) !?[]u8 {
-    const text = value orelse return null;
-    return try allocator.dupe(u8, text);
 }
 
 fn dupWorkspaceRoot(allocator: std.mem.Allocator, from_record: ?[]const u8, fallback: ?[]const u8) ![]u8 {

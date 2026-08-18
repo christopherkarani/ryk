@@ -72,11 +72,23 @@ fn sessionIdContainsStructuredSecret(value: []const u8) bool {
     const trimmed = std.mem.trim(u8, value, " \t\r\n");
     if (looksLikeAwsAccessKey(trimmed)) return true;
     var i: usize = 0;
-    while (i + 20 <= value.len) : (i += 1) {
+    while (i < value.len) : (i += 1) {
         if (!isSessionIdTokenBoundary(value, i)) continue;
-        const cand = value[i .. i + 20];
-        if (!looksLikeAwsAccessKey(cand)) continue;
-        if (i + 20 == value.len or !std.ascii.isAlphanumeric(value[i + 20])) return true;
+        if (i + 20 <= value.len) {
+            const cand = value[i .. i + 20];
+            if (looksLikeAwsAccessKey(cand) and
+                (i + 20 == value.len or !std.ascii.isAlphanumeric(value[i + 20])))
+                return true;
+        }
+        // Vendor prefixes inside findStructuredSecret use isStructuredTokenBoundary,
+        // which treats `_` as interior — so sess_xoxb- / sess_sk_live_ never emit
+        // a span. Scan them here at session-id boundaries only.
+        for (vendor_token_prefixes) |vendor| {
+            if (!startsWithIgnoreCase(value[i..], vendor.prefix)) continue;
+            var end = i + vendor.prefix.len;
+            while (end < value.len and isTokenChar(value[end])) : (end += 1) {}
+            if (end >= i + vendor.prefix.len + vendor.min_after) return true;
+        }
     }
     return false;
 }
@@ -100,11 +112,36 @@ test "pathSafeSessionId keeps host ids and redacts structured tokens" {
         .{ .sid = "sess.ghp_fakeSyntheticTokenValue1234567890", .want = path_safe_session_id },
         .{ .sid = "GHP_0123456789AB", .want = path_safe_session_id },
         .{ .sid = "sess_AKIAIOSFODNN7EXAMPLE", .want = path_safe_session_id },
+        .{ .sid = "sess_xoxb-abcdefghijkl", .want = path_safe_session_id },
+        .{ .sid = "sess-xoxb-abcdefghijkl", .want = path_safe_session_id },
+        .{ .sid = "sess_sk_live_abcdefgh", .want = path_safe_session_id },
+        .{ .sid = "sess-glpat-abcdefghijkl", .want = path_safe_session_id },
+        .{ .sid = "sess_hf_abcdefghijklmnopqrst", .want = path_safe_session_id },
     };
     for (cases) |case| {
         try std.testing.expectEqualStrings(case.want, pathSafeSessionId(case.sid));
     }
 }
+
+const vendor_token_prefixes = [_]struct { prefix: []const u8, min_after: usize }{
+    .{ .prefix = "xoxb-", .min_after = 12 },
+    .{ .prefix = "xoxp-", .min_after = 12 },
+    .{ .prefix = "xoxa-", .min_after = 12 },
+    .{ .prefix = "xoxs-", .min_after = 12 },
+    .{ .prefix = "xoxe-", .min_after = 12 },
+    .{ .prefix = "xoxc-", .min_after = 12 },
+    .{ .prefix = "sk_live_", .min_after = 8 },
+    .{ .prefix = "sk_test_", .min_after = 8 },
+    .{ .prefix = "rk_live_", .min_after = 8 },
+    .{ .prefix = "rk_test_", .min_after = 8 },
+    .{ .prefix = "pk_live_", .min_after = 8 },
+    .{ .prefix = "pk_test_", .min_after = 8 },
+    .{ .prefix = "glpat-", .min_after = 12 },
+    .{ .prefix = "gldt-", .min_after = 12 },
+    // 20 after `hf_` (23 total) sits under real HF tokens (~34) and
+    // above common HF_* identifiers (`HF_HUB_OFFLINE`, `hf_home_directory`).
+    .{ .prefix = "hf_", .min_after = 20 },
+};
 
 const SecretSpan = struct { start: usize, end: usize };
 
@@ -155,29 +192,10 @@ fn findStructuredSecret(value: []const u8, from: usize) ?SecretSpan {
         // Vendor prefixes use per-shape floors so Stripe `sk_live_`/`sk_test_`
         // (underscore) never collide with OpenAI `sk-`, and short false friends
         // (`xox`, `hf`, `HF_HUB_OFFLINE`, `glpat`) stay unclassified.
-        const vendor_prefixes = [_]struct { prefix: []const u8, min_after: usize }{
-            .{ .prefix = "xoxb-", .min_after = 12 },
-            .{ .prefix = "xoxp-", .min_after = 12 },
-            .{ .prefix = "xoxa-", .min_after = 12 },
-            .{ .prefix = "xoxs-", .min_after = 12 },
-            .{ .prefix = "xoxe-", .min_after = 12 },
-            .{ .prefix = "xoxc-", .min_after = 12 },
-            .{ .prefix = "sk_live_", .min_after = 8 },
-            .{ .prefix = "sk_test_", .min_after = 8 },
-            .{ .prefix = "rk_live_", .min_after = 8 },
-            .{ .prefix = "rk_test_", .min_after = 8 },
-            .{ .prefix = "pk_live_", .min_after = 8 },
-            .{ .prefix = "pk_test_", .min_after = 8 },
-            .{ .prefix = "glpat-", .min_after = 12 },
-            .{ .prefix = "gldt-", .min_after = 12 },
-            // 20 after `hf_` (23 total) sits under real HF tokens (~34) and
-            // above common HF_* identifiers (`HF_HUB_OFFLINE`, `hf_home_directory`).
-            .{ .prefix = "hf_", .min_after = 20 },
-        };
         // Token-char left boundary so mid-base64url `hf_` / `xoxb-` inside a
         // JWT or high-entropy blob does not punch a hole and skip classify.
         if (isStructuredTokenBoundary(value, i)) {
-            for (vendor_prefixes) |vendor| {
+            for (vendor_token_prefixes) |vendor| {
                 if (startsWithIgnoreCase(value[i..], vendor.prefix)) {
                     var end = i + vendor.prefix.len;
                     while (end < value.len and isTokenChar(value[end])) : (end += 1) {}
