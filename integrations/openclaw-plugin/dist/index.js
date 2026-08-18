@@ -306,7 +306,32 @@ export function installerProvenanceValid(binaryPath, receiptPath = join(resolve(
         return false;
     }
 }
-function attestRykCandidate(path, cwd, platform = process.platform, allowWorkspaceOverride = process.env.RYK_ALLOW_WORKSPACE_BIN === '1') {
+/** In-process skip of hash + `version --json` after managed-provenance success. Not TOCTOU-safe. */
+const managedAttestCache = new Map();
+function statIdentity(stat) {
+    return {
+        dev: stat.dev,
+        ino: stat.ino,
+        size: stat.size,
+        mtimeMs: stat.mtimeMs,
+        mtimeNs: typeof stat.mtimeNs === 'bigint' ? stat.mtimeNs : undefined,
+    };
+}
+function identityMatches(cached, stat) {
+    if (cached.dev !== stat.dev || cached.ino !== stat.ino || cached.size !== stat.size) {
+        return false;
+    }
+    if (typeof cached.mtimeNs === 'bigint' && typeof stat.mtimeNs === 'bigint') {
+        return cached.mtimeNs === stat.mtimeNs;
+    }
+    return cached.mtimeMs === stat.mtimeMs;
+}
+function forceExpensiveAttestProbe(allowWorkspaceOverride) {
+    return allowWorkspaceOverride ||
+        process.env.RYK_ALLOW_WORKSPACE_BIN === '1' ||
+        Boolean(process.env.RYK_BIN?.trim());
+}
+export function attestRykCandidate(path, cwd, platform = process.platform, allowWorkspaceOverride = process.env.RYK_ALLOW_WORKSPACE_BIN === '1') {
     if (!existsSync(path))
         return false;
     const canonical = canonicalPath(path);
@@ -326,6 +351,12 @@ function attestRykCandidate(path, cwd, platform = process.platform, allowWorkspa
         }
         const workspaceOverride = allowWorkspaceOverride &&
             isWithin(canonical, canonicalPath(cwd ?? process.cwd()));
+        const fullProbe = workspaceOverride || forceExpensiveAttestProbe(allowWorkspaceOverride);
+        if (!fullProbe) {
+            const cached = managedAttestCache.get(canonical);
+            if (cached && identityMatches(cached, stat))
+                return true;
+        }
         if (!workspaceOverride && !installerProvenanceValid(canonical))
             return false;
         const output = execFileSync(canonical, ['version', '--json'], {
@@ -334,9 +365,13 @@ function attestRykCandidate(path, cwd, platform = process.platform, allowWorkspa
             stdio: ['ignore', 'pipe', 'ignore'],
         }).trim();
         const identity = JSON.parse(output);
-        return identity.product === 'ryk' &&
+        const ok = identity.product === 'ryk' &&
             typeof identity.version === 'string' &&
             RYK_VERSION_RE.test(identity.version);
+        if (ok && !fullProbe) {
+            managedAttestCache.set(canonical, statIdentity(stat));
+        }
+        return ok;
     }
     catch {
         return false;
@@ -433,9 +468,11 @@ function normalizeBlockingDecision(decision, base, options = {}) {
         };
     }
     if (decision === 'ask') {
-        return failClosedBlock(options.unattended ? 'ryk_unattended_ask' : 'ryk_ask_unsupported', options.unattended
+        // Leftover unused policy ask is rewritten by ryk hook before emit.
+        // A leaked `ask` here is unexpected: fail-closed deny.
+        return failClosedBlock(options.unattended ? 'ryk_unattended_ask' : 'ryk_unexpected_ask', options.unattended
             ? 'ryk requested approval, but this OpenClaw process is unattended; blocking without waiting.'
-            : 'ryk requested interactive approval (ask), but this OpenClaw integration has no verified resumable approval contract; blocking.', base);
+            : 'ryk returned an unexpected ask; blocking fail-closed.', base);
     }
     if (!ALLOW_DECISIONS.has(decision)) {
         return failClosedBlock('ryk_unrecognized_decision', `ryk returned unrecognized decision "${decision}"; blocking as a precaution.`, base);
@@ -455,10 +492,10 @@ function normalizeBlockingDecision(decision, base, options = {}) {
 /**
  * Parse ryk hook stdout into a decision.
  * Non-blocking: soft-allow on empty/malformed.
- * Blocking: fail closed on empty/whitespace, parse errors, missing/non-string decision,
- * `ask`, and unrecognized decisions. Approval is deliberately not translated
- * into a host-native request until a live, versioned OpenClaw approval contract
- * is available; an unknown host must never receive an unenforced ask.
+ * Blocking: fail closed on empty/whitespace, parse errors, missing/non-string
+ * decision, unexpected `ask`, and unrecognized decisions. Leftover unused
+ * policy ask is rewritten by `ryk hook` before emit. Approval is not translated
+ * into a host-native request.
  */
 export function parseHookResponse(stdout, blocking, options = {}) {
     const fail = (reason, blockMsg, softMsg) => blocking ? failClosedBlock(reason, blockMsg) : softAllow(reason, softMsg);
@@ -519,7 +556,12 @@ async function callRyk(rykBin, event, data, sessionId, blocking, logger, options
             : softAllow('ryk_binary_untrusted', 'ryk executable provenance or identity could not be re-attested; skipping this non-blocking event.');
     }
     try {
-        const stdout = await runRykHookProcess(rykBin, ['hook', 'openclaw', event], payload.json, blocking ? 15000 : 10000, options.cwd);
+        const hookArgs = ['hook', 'openclaw', event];
+        // Host extra `RYK_OPENCLAW_UNATTENDED` is not a Zig shared key — fold it
+        // into `--ci` so leftover unused policy ask hardens inside ryk.
+        if (options.unattended)
+            hookArgs.push('--ci');
+        const stdout = await runRykHookProcess(rykBin, hookArgs, payload.json, blocking ? 15000 : 10000, options.cwd);
         return parseHookResponse(stdout, blocking, options);
     }
     catch {

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { realpathSync } from 'node:fs';
+import { existsSync, readFileSync, realpathSync, statSync, utimesSync } from 'node:fs';
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -49,6 +49,11 @@ fi
   process.env.PATH = `${directory}:${originalPath ?? ''}`;
   process.env.RYK_BIN = rykBin;
   process.env.RYK_ALLOW_WORKSPACE_BIN = '1';
+  const unattendedKeys = ['CI', 'RYK_CI', 'RYK_NONINTERACTIVE', 'RYK_UNATTENDED'];
+  const savedUnattended = Object.fromEntries(
+    unattendedKeys.map((key) => [key, process.env[key]])
+  );
+  for (const key of unattendedKeys) delete process.env[key];
 
   try {
     await run(await rykPlugin({ directory, worktree: directory, ...pluginExtras }));
@@ -58,6 +63,10 @@ fi
     else process.env.RYK_ALLOW_WORKSPACE_BIN = originalAllow;
     if (originalRykBin === undefined) delete process.env.RYK_BIN;
     else process.env.RYK_BIN = originalRykBin;
+    for (const key of unattendedKeys) {
+      if (savedUnattended[key] === undefined) delete process.env[key];
+      else process.env[key] = savedUnattended[key];
+    }
     await rm(directory, { recursive: true, force: true });
   }
 }
@@ -74,23 +83,18 @@ function assertShortBlockThrow(err, contextRe) {
   assert.ok(msg.length <= 200, `throw should stay short (≤200), got ${msg.length}: ${msg}`);
 }
 
-for (const [command, message] of [
-  ['rm file.txt', 'approval required'],
-  ['rm -r build', 'approval required'],
-  ['rm -rf build', 'command blocked'],
-]) {
-  test(`tool.execute.before blocks ${command}`, async () => {
+for (const command of ['rm file.txt', 'rm -r build']) {
+  test(`tool.execute.before denies unexpected ask for ${command}`, async () => {
     await withFakeRyk(async (plugin) => {
       const before = plugin['tool.execute.before'];
       assert.ok(before);
-
       await assert.rejects(
         before(
           { tool: 'bash', sessionID: 'session-1', callID: 'call-1' },
           { args: { command } }
         ),
         (err) => {
-          assertShortBlockThrow(err, new RegExp(`ryk blocked tool execution: ${message}`));
+          assertShortBlockThrow(err, /ryk blocked/);
           return true;
         }
       );
@@ -98,7 +102,52 @@ for (const [command, message] of [
   });
 }
 
-test('permission.ask keeps host ask for ryk ask (approve-and-resume)', async () => {
+test('tool.execute.before blocks rm -rf build', async () => {
+  await withFakeRyk(async (plugin) => {
+    const before = plugin['tool.execute.before'];
+    assert.ok(before);
+
+    await assert.rejects(
+      before(
+        { tool: 'bash', sessionID: 'session-1', callID: 'call-1' },
+        { args: { command: 'rm -rf build' } }
+      ),
+      (err) => {
+        assertShortBlockThrow(err, /ryk blocked tool execution: command blocked/);
+        return true;
+      }
+    );
+  });
+});
+
+test('tool.execute.before unattended residual ask is deny', async () => {
+  await withFakeRyk(async (plugin) => {
+    process.env.RYK_UNATTENDED = '1';
+    const before = plugin['tool.execute.before'];
+    await assert.rejects(
+      before(
+        { tool: 'bash', sessionID: 'session-1', callID: 'call-1' },
+        { args: { command: 'rm file.txt' } }
+      ),
+      (err) => {
+        assertShortBlockThrow(err, /approval required|ryk blocked/);
+        return true;
+      }
+    );
+  });
+});
+
+test('permission.ask unattended residual ask is deny', async () => {
+  await withFakeRyk(async (plugin) => {
+    process.env.RYK_UNATTENDED = '1';
+    const permissionAsk = plugin['permission.ask'];
+    const output = { status: 'ask' };
+    await permissionAsk({ sessionID: 'session-1', command: 'rm file.txt' }, output);
+    assert.equal(output.status, 'deny');
+  });
+});
+
+test('permission.ask denies unexpected ryk ask', async () => {
   await withFakeRyk(async (plugin) => {
     const permissionAsk = plugin['permission.ask'];
     assert.ok(permissionAsk);
@@ -106,8 +155,7 @@ test('permission.ask keeps host ask for ryk ask (approve-and-resume)', async () 
 
     await permissionAsk({ sessionID: 'session-1', command: 'rm file.txt' }, output);
 
-    // Native permission UI: ryk ask must not hard-deny without resume.
-    assert.equal(output.status, 'ask');
+    assert.equal(output.status, 'deny');
   });
 });
 
@@ -243,7 +291,7 @@ printf '%s\\n' '{"decision":"block","message":"command blocked"}'
   );
 });
 
-test('permission.ask warn maps to host ask and may toast warning', async () => {
+test('permission.ask warn proceeds without a host ask and may toast warning', async () => {
   const toasts = [];
   await withFakeRyk(
     async (plugin) => {
@@ -251,7 +299,7 @@ test('permission.ask warn maps to host ask and may toast warning', async () => {
       assert.ok(permissionAsk);
       const output = { status: 'ask' };
       await permissionAsk({ sessionID: 'session-1', command: 'echo warn-me' }, output);
-      assert.equal(output.status, 'ask', 'warn must not silent-allow or hard-deny');
+      assert.equal(output.status, 'allow', 'warn must not open a host ask');
       assert.equal(toasts.length, 1);
       assert.equal(toastPayload(toasts[0])?.variant, 'warning');
     },
@@ -270,7 +318,7 @@ printf '%s\\n' '{"decision":"warn","message":"soft policy note"}'
   );
 });
 
-test('permission.ask ryk ask toasts warning not error', async () => {
+test('permission.ask unexpected ask is deny', async () => {
   const toasts = [];
   await withFakeRyk(
     async (plugin) => {
@@ -278,9 +326,7 @@ test('permission.ask ryk ask toasts warning not error', async () => {
       assert.ok(permissionAsk);
       const output = { status: 'ask' };
       await permissionAsk({ sessionID: 'session-1', command: 'rm file.txt' }, output);
-      assert.equal(output.status, 'ask');
-      assert.equal(toasts.length, 1);
-      assert.equal(toastPayload(toasts[0])?.variant, 'warning');
+      assert.equal(output.status, 'deny');
     },
     undefined,
     {
@@ -381,7 +427,7 @@ process.stdin.on("end", () => {
   );
 });
 
-test('tool.execute.before still hard-blocks ryk ask (no resume on that path)', async () => {
+test('tool.execute.before denies unexpected ryk ask', async () => {
   await withFakeRyk(async (plugin) => {
     const before = plugin['tool.execute.before'];
     assert.ok(before);
@@ -391,7 +437,7 @@ test('tool.execute.before still hard-blocks ryk ask (no resume on that path)', a
         { args: { command: 'rm file.txt' } }
       ),
       (err) => {
-        assertShortBlockThrow(err, /ryk blocked tool execution: approval required/);
+        assertShortBlockThrow(err, /ryk blocked/);
         return true;
       }
     );
@@ -1697,6 +1743,133 @@ test('findRyk accepts workspace zig-out when RYK_ALLOW_WORKSPACE_BIN=1', async (
   }
 });
 
+function readProbeCount(countFile) {
+  if (!existsSync(countFile)) return 0;
+  return readFileSync(countFile, 'utf8').length;
+}
+
+function versionCountingScript(countFile, product = 'ryk', version = '1.2.16') {
+  return `#!/bin/sh
+if [ "$1" = version ] && [ "$2" = --json ]; then
+  printf x >> '${countFile}'
+  printf '%s\\n' '{"product":"${product}","version":"${version}"}'
+  exit 0
+fi
+`;
+}
+
+async function withManagedCountingRyk(run, { product = 'ryk', version = '1.2.16' } = {}) {
+  const directory = await mkdtemp(join(tmpdir(), 'ryk-opencode-attest-'));
+  const localBin = join(directory, '.local', 'bin');
+  await mkdir(localBin, { recursive: true });
+  const rykBin = join(localBin, 'ryk');
+  const countFile = join(directory, 'version-count');
+  const emptyPath = join(directory, 'empty-path');
+  await mkdir(emptyPath, { recursive: true });
+  await writeFile(rykBin, versionCountingScript(countFile, product, version), { mode: 0o755 });
+  const originalPath = process.env.PATH;
+  const originalAllow = process.env.RYK_ALLOW_WORKSPACE_BIN;
+  const originalHome = process.env.HOME;
+  const originalBin = process.env.RYK_BIN;
+  delete process.env.RYK_BIN;
+  delete process.env.RYK_ALLOW_WORKSPACE_BIN;
+  process.env.HOME = directory;
+  // Empty PATH so findRyk attests the well-known managed path once per call.
+  process.env.PATH = emptyPath;
+  try {
+    return await run({ directory, rykBin, countFile, localBin });
+  } finally {
+    process.env.PATH = originalPath;
+    process.env.HOME = originalHome;
+    if (originalAllow === undefined) delete process.env.RYK_ALLOW_WORKSPACE_BIN;
+    else process.env.RYK_ALLOW_WORKSPACE_BIN = originalAllow;
+    if (originalBin === undefined) delete process.env.RYK_BIN;
+    else process.env.RYK_BIN = originalBin;
+    await rm(directory, { recursive: true, force: true });
+  }
+}
+
+test('findRyk second resolve with unchanged identity skips version --json', async () => {
+  await withManagedCountingRyk(async ({ directory, rykBin, countFile }) => {
+    assert.equal(findRyk(directory), realpathSync(rykBin));
+    assert.equal(readProbeCount(countFile), 1);
+    assert.equal(findRyk(directory), realpathSync(rykBin));
+    assert.equal(
+      readProbeCount(countFile),
+      1,
+      'unchanged managed identity must not re-exec version --json'
+    );
+  });
+});
+
+test('findRyk does not cache a failed identity', async () => {
+  await withManagedCountingRyk(async ({ directory, countFile }) => {
+    assert.equal(findRyk(directory), null);
+    assert.equal(readProbeCount(countFile), 1);
+    assert.equal(findRyk(directory), null);
+    assert.equal(readProbeCount(countFile), 2);
+  }, { product: 'not-ryk' });
+});
+
+test('findRyk size change forces a new version --json', async () => {
+  await withManagedCountingRyk(async ({ directory, rykBin, countFile }) => {
+    assert.equal(findRyk(directory), realpathSync(rykBin));
+    assert.equal(readProbeCount(countFile), 1);
+    const before = statSync(rykBin);
+    await writeFile(rykBin, `${readFileSync(rykBin, 'utf8')}\n# size-bump\n`, { mode: 0o755 });
+    assert.notEqual(statSync(rykBin).size, before.size);
+    assert.equal(findRyk(directory), realpathSync(rykBin));
+    assert.equal(readProbeCount(countFile), 2);
+  });
+});
+
+test('findRyk mtime change forces a new version --json', async () => {
+  await withManagedCountingRyk(async ({ directory, rykBin, countFile }) => {
+    assert.equal(findRyk(directory), realpathSync(rykBin));
+    assert.equal(readProbeCount(countFile), 1);
+    const before = statSync(rykBin);
+    utimesSync(rykBin, before.atime, new Date(before.mtimeMs + 5_000));
+    assert.ok(statSync(rykBin).mtimeMs !== before.mtimeMs, 'mtime must change to force re-attest');
+    assert.equal(findRyk(directory), realpathSync(rykBin));
+    assert.equal(readProbeCount(countFile), 2);
+  });
+});
+
+test('findRyk RYK_BIN pin always re-runs version --json', async () => {
+  await withManagedCountingRyk(async ({ directory, rykBin, countFile }) => {
+    process.env.RYK_BIN = rykBin;
+    assert.equal(findRyk(directory), realpathSync(rykBin));
+    assert.equal(findRyk(directory), realpathSync(rykBin));
+    assert.equal(readProbeCount(countFile), 2);
+  });
+});
+
+test('findRyk RYK_ALLOW_WORKSPACE_BIN always re-runs version --json', async () => {
+  await withManagedCountingRyk(async ({ directory, rykBin, countFile }) => {
+    process.env.RYK_ALLOW_WORKSPACE_BIN = '1';
+    assert.equal(findRyk(directory), realpathSync(rykBin));
+    assert.equal(findRyk(directory), realpathSync(rykBin));
+    assert.equal(readProbeCount(countFile), 2);
+  });
+});
+
+test('findRyk still rejects a vanished binary after sticky success', async () => {
+  await withManagedCountingRyk(async ({ directory, rykBin, countFile }) => {
+    assert.equal(findRyk(directory), realpathSync(rykBin));
+    assert.equal(readProbeCount(countFile), 1);
+    await rm(rykBin);
+    assert.equal(findRyk(directory), null);
+    assert.equal(readProbeCount(countFile), 1);
+  });
+});
+
+test('OpenCode resolve-time attest does not hash the ryk binary', async () => {
+  const src = await readFile(join(pluginRoot, 'src/index.ts'), 'utf8');
+  assert.doesNotMatch(src, /createHash\s*\(/);
+  assert.doesNotMatch(src, /sha256/i);
+  assert.doesNotMatch(src, /readFileSync\s*\(/);
+});
+
 test('findRyk resolves ryk.exe on a Windows-style PATH', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'ryk-opencode-plugin-'));
   const rykBin = join(directory, 'ryk.exe');
@@ -1747,9 +1920,9 @@ test('parseHookResponse unknown decision blocks on blocking path', () => {
   assert.equal(r.reason, 'ryk_unrecognized_decision');
 });
 
-test('parseHookResponse keeps ask on blocking path for permission.ask UX', () => {
+test('parseHookResponse unexpected ask is fail-closed deny', () => {
   const r = parseHookResponse(JSON.stringify({ decision: 'ask', message: 'need approval' }), true);
-  assert.equal(r.decision, 'ask');
+  assert.equal(r.decision, 'block');
 });
 
 test('shell.env scrubs secret-looking variables', async () => {

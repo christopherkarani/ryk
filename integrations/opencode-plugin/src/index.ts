@@ -115,11 +115,27 @@ type PluginHooks = {
   ) => Promise<void>;
 };
 
-/** Decisions that may pass through on a blocking path (ask kept for permission.ask UX). */
-const ALLOW_DECISIONS = new Set(['allow', 'warn', 'context_only', 'ask']);
+/** Decisions that may pass through on a blocking path. Unexpected `ask` is deny. */
+const ALLOW_DECISIONS = new Set(['allow', 'warn', 'context_only']);
 
 /** Decisions that do not veto tool.execute.before after parsing. */
 const BLOCKING_PASS_THROUGH = new Set(['allow', 'warn', 'context_only']);
+
+function envFlagTruthy(raw: string | undefined): boolean {
+  if (!raw) return false;
+  const value = raw.trim().toLowerCase();
+  return value === '1' || value === 'true' || value === 'yes' || value === 'on';
+}
+
+/** Shared unattended keys. Leftover unused policy ask is rewritten by ryk hook. */
+function isUnattendedEnv(env: NodeJS.ProcessEnv = process.env): boolean {
+  return (
+    envFlagTruthy(env.RYK_UNATTENDED) ||
+    envFlagTruthy(env.RYK_CI) ||
+    envFlagTruthy(env.RYK_NONINTERACTIVE) ||
+    envFlagTruthy(env.CI)
+  );
+}
 
 const SECRET_KEYS = [
   'password', 'token', 'secret', 'api_key', 'apikey', 'api_secret',
@@ -433,19 +449,81 @@ function wellKnownRykBins(platform: NodeJS.Platform): string[] {
   return out;
 }
 
+type StickyIdentity = {
+  dev: number;
+  ino: number;
+  size: number;
+  mtimeMs: number;
+  mtimeNs?: bigint;
+};
+
+/** Process-local skip of `version --json` after a successful resolve-time attest.
+ * Path / workspace checks still run every call. Not TOCTOU-safe. Residual:
+ * same-size metadata-preserving swap. Failures are never cached. */
+const stickyAttestCache = new Map<string, StickyIdentity>();
+
+function statIdentity(stat: {
+  dev: number;
+  ino: number;
+  size: number;
+  mtimeMs: number;
+  mtimeNs?: bigint;
+}): StickyIdentity {
+  return {
+    dev: stat.dev,
+    ino: stat.ino,
+    size: stat.size,
+    mtimeMs: stat.mtimeMs,
+    mtimeNs: typeof stat.mtimeNs === 'bigint' ? stat.mtimeNs : undefined,
+  };
+}
+
+function identityMatches(cached: StickyIdentity, stat: {
+  dev: number;
+  ino: number;
+  size: number;
+  mtimeMs: number;
+  mtimeNs?: bigint;
+}): boolean {
+  if (cached.dev !== stat.dev || cached.ino !== stat.ino || cached.size !== stat.size) {
+    return false;
+  }
+  if (typeof cached.mtimeNs === 'bigint' && typeof stat.mtimeNs === 'bigint') {
+    return cached.mtimeNs === stat.mtimeNs;
+  }
+  return cached.mtimeMs === stat.mtimeMs;
+}
+
+/** RYK_BIN pins and workspace override always re-run `version --json`. */
+function forceFullIdentityProbe(): boolean {
+  return process.env.RYK_ALLOW_WORKSPACE_BIN === '1' ||
+    Boolean(process.env.RYK_BIN?.trim());
+}
+
 function attestRykCandidate(path: string, cwd?: string): boolean {
   if (!existsSync(path) || isWorkspaceCandidate(path, cwd)) return false;
   try {
-    if (!statSync(path).isFile()) return false;
+    const stat = statSync(path);
+    if (!stat.isFile()) return false;
+    const canonical = canonicalPath(path);
+    const fullProbe = forceFullIdentityProbe();
+    if (!fullProbe) {
+      const cached = stickyAttestCache.get(canonical);
+      if (cached && identityMatches(cached, stat)) return true;
+    }
     const output = execFileSync(path, ['version', '--json'], {
       encoding: 'utf-8',
       timeout: 3000,
       stdio: ['ignore', 'pipe', 'ignore'],
     }).trim();
     const identity = JSON.parse(output) as { product?: unknown; version?: unknown };
-    return identity.product === 'ryk' &&
+    const ok = identity.product === 'ryk' &&
       typeof identity.version === 'string' &&
       RYK_VERSION_RE.test(identity.version);
+    if (ok && !fullProbe) {
+      stickyAttestCache.set(canonical, statIdentity(stat));
+    }
+    return ok;
   } catch {
     return false;
   }
@@ -476,7 +554,9 @@ function callRyk(
 
   try {
     // argv array — no shell interpolation of rykBin or event
-    const stdout = execFileSync(rykBin, ['hook', 'opencode', event], {
+    const hookArgs = ['hook', 'opencode', event];
+    if (isUnattendedEnv()) hookArgs.push('--ci');
+    const stdout = execFileSync(rykBin, hookArgs, {
       input: payloadJson,
       encoding: 'utf-8',
       timeout: blocking ? 15000 : 10000,
@@ -744,7 +824,10 @@ async function applyBlockingDecision(
     return;
   }
 
-  // block, ask, error, unrecognized → veto tool execution
+  // Leftover unused policy ask is rewritten by ryk hook before emit.
+  // A leaked `ask` is unexpected: fail-closed deny.
+
+  // block, unexpected ask, error, unrecognized → veto tool execution
   await hardBlockWithToast(
     ctx,
     formatShortBlock(response, context),
@@ -756,11 +839,11 @@ async function applyBlockingDecision(
 const PERMISSION_STATUS: Record<string, PermissionAskOutput['status']> = {
   block: 'deny',
   error: 'deny',
-  ask: 'ask',
+  ask: 'deny',
   allow: 'allow',
   context_only: 'allow',
-  // Keep host permission UI for advisory outcomes (do not auto-allow).
-  warn: 'ask',
+  // Advisory: proceed. No host ask UI.
+  warn: 'allow',
 };
 
 function applyPermissionDecision(response: RykResponse, output: PermissionAskOutput): void {
@@ -964,7 +1047,6 @@ async function rykPlugin(ctx: PluginContext): Promise<PluginHooks> {
     'permission.ask': async (input, output) => {
       const sessionId = sessionIdFromRecord(input);
       const response = callRyk(rykBin, 'permission.asked', input, sessionId, true);
-      // Host already presents permission UI: map via table (ask stays ask for resume).
       applyPermissionDecision(response, output);
       if (output.status === 'deny') {
         // Best-effort error toast; operator detail only when RYK_OPENCODE_VERBOSE=1.
@@ -975,12 +1057,12 @@ async function rykPlugin(ctx: PluginContext): Promise<PluginHooks> {
           'ryk blocked',
           formatShortBlock(response, 'permission')
         );
-      } else if (response.decision === 'warn' || response.decision === 'ask') {
+      } else if (response.decision === 'warn') {
         await maybeToast(
           ctx,
           'warning',
-          'ryk approval',
-          response.message || response.reason || 'needs your approval'
+          'ryk warning',
+          response.message || response.reason || 'advisory policy note'
         );
       }
     },

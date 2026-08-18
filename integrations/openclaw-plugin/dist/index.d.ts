@@ -95,6 +95,7 @@ export declare function findRyk(cwd?: string, platform?: NodeJS.Platform): strin
 export declare function isUntrustedCandidate(path: string, cwd?: string, allowWorkspaceOverride?: boolean): boolean;
 /** Validate the installer-generated path-bound checksum receipt. */
 export declare function installerProvenanceValid(binaryPath: string, receiptPath?: string): boolean;
+export declare function attestRykCandidate(path: string, cwd?: string, platform?: NodeJS.Platform, allowWorkspaceOverride?: boolean): boolean;
 /** Normalize OpenClaw tool events into the envelope ryk hook understands. */
 export declare function normalizeOpenClawToolEvent(event: unknown): Record<string, unknown>;
 /** Extract the stable OpenClaw session identity used for ryk audit correlation. */
@@ -102,10 +103,10 @@ export declare function openClawSessionId(ctx: unknown): string | undefined;
 /**
  * Parse ryk hook stdout into a decision.
  * Non-blocking: soft-allow on empty/malformed.
- * Blocking: fail closed on empty/whitespace, parse errors, missing/non-string decision,
- * `ask`, and unrecognized decisions. Approval is deliberately not translated
- * into a host-native request until a live, versioned OpenClaw approval contract
- * is available; an unknown host must never receive an unenforced ask.
+ * Blocking: fail closed on empty/whitespace, parse errors, missing/non-string
+ * decision, unexpected `ask`, and unrecognized decisions. Leftover unused
+ * policy ask is rewritten by `ryk hook` before emit. Approval is not translated
+ * into a host-native request.
  */
 export declare function parseHookResponse(stdout: string, blocking: boolean, options?: {
     unattended?: boolean;

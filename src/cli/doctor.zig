@@ -22,6 +22,7 @@ const host_status = @import("host_status.zig");
 const pack_state = @import("pack_state.zig");
 const readiness = @import("readiness.zig");
 const ensure = @import("ensure.zig");
+const brand = @import("brand.zig");
 const policy_migrate = @import("policy_migrate.zig");
 const deadlock_check = @import("deadlock_check.zig");
 const enable_tui = @import("build_options").enable_tui;
@@ -202,6 +203,9 @@ pub fn command(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: an
     // (D25: 0 iff core_ok). No hard-dep on daemon ensure_running (D41).
     // Default / --check / --json remain diagnose or probe-only (D42).
     if (options.fix) {
+        try writeNonProductFixWarning(io, allocator, stderr);
+        const pi_before = host_status.inspectPi(io, allocator);
+        const grok_before = host_status.inspectGrok(io, allocator);
         var outcome = try ensure.runEnsure(
             io,
             allocator,
@@ -221,6 +225,7 @@ pub fn command(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: an
         if (outcome.protection_label == .partial or outcome.protection_label == .core_failed) {
             try ensure.writeEnsureReceipt(stdout, outcome);
         }
+        try writeBakeRepairNotes(stdout, pi_before, host_status.inspectPi(io, allocator), grok_before, host_status.inspectGrok(io, allocator));
         return ensure.processExitForOutcome(outcome);
     }
 
@@ -286,7 +291,7 @@ fn writeCheckReceipt(stdout: anytype, assessment: readiness.Assessment, context:
         return;
     }
     try stdout.print("not ready · {s}\n", .{receipt});
-    if (context.daemon_health != .compatible) {
+    if (!context.daemon_health.evaluationReady() and context.daemon_binary_exists) {
         try stdout.writeAll("Next: ryk doctor --fix\n");
     } else if (!context.policy_present) {
         try stdout.writeAll("Next: ryk doctor --fix\n");
@@ -380,7 +385,7 @@ fn runDoctorTui(
     }
 
     const next: doctor_tui.NextStepFacts = .{
-        .daemon_health_compatible = context.daemon_health == .compatible,
+        .daemon_health_compatible = context.daemon_health.evaluationReady(),
         .daemon_detail = redacted_daemon_detail,
         .daemon_binary_untrusted = context.daemon_binary_untrusted,
         .daemon_binary_exists = context.daemon_binary_exists,
@@ -557,6 +562,7 @@ fn countCapabilitySummary(os: core.platform.Os, backend_report: sandbox.backend.
 fn daemonStatusSummary(status: onboarding.DaemonHealthStatus) []const u8 {
     return switch (status) {
         .compatible => "daemon compatible",
+        .in_process => "engine in-process",
         .unavailable => "daemon unavailable",
         .incompatible => "daemon incompatible",
         .degraded => "daemon degraded",
@@ -711,12 +717,15 @@ fn writeReportRaw(io: std.Io, stdout: anytype, os: core.platform.Os, backend_rep
         });
     }
 
+    try writeHookServerLine(io, context.allocator, stdout);
+
     if (!verbose) {
         try writeDefaultPanels(io, stdout, os, backend_report, context, policy_status, counts);
         try writeMcpSetupReport(io, stdout, context);
         try writeHostStatusTable(io, stdout, context);
         try writePacksSection(io, stdout, context);
         try writeHermesFailOpenWarning(io, stdout, context);
+        try writeBrokenEvaluatorWarning(io, stdout, context);
         try writePiNote(stdout);
         try writePolicyFreshnessNotices(stdout, context);
         try writeRecommendations(stdout, context);
@@ -730,6 +739,7 @@ fn writeReportRaw(io: std.Io, stdout: anytype, os: core.platform.Os, backend_rep
     try writeHostStatusTable(io, stdout, context);
     try writePacksSection(io, stdout, context);
     try writeHermesFailOpenWarning(io, stdout, context);
+    try writeBrokenEvaluatorWarning(io, stdout, context);
     try writePiNote(stdout);
     try stdout.print("Secret boundary: {s}\n\n", .{secretBoundaryCapability(backend_report)});
     try stdout.writeAll("Capabilities:\n");
@@ -853,6 +863,20 @@ fn writePolicyFreshnessNotices(stdout: anytype, context: IntegrationContext) !vo
     try stdout.writeByte('\n');
 }
 
+fn writeHookServerLine(io: std.Io, allocator: std.mem.Allocator, stdout: anytype) !void {
+    if (comptime builtin.os.tag == .windows) {
+        try stdout.writeAll("hook server: unavailable on Windows; hooks stay in-process\n\n");
+        return;
+    }
+    const path = cli.hook_client.socketPathForDoctor(io, allocator) catch {
+        try stdout.writeAll("hook server: not running\n\n");
+        return;
+    };
+    defer allocator.free(path);
+    const status = if (cli.hook_client.socketIsLive(path)) "running" else "not running";
+    try stdout.print("hook server: {s}\n  socket: {s}\n\n", .{ status, path });
+}
+
 fn writeDefaultPanels(
     io: std.Io,
     stdout: anytype,
@@ -866,7 +890,10 @@ fn writeDefaultPanels(
     const health_lines = [_][]const u8{
         try std.fmt.bufPrint(&health_storage[0], "Platform       {s}", .{os.toString()}),
         try std.fmt.bufPrint(&health_storage[1], "Policy         {s}", .{policy_status}),
-        try std.fmt.bufPrint(&health_storage[2], "Daemon         {s}", .{daemonStatusSummary(context.daemon_health)}),
+        if (context.daemon_health == .in_process)
+            try std.fmt.bufPrint(&health_storage[2], "Engine         in-process", .{})
+        else
+            try std.fmt.bufPrint(&health_storage[2], "Daemon         {s}", .{daemonStatusSummary(context.daemon_health)}),
         try std.fmt.bufPrint(&health_storage[3], "Capabilities   {d} active · {d} limited", .{ counts.active, counts.limited }),
         try std.fmt.bufPrint(&health_storage[4], "Unavailable    {d}", .{counts.unavailable}),
         try std.fmt.bufPrint(&health_storage[5], "Secret boundary {s}", .{secretBoundaryCapability(backend_report)}),
@@ -953,9 +980,13 @@ fn writeMcpSetupReport(io: std.Io, stdout: anytype, context: IntegrationContext)
     try stdout.writeByte('\n');
 }
 
+const last_session_audit_degraded_needle = "\"type\":\"audit_degraded\"";
+const last_session_audit_scan_chunk_len = 4096;
+
 /// P1-1: true when the most recent session recorded an `audit_degraded` event
 /// (shim execs ran without in-shim audit evidence). Best-effort: any read
 /// failure reports as not degraded — doctor must not fail on missing evidence.
+/// Stream-scans events.jsonl (capped at max_audit_log_len); does not allocate the file.
 fn lastSessionAuditDegraded(io: std.Io, allocator: std.mem.Allocator, workspace_root: []const u8) bool {
     const last_path = std.fs.path.join(allocator, &.{ workspace_root, ".ryk", "last" }) catch return false;
     defer allocator.free(last_path);
@@ -965,9 +996,41 @@ fn lastSessionAuditDegraded(io: std.Io, allocator: std.mem.Allocator, workspace_
     if (session_id.len == 0) return false;
     const events_path = std.fs.path.join(allocator, &.{ workspace_root, ".ryk", "sessions", session_id, "events.jsonl" }) catch return false;
     defer allocator.free(events_path);
-    const events = std.Io.Dir.cwd().readFileAlloc(io, events_path, allocator, .limited(core.limits.max_audit_log_len)) catch return false;
-    defer allocator.free(events);
-    return std.mem.indexOf(u8, events, "\"type\":\"audit_degraded\"") != null;
+
+    const file = std.Io.Dir.cwd().openFile(io, events_path, .{}) catch return false;
+    defer file.close(io);
+
+    const needle = last_session_audit_degraded_needle;
+    const overlap = needle.len - 1;
+    var buf: [last_session_audit_scan_chunk_len]u8 = undefined;
+    var carry: usize = 0;
+    var scanned: usize = 0;
+
+    while (scanned < core.limits.max_audit_log_len) {
+        const room = buf.len - carry;
+        const remaining = core.limits.max_audit_log_len - scanned;
+        const want = @min(room, remaining);
+        if (want == 0) break;
+
+        const dest = buf[carry..][0..want];
+        const n = file.readStreaming(io, &.{dest}) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return false,
+        };
+        if (n == 0) break;
+
+        const view_len = carry + n;
+        if (std.mem.indexOf(u8, buf[0..view_len], needle) != null) return true;
+
+        scanned += n;
+        if (view_len <= overlap) {
+            carry = view_len;
+        } else {
+            @memmove(buf[0..overlap], buf[view_len - overlap .. view_len]);
+            carry = overlap;
+        }
+    }
+    return false;
 }
 
 fn writeIntegrationReport(io: std.Io, stdout: anytype, context: IntegrationContext) !void {
@@ -1163,7 +1226,52 @@ fn writeHermesFailOpenWarning(io: std.Io, stdout: anytype, context: IntegrationC
 
 fn writePiNote(stdout: anytype) !void {
     try stdout.writeAll("\nPi: bundled extension setup is managed by `ryk doctor --fix` (no npm step).\n");
-    try stdout.writeAll("  Process env/network isolation: ryk run -- pi · verify: ryk doctor\n");
+    try stdout.writeAll("  Process env/network isolation: ryk run -- pi (doctor is a probe, not live attach)\n");
+}
+
+fn writeBrokenEvaluatorWarning(io: std.Io, stdout: anytype, context: IntegrationContext) !void {
+    var any = false;
+    for (context.host_rows) |row| {
+        if (std.mem.eql(u8, row.wired, "broken")) {
+            any = true;
+            break;
+        }
+    }
+    if (!any) return;
+    try stdout.writeAll("\n");
+    try tui.render.callout(
+        io,
+        stdout,
+        .danger,
+        "Hook is a test program, not ryk",
+        "Pi or Grok is calling a Zig test binary (or another non-product file) instead of ryk. Every tool fail-closes. Run `ryk doctor --fix` from a normal terminal using the installed ryk binary, then restart the host.",
+    );
+}
+
+fn writeNonProductFixWarning(io: std.Io, allocator: std.mem.Allocator, stderr: anytype) !void {
+    const exe = std.process.executablePathAlloc(io, allocator) catch return;
+    defer allocator.free(exe);
+    const kind = brand.classifyEvaluator(exe);
+    if (kind.isProduct()) return;
+    try stderr.print(
+        "ryk doctor --fix: this process is a {s} ({s}), not product ryk. Host hooks were not rewritten. Run `ryk doctor --fix` from a normal terminal using the installed ryk binary.\n",
+        .{ kind.diagnoseLabel(), std.fs.path.basename(exe) },
+    );
+}
+
+fn writeBakeRepairNotes(
+    stdout: anytype,
+    pi_before: host_status.PiStatus,
+    pi_after: host_status.PiStatus,
+    grok_before: host_status.GrokStatus,
+    grok_after: host_status.GrokStatus,
+) !void {
+    if (host_status.bakeRepairLine("pi", pi_before.evaluator_ok, pi_after.evaluator_ok, pi_after.extension_installed)) |line| {
+        try stdout.print("{s}\n", .{line});
+    }
+    if (host_status.bakeRepairLine("grok", grok_before.evaluator_ok, grok_after.evaluator_ok, grok_after.hook_installed)) |line| {
+        try stdout.print("{s}\n", .{line});
+    }
 }
 
 fn writePacksSection(io: std.Io, stdout: anytype, context: IntegrationContext) !void {
@@ -1191,17 +1299,19 @@ fn hermesFailOpenFromEnv() bool {
     return host_status.hermesFailOpenFromEnv();
 }
 
+fn companionNeedsRemediation(context: IntegrationContext) bool {
+    // Missing companion is CLI-only / first-run, not a broken install.
+    return !context.daemon_health.evaluationReady() and context.daemon_binary_exists;
+}
+
 fn writeRecommendations(stdout: anytype, context: IntegrationContext) !void {
     try stdout.writeAll("\nRecommended next step:\n");
-    if (context.daemon_health != .compatible) {
+    if (companionNeedsRemediation(context)) {
         try writeDynamicLine(context.allocator, stdout, "  Daemon health issue: ", context.daemon_detail, "\n");
         if (context.daemon_binary_untrusted) {
             try stdout.writeAll("  Remove the untrusted legacy companion override, then re-run `ryk doctor`.\n");
-        } else if (context.daemon_binary_exists and !context.daemon_binary_executable) {
+        } else if (!context.daemon_binary_executable) {
             try stdout.writeAll("  Restore companion-service execute permission or reinstall ryk, then re-run `ryk doctor`.\n");
-        } else if (!context.daemon_binary_exists) {
-            try stdout.writeAll("  Reinstall the complete ryk release, then re-run `ryk doctor`.\n");
-            try stdout.writeAll("  Source checkout: `./scripts/zig build`.\n");
         } else {
             try stdout.writeAll("  Reinstall ryk or rebuild with `./scripts/build-all.sh`, then re-run `ryk doctor`.\n");
         }
@@ -1265,8 +1375,22 @@ fn collectIntegrationContextAt(io: std.Io, allocator: std.mem.Allocator, workspa
     defer if (daemon_paths) |value| cli.daemon.freeRuntimePaths(allocator, value);
     // Shared onboarding health path (same as status/quickstart). Probe paths pass
     // ensure_running=false so --check never mutates daemon runtime.
+    // CLI-only: missing companion is the in-process Zig shell_engine, not a broken install.
+    const binary_missing = if (daemon_inspection) |value| !value.exists else true;
     const daemon_health: DaemonHealth = blk: {
+        if (binary_missing) {
+            break :blk .{
+                .status = .in_process,
+                .detail = try allocator.dupe(u8, onboarding.in_process_engine_detail),
+            };
+        }
         const check = onboarding.checkDaemonHealth(allocator, ensure_running, null) catch |err| {
+            if (err == error.DaemonBinaryNotFound) {
+                break :blk .{
+                    .status = .in_process,
+                    .detail = try allocator.dupe(u8, onboarding.in_process_engine_detail),
+                };
+            }
             break :blk try daemonDetailFromError(allocator, err);
         };
         break :blk .{
@@ -1360,22 +1484,36 @@ fn collectHostDoctorRows(io: std.Io, allocator: std.mem.Allocator) !HostDoctorSn
 
     for (host_status.managed_hosts) |host_name| {
         const installed = plugin.hostPluginInstalledFromReport(host_name, doctor_report);
-        const detected = plugin.binaryInPath(io, allocator, host_name);
+        const detected = plugin.hostBinaryDetectedFromReport(host_name, doctor_report);
         if (std.mem.eql(u8, host_name, "hermes") and installed) hermes_installed = true;
 
         const wired: []const u8 = if (installed) "yes" else if (detected) "no" else "—";
         const shell_gate = host_status.shellGate(host_name);
         const fail_stance = host_status.failStance(host_name, hermes_fail_open, wired);
         const smoke = host_status.HostSmokePair{};
+        // #367: locals + errdefer before append; multi-dupe struct literal leaks on mid-row OOM.
+        const host_owned = try allocator.dupe(u8, host_name);
+        errdefer allocator.free(host_owned);
+        const wired_owned = try allocator.dupe(u8, wired);
+        errdefer allocator.free(wired_owned);
+        const shell_gate_owned = try allocator.dupe(u8, shell_gate);
+        errdefer allocator.free(shell_gate_owned);
+        const fail_stance_owned = try allocator.dupe(u8, fail_stance);
+        errdefer allocator.free(fail_stance_owned);
+        const smoke_allow_owned = try allocator.dupe(u8, smoke.allow.toString());
+        errdefer allocator.free(smoke_allow_owned);
+        const smoke_deny_owned = try allocator.dupe(u8, smoke.deny.toString());
+        errdefer allocator.free(smoke_deny_owned);
         const fix = try host_status.formatFix(allocator, host_name, wired, smoke, hermes_fail_open);
+        errdefer allocator.free(fix);
 
         try list.append(allocator, .{
-            .host = try allocator.dupe(u8, host_name),
-            .wired = try allocator.dupe(u8, wired),
-            .shell_gate = try allocator.dupe(u8, shell_gate),
-            .fail_stance = try allocator.dupe(u8, fail_stance),
-            .smoke_allow = try allocator.dupe(u8, smoke.allow.toString()),
-            .smoke_deny = try allocator.dupe(u8, smoke.deny.toString()),
+            .host = host_owned,
+            .wired = wired_owned,
+            .shell_gate = shell_gate_owned,
+            .fail_stance = fail_stance_owned,
+            .smoke_allow = smoke_allow_owned,
+            .smoke_deny = smoke_deny_owned,
             .fix = fix,
         });
     }
@@ -1385,14 +1523,57 @@ fn collectHostDoctorRows(io: std.Io, allocator: std.mem.Allocator) !HostDoctorSn
         const pi_status = host_status.inspectPi(io, allocator);
         const wired = pi_status.wiredLabel();
         const smoke = host_status.HostSmokePair{};
+        const host_owned = try allocator.dupe(u8, "pi");
+        errdefer allocator.free(host_owned);
+        const wired_owned = try allocator.dupe(u8, wired);
+        errdefer allocator.free(wired_owned);
+        const shell_gate_owned = try allocator.dupe(u8, host_status.shellGate("pi"));
+        errdefer allocator.free(shell_gate_owned);
+        const fail_stance_owned = try allocator.dupe(u8, host_status.failStance("pi", hermes_fail_open, wired));
+        errdefer allocator.free(fail_stance_owned);
+        const smoke_allow_owned = try allocator.dupe(u8, smoke.allow.toString());
+        errdefer allocator.free(smoke_allow_owned);
+        const smoke_deny_owned = try allocator.dupe(u8, smoke.deny.toString());
+        errdefer allocator.free(smoke_deny_owned);
         const fix = try host_status.formatFix(allocator, "pi", wired, smoke, hermes_fail_open);
+        errdefer allocator.free(fix);
         try list.append(allocator, .{
-            .host = try allocator.dupe(u8, "pi"),
-            .wired = try allocator.dupe(u8, wired),
-            .shell_gate = try allocator.dupe(u8, host_status.shellGate("pi")),
-            .fail_stance = try allocator.dupe(u8, host_status.failStance("pi", hermes_fail_open, wired)),
-            .smoke_allow = try allocator.dupe(u8, smoke.allow.toString()),
-            .smoke_deny = try allocator.dupe(u8, smoke.deny.toString()),
+            .host = host_owned,
+            .wired = wired_owned,
+            .shell_gate = shell_gate_owned,
+            .fail_stance = fail_stance_owned,
+            .smoke_allow = smoke_allow_owned,
+            .smoke_deny = smoke_deny_owned,
+            .fix = fix,
+        });
+    }
+
+    // Grok: native PreToolUse Command Guard (not marketplace-plugin-managed).
+    {
+        const grok_status = host_status.inspectGrok(io, allocator);
+        const wired = grok_status.wiredLabel();
+        const smoke = host_status.HostSmokePair{};
+        const host_owned = try allocator.dupe(u8, "grok");
+        errdefer allocator.free(host_owned);
+        const wired_owned = try allocator.dupe(u8, wired);
+        errdefer allocator.free(wired_owned);
+        const shell_gate_owned = try allocator.dupe(u8, host_status.shellGate("grok"));
+        errdefer allocator.free(shell_gate_owned);
+        const fail_stance_owned = try allocator.dupe(u8, host_status.failStance("grok", hermes_fail_open, wired));
+        errdefer allocator.free(fail_stance_owned);
+        const smoke_allow_owned = try allocator.dupe(u8, smoke.allow.toString());
+        errdefer allocator.free(smoke_allow_owned);
+        const smoke_deny_owned = try allocator.dupe(u8, smoke.deny.toString());
+        errdefer allocator.free(smoke_deny_owned);
+        const fix = try host_status.formatFix(allocator, "grok", wired, smoke, hermes_fail_open);
+        errdefer allocator.free(fix);
+        try list.append(allocator, .{
+            .host = host_owned,
+            .wired = wired_owned,
+            .shell_gate = shell_gate_owned,
+            .fail_stance = fail_stance_owned,
+            .smoke_allow = smoke_allow_owned,
+            .smoke_deny = smoke_deny_owned,
             .fix = fix,
         });
     }
@@ -1731,6 +1912,7 @@ test "doctor renders a compact summary from an injected context" {
 
     const output = stdout_writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, output, "Summary:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "hook server:") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "active") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Recommended next step:") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Capabilities:") == null);
@@ -1874,6 +2056,44 @@ test "doctor summary includes daemon availability" {
     try std.testing.expect(std.mem.indexOf(u8, written, "no running daemon answered on the expected socket") != null);
 }
 
+test "doctor summary names in-process engine when companion is not required" {
+    var stdout_buf: [32768]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    const report = sandbox.backend.detect(.linux);
+    var context = try testContext(std.testing.allocator, .{
+        .daemon_binary_exists = false,
+        .daemon_health = .in_process,
+        .daemon_detail = onboarding.in_process_engine_detail,
+    });
+    defer context.deinit();
+
+    try writeReport(std.testing.io, &stdout_writer, .linux, report, context, false);
+    const written = stdout_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "engine in-process") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "Engine         in-process") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "daemon unavailable") == null);
+}
+
+test "doctor recommendations skip reinstall when companion binary is missing" {
+    var stdout_buf: [32768]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    const report = sandbox.backend.detect(.linux);
+    var context = try testContext(std.testing.allocator, .{
+        .daemon_binary_exists = false,
+        .daemon_health = .unavailable,
+        .daemon_detail = "The ryk companion service was not found.",
+    });
+    defer context.deinit();
+
+    try writeReport(std.testing.io, &stdout_writer, .linux, report, context, false);
+    const written = stdout_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "Reinstall the complete ryk release") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "The ryk companion service was not found.") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "install is incomplete") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "Daemon health issue:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "ryk redteam --ci") != null);
+}
+
 test "doctor integration report includes daemon health details" {
     var stdout_buf: [32768]u8 = undefined;
     var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
@@ -1952,6 +2172,26 @@ test "doctor packs section stays known when daemon is unavailable" {
     try std.testing.expect(std.mem.indexOf(u8, written, "shell evaluation fails closed") == null);
 }
 
+test "collectHostDoctorRows reuses plugin report host_binaries without binaryInPath" {
+    // #448: default host-row collect must use the plugin-report PATH snapshot.
+    // Managed hosts must not re-walk PATH via plugin.binaryInPath / binaryInPath(.
+    const src = @embedFile("doctor.zig");
+    const start = std.mem.indexOf(u8, src, "fn collectHostDoctorRows(") orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    const after = src[start..];
+    const end_rel = std.mem.indexOf(u8, after[1..], "\nfn ") orelse after.len - 1;
+    const fn_src = after[0 .. 1 + end_rel];
+
+    try std.testing.expect(std.mem.indexOf(u8, fn_src, "hostBinaryDetectedFromReport") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fn_src, "hostPluginInstalledFromReport") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fn_src, "collectPluginDoctorReportWithHermesSmoke") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fn_src, "inspectPi") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fn_src, "inspectGrok") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fn_src, "binaryInPath") == null);
+}
+
 test "doctor host table lists managed hosts and shell gates" {
     var stdout_buf: [16384]u8 = undefined;
     var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
@@ -1969,6 +2209,7 @@ test "doctor host table lists managed hosts and shell gates" {
     try std.testing.expect(std.mem.indexOf(u8, written, "hermes") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "pre_tool_call") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "pi") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "grok") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "extension-managed (smoke not run)") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "SMOKE ALLOW") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "SMOKE DENY") != null);
@@ -1980,6 +2221,23 @@ test "doctor host table lists managed hosts and shell gates" {
     try std.testing.expect(std.mem.indexOf(u8, written, "ryk doctor --fix") != null);
     // Forbidden start-onboard needle must not appear in rendered host table / Pi note.
     try std.testing.expect(std.mem.indexOf(u8, written, "ryk" ++ " start") == null);
+}
+
+test "doctor names a test-program host bake and teaches doctor --fix" {
+    var stdout_buf: [16384]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    const report = sandbox.backend.detect(.linux);
+    var context = try testContext(std.testing.allocator, .{ .broken_evaluator_host = "pi" });
+    defer context.deinit();
+
+    try writeReport(std.testing.io, &stdout_writer, .linux, report, context, false);
+    const written = stdout_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "broken") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "Hook is a test program, not ryk") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "ryk doctor --fix") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "test/non-product") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "OS-enforced") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "evaluator not product ryk") != null);
 }
 
 test "doctor warns when Hermes is explicitly fail-open" {
@@ -2616,7 +2874,7 @@ test "doctorFix --fix command path invokes ensure mutation door" {
     // Acceptance (2): --fix early-branches to ensure. Contrast with probe-only:
     // under empty tmpDir, doctor --fix must create-if-missing .ryk/policy.yaml
     // (ensure core). Host wire may soft-fail under zig-test binary; policy create is
-    // the greppable ensure side effect. RED until production wires the fix door.
+    // the greppable ensure side effect.
     const io = std.testing.io;
     const allocator = std.testing.allocator;
 
@@ -2859,6 +3117,8 @@ test "MessageMigrate doctor production teaches doctor --fix repair door" {
     const window_end = @min(prod.len, pi_idx + 200);
     const pi_window = prod[pi_idx..window_end];
     try std.testing.expect(std.mem.indexOf(u8, pi_window, "doctor --fix") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pi_window, "probe") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pi_window, "verify: ryk doctor") == null);
     try std.testing.expect(std.mem.indexOf(u8, pi_window, messageMigrateForbiddenStartNeedle()) == null);
 }
 
@@ -2966,10 +3226,23 @@ const TestContextOptions = struct {
     daemon_detail: []const u8 = "running daemon answered with a compatible handshake.",
     hermes_fail_open: bool = true,
     hermes_installed: bool = false,
+    /// When set, that host row is marked wired=broken (test-program bake).
+    broken_evaluator_host: ?[]const u8 = null,
 };
 
 fn testContext(allocator: std.mem.Allocator, options: TestContextOptions) !IntegrationContext {
     const host_rows = try testHostRows(allocator);
+    if (options.broken_evaluator_host) |host| {
+        for (host_rows) |*row| {
+            if (!std.mem.eql(u8, row.host, host)) continue;
+            allocator.free(row.wired);
+            row.wired = try allocator.dupe(u8, "broken");
+            allocator.free(row.fail_stance);
+            row.fail_stance = try allocator.dupe(u8, host_status.failStance(host, options.hermes_fail_open, "broken"));
+            allocator.free(row.fix);
+            row.fix = try host_status.formatFix(allocator, host, "broken", .{}, options.hermes_fail_open);
+        }
+    }
     return .{
         .allocator = allocator,
         .workspace_root = try allocator.dupe(u8, "."),
@@ -3009,6 +3282,7 @@ fn testHostRows(allocator: std.mem.Allocator) ![]HostDoctorRow {
         .{ .name = "openclaw", .gate = "tool.before", .stance = "fail-closed shell" },
         .{ .name = "hermes", .gate = "pre_tool_call", .stance = "fail-closed" },
         .{ .name = "pi", .gate = "extension-managed (smoke not run)", .stance = "mode-dependent" },
+        .{ .name = "grok", .gate = "PreToolUse", .stance = "fail-closed shell" },
     };
     var list: std.ArrayList(HostDoctorRow) = .empty;
     errdefer {
@@ -3029,14 +3303,28 @@ fn testHostRows(allocator: std.mem.Allocator) ![]HostDoctorRow {
     const hermes_fail_open = true;
     for (hosts) |h| {
         const wired = "—";
+        // #368: same locals+errdefer ownership as production collectHostDoctorRows.
+        const host_owned = try allocator.dupe(u8, h.name);
+        errdefer allocator.free(host_owned);
+        const wired_owned = try allocator.dupe(u8, wired);
+        errdefer allocator.free(wired_owned);
+        const shell_gate_owned = try allocator.dupe(u8, h.gate);
+        errdefer allocator.free(shell_gate_owned);
+        const fail_stance_owned = try allocator.dupe(u8, h.stance);
+        errdefer allocator.free(fail_stance_owned);
+        const smoke_allow_owned = try allocator.dupe(u8, "not-run");
+        errdefer allocator.free(smoke_allow_owned);
+        const smoke_deny_owned = try allocator.dupe(u8, "not-run");
+        errdefer allocator.free(smoke_deny_owned);
         const fix = try host_status.formatFix(allocator, h.name, wired, smoke, hermes_fail_open);
+        errdefer allocator.free(fix);
         try list.append(allocator, .{
-            .host = try allocator.dupe(u8, h.name),
-            .wired = try allocator.dupe(u8, wired),
-            .shell_gate = try allocator.dupe(u8, h.gate),
-            .fail_stance = try allocator.dupe(u8, h.stance),
-            .smoke_allow = try allocator.dupe(u8, "not-run"),
-            .smoke_deny = try allocator.dupe(u8, "not-run"),
+            .host = host_owned,
+            .wired = wired_owned,
+            .shell_gate = shell_gate_owned,
+            .fail_stance = fail_stance_owned,
+            .smoke_allow = smoke_allow_owned,
+            .smoke_deny = smoke_deny_owned,
             .fix = fix,
         });
     }
@@ -3070,4 +3358,73 @@ test "lastSessionAuditDegraded detects audit_degraded in the pointed-at session"
         .data = "{\"type\":\"session_start\"}\n{\"type\":\"command_allowed\"}\n",
     });
     try std.testing.expect(!lastSessionAuditDegraded(io, allocator, root));
+}
+
+test "lastSessionAuditDegraded is false for empty last pointer or missing events" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+
+    try tmp.dir.createDirPath(io, ".ryk");
+    try tmp.dir.writeFile(io, .{ .sub_path = ".ryk/last", .data = "" });
+    try std.testing.expect(!lastSessionAuditDegraded(io, allocator, root));
+
+    try tmp.dir.writeFile(io, .{ .sub_path = ".ryk/last", .data = "   \n\t" });
+    try std.testing.expect(!lastSessionAuditDegraded(io, allocator, root));
+
+    try tmp.dir.createDirPath(io, ".ryk/sessions/sess-no-events");
+    try tmp.dir.writeFile(io, .{ .sub_path = ".ryk/last", .data = "sess-no-events\n" });
+    try std.testing.expect(!lastSessionAuditDegraded(io, allocator, root));
+}
+
+test "lastSessionAuditDegraded finds audit_degraded past the stream window" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(allocator);
+    const pad_line = "{\"type\":\"session_start\"}\n";
+    while (payload.items.len < 12 * 1024) {
+        try payload.appendSlice(allocator, pad_line);
+    }
+    try payload.appendSlice(allocator, "{\"type\":\"audit_degraded\"}\n");
+
+    try tmp.dir.createDirPath(io, ".ryk/sessions/sess-late");
+    try tmp.dir.writeFile(io, .{ .sub_path = ".ryk/last", .data = "sess-late\n" });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = ".ryk/sessions/sess-late/events.jsonl",
+        .data = payload.items,
+    });
+    try std.testing.expect(lastSessionAuditDegraded(io, allocator, root));
+}
+
+test "lastSessionAuditDegraded finds audit_degraded split across a stream chunk" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+
+    const needle = last_session_audit_degraded_needle;
+    const prefix_len = last_session_audit_scan_chunk_len - (needle.len / 2);
+    const payload = try allocator.alloc(u8, prefix_len + needle.len);
+    defer allocator.free(payload);
+    @memset(payload[0..prefix_len], '.');
+    @memcpy(payload[prefix_len..], needle);
+
+    try tmp.dir.createDirPath(io, ".ryk/sessions/sess-split");
+    try tmp.dir.writeFile(io, .{ .sub_path = ".ryk/last", .data = "sess-split\n" });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = ".ryk/sessions/sess-split/events.jsonl",
+        .data = payload,
+    });
+    try std.testing.expect(lastSessionAuditDegraded(io, allocator, root));
 }

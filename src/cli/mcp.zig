@@ -634,16 +634,20 @@ fn trust(argv: []const []const u8, stdout: anytype, stderr: anytype) !u8 {
     defer allocator.free(safe_server);
     const safe_tool = try audit.redact_bridge.redactAlloc(allocator, tool);
     defer allocator.free(safe_tool);
+    // #293: nonzero exit + pointer to edit policy.yaml (stdout stays the snippet).
     try stdout.print(
         \\Direct policy mutation is not implemented for this command.
-        \\Add this snippet to your policy after reviewing the server manifest:
+        \\Add this snippet to .ryk/policy.yaml after reviewing the server manifest:
         \\
         \\mcp:
         \\  allow:
         \\    - "{s}.{s}"
         \\
     , .{ safe_server, safe_tool });
-    return exit_codes.success;
+    try stderr.writeAll(
+        "ryk mcp trust: does not mutate policy; copy the snippet above into .ryk/policy.yaml.\n",
+    );
+    return exit_codes.general;
 }
 
 fn manifestCommand(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: anytype) !u8 {
@@ -1437,8 +1441,10 @@ test "mcp manifest check list trust and generate commands are safe" {
     stdout_writer = .fixed(&stdout_buf);
     stderr_writer = .fixed(&stderr_buf);
     const trust_code = try command(std.testing.io, &.{ "trust", "github", "--tool", "search_issues" }, &stdout_writer, &stderr_writer);
-    try std.testing.expectEqual(exit_codes.success, trust_code);
+    // #293: trust prints a snippet but does not mutate policy — nonzero exit.
+    try std.testing.expectEqual(exit_codes.general, trust_code);
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "\"github.search_issues\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "does not mutate policy") != null);
 
     stdout_writer = .fixed(&stdout_buf);
     stderr_writer = .fixed(&stderr_buf);

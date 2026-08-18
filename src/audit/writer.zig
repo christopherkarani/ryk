@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 const core = @import("../core/public.zig");
 const hash_chain = @import("hash_chain.zig");
@@ -40,7 +41,7 @@ pub const SessionWriter = struct {
         const events_file = try std.Io.Dir.cwd().createFile(io, events_path, .{ .read = true, .exclusive = true });
         errdefer events_file.close(io);
 
-        return .{
+        var writer: SessionWriter = .{
             .io = io,
             .allocator = allocator,
             .workspace_root = session.workspace_root,
@@ -49,6 +50,9 @@ pub const SessionWriter = struct {
             .session_dir_path = session_dir_path,
             .events_file = events_file,
         };
+        // Fail closed: a session that cannot publish `.ryk/last` at start is not usable.
+        try writer.writeLastPointer();
+        return writer;
     }
 
     pub fn openExisting(io: std.Io, allocator: std.mem.Allocator, workspace_root: []const u8, session_id_text: []const u8) !SessionWriter {
@@ -125,7 +129,9 @@ pub const SessionWriter = struct {
         try file_writer.seekTo(write_offset);
         try file_writer.interface.writeAll(line);
         try file_writer.interface.flush();
-        try self.events_file.sync(self.io);
+        // Durability is required per event (hash-chain evidence). Prefer
+        // fdatasync so we flush file data without a full metadata fsync (#394).
+        try syncEventsDurable(self);
 
         self.previous_hash = hash;
         self.event_count += 1;
@@ -194,6 +200,20 @@ fn safeAuditDirName(value: []const u8) bool {
         for (part) |byte| if (byte < 0x20 or byte == 0x7f) return false;
     }
     return true;
+}
+
+/// Flush event bytes to stable storage. Data-only sync is enough for the
+/// hash-chain payload; fall back to full `File.sync` when fdatasync is
+/// unavailable or fails. Do not drop this call — appends are evidence.
+fn syncEventsDurable(self: *SessionWriter) !void {
+    switch (builtin.os.tag) {
+        .linux, .macos, .freebsd, .netbsd, .openbsd, .dragonfly => {
+            std.posix.fdatasync(self.events_file.handle) catch {
+                try self.events_file.sync(self.io);
+            };
+        },
+        else => try self.events_file.sync(self.io),
+    }
 }
 
 const ExistingState = struct {
@@ -652,6 +672,69 @@ test "session writer preserves interleaved parent and shim appends" {
     var tamper = try replay.verifySessionDir(std.testing.io, std.testing.allocator, resumed.session_dir_path);
     defer tamper.deinit(std.testing.allocator);
     try std.testing.expect(!tamper.ok);
+}
+
+test "session writer writes last pointer at init so replay last resolves" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const ts = core.time.Timestamp.fromUnixSeconds(1_777_983_130);
+    const session: core.session.Session = .{
+        .id = try core.session.generateSessionId(ts),
+        .started_at = ts,
+        .command = "echo",
+        .args = &.{"hello"},
+        .workspace_root = root,
+        .mode = .observe,
+        .platform = core.platform.detectOs(),
+    };
+
+    var session_writer = try SessionWriter.init(std.testing.io, std.testing.allocator, session);
+    defer session_writer.deinit();
+
+    const last_text = tmp.dir.readFileAlloc(std.testing.io, ".ryk/last", std.testing.allocator, .limited(128)) catch "";
+    defer if (last_text.len != 0) std.testing.allocator.free(last_text);
+    try std.testing.expectEqualStrings(session.id.slice(), std.mem.trim(u8, last_text, " \t\r\n"));
+
+    var loaded = replay.load(std.testing.io, std.testing.allocator, root, .{ .session = "last" }) catch {
+        try std.testing.expect(false);
+        return;
+    };
+    defer loaded.deinit();
+    try std.testing.expectEqualStrings(session.id.slice(), loaded.session_id);
+}
+
+test "session writer writeLastPointer at end keeps the same replay session id" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const ts = core.time.Timestamp.fromUnixSeconds(1_777_983_130);
+    const session: core.session.Session = .{
+        .id = try core.session.generateSessionId(ts),
+        .started_at = ts,
+        .command = "echo",
+        .args = &.{"hello"},
+        .workspace_root = root,
+        .mode = .observe,
+        .platform = core.platform.detectOs(),
+    };
+
+    var session_writer = try SessionWriter.init(std.testing.io, std.testing.allocator, session);
+    defer session_writer.deinit();
+
+    const first_last = tmp.dir.readFileAlloc(std.testing.io, ".ryk/last", std.testing.allocator, .limited(128)) catch "";
+    defer if (first_last.len != 0) std.testing.allocator.free(first_last);
+    try std.testing.expectEqualStrings(session.id.slice(), std.mem.trim(u8, first_last, " \t\r\n"));
+
+    try session_writer.writeLastPointer();
+
+    const second_last = try tmp.dir.readFileAlloc(std.testing.io, ".ryk/last", std.testing.allocator, .limited(128));
+    defer std.testing.allocator.free(second_last);
+    try std.testing.expectEqualStrings(session.id.slice(), std.mem.trim(u8, second_last, " \t\r\n"));
 }
 
 fn testEvent(

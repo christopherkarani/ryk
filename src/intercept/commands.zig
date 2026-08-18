@@ -209,8 +209,9 @@ pub fn evaluate(
     // protected workspace write roots. Shell commands do not carry a typed
     // file-write action, so enforce the same control-directory boundary here.
     if (protectedCommandWritePath(argv)) |path| {
+        const next = try protectedCommandWriteEvaluation(allocator, effective_mode, path);
         evaluation.deinit(allocator);
-        evaluation = try protectedCommandWriteEvaluation(allocator, effective_mode, path);
+        evaluation = next;
     }
 
     const classification = classifyArgv(argv);
@@ -348,7 +349,25 @@ pub fn createShimDirectory(
             try writePosixShim(io, allocator, shim_dir, name, ryk_executable);
         }
     }
+    try verifyRequiredShims(io, shim_dir);
     return shim_dir;
+}
+
+/// Fail closed if a required PATH shim is missing on disk.
+/// Required set is every name in `shim_names` (includes git, rm, curl, sh).
+pub fn verifyRequiredShims(io: std.Io, shim_dir: []const u8) !void {
+    inline for (shim_names) |name| {
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = shimOnDiskPath(&path_buf, shim_dir, name) catch return error.RequiredShimMissing;
+        std.Io.Dir.cwd().access(io, path, .{}) catch return error.RequiredShimMissing;
+    }
+}
+
+fn shimOnDiskPath(buf: []u8, shim_dir: []const u8, name: []const u8) ![]u8 {
+    if (builtin.os.tag == .windows) {
+        return std.fmt.bufPrint(buf, "{s}{c}{s}.cmd", .{ shim_dir, std.fs.path.sep, name });
+    }
+    return std.fmt.bufPrint(buf, "{s}{c}{s}", .{ shim_dir, std.fs.path.sep, name });
 }
 
 pub fn prependShimPath(allocator: std.mem.Allocator, env_map: *std.process.Environ.Map, shim_dir: []const u8) !void {
@@ -606,7 +625,6 @@ fn isAbsoluteOrExplicitPath(command_name: []const u8) bool {
 
 fn resolveCandidateInDir(io: std.Io, allocator: std.mem.Allocator, dir: []const u8, command_name: []const u8, shim_dir: []const u8) !?[]u8 {
     const direct = try std.fs.path.join(allocator, &.{ dir, command_name });
-    errdefer allocator.free(direct);
     if (isExecutable(io, direct) and !isWithinDir(direct, shim_dir)) return direct;
     allocator.free(direct);
 
@@ -616,7 +634,6 @@ fn resolveCandidateInDir(io: std.Io, allocator: std.mem.Allocator, dir: []const 
         const candidate_name = try std.fmt.allocPrint(allocator, "{s}{s}", .{ command_name, extension });
         defer allocator.free(candidate_name);
         const candidate = try std.fs.path.join(allocator, &.{ dir, candidate_name });
-        errdefer allocator.free(candidate);
         if (isExecutable(io, candidate) and !isWithinDir(candidate, shim_dir)) return candidate;
         allocator.free(candidate);
     }
@@ -1236,15 +1253,25 @@ fn tokenizeShellLike(allocator: std.mem.Allocator, command_text: []const u8) !To
         }
         if (std.ascii.isWhitespace(char) or char == '|' or char == ';') {
             if (current.items.len > 0) {
-                try tokens.append(allocator, try current.toOwnedSlice(allocator));
+                const tok = try current.toOwnedSlice(allocator);
+                errdefer allocator.free(tok);
+                try tokens.append(allocator, tok);
                 current = .empty;
             }
-            if (char == '|') try tokens.append(allocator, try allocator.dupe(u8, "|"));
+            if (char == '|') {
+                const pipe = try allocator.dupe(u8, "|");
+                errdefer allocator.free(pipe);
+                try tokens.append(allocator, pipe);
+            }
             continue;
         }
         try current.append(allocator, char);
     }
-    if (current.items.len > 0) try tokens.append(allocator, try current.toOwnedSlice(allocator));
+    if (current.items.len > 0) {
+        const tok = try current.toOwnedSlice(allocator);
+        errdefer allocator.free(tok);
+        try tokens.append(allocator, tok);
+    }
     return .{ .allocator = allocator, .items = try tokens.toOwnedSlice(allocator) };
 }
 
@@ -1514,6 +1541,54 @@ test "shim list covers high-risk PATH filesystem tools" {
     }
 }
 
+test "shim_names keeps git and excludes cat find sudo" {
+    var has_git = false;
+    inline for (shim_names) |name| {
+        if (std.mem.eql(u8, name, "git")) has_git = true;
+        try std.testing.expect(!std.mem.eql(u8, name, "cat"));
+        try std.testing.expect(!std.mem.eql(u8, name, "find"));
+        try std.testing.expect(!std.mem.eql(u8, name, "sudo"));
+    }
+    try std.testing.expect(has_git);
+}
+
+test "shim directory includes git wrapper with posix shim exec" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+
+    const shim_dir = try createShimDirectory(std.testing.io, std.testing.allocator, root, "git-shim-test", "/usr/bin/true");
+    defer std.testing.allocator.free(shim_dir);
+
+    const shim_path = try std.fs.path.join(std.testing.allocator, &.{ shim_dir, "git" });
+    defer std.testing.allocator.free(shim_path);
+    try std.Io.Dir.cwd().access(std.testing.io, shim_path, .{});
+    const script = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, shim_path, std.testing.allocator, .limited(1024));
+    defer std.testing.allocator.free(script);
+    try std.testing.expect(std.mem.indexOf(u8, script, "shim exec -- \"git\"") != null);
+}
+
+test "verifyRequiredShims fail-closed when required git shim is missing" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+
+    const shim_dir = try createShimDirectory(std.testing.io, std.testing.allocator, root, "missing-git-shim-test", "/usr/bin/true");
+    defer std.testing.allocator.free(shim_dir);
+
+    const git_path = try std.fs.path.join(std.testing.allocator, &.{ shim_dir, "git" });
+    defer std.testing.allocator.free(git_path);
+    try std.Io.Dir.cwd().deleteFile(std.testing.io, git_path);
+
+    try std.testing.expectError(error.RequiredShimMissing, verifyRequiredShims(std.testing.io, shim_dir));
+}
+
 test "shim directory includes sh bash and zsh wrappers" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
 
@@ -1663,4 +1738,33 @@ test "approval hashes are bounded and consumable without raw command persistence
 
     try consumeOnceApproval(std.testing.allocator, &env_map, command);
     try std.testing.expect(!approvalEnvMatches(&env_map, command));
+}
+
+fn tokenizeShellLikeOomProbe(allocator: std.mem.Allocator) !void {
+    var tokens = try tokenizeShellLike(allocator, "echo hello | cat | wc");
+    tokens.deinit();
+}
+
+fn protectedPathReplaceOomProbe(allocator: std.mem.Allocator, selected: *const policy.schema.Policy) !void {
+    var decision = try evaluate(allocator, selected, .ask, &.{ "mkdir", ".ryk/x" });
+    decision.deinit(allocator);
+}
+
+test "tokenizeShellLike OOM ownership does not leak tokens" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, tokenizeShellLikeOomProbe, .{});
+}
+
+test "evaluate protected-path replacement OOM does not double-free" {
+    var selected = try policy.load.parseFromSlice(std.testing.allocator,
+        \\version: 1
+        \\mode: ask
+        \\commands:
+        \\  default: allow
+    , "allow-all.yaml");
+    defer selected.deinit();
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        protectedPathReplaceOomProbe,
+        .{&selected},
+    );
 }

@@ -83,6 +83,7 @@ pub const StartFlags = struct {
 
 pub const DaemonHealthStatus = enum {
     compatible,
+    in_process,
     unavailable,
     incompatible,
     degraded,
@@ -90,12 +91,21 @@ pub const DaemonHealthStatus = enum {
     pub fn label(self: DaemonHealthStatus) []const u8 {
         return switch (self) {
             .compatible => "healthy",
+            .in_process => "in-process",
             .unavailable => "unavailable",
             .incompatible => "incompatible",
             .degraded => "degraded",
         };
     }
+
+    /// Companion healthy, or CLI-only in-process Zig shell_engine (no companion required).
+    pub fn evaluationReady(self: DaemonHealthStatus) bool {
+        return self == .compatible or self == .in_process;
+    }
 };
+
+/// Doctor / start copy when command evaluation is the in-process engine.
+pub const in_process_engine_detail = "Command evaluation uses the in-process Zig shell_engine; companion is not required.";
 
 pub const DaemonCheck = struct {
     status: DaemonHealthStatus,
@@ -281,17 +291,19 @@ pub fn collectHostStatuses(io: std.Io, allocator: std.mem.Allocator, doctor_repo
     errdefer list.deinit(allocator);
 
     for (supported_hosts) |host_name| {
-        // Pi uses extension inspection; grok uses PATH + settings hook evidence;
-        // remaining day-one hosts use PATH + plugin report.
+        // Pi/Grok leftover glue is inspect-backed so a zig/other bake still
+        // counts when the host CLI is off PATH. Other day-one hosts use PATH.
         // Cursor (W3 writer pending): binary detect ok; never claim wired without a writer.
         const detected = if (std.mem.eql(u8, host_name, "pi"))
-            @import("host_status.zig").inspectPi(io, allocator).binary_detected
+            @import("host_status.zig").inspectPi(io, allocator).detected()
+        else if (std.mem.eql(u8, host_name, "grok"))
+            @import("host_status.zig").inspectGrok(io, allocator).detected()
         else
             plugin.binaryInPath(io, allocator, host_name);
         const installed = if (std.mem.eql(u8, host_name, "pi"))
             @import("host_status.zig").inspectPi(io, allocator).extension_installed
         else if (std.mem.eql(u8, host_name, "grok"))
-            @import("grok_install.zig").installed(io, allocator)
+            @import("host_status.zig").inspectGrok(io, allocator).hook_installed
         else if (std.mem.eql(u8, host_name, "cursor"))
             // Fail-closed until W3 Cursor writer: detect-only, never mark installed.
             false
@@ -307,6 +319,12 @@ pub fn collectHostStatuses(io: std.Io, allocator: std.mem.Allocator, doctor_repo
     return try list.toOwnedSlice(allocator);
 }
 
+fn appendOwnedCopy(allocator: std.mem.Allocator, list: *std.ArrayList([]const u8), bytes: []const u8) !void {
+    const owned = try allocator.dupe(u8, bytes);
+    errdefer allocator.free(owned);
+    try list.append(allocator, owned);
+}
+
 pub fn parseHostsCsv(allocator: std.mem.Allocator, csv: []const u8) ![][]const u8 {
     var list: std.ArrayList([]const u8) = .empty;
     errdefer {
@@ -319,7 +337,7 @@ pub fn parseHostsCsv(allocator: std.mem.Allocator, csv: []const u8) ![][]const u
         const trimmed = std.mem.trim(u8, token, " \t");
         if (trimmed.len == 0) continue;
         if (!isSupportedHost(trimmed)) return error.UnsupportedHost;
-        try list.append(allocator, try allocator.dupe(u8, trimmed));
+        try appendOwnedCopy(allocator, &list, trimmed);
     }
 
     return try list.toOwnedSlice(allocator);
@@ -333,6 +351,7 @@ pub fn deinitHostList(allocator: std.mem.Allocator, hosts: [][]const u8) void {
 pub fn daemonRemediation(status: DaemonHealthStatus) []const u8 {
     return switch (status) {
         .compatible => "Daemon is ready.",
+        .in_process => "Shell evaluation uses the CLI binary (no companion daemon).",
         .unavailable => "Install the ryk background service, then run: ryk doctor",
         .incompatible => "Upgrade ryk and its background service together, then run: ryk doctor",
         .degraded => "Restart the background service: ryk shutdown --daemon && ryk doctor",
@@ -696,6 +715,27 @@ test "onboarding parseHostsCsv validates supported hosts" {
     try std.testing.expectError(error.UnsupportedHost, parseHostsCsv(allocator, "unknown-host-xyz"));
 }
 
+fn hostsListOomParseHostsCsvProbe(allocator: std.mem.Allocator) !void {
+    // Multi-host fixture so a later append can fail after an earlier dupe.
+    const hosts = try parseHostsCsv(allocator, "codex,hermes");
+    defer deinitHostList(allocator, hosts);
+    try std.testing.expectEqual(@as(usize, 2), hosts.len);
+    try std.testing.expectEqualStrings("codex", hosts[0]);
+    try std.testing.expectEqualStrings("hermes", hosts[1]);
+}
+
+test "HostsListOom parseHostsCsv OOM ownership" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        hostsListOomParseHostsCsvProbe,
+        .{},
+    );
+
+    try std.testing.expectError(error.UnsupportedHost, parseHostsCsv(std.testing.allocator, "unknown-host-xyz"));
+    // Mid-list reject must still be UnsupportedHost (errdefer frees the prior dupe).
+    try std.testing.expectError(error.UnsupportedHost, parseHostsCsv(std.testing.allocator, "codex,unknown-host-xyz"));
+}
+
 pub fn mockOnboardingEvaluator(allocator: std.mem.Allocator, shell_event: shell_eval.ShellCommandEvent) daemon.DaemonError!std.json.Parsed(daemon.DaemonResponse) {
     if (std.mem.indexOf(u8, shell_event.command, "rm -rf") != null) {
         return shell_eval.mockDaemonDenyEvaluator(allocator, shell_event);
@@ -718,6 +758,14 @@ test "onboarding host evidence distinguishes installed chain from native proof" 
     try std.testing.expectEqual(HostEvidence.wrapper_required, classifyHostEvidence(&.{ "codex", "openclaw" }));
     try std.testing.expectEqual(HostEvidence.not_applicable, classifyHostEvidence(&.{"cursor"}));
     try std.testing.expectEqual(HostEvidence.installed_fail_closed, classifyHostEvidence(&.{ "cursor", "codex" }));
+}
+
+test "onboarding in-process engine is evaluation-ready without a companion" {
+    try std.testing.expectEqualStrings("in-process", DaemonHealthStatus.in_process.label());
+    try std.testing.expect(DaemonHealthStatus.in_process.evaluationReady());
+    try std.testing.expect(DaemonHealthStatus.compatible.evaluationReady());
+    try std.testing.expect(!DaemonHealthStatus.unavailable.evaluationReady());
+    try std.testing.expect(std.mem.indexOf(u8, daemonRemediation(.in_process), "no companion daemon") != null);
 }
 
 test "onboarding checkDaemonHealth reports unavailable from mock checker" {
@@ -938,6 +986,68 @@ test "DayOneHost collectHostStatuses iterates only day-one membership set" {
     for (supported_hosts, 0..) |want, i| {
         try std.testing.expectEqualStrings(want, statuses[i].name);
     }
+}
+
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+
+fn dayOneHostDupEnvZ(name: [*:0]const u8) !?[:0]u8 {
+    if (std.c.getenv(name)) |value| {
+        return try std.testing.allocator.dupeZ(u8, std.mem.span(value));
+    }
+    return null;
+}
+
+fn dayOneHostRestoreEnv(name: [*:0]const u8, prev: ?[:0]u8) void {
+    if (prev) |value| {
+        _ = setenv(name, value.ptr, 1);
+        std.testing.allocator.free(value);
+    } else {
+        _ = unsetenv(name);
+    }
+}
+
+test "DayOneHost leftover zig Grok hook is detected off PATH" {
+    // Leftover-repair predicate must match inspectGrok (hook_installed), not
+    // grok_install.installed() / isRykGrokHookCommand — a zig bake is broken
+    // even when `grok` is missing from PATH.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "empty-bin");
+    try tmp.dir.createDirPath(std.testing.io, "home/.grok/hooks");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "home/.grok/hooks/ryk.json",
+        .data =
+        \\{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"/Users/me/.local/zig/zig-aarch64-macos/zig hook grok PreToolUse","timeout":30}]}]}}
+        \\
+        ,
+    });
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, "home", std.testing.allocator);
+    defer std.testing.allocator.free(home);
+    const empty_bin = try tmp.dir.realPathFileAlloc(std.testing.io, "empty-bin", std.testing.allocator);
+    defer std.testing.allocator.free(empty_bin);
+    const home_z = try std.testing.allocator.dupeZ(u8, home);
+    defer std.testing.allocator.free(home_z);
+    const path_z = try std.testing.allocator.dupeZ(u8, empty_bin);
+    defer std.testing.allocator.free(path_z);
+
+    const prev_home = try dayOneHostDupEnvZ("HOME");
+    defer dayOneHostRestoreEnv("HOME", prev_home);
+    const prev_path = try dayOneHostDupEnvZ("PATH");
+    defer dayOneHostRestoreEnv("PATH", prev_path);
+    try std.testing.expectEqual(@as(c_int, 0), setenv("HOME", home_z.ptr, 1));
+    try std.testing.expectEqual(@as(c_int, 0), setenv("PATH", path_z.ptr, 1));
+
+    const statuses = try collectHostStatuses(std.testing.io, std.testing.allocator, dayOneHostEmptyPluginReport());
+    defer std.testing.allocator.free(statuses);
+    const grok = blk: {
+        for (statuses) |st| {
+            if (std.mem.eql(u8, st.name, "grok")) break :blk st;
+        }
+        return error.TestUnexpectedResult;
+    };
+    try std.testing.expect(grok.detected);
+    try std.testing.expect(grok.installed);
 }
 
 test "DayOneHost ensure HostWireTable membership keys onboarding isSupportedHost (F2)" {

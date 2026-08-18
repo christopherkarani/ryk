@@ -177,6 +177,35 @@ test "phase2510 daemon unavailable and incompatible feed statuses" {
     try std.testing.expectEqualStrings("incompatible", metadata.daemon_status.?);
 }
 
+test "historical JSONL secrets are absent from status json" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+
+    const path = try feed_writer.feedPath(std.testing.allocator, root);
+    defer std.testing.allocator.free(path);
+    const parent = std.fs.path.dirname(path).?;
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, parent);
+
+    const leak = "ghp_fakeSyntheticTokenValue1234567890";
+    const line = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"timestamp\":\"2026-07-13T00:00:00Z\",\"workspace_root\":\"{s}\",\"event_type\":\"command_denied\",\"decision\":\"deny\",\"decision_source\":\"rust-daemon\",\"event_source\":\"hook\",\"host\":\"codex\",\"daemon_status\":\"healthy\",\"pack_id\":\"core.shell\",\"severity\":\"high\",\"reason\":\"blocked {s}\",\"remediation\":null,\"target_summary\":\"shell command (redacted)\",\"session_id\":\"{s}\",\"verified\":false}}\n",
+        .{ root, leak, leak },
+    );
+    defer std.testing.allocator.free(line);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = line });
+
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    try dashboard.writeStatusJson(std.testing.io, std.testing.allocator, &aw.writer, root);
+    var out = aw.toArrayList();
+    defer out.deinit(std.testing.allocator);
+
+    try std.testing.expect(std.mem.indexOf(u8, out.items, leak) == null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"session_id\":\"redacted\"") != null);
+}
+
 test "phase2510 status json exposes daemon health and shell feed" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

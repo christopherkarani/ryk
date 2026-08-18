@@ -17,26 +17,11 @@ const core_api = @import("ryk_core").api;
 const ryk_policy = @import("ryk_core").policy;
 const decide = @import("decide.zig");
 const shell_engine = @import("../shell_engine/mod.zig");
+const deadlock_corpus = @import("deadlock_corpus.zig");
 
-pub const corpus_jsonl = @embedFile("deadlock_replay_corpus.jsonl");
-
-pub const Expect = enum {
-    allow,
-    deny,
-
-    fn parse(value: []const u8) ?Expect {
-        if (std.mem.eql(u8, value, "allow")) return .allow;
-        if (std.mem.eql(u8, value, "deny")) return .deny;
-        return null;
-    }
-};
-
-pub const Step = struct {
-    command: []const u8,
-    expect: Expect,
-    /// Why this step is in the corpus (transcript provenance).
-    note: []const u8,
-};
+pub const corpus_jsonl = deadlock_corpus.jsonl;
+pub const Expect = deadlock_corpus.Expect;
+pub const Step = deadlock_corpus.Step;
 
 pub const StepOutcome = struct {
     step: Step,
@@ -89,35 +74,6 @@ pub const Report = struct {
     }
 };
 
-/// Parse one corpus line. Slices borrow from `line`, which borrows from the
-/// embedded corpus, so no allocation and no ownership to track.
-fn parseLine(allocator: std.mem.Allocator, line: []const u8) !?Step {
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch return null;
-    defer parsed.deinit();
-    if (parsed.value != .object) return null;
-    const obj = parsed.value.object;
-
-    const command_value = obj.get("command") orelse return null;
-    const expect_value = obj.get("expect") orelse return null;
-    if (command_value != .string or expect_value != .string) return null;
-    const expect = Expect.parse(expect_value.string) orelse return null;
-
-    // Re-slice into the source line so the returned Step outlives `parsed`.
-    const command = std.mem.indexOf(u8, line, command_value.string) orelse return null;
-    const note: []const u8 = blk: {
-        const note_value = obj.get("note") orelse break :blk "";
-        if (note_value != .string) break :blk "";
-        const at = std.mem.indexOf(u8, line, note_value.string) orelse break :blk "";
-        break :blk line[at .. at + note_value.string.len];
-    };
-
-    return .{
-        .command = line[command .. command + command_value.string.len],
-        .expect = expect,
-        .note = note,
-    };
-}
-
 /// Decide one step exactly as the decide surface would: YAML policy evaluation
 /// merged with the shell pack fence via the shared precedence resolver. Any
 /// evaluation failure is reported as `block` (fail closed), which shows up as a
@@ -144,21 +100,19 @@ fn stepDecision(
 
 /// Evaluate the whole workflow against `policy`.
 pub fn run(allocator: std.mem.Allocator, policy: *const ryk_policy.schema.Policy) !Report {
+    const steps = try deadlock_corpus.parsedSteps();
+
     var outcomes: std.ArrayList(StepOutcome) = .empty;
     errdefer outcomes.deinit(allocator);
+    try outcomes.ensureTotalCapacity(allocator, steps.len);
 
-    var it = std.mem.splitScalar(u8, corpus_jsonl, '\n');
-    while (it.next()) |raw| {
-        const line = std.mem.trim(u8, raw, " \t\r");
-        if (line.len == 0) continue;
-        const step = (try parseLine(allocator, line)) orelse return error.UnparsedCorpus;
-        try outcomes.append(allocator, .{
+    for (steps) |step| {
+        outcomes.appendAssumeCapacity(.{
             .step = step,
             .actual = stepDecision(allocator, policy, step.command),
         });
     }
 
-    if (outcomes.items.len == 0) return error.EmptyCorpus;
     return .{ .outcomes = try outcomes.toOwnedSlice(allocator) };
 }
 
@@ -229,15 +183,15 @@ pub fn writeReport(
 // Tests
 // ---------------------------------------------------------------------------
 
+test {
+    _ = deadlock_corpus;
+}
+
 test "corpus parses and covers both expectations" {
-    const allocator = std.testing.allocator;
+    const steps = try deadlock_corpus.parsedSteps();
     var allow_steps: usize = 0;
     var deny_steps: usize = 0;
-    var it = std.mem.splitScalar(u8, corpus_jsonl, '\n');
-    while (it.next()) |raw| {
-        const line = std.mem.trim(u8, raw, " \t\r");
-        if (line.len == 0) continue;
-        const step = (try parseLine(allocator, line)) orelse return error.TestCorpusLineUnparsed;
+    for (steps) |step| {
         try std.testing.expect(step.command.len > 0);
         switch (step.expect) {
             .allow => allow_steps += 1,

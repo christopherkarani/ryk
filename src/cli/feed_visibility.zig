@@ -564,14 +564,14 @@ pub fn writeFeedRecordJson(writer: anytype, record: RustShellFeedRecord) !void {
     try writer.writeByte(',');
     try writeJsonField(writer, "target_summary", record.target_summary);
     try writer.writeByte(',');
-    // session_id is a path key. High-entropy / JWT classification would collapse
-    // legitimate host ids. Gate structured tokens here so append-time JSONL
-    // cannot persist a raw `ghp_` / `sk-` host id.
-    const session_id = if (record.session_id) |sid|
-        if (redact_bridge.containsStructuredSecret(sid)) "redacted" else sid
-    else
-        null;
-    try writeJsonStringFieldNullable(writer, "session_id", session_id);
+    // session_id is a path key. Do not run redactStringBounded (high-entropy /
+    // JWT would collapse Codex rollout stems and UUID v4s).
+    try writer.writeAll("\"session_id\":");
+    if (record.session_id) |sid| {
+        try core.util.writeJsonString(writer, redact_bridge.pathSafeSessionId(sid));
+    } else {
+        try writer.writeAll("null");
+    }
     try writer.writeAll(",\"verified\":");
     try writer.writeAll(if (record.verified) "true" else "false");
     try writer.writeByte('}');
@@ -592,17 +592,6 @@ fn writeJsonFieldNullable(writer: anytype, field: []const u8, value: ?[]const u8
     if (value) |text| {
         var redacted_buf: [512]u8 = undefined;
         try core.util.writeJsonString(writer, core_api.redactStringBounded(text, &redacted_buf));
-    } else {
-        try writer.writeAll("null");
-    }
-}
-
-fn writeJsonStringFieldNullable(writer: anytype, field: []const u8, value: ?[]const u8) !void {
-    try writer.writeAll("\"");
-    try writer.writeAll(field);
-    try writer.writeAll("\":");
-    if (value) |text| {
-        try core.util.writeJsonString(writer, text);
     } else {
         try writer.writeAll("null");
     }

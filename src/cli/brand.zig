@@ -37,6 +37,39 @@ pub fn isPrimaryInvocation(argv0_basename: []const u8) bool {
     return false;
 }
 
+/// What a baked hook/extension path is actually pointing at.
+pub const EvaluatorKind = enum {
+    product,
+    test_harness,
+    zig_compiler,
+    other,
+
+    pub fn isProduct(self: EvaluatorKind) bool {
+        return self == .product;
+    }
+
+    /// Short diagnose label. Never claims OS enforcement.
+    pub fn diagnoseLabel(self: EvaluatorKind) []const u8 {
+        return switch (self) {
+            .product => "product ryk",
+            .test_harness => "Zig test program",
+            .zig_compiler => "Zig compiler",
+            .other => "non-product binary",
+        };
+    }
+};
+
+/// Classify a baked evaluator path by basename (`ryk` / `test` / `zig` / other).
+pub fn classifyEvaluator(path: []const u8) EvaluatorKind {
+    const trimmed = std.mem.trim(u8, path, " \t\r\n");
+    if (trimmed.len == 0) return .other;
+    const base = std.fs.path.basename(trimmed);
+    if (isPrimaryInvocation(base)) return .product;
+    if (std.mem.eql(u8, base, "test") or std.mem.eql(u8, base, "test.exe")) return .test_harness;
+    if (std.mem.eql(u8, base, "zig") or std.mem.eql(u8, base, "zig.exe")) return .zig_compiler;
+    return .other;
+}
+
 /// Safety-boundary blurb for version metadata. Telemetry is intentionally
 /// separate from hosted policy, enforcement, and synchronization services.
 pub fn safetyBoundary() []const u8 {
@@ -77,4 +110,23 @@ test "brand safety boundary names ryk not retired brands" {
     try std.testing.expect(std.mem.indexOf(u8, safetyBoundary(), "ryk") != null);
     try std.testing.expect(std.mem.indexOf(u8, safetyBoundary(), retired_title) == null);
     try std.testing.expect(std.mem.indexOf(u8, safetyBoundary(), retired_cli) == null);
+}
+
+test "classifyEvaluator names product ryk vs Zig test program vs compiler" {
+    try std.testing.expectEqual(EvaluatorKind.product, classifyEvaluator("/Users/me/.local/bin/ryk"));
+    try std.testing.expectEqual(EvaluatorKind.product, classifyEvaluator("/opt/ryk/bin/ryk.exe"));
+    try std.testing.expectEqual(EvaluatorKind.test_harness, classifyEvaluator(
+        "/private/tmp/ryk-factory/.zig-cache/o/deadbeef/test",
+    ));
+    try std.testing.expectEqual(EvaluatorKind.test_harness, classifyEvaluator(
+        "/Users/me/CodingProjects/ryk/.zig-cache/o/abc/test",
+    ));
+    try std.testing.expectEqual(EvaluatorKind.zig_compiler, classifyEvaluator(
+        "/Users/me/.local/zig/zig-aarch64-macos-0.16.0/zig",
+    ));
+    try std.testing.expectEqual(EvaluatorKind.other, classifyEvaluator("/usr/bin/true"));
+    try std.testing.expectEqual(EvaluatorKind.other, classifyEvaluator(""));
+    try std.testing.expectEqualStrings("Zig test program", EvaluatorKind.test_harness.diagnoseLabel());
+    try std.testing.expect(!classifyEvaluator("/tmp/.zig-cache/o/x/test").isProduct());
+    try std.testing.expect(classifyEvaluator("/opt/ryk/bin/ryk").isProduct());
 }

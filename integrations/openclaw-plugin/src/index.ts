@@ -406,7 +406,56 @@ export function installerProvenanceValid(
   }
 }
 
-function attestRykCandidate(
+type ManagedAttestIdentity = {
+  dev: number;
+  ino: number;
+  size: number;
+  mtimeMs: number;
+  mtimeNs?: bigint;
+};
+
+/** In-process skip of hash + `version --json` after managed-provenance success. Not TOCTOU-safe. */
+const managedAttestCache = new Map<string, ManagedAttestIdentity>();
+
+function statIdentity(stat: {
+  dev: number;
+  ino: number;
+  size: number;
+  mtimeMs: number;
+  mtimeNs?: bigint;
+}): ManagedAttestIdentity {
+  return {
+    dev: stat.dev,
+    ino: stat.ino,
+    size: stat.size,
+    mtimeMs: stat.mtimeMs,
+    mtimeNs: typeof stat.mtimeNs === 'bigint' ? stat.mtimeNs : undefined,
+  };
+}
+
+function identityMatches(cached: ManagedAttestIdentity, stat: {
+  dev: number;
+  ino: number;
+  size: number;
+  mtimeMs: number;
+  mtimeNs?: bigint;
+}): boolean {
+  if (cached.dev !== stat.dev || cached.ino !== stat.ino || cached.size !== stat.size) {
+    return false;
+  }
+  if (typeof cached.mtimeNs === 'bigint' && typeof stat.mtimeNs === 'bigint') {
+    return cached.mtimeNs === stat.mtimeNs;
+  }
+  return cached.mtimeMs === stat.mtimeMs;
+}
+
+function forceExpensiveAttestProbe(allowWorkspaceOverride: boolean): boolean {
+  return allowWorkspaceOverride ||
+    process.env.RYK_ALLOW_WORKSPACE_BIN === '1' ||
+    Boolean(process.env.RYK_BIN?.trim());
+}
+
+export function attestRykCandidate(
   path: string,
   cwd?: string,
   platform: NodeJS.Platform = process.platform,
@@ -425,6 +474,11 @@ function attestRykCandidate(
     }
     const workspaceOverride = allowWorkspaceOverride &&
       isWithin(canonical, canonicalPath(cwd ?? process.cwd()));
+    const fullProbe = workspaceOverride || forceExpensiveAttestProbe(allowWorkspaceOverride);
+    if (!fullProbe) {
+      const cached = managedAttestCache.get(canonical);
+      if (cached && identityMatches(cached, stat)) return true;
+    }
     if (!workspaceOverride && !installerProvenanceValid(canonical)) return false;
     const output = execFileSync(canonical, ['version', '--json'], {
       encoding: 'utf-8',
@@ -432,9 +486,13 @@ function attestRykCandidate(
       stdio: ['ignore', 'pipe', 'ignore'],
     }).trim();
     const identity = JSON.parse(output) as { product?: unknown; version?: unknown };
-    return identity.product === 'ryk' &&
+    const ok = identity.product === 'ryk' &&
       typeof identity.version === 'string' &&
       RYK_VERSION_RE.test(identity.version);
+    if (ok && !fullProbe) {
+      managedAttestCache.set(canonical, statIdentity(stat));
+    }
+    return ok;
   } catch {
     return false;
   }
@@ -550,11 +608,13 @@ function normalizeBlockingDecision(
     };
   }
   if (decision === 'ask') {
+    // Leftover unused policy ask is rewritten by ryk hook before emit.
+    // A leaked `ask` here is unexpected: fail-closed deny.
     return failClosedBlock(
-      options.unattended ? 'ryk_unattended_ask' : 'ryk_ask_unsupported',
+      options.unattended ? 'ryk_unattended_ask' : 'ryk_unexpected_ask',
       options.unattended
         ? 'ryk requested approval, but this OpenClaw process is unattended; blocking without waiting.'
-        : 'ryk requested interactive approval (ask), but this OpenClaw integration has no verified resumable approval contract; blocking.',
+        : 'ryk returned an unexpected ask; blocking fail-closed.',
       base
     );
   }
@@ -581,10 +641,10 @@ function normalizeBlockingDecision(
 /**
  * Parse ryk hook stdout into a decision.
  * Non-blocking: soft-allow on empty/malformed.
- * Blocking: fail closed on empty/whitespace, parse errors, missing/non-string decision,
- * `ask`, and unrecognized decisions. Approval is deliberately not translated
- * into a host-native request until a live, versioned OpenClaw approval contract
- * is available; an unknown host must never receive an unenforced ask.
+ * Blocking: fail closed on empty/whitespace, parse errors, missing/non-string
+ * decision, unexpected `ask`, and unrecognized decisions. Leftover unused
+ * policy ask is rewritten by `ryk hook` before emit. Approval is not translated
+ * into a host-native request.
  */
 export function parseHookResponse(
   stdout: string,
@@ -687,9 +747,13 @@ async function callRyk(
   }
 
   try {
+    const hookArgs = ['hook', 'openclaw', event];
+    // Host extra `RYK_OPENCLAW_UNATTENDED` is not a Zig shared key — fold it
+    // into `--ci` so leftover unused policy ask hardens inside ryk.
+    if (options.unattended) hookArgs.push('--ci');
     const stdout = await runRykHookProcess(
       rykBin,
-      ['hook', 'openclaw', event],
+      hookArgs,
       payload.json,
       blocking ? 15000 : 10000,
       options.cwd

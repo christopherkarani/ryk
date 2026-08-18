@@ -104,7 +104,7 @@ pub const commands =
         },
         .{
             .name = "start",
-            .summary = "Guided setup: policy, hosts, and verification",
+            .summary = "Repair setup or wire optional host integrations",
             .usage = "ryk start [--auto|--yes|--no-interact] [--hosts <list>] [--preset <name>] [--skip-verify]",
             .category = .getting_started,
             .public = true,
@@ -114,15 +114,14 @@ pub const commands =
                 "ryk start --auto --hosts codex,claude",
             },
             .details = &.{
-                "Primary first-run onboarding — the only Safe Launch door.",
-                "Creates a policy if missing (coding DCG defaults via generic-agent: matrix-only strict, no ask main loop).",
+                "Repair an existing install or optionally wire hosts. Curl install already leaves ryk ready.",
+                "Creates a policy if missing.",
                 "Wires detected host integrations and verifies daemon/hook paths when available.",
-                "No protection-grade menu; the banner names the posture from the written policy YAML.",
                 "On interactive terminals, prompts only for host selection when hosts are detected.",
                 "On non-TTY terminals, auto-selects safe defaults (no --auto required).",
                 "Use --auto to force non-interactive mode on a TTY; optional --hosts and --preset.",
                 "Compatibility flags --yes and --no-interact also select non-interactive mode.",
-                "Next steps after start: ryk <agent> · ryk doctor · ryk replay.",
+                "After repair: ryk <agent> · ryk doctor · ryk replay.",
                 "Re-run safely to repair or update an existing setup.",
             },
         },
@@ -215,7 +214,7 @@ pub const commands =
                 "Use --json for a minimal readiness report (ready, state, policy.valid).",
                 "Use --tui for a four-pane deep-dive (Summary · Hosts · Capabilities · Next steps) on an interactive TTY; non-TTY / --json / --plain falls back to linear.",
                 "Next steps in --tui deep-link `ryk packs` and `ryk allowlist`.",
-                "Use --fix to repair protection (create policy if missing, auto-wire day-one hosts). Exit 0 when core policy is ok; host soft-fails stay partial.",
+                "Use --fix to repair protection (create policy if missing, auto-wire day-one hosts, rebind Pi/Grok hooks that point at a Zig test program). Exit 0 when core policy is ok; host soft-fails stay partial. Must run as product ryk, not a test binary.",
                 "--fix is exclusive with --check and --json (cannot combine; probe contracts stay pure).",
                 "Optional --from-install scopes ensure to install HOME/resource-root; --preset selects create-if-missing policy preset. Both require --fix.",
                 "Use --deadlock-check to replay a standard coding workflow against your active policy: exit non-zero when a normal step would ask/deny (an agent would stall) or a dangerous step would be allowed.",
@@ -280,17 +279,16 @@ pub const commands =
         },
         .{
             .name = "precommit",
-            .summary = "Run the Rust pre-commit safety scan",
-            .usage = "ryk precommit [options]",
+            .summary = "Not available (hide-list stub)",
+            .usage = "ryk precommit  (not available)",
             .category = .core_workflow,
             .hidden = true,
             .examples = &.{
-                "ryk precommit",
-                "ryk precommit --format json",
+                "ryk scan",
             },
             .details = &.{
-                "Proxies to the Rust daemon and runs the staged-file pre-commit scan path.",
-                "This is the Phase 1 user-facing alias for the Rust scan pre-commit workflow.",
+                "Hide-list stub: command 'precommit' is not available.",
+                "The product scan surface is ryk scan (session forensics).",
             },
         },
         .{
@@ -315,17 +313,17 @@ pub const commands =
         },
         .{
             .name = "classify",
-            .summary = "Classify a shell command's risk without blocking",
-            .usage = "ryk classify <command> [options]",
+            .summary = "Not available (hide-list stub)",
+            .usage = "ryk classify  (not available)",
             .category = .diagnostics,
             .hidden = true,
             .examples = &.{
-                "ryk classify \"git status\"",
-                "ryk classify \"rm -rf /\" --format json",
+                "ryk explain \"git status\"",
+                "ryk tools classify send_email",
             },
             .details = &.{
-                "Proxies to the Rust daemon risk classifier (read-only; does not block).",
-                "Use 'ryk classify --help' for the full Rust-backed option set.",
+                "Hide-list stub: command 'classify' is not available.",
+                "Use ryk explain for shell risk; ryk tools classify for effect-class tools.",
             },
         },
         .{
@@ -403,70 +401,60 @@ pub const commands =
         },
         .{
             .name = "suggest-allowlist",
-            .summary = "Suggest allowlist entries from protected history",
-            .usage = "ryk suggest-allowlist [options]",
+            .summary = "Not available (hide-list stub)",
+            .usage = "ryk suggest-allowlist  (not available)",
             .category = .diagnostics,
             .hidden = true,
             .examples = &.{
-                "ryk suggest-allowlist",
-                "ryk suggest-allowlist --confidence high",
-                "ryk suggest-allowlist --format json",
-                "ryk history suggest",
+                "ryk replay",
+                "ryk allowlist",
             },
-            .additional_completion_flags = &.{"--apply"},
             .details = &.{
-                "Day-2 policy loop: denials → suggestions → allowlist.",
-                "Proxies to the Rust daemon; requires history to be enabled.",
-                "Human output includes copy-pasteable next commands (`suggest-allowlist --apply N` / `allowlist add-command`) for high-confidence items.",
-                "Alias: `ryk history suggest` (same as suggest-allowlist).",
-                "Use 'ryk suggest-allowlist --help' for filters and confidence options.",
+                "Hide-list stub: command 'suggest-allowlist' is not available.",
+                "Use ryk replay and ryk allowlist instead.",
             },
         },
         .{
             .name = "simulate",
-            .summary = "Dry-run policy / packs against a command file or history dump",
-            .usage = "ryk simulate [--file <path>] [options]",
+            .summary = "Not available (hide-list stub)",
+            .usage = "ryk simulate  (not available)",
             .category = .diagnostics,
             .hidden = true,
             .examples = &.{
-                "ryk simulate --file commands.txt",
-                "ryk simulate -f denials.jsonl --format pretty",
-                "ryk simulate --help",
+                "ryk explain \"git status\"",
+                "ryk policy check",
             },
             .details = &.{
-                "What-if dry-run for pack rollout and false-positive review before tightening modes.",
-                "Proxies to the Rust daemon simulate engine (does not execute shell commands).",
-                "Input is a file of commands or hook JSONL (use -f / --file; default stdin).",
-                "Prints allow/deny counts and top denials. Use before enabling packs or switching to strict/ci.",
+                "Hide-list stub: command 'simulate' is not available.",
+                "Use ryk explain or ryk policy check instead.",
             },
         },
         .{
             .name = "rebase-recover",
-            .summary = "Issue a short-lived permit for git rebase recovery",
-            .usage = "ryk rebase-recover [--ttl <seconds>]",
+            .summary = "Not available (hide-list stub)",
+            .usage = "ryk rebase-recover  (not available)",
             .category = .core_workflow,
             .hidden = true,
             .examples = &.{
-                "ryk rebase-recover",
-                "ryk rebase-recover --ttl 120",
+                "ryk allow-once",
             },
             .details = &.{
-                "Proxies to the Rust daemon. Unblocks the next git checkout -- / restore",
-                "step after a messy rebase recovery within a short TTL.",
+                "Hide-list stub: command 'rebase-recover' is not available.",
+                "Use ryk allow-once for a single-use grant.",
             },
         },
         .{
             .name = "config",
-            .summary = "Show ryk daemon configuration",
-            .usage = "ryk config",
+            .summary = "Not available (hide-list stub)",
+            .usage = "ryk config  (not available)",
             .category = .diagnostics,
             .hidden = true,
             .examples = &.{
-                "ryk config",
+                "ryk doctor",
             },
             .details = &.{
-                "Proxies to the Rust daemon config show path (read-only).",
-                "Use 'ryk config --help' for daemon-backed details.",
+                "Hide-list stub: command 'config' is not available.",
+                "Use ryk doctor instead.",
             },
         },
         .{
@@ -558,22 +546,21 @@ pub const commands =
         .{ .name = "ci", .summary = "Run local CI readiness checks", .usage = "ryk ci check [--format markdown|json] [--github-summary <path>]", .category = .advanced, .details = &.{
             "Validates .ryk/policy.yaml, rejects dangerous obvious defaults, runs a focused CI-safe redteam fixture, and emits GitHub Actions-friendly output.",
         } },
-        .{ .name = "shutdown", .summary = "Stop the background ryk daemon", .usage = "ryk shutdown [--daemon]", .category = .advanced, .examples = &.{
+        .{ .name = "shutdown", .summary = "Stop leftover local daemon sockets and the hook server", .usage = "ryk shutdown [--daemon]", .category = .advanced, .examples = &.{
             "ryk shutdown",
             "ryk shutdown --daemon",
         }, .details = &.{
-            "Sends a graceful Shutdown request to the Rust daemon over UDS.",
-            "Removes $HOME/.ryk/daemon.sock and daemon.pid when shutdown succeeds.",
-            "When the daemon is not running, stale artifacts are cleaned when safe.",
+            "Stops leftover local daemon socket artifacts ($HOME/.ryk/daemon.sock, daemon.pid) when safe.",
+            "Best-effort stops the local ryk hook server. This is local process cleanup, not a hosted service.",
         } },
-        .{ .name = "stop", .summary = "Stop ryk protection for host agents", .usage = "ryk stop [codex|claude|cursor|opencode|openclaw|hermes|all] [--yes|--no]", .category = .integrations, .public = true, .examples = &.{
+        .{ .name = "stop", .summary = "Stop ryk protection for host agents", .usage = "ryk stop [codex|claude|opencode|openclaw|hermes|all] [--yes|--no]", .category = .integrations, .public = true, .examples = &.{
             "ryk stop",
             "ryk stop codex",
-            "ryk stop cursor",
+            "ryk stop claude",
         }, .details = &.{
             "Removes ryk plugin registrations from host agents without removing the ryk binary or policy files.",
             "Non-interactive cancel: --no. Mutation requires --yes or an interactive confirm.",
-            "Hosts: codex, claude, cursor, opencode, openclaw, hermes, grok. Defaults to all if no host is specified.",
+            "Hosts: codex, claude, opencode, openclaw, hermes, grok. Defaults to all if no host is specified.",
             "Cursor: removes the ryk shell hook wrapper and disables simple ryk-only hooks.json files.",
             "OpenCode: removes .opencode/plugins/ryk.ts, ryk-tui.ts and ~/.config/opencode/plugins/ryk.ts, ryk-tui.ts",
             "OpenClaw: runs 'openclaw plugins uninstall ryk'",
@@ -582,13 +569,13 @@ pub const commands =
             "Codex / Claude: removes known plugin paths (host-managed install locations).",
             "Restart protection later with: ryk start",
         } },
-        .{ .name = "disable", .summary = "Stop ryk protection for host agents", .usage = "ryk disable [codex|claude|cursor|opencode|openclaw|hermes|all] [--yes|--no]", .category = .integrations, .hidden = true, .examples = &.{
+        .{ .name = "disable", .summary = "Stop ryk protection for host agents", .usage = "ryk disable [codex|claude|opencode|openclaw|hermes|all] [--yes|--no]", .category = .integrations, .hidden = true, .examples = &.{
             "ryk disable",
             "ryk disable codex",
         }, .details = &.{
             "Alias of `ryk stop`. Removes ryk plugin registrations from host agents without removing the ryk binary or policy files.",
             "Non-interactive cancel: --no. Mutation requires --yes or an interactive confirm.",
-            "Hosts: codex, claude, cursor, opencode, openclaw, hermes, grok. Defaults to all if no host is specified.",
+            "Hosts: codex, claude, opencode, openclaw, hermes, grok. Defaults to all if no host is specified.",
             "Restart protection later with: ryk start",
         } },
         .{ .name = "uninstall", .summary = "Uninstall ryk from this machine", .usage = "ryk uninstall [--plugins-only] [--keep-config] [--dry-run] [--yes]", .category = .integrations, .details = &.{
@@ -771,6 +758,19 @@ pub const commands =
             "Exit codes: 0 allow, 2 deny, 3 evaluator failure, 64 invalid input, 1 unexpected internal error.",
             "Designed for external integrations such as Pi bash tool-call evaluation; non-shell evaluation is intentionally unsupported.",
         } },
+        .{
+            .name = "hook-serve",
+            .summary = "Long-lived hook server for warm host decisions",
+            .usage = "ryk hook-serve --socket <path>",
+            .category = .internal,
+            .hidden = true,
+            .details = &.{
+                "Accepts NDJSON ryk-hook-v1 requests from ryk hook / evaluate / bare ryk.",
+                "One server per UNIX user and ryk binary. Hosts keep spawning ryk hook; this process stays warm.",
+                "Not a second binary and not the removed Rust daemon. Idle exit after 30 minutes.",
+                "Hidden from default help; use ryk hook-serve --help.",
+            },
+        },
         .{ .name = "hook", .summary = "Receive events from AI agent hosts", .usage = "ryk hook <codex|claude|grok|opencode|openclaw|hermes> <event> [--ci]", .category = .advanced, .details = &.{
             "Reads a JSON payload from stdin, normalizes host-specific events to ryk decisions,",
             "and emits a host-valid JSON response to stdout. Debug logs go to stderr only.",
@@ -891,8 +891,8 @@ pub fn writeWithMode(io: std.Io, writer: anytype, mode: WriteMode) !void {
     try writer.writeAll("\n");
     const Task = struct { label: []const u8, cmd: []const u8 };
     const public_tasks = [_]Task{
-        .{ .label = "Get protected", .cmd = "ryk doctor --fix" },
-        .{ .label = "Guided setup", .cmd = "ryk start" },
+        .{ .label = "Get protected", .cmd = "ryk claude" },
+        .{ .label = "Repair / wire hosts", .cmd = "ryk start" },
         .{ .label = "Always-on setup", .cmd = "ryk agents setup" },
         .{ .label = "Run an agent", .cmd = "ryk claude  (or: codex | pi | opencode | openclaw | hermes | grok)" },
         .{ .label = "Diagnose", .cmd = "ryk doctor" },
@@ -902,8 +902,8 @@ pub fn writeWithMode(io: std.Io, writer: anytype, mode: WriteMode) !void {
         .{ .label = "Stop protection", .cmd = "ryk stop" },
     };
     const all_tasks = [_]Task{
-        .{ .label = "Get protected", .cmd = "ryk doctor --fix" },
-        .{ .label = "Guided setup", .cmd = "ryk start" },
+        .{ .label = "Get protected", .cmd = "ryk claude" },
+        .{ .label = "Repair / wire hosts", .cmd = "ryk start" },
         .{ .label = "Always-on setup", .cmd = "ryk agents setup" },
         .{ .label = "Diagnose", .cmd = "ryk doctor" },
         .{ .label = "Why blocked?", .cmd = "ryk explain \"…\"" },
@@ -1002,9 +1002,9 @@ pub fn writeWithMode(io: std.Io, writer: anytype, mode: WriteMode) !void {
         },
     }
 
-    // Global options (Phase 7 discoverability): surface the --no-rich /
-    // RYK_NO_RICH escape hatch at the top level so users can find it without
-    // reading the source. --json/--robot are per-command machine flags.
+    // Global options: --no-rich / RYK_NO_RICH is the only true prefix.
+    // --json is per-command (`ryk help <command>` / `ryk version --json`);
+    // it is not a working `ryk --json <cmd>` switch.
     try writer.writeAll("  ");
     try tui.theme.paintBold(io, writer, .brand, "Global options");
     try writer.writeAll("\n");
@@ -1012,22 +1012,18 @@ pub fn writeWithMode(io: std.Io, writer: anytype, mode: WriteMode) !void {
     try tui.theme.paint(io, writer, .muted, "Also RYK_NO_RICH=1.");
     try writer.writeAll("\n");
     try writer.writeAll("                 Use this for piping, scripting, or terminals that mis-render colour.\n");
-    try writer.writeAll("    --json      Per-command machine output (byte-stable). See `ryk help <command>`.\n");
+    try writer.writeAll("  ");
+    try tui.theme.paint(io, writer, .muted, "--json is per-command (`ryk help <command>` / `ryk version --json`), not a global prefix.");
+    try writer.writeAll("\n");
     try writer.writeAll("\n");
 
-    // Try-next hint.
+    // Try-next hint: one agent launch. Power features stay on the public
+    // "ryk help --all" disclosure line, not as a second Next.
     try writer.writeAll("  ");
     try tui.theme.paint(io, writer, .muted, "Next:");
     try writer.writeAll(" run ");
-    try tui.theme.paint(io, writer, .text_bright, "ryk start");
-    try writer.writeAll(" to get protected, or ");
-    if (mode == .public) {
-        try tui.theme.paint(io, writer, .text_bright, "ryk help --all");
-        try writer.writeAll(" for the full surface.\n");
-    } else {
-        try tui.theme.paint(io, writer, .text_bright, "ryk help <command>");
-        try writer.writeAll(" for details.\n");
-    }
+    try tui.theme.paint(io, writer, .text_bright, "ryk claude");
+    try writer.writeAll("\n");
 }
 
 fn categoryTitle(cat: Category) []const u8 {
@@ -1502,6 +1498,7 @@ test "P0 honesty: default help and help --all omit hide-list and unfinished P0; 
     try std.testing.expect(!helpListsPeerCommand(top, "allow-once"));
     try std.testing.expect(!helpListsPeerCommand(top, "allow"));
     try std.testing.expect(!helpListsPeerCommand(top, "unallow"));
+    try std.testing.expect(!helpListsPeerCommand(top, "hook-serve"));
 
     writer = .fixed(&buf);
     try writeAll(std.testing.io, &writer);
@@ -1519,6 +1516,7 @@ test "P0 honesty: default help and help --all omit hide-list and unfinished P0; 
     try std.testing.expect(helpListsPeerCommand(all, "packs"));
     try std.testing.expect(helpListsPeerCommand(all, "allowlist"));
     try std.testing.expect(helpListsPeerCommand(all, "allow-once"));
+    try std.testing.expect(!helpListsPeerCommand(all, "hook-serve"));
 
     // Explicit full-text: root --all must not teach daemon allowlist wording or
     // promote allow/unallow shortcuts in Common-tasks / remediation copy.
@@ -1533,6 +1531,56 @@ test "P0 honesty: default help and help --all omit hide-list and unfinished P0; 
     try std.testing.expect(helpListsPeerCommand(all, "test"));
     try std.testing.expect(helpListsPeerCommand(all, "explain"));
     try std.testing.expect(helpListsPeerCommand(all, "start"));
+}
+
+test "P0 honesty: help catalog does not claim Rust daemon" {
+    const banned = [_][]const u8{
+        "Rust daemon",
+        "Rust pre-commit",
+        "Rust scan",
+        "Rust-backed",
+    };
+    const hide_list = [_][]const u8{
+        "precommit",
+        "classify",
+        "suggest-allowlist",
+        "simulate",
+        "rebase-recover",
+        "config",
+    };
+
+    var buf: [32768]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try write(std.testing.io, &writer);
+    const top = writer.buffered();
+    for (banned) |phrase| {
+        try std.testing.expect(std.mem.indexOf(u8, top, phrase) == null);
+    }
+
+    writer = .fixed(&buf);
+    try writeAll(std.testing.io, &writer);
+    const all = writer.buffered();
+    for (banned) |phrase| {
+        try std.testing.expect(std.mem.indexOf(u8, all, phrase) == null);
+    }
+
+    writer = .fixed(&buf);
+    try std.testing.expect(try writeCommand(std.testing.io, &writer, "shutdown"));
+    const shutdown_out = writer.buffered();
+    for (banned) |phrase| {
+        try std.testing.expect(std.mem.indexOf(u8, shutdown_out, phrase) == null);
+    }
+
+    // Do not render hook-serve: its honest "not the removed Rust daemon" line is allowed.
+    for (hide_list) |name| {
+        writer = .fixed(&buf);
+        try std.testing.expect(try writeCommand(std.testing.io, &writer, name));
+        const out = writer.buffered();
+        for (banned) |phrase| {
+            try std.testing.expect(std.mem.indexOf(u8, out, phrase) == null);
+        }
+        try std.testing.expect(std.mem.indexOf(u8, out, "not available") != null);
+    }
 }
 
 test "public Safe Launch: packs and allowlist help details mention TTY browse and --plain" {
@@ -1602,4 +1650,123 @@ test "cloud help is a localhost dashboard alias and does not sell a control plan
     const rendered = help_writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, rendered, "ryk cloud") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "dashboard --view terminal") != null);
+}
+
+test "hook-serve is hidden and has --help text" {
+    const info = findCommand("hook-serve") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(info.hidden);
+    var buf: [4096]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try std.testing.expect(try writeCommand(std.testing.io, &writer, "hook-serve"));
+    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "ryk hook-serve") != null);
+}
+
+fn helpLineContaining(text: []const u8, needle: []const u8) ?[]const u8 {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.indexOf(u8, line, needle) != null) return line;
+    }
+    return null;
+}
+
+test "public help Next is a single agent launch" {
+    var buf: [24576]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try write(std.testing.io, &writer);
+    const top = writer.buffered();
+
+    const next = helpLineContaining(top, "Next:") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, next, "ryk claude") != null);
+    try std.testing.expect(std.mem.indexOf(u8, next, "ryk start") == null);
+    try std.testing.expect(std.mem.indexOf(u8, next, " or ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, next, "help --all") == null);
+    // Power features stay on public help as disclosure, not as a second Next.
+    try std.testing.expect(std.mem.indexOf(u8, top, "help --all") != null);
+
+    var all_buf: [32768]u8 = undefined;
+    var all_writer: std.Io.Writer = .fixed(&all_buf);
+    try writeAll(std.testing.io, &all_writer);
+    const all = all_writer.buffered();
+    const all_next = helpLineContaining(all, "Next:") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, all_next, "ryk claude") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all_next, "ryk start") == null);
+    try std.testing.expect(std.mem.indexOf(u8, all_next, " or ") == null);
+}
+
+test "common tasks Get protected is not doctor --fix" {
+    var buf: [24576]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try write(std.testing.io, &writer);
+    const top = writer.buffered();
+
+    const row = helpLineContaining(top, "Get protected") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, row, "ryk doctor --fix") == null);
+    try std.testing.expect(std.mem.indexOf(u8, row, "doctor --fix") == null);
+    try std.testing.expect(std.mem.indexOf(u8, row, "ryk claude") != null);
+    try std.testing.expect(std.mem.indexOf(u8, top, "ryk doctor") != null);
+
+    writer = .fixed(&buf);
+    try writeAll(std.testing.io, &writer);
+    const all = writer.buffered();
+    const all_row = helpLineContaining(all, "Get protected") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, all_row, "doctor --fix") == null);
+    try std.testing.expect(std.mem.indexOf(u8, all_row, "ryk claude") != null);
+}
+
+test "help start has no Ask/DCG or first-run-onboarding jargon" {
+    const info = findCommand("start") orelse return error.TestUnexpectedResult;
+    var details: [4096]u8 = undefined;
+    var details_w: std.Io.Writer = .fixed(&details);
+    for (info.details) |line| {
+        try details_w.writeAll(line);
+        try details_w.writeAll("\n");
+    }
+    const details_text = details_w.buffered();
+
+    var printed_buf: [8192]u8 = undefined;
+    var printed_w: std.Io.Writer = .fixed(&printed_buf);
+    try std.testing.expect(try writeCommand(std.testing.io, &printed_w, "start"));
+    const printed = printed_w.buffered();
+
+    for ([_][]const u8{ details_text, printed }) |text| {
+        try std.testing.expect(std.mem.indexOf(u8, text, "DCG") == null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "Ask posture") == null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "ask main loop") == null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "first-run onboarding") == null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "Repair") != null or std.mem.indexOf(u8, text, "repair") != null);
+    }
+}
+
+fn expectStopFamilyDoesNotAdvertiseCursor(printed: []const u8, verb: []const u8) !void {
+    try std.testing.expect(std.mem.indexOf(u8, printed, "ryk ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, printed, verb) != null);
+    try std.testing.expect(std.mem.indexOf(u8, printed, "codex") != null);
+    try std.testing.expect(std.mem.indexOf(u8, printed, "|cursor|") == null);
+    try std.testing.expect(std.mem.indexOf(u8, printed, "[codex|claude|cursor") == null);
+
+    var expected_example_buf: [64]u8 = undefined;
+    const expected_example = try std.fmt.bufPrint(&expected_example_buf, "ryk {s} cursor", .{verb});
+    try std.testing.expect(std.mem.indexOf(u8, printed, expected_example) == null);
+
+    const hosts_idx = std.mem.indexOf(u8, printed, "Hosts:") orelse return error.TestUnexpectedResult;
+    const hosts_rest = printed[hosts_idx..];
+    const hosts_end = std.mem.indexOfScalar(u8, hosts_rest, '\n') orelse hosts_rest.len;
+    try std.testing.expect(std.mem.indexOf(u8, hosts_rest[0..hosts_end], "cursor") == null);
+}
+
+test "stop help does not advertise cursor" {
+    var buf: [8192]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try std.testing.expect(try writeCommand(std.testing.io, &writer, "stop"));
+    const printed = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, printed, "ryk stop") != null);
+    try std.testing.expect(std.mem.indexOf(u8, printed, "Cursor: removes the ryk shell hook wrapper") != null);
+    try expectStopFamilyDoesNotAdvertiseCursor(printed, "stop");
+}
+
+test "disable help does not advertise cursor" {
+    var buf: [8192]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try std.testing.expect(try writeCommand(std.testing.io, &writer, "disable"));
+    try expectStopFamilyDoesNotAdvertiseCursor(writer.buffered(), "disable");
 }

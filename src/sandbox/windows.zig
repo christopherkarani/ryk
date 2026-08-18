@@ -152,7 +152,11 @@ pub fn normalizePathAlloc(allocator: std.mem.Allocator, raw_path: []const u8, ro
             if (components.items.len > 0) allocator.free(components.pop().?);
             continue;
         }
-        try components.append(allocator, try allocator.dupe(u8, component));
+        const owned = try allocator.dupe(u8, component);
+        components.append(allocator, owned) catch |err| {
+            allocator.free(owned);
+            return err;
+        };
     }
 
     var out: std.ArrayList(u8) = .empty;
@@ -300,4 +304,49 @@ test "Windows protected path matching uses simulated profile roots only" {
     }
 
     try std.testing.expect((try protectedPathMatch(std.testing.allocator, "C:\\Users\\Dev User\\project\\src\\main.zig", roots)) == null);
+}
+
+/// Same roots as the drive/UNC/USERPROFILE happy-path fixtures above.
+const windows_normalize_oom_roots: EnvRoots = .{
+    .user_profile = "C:\\Users\\Dev User",
+    .app_data = "C:\\Users\\Dev User\\AppData\\Roaming",
+    .local_app_data = "C:\\Users\\Dev User\\AppData\\Local",
+};
+
+fn windowsNormalizeOomDriveUncProbe(allocator: std.mem.Allocator) !void {
+    const roots = windows_normalize_oom_roots;
+
+    // Clone existing fixtures so the component loop actually dupes. Drive-only
+    // "C:" never enters that loop.
+    const drive = try normalizePathAlloc(allocator, "C:\\Users\\Dev User\\PROJECT\\src\\..\\Src\\main.zig", roots);
+    defer allocator.free(drive);
+    try std.testing.expectEqualStrings("c:/users/dev user/project/src/main.zig", drive);
+
+    const unc = try normalizePathAlloc(allocator, "\\\\Server\\Share\\Team\\..\\Repo\\file.txt", roots);
+    defer allocator.free(unc);
+    try std.testing.expectEqualStrings("//server/share/repo/file.txt", unc);
+
+    const expanded = try normalizePathAlloc(allocator, "%USERPROFILE%\\.ssh\\id_ed25519", roots);
+    defer allocator.free(expanded);
+    try std.testing.expectEqualStrings("c:/users/dev user/.ssh/id_ed25519", expanded);
+}
+
+fn windowsNormalizeOomProtectedMatchProbe(allocator: std.mem.Allocator) !void {
+    const roots = windows_normalize_oom_roots;
+    // OOM must stay error.OutOfMemory — never swallow as not-protected (null).
+    const match = try protectedPathMatch(allocator, "%USERPROFILE%\\.ssh\\id_ed25519", roots);
+    if (match == null) return error.TestUnexpectedResult;
+}
+
+test "WindowsNormalizeOom normalizePathAlloc OOM ownership" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        windowsNormalizeOomDriveUncProbe,
+        .{},
+    );
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        windowsNormalizeOomProtectedMatchProbe,
+        .{},
+    );
 }

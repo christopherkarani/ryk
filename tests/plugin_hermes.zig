@@ -79,15 +79,14 @@ test "hermes plugin readme documents install and limits" {
     try std.testing.expect(std.mem.indexOf(u8, content, "ryk run -- hermes") != null or std.mem.indexOf(u8, content, "ryk run -- hermes") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "context-only") != null or std.mem.indexOf(u8, content, "Context-only") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "Telegram and Discord") != null);
-    // Native approve-and-resume for tool ask (not block-without-resume).
-    try std.testing.expect(std.mem.indexOf(u8, content, "approve") != null);
-    try std.testing.expect(std.mem.indexOf(u8, content, "rule_key") != null);
-    try std.testing.expect(std.mem.indexOf(u8, content, "approve-and-resume") != null);
+    // Leftover unused policy ask is rewritten by ryk hook; unattended still hardens to deny.
+    try std.testing.expect(std.mem.indexOf(u8, content, "permit") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "unattended") != null or std.mem.indexOf(u8, content, "Unattended") != null);
     // Must not claim passive notes or clarify are the approval mechanism.
     try std.testing.expect(std.mem.indexOf(u8, content, "tell the model to call") == null);
 }
 
-test "hermes plugin source maps ask to approve not permanent block" {
+test "hermes plugin source maps unexpected ask to fail-closed deny" {
     const content = try readFile(std.testing.allocator, source_path);
     defer std.testing.allocator.free(content);
 
@@ -99,10 +98,9 @@ test "hermes plugin source maps ask to approve not permanent block" {
     try std.testing.expect(fileExists(mapping_path));
     const mapping = try readFile(std.testing.allocator, mapping_path);
     defer std.testing.allocator.free(mapping);
-    try std.testing.expect(std.mem.indexOf(u8, mapping, "approve") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mapping, "unexpected ask") != null);
     try std.testing.expect(std.mem.indexOf(u8, mapping, "ci_mode") != null);
-    try std.testing.expect(std.mem.indexOf(u8, mapping, "stable_rule_key") != null);
-    try std.testing.expect(std.mem.indexOf(u8, mapping, "rule_key") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mapping, "\"ask\": \"fail_closed_block\"") != null);
 }
 
 test "all hermes fixtures exist" {

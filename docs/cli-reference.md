@@ -58,7 +58,7 @@ ryk doctor --deadlock-check
 ryk replay --session last --verify
 ~~~
 
-doctor reports readiness and host capabilities. doctor --check is the automation gate and returns nonzero when core readiness fails. doctor --json is a small readiness document, but a JSON result with ready: false can still exit zero. Use --check when the process exit status is the gate. doctor --fix is a mutating repair path and cannot be combined with --check or --json.
+doctor reports readiness and host capabilities. doctor --check is the automation gate and returns nonzero when core readiness fails. doctor --json is a small readiness document, but a JSON result with ready: false can still exit zero. Use --check when the process exit status is the gate. doctor --fix is a mutating repair path and cannot be combined with --check or --json. Doctor names Pi/Grok hooks that point at a Zig test program or Zig compiler as `wired: broken`. doctor --fix, run as product ryk from a normal terminal, rebinds those hooks to the running ryk binary. A --fix invoked as zig-cache `test` refuses to rewrite hooks and says so.
 
 doctor --deadlock-check replays a standard coding workflow (build, test, package install, git inspection, recovery commands) plus dangerous control samples against the active policy, and reports the mismatches: a normal step that would ask or deny is a deadlock, because several hosts hard-block ask with no resume; a dangerous step that would be allowed is a fence hole. It is read-only, exits nonzero on either kind of mismatch, and cannot be combined with --fix, --check, or --json. Decisions use the same policy-plus-pack precedence a live session applies, so a clean result means the composed surface agrees, not just the YAML.
 
@@ -297,7 +297,7 @@ printf '%s\n' "{\"schema_version\":1,\"kind\":\"shell_command\",\"command\":\"gi
   ryk evaluate --json --stdin
 ~~~
 
-It writes its response to stdout for valid decisions and typed input errors. The tested exit contract is 0 allow, 2 deny, 3 evaluator failure, 64 invalid input, and 1 unexpected internal error. Non-shell evaluation is not supported by this API.
+It writes its response to stdout for valid decisions and typed input errors. The tested exit contract is 0 allow, 2 deny, 3 evaluator failure (including invalid, empty, or unreadable discovered policy), 64 invalid input, and 1 unexpected internal error. Missing policy files still fall back to builtin strict. Non-shell evaluation is not supported by this API.
 
 ### decide
 
@@ -323,6 +323,8 @@ ryk hook opencode tool.execute.before < host-payload.json
 ~~~
 
 The payload schema belongs to the host. Use the host integration documentation to construct it. Hook responses include host_limitations; hook enforcement is additive and does not replace supervision through ryk run. Shell tool-before events use the Zig shell engine, and the rejected Rust evaluator setting applies here too. `ryk hook --help` lists every dispatch host, including grok. Pi is extension-only (`ryk evaluate` / bundled extension); it is not a hook host.
+
+Hosts still spawn `ryk hook`, `ryk evaluate`, or bare `ryk`. Those commands try a per-user `ryk hook-serve` process for a warm decision, then fall back in-process. `ryk hook-serve` is internal (`ryk hook-serve --help`); it is not a second binary and is hidden from default help.
 
 ### Plugins and MCP
 
@@ -445,5 +447,5 @@ These are recorded because they affect documentation and automation:
 
 1. ryk help run mentions yolo in the displayed mode list, but the current run parser rejects --mode yolo and accepts only observe, ask, strict, and ci. Use the accepted list until the help and parser converge.
 2. ryk help decide and the parser accept --stdin. Piped stdin has failed with EndOfStream in the reader, so do not treat that route as reliable. Prefer the inline --json form. The source location is [decide.zig](../src/cli/decide.zig#L696).
-3. --json is scoped to a command implementation. `replay --json --list` has rendered the list form rather than a JSON document. Treat each subcommand's help as its output contract.
+3. --json is scoped to a command implementation. `replay --list --json` emits a JSON list document (`schema_version`, `sessions`). Treat each subcommand's help as its output contract.
 4. doctor --json can return exit 0 with ready: false; use doctor --check when readiness must control a job.

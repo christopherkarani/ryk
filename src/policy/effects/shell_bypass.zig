@@ -7,6 +7,26 @@ const catalog = @import("catalog.zig");
 const ids = @import("ids.zig");
 const network_tags = @import("network_tags.zig");
 
+pub fn freeCurlLikeHosts(allocator: std.mem.Allocator, hosts: [][]const u8) void {
+    for (hosts) |h| allocator.free(h);
+    allocator.free(hosts);
+}
+
+/// Transfer hosts from curl/wget operands (allocator-owned unique list).
+/// Reused by effect classification and the shell_eval destination allowlist fence.
+/// `error.UnreadableCurlConfig` when `--config`/`-K` has no inline URL (cannot parse file).
+pub fn extractCurlLikeHosts(allocator: std.mem.Allocator, command_text: []const u8) ![][]const u8 {
+    var hosts: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (hosts.items) |h| allocator.free(h);
+        hosts.deinit(allocator);
+    }
+    var opaque_config = false;
+    try appendCurlLikeHosts(allocator, command_text, &hosts, &opaque_config, 0);
+    if (opaque_config) return error.UnreadableCurlConfig;
+    return try hosts.toOwnedSlice(allocator);
+}
+
 /// Classify a command display string into effect hits (owned slice).
 pub fn classifyCommand(allocator: std.mem.Allocator, command_text: []const u8) ![]catalog.EffectHit {
     var hits: std.ArrayList(catalog.EffectHit) = .empty;
@@ -119,9 +139,15 @@ fn isOpenToken(token: []const u8) bool {
 }
 
 fn isCurlLikeToken(token: []const u8) bool {
-    if (std.ascii.eqlIgnoreCase(token, "curl") or std.ascii.eqlIgnoreCase(token, "wget")) return true;
-    if (endsWithIgnoreCase(token, "/curl") or endsWithIgnoreCase(token, "/wget")) return true;
-    return false;
+    return isCurlToken(token) or isWgetToken(token);
+}
+
+fn isCurlToken(token: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(token, "curl") or endsWithIgnoreCase(token, "/curl");
+}
+
+fn isWgetToken(token: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(token, "wget") or endsWithIgnoreCase(token, "/wget");
 }
 
 /// True when `index` is the first executable of a shell command segment:
@@ -224,7 +250,7 @@ fn isEnvAssignment(token: []const u8) bool {
 
 fn isCommandWrapper(token: []const u8) bool {
     // Launchers that run a following COMMAND (not mere data operands).
-    const wrappers = [_][]const u8{ "sudo", "env", "command", "xargs", "nohup", "nice", "time", "builtin" };
+    const wrappers = [_][]const u8{ "sudo", "env", "command", "xargs", "nohup", "nice", "time", "builtin", "exec" };
     // Strip path prefix: /usr/bin/sudo
     var base = token;
     if (std.mem.lastIndexOfScalar(u8, token, '/')) |slash| base = token[slash + 1 ..];
@@ -431,64 +457,326 @@ fn curlFlagTakesValue(flag: []const u8) bool {
     return false;
 }
 
-/// Append effect hits for every curl/wget URL / tagged host operand in command position.
-fn appendCurlLikeHostEffects(
+fn appendUniqueOwnedHost(allocator: std.mem.Allocator, hosts: *std.ArrayList([]const u8), host: []const u8) !void {
+    const trimmed = std.mem.trim(u8, host, " \t\r\n");
+    if (trimmed.len == 0) return;
+    for (hosts.items) |existing| {
+        if (std.ascii.eqlIgnoreCase(existing, trimmed)) return;
+    }
+    const owned = try allocator.dupe(u8, trimmed);
+    errdefer allocator.free(owned);
+    try hosts.append(allocator, owned);
+}
+
+const max_dash_c_depth: u8 = 8;
+
+const CurlDestKind = enum { proxy, connect_to, resolve, doh_url, config };
+
+fn isAllDigits(s: []const u8) bool {
+    if (s.len == 0) return false;
+    for (s) |c| {
+        if (!std.ascii.isDigit(c)) return false;
+    }
+    return true;
+}
+
+fn looksLikeInlineUrl(value: []const u8) bool {
+    return std.mem.indexOf(u8, value, "://") != null;
+}
+
+/// `--proxy`/`-x`, `--connect-to`, `--resolve`, `--doh-url`, `--config`/`-K`
+/// (including `--name=value` and attached `-xVALUE` / `-KVALUE`).
+fn curlDestKind(flag: []const u8) ?CurlDestKind {
+    if (flag.len == 0 or flag[0] != '-') return null;
+    if (std.mem.eql(u8, flag, "--proxy") or std.mem.startsWith(u8, flag, "--proxy=")) return .proxy;
+    if (std.mem.eql(u8, flag, "--proxy1.0") or std.mem.startsWith(u8, flag, "--proxy1.0=")) return .proxy;
+    if (std.mem.eql(u8, flag, "--preproxy") or std.mem.startsWith(u8, flag, "--preproxy=")) return .proxy;
+    if (std.mem.eql(u8, flag, "--socks4") or std.mem.startsWith(u8, flag, "--socks4=")) return .proxy;
+    if (std.mem.eql(u8, flag, "--socks4a") or std.mem.startsWith(u8, flag, "--socks4a=")) return .proxy;
+    if (std.mem.eql(u8, flag, "--socks5") or std.mem.startsWith(u8, flag, "--socks5=")) return .proxy;
+    if (std.mem.eql(u8, flag, "--socks5-hostname") or std.mem.startsWith(u8, flag, "--socks5-hostname=")) return .proxy;
+    if (std.mem.eql(u8, flag, "-x") or (flag.len > 2 and flag[1] == 'x' and flag[2] != '-')) return .proxy;
+    if (std.mem.eql(u8, flag, "--connect-to") or std.mem.startsWith(u8, flag, "--connect-to=")) return .connect_to;
+    if (std.mem.eql(u8, flag, "--resolve") or std.mem.startsWith(u8, flag, "--resolve=")) return .resolve;
+    if (std.mem.eql(u8, flag, "--doh-url") or std.mem.startsWith(u8, flag, "--doh-url=")) return .doh_url;
+    if (std.mem.eql(u8, flag, "--config") or std.mem.startsWith(u8, flag, "--config=")) return .config;
+    if (std.mem.eql(u8, flag, "-K") or (flag.len > 2 and flag[1] == 'K')) return .config;
+    return null;
+}
+
+fn curlDestInlineValue(flag: []const u8) ?[]const u8 {
+    if (std.mem.startsWith(u8, flag, "--")) {
+        if (std.mem.indexOfScalar(u8, flag, '=')) |eq| return flag[eq + 1 ..];
+        return null;
+    }
+    if (flag.len > 2) return flag[2..];
+    return null;
+}
+
+/// CONNECT-TO `HOST:PORT:ADDR:PORT` — dest-check the ADDR hop.
+fn destHostFromConnectTo(value: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    const last_colon = std.mem.lastIndexOfScalar(u8, trimmed, ':') orelse
+        return network_tags.hostFromUrlOrHost(trimmed);
+    if (!isAllDigits(trimmed[last_colon + 1 ..])) return network_tags.hostFromUrlOrHost(trimmed);
+    const without_port2 = trimmed[0..last_colon];
+    if (without_port2.len >= 2 and without_port2[without_port2.len - 1] == ']') {
+        if (std.mem.lastIndexOfScalar(u8, without_port2, '[')) |lb| {
+            return without_port2[lb + 1 .. without_port2.len - 1];
+        }
+    }
+    if (std.mem.lastIndexOfScalar(u8, without_port2, ':')) |colon| {
+        const addr = without_port2[colon + 1 ..];
+        const before = without_port2[0..colon];
+        if (std.mem.lastIndexOfScalar(u8, before, ':')) |c2| {
+            if (isAllDigits(before[c2 + 1 ..])) return network_tags.hostFromUrlOrHost(addr);
+        }
+    }
+    return network_tags.hostFromUrlOrHost(without_port2);
+}
+
+/// `--resolve host:port:addr` — dest-check addr.
+fn destHostFromResolve(value: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    var rest = trimmed;
+    if (rest.len > 0 and rest[0] == '[') {
+        const close = std.mem.indexOfScalar(u8, rest, ']') orelse
+            return network_tags.hostFromUrlOrHost(trimmed);
+        rest = rest[close + 1 ..];
+    } else {
+        const colon = std.mem.indexOfScalar(u8, rest, ':') orelse
+            return network_tags.hostFromUrlOrHost(trimmed);
+        rest = rest[colon..];
+    }
+    if (rest.len == 0 or rest[0] != ':') return network_tags.hostFromUrlOrHost(trimmed);
+    rest = rest[1..];
+    const colon = std.mem.indexOfScalar(u8, rest, ':') orelse
+        return network_tags.hostFromUrlOrHost(trimmed);
+    if (!isAllDigits(rest[0..colon])) return network_tags.hostFromUrlOrHost(trimmed);
+    const addr = rest[colon + 1 ..];
+    if (addr.len == 0) return network_tags.hostFromUrlOrHost(trimmed);
+    return network_tags.hostFromUrlOrHost(addr);
+}
+
+fn appendDestFlagHost(
+    allocator: std.mem.Allocator,
+    hosts: *std.ArrayList([]const u8),
+    kind: CurlDestKind,
+    value: []const u8,
+) !void {
+    const host = switch (kind) {
+        .proxy, .doh_url => network_tags.hostFromUrlOrHost(value),
+        .connect_to => destHostFromConnectTo(value),
+        .resolve => destHostFromResolve(value),
+        .config => if (looksLikeInlineUrl(value)) network_tags.hostFromUrlOrHost(value) else "",
+    };
+    if (host.len > 0) try appendUniqueOwnedHost(allocator, hosts, host);
+}
+
+fn isDashCShellToken(token: []const u8) bool {
+    var base = token;
+    if (std.mem.lastIndexOfScalar(u8, token, '/')) |slash| base = token[slash + 1 ..];
+    return std.ascii.eqlIgnoreCase(base, "bash") or
+        std.ascii.eqlIgnoreCase(base, "sh") or
+        std.ascii.eqlIgnoreCase(base, "zsh") or
+        std.ascii.eqlIgnoreCase(base, "dash");
+}
+
+fn isDashCFlag(token: []const u8) bool {
+    if (std.mem.eql(u8, token, "-c") or std.mem.eql(u8, token, "-lc")) return true;
+    // Clustered shorts: bash -xc / -ic. Long options are `--…`.
+    if (token.len >= 2 and token[0] == '-' and token[1] != '-') {
+        for (token[1..]) |ch| {
+            if (ch == 'c') return true;
+        }
+    }
+    return false;
+}
+
+/// Curl `-K` / `-sK` / `-sKfile` (wget `-K` is `--backup-converted`, not config).
+fn curlShortClusterConfigValue(flag: []const u8) ?struct { found: bool, inline_value: ?[]const u8 } {
+    if (flag.len < 2 or flag[0] != '-' or flag[1] == '-') return null;
+    var i: usize = 1;
+    while (i < flag.len) : (i += 1) {
+        if (flag[i] == 'K') {
+            if (i + 1 < flag.len) return .{ .found = true, .inline_value = flag[i + 1 ..] };
+            return .{ .found = true, .inline_value = null };
+        }
+    }
+    return null;
+}
+
+fn joinTokenRange(allocator: std.mem.Allocator, tokens: []const []const u8) ![]u8 {
+    if (tokens.len == 0) return try allocator.dupe(u8, "");
+    if (tokens.len == 1) return try allocator.dupe(u8, tokens[0]);
+    var total: usize = tokens.len - 1;
+    for (tokens) |t| total += t.len;
+    const buf = try allocator.alloc(u8, total);
+    var o: usize = 0;
+    for (tokens, 0..) |t, i| {
+        @memcpy(buf[o..][0..t.len], t);
+        o += t.len;
+        if (i + 1 < tokens.len) {
+            buf[o] = ' ';
+            o += 1;
+        }
+    }
+    return buf;
+}
+
+fn appendDashCEmbedHosts(
+    allocator: std.mem.Allocator,
+    tokens: []const []const u8,
+    start: usize,
+    hosts: *std.ArrayList([]const u8),
+    opaque_config: ?*bool,
+    depth: u8,
+) error{OutOfMemory}!void {
+    if (depth >= max_dash_c_depth) return;
+    var j = start;
+    while (j < tokens.len) : (j += 1) {
+        if (isShellOperator(tokens[j])) return;
+        const t = tokens[j];
+        if (isDashCFlag(t)) {
+            const payload_start = j + 1;
+            if (payload_start >= tokens.len or isShellOperator(tokens[payload_start])) return;
+            var payload_end = payload_start + 1;
+            while (payload_end < tokens.len and !isShellOperator(tokens[payload_end])) : (payload_end += 1) {}
+            const payload = try joinTokenRange(allocator, tokens[payload_start..payload_end]);
+            defer allocator.free(payload);
+            try appendCurlLikeHosts(allocator, payload, hosts, opaque_config, depth + 1);
+            return;
+        }
+        if (std.mem.startsWith(u8, t, "-c") and t.len > 2 and t[2] != '-') {
+            try appendCurlLikeHosts(allocator, t[2..], hosts, opaque_config, depth + 1);
+            return;
+        }
+        if (t.len > 0 and t[0] == '-') continue;
+        return;
+    }
+}
+
+fn appendCurlOperands(
+    allocator: std.mem.Allocator,
+    tokens: []const []const u8,
+    start: usize,
+    hosts: *std.ArrayList([]const u8),
+    opaque_config: ?*bool,
+    is_curl: bool,
+) error{OutOfMemory}!void {
+    var j = start;
+    while (j < tokens.len) : (j += 1) {
+        if (isShellOperator(tokens[j])) break;
+        const t = tokens[j];
+        if (t.len == 0) continue;
+
+        if (is_curl) {
+            if (curlShortClusterConfigValue(t)) |cluster| {
+                const value: ?[]const u8 = cluster.inline_value orelse blk: {
+                    if (j + 1 < tokens.len and !isShellOperator(tokens[j + 1])) {
+                        j += 1;
+                        break :blk tokens[j];
+                    }
+                    break :blk null;
+                };
+                if (value == null or !looksLikeInlineUrl(value.?)) {
+                    if (opaque_config) |p| p.* = true;
+                }
+                if (value) |v| try appendDestFlagHost(allocator, hosts, .config, v);
+                continue;
+            }
+        }
+
+        if (curlDestKind(t)) |kind| {
+            // wget `-K` is `--backup-converted`, not curl `--config`.
+            if (kind == .config and !is_curl) continue;
+            const value: ?[]const u8 = curlDestInlineValue(t) orelse blk: {
+                if (j + 1 < tokens.len and !isShellOperator(tokens[j + 1])) {
+                    j += 1;
+                    break :blk tokens[j];
+                }
+                break :blk null;
+            };
+            if (kind == .config and (value == null or !looksLikeInlineUrl(value.?))) {
+                if (opaque_config) |p| p.* = true;
+            }
+            if (value) |v| try appendDestFlagHost(allocator, hosts, kind, v);
+            continue;
+        }
+
+        // --url=VALUE / -url=VALUE → transfer URL (always classify).
+        if (std.mem.startsWith(u8, t, "--url=") or std.mem.startsWith(u8, t, "-url=")) {
+            const raw = if (std.mem.startsWith(u8, t, "--url=")) t["--url=".len..] else t["-url=".len..];
+            try appendUniqueOwnedHost(allocator, hosts, network_tags.hostFromUrlOrHost(raw));
+            continue;
+        }
+
+        // --url / -url VALUE → transfer URL (always classify).
+        if ((std.mem.eql(u8, t, "--url") or std.mem.eql(u8, t, "-url")) and j + 1 < tokens.len) {
+            try appendUniqueOwnedHost(allocator, hosts, network_tags.hostFromUrlOrHost(tokens[j + 1]));
+            j += 1;
+            continue;
+        }
+
+        // Value-taking options: skip the next token (not a transfer URL).
+        if (t[0] == '-') {
+            if (curlFlagTakesValue(t) and j + 1 < tokens.len and !isShellOperator(tokens[j + 1])) {
+                j += 1; // skip option value
+            }
+            continue;
+        }
+
+        if (startsWithIgnoreCase(t, "https://") or startsWithIgnoreCase(t, "http://")) {
+            try appendUniqueOwnedHost(allocator, hosts, network_tags.hostFromUrlOrHost(t));
+            continue;
+        }
+
+        // Bare host-looking tokens (allowlist default-deny needs unmatched hosts too).
+        if (std.mem.indexOfScalar(u8, t, '.') != null) {
+            try appendUniqueOwnedHost(allocator, hosts, network_tags.hostFromUrlOrHost(t));
+        }
+    }
+}
+
+/// Collect unique curl/wget transfer + dest-flag hosts from command-position operands.
+/// Recurses into `sh`/`bash`/`zsh`/`dash` `-c`/`-lc` payloads. Empty extract is not fail-closed.
+fn appendCurlLikeHosts(
     allocator: std.mem.Allocator,
     command_text: []const u8,
-    hits: *std.ArrayList(catalog.EffectHit),
-) !void {
+    hosts: *std.ArrayList([]const u8),
+    opaque_config: ?*bool,
+    depth: u8,
+) error{OutOfMemory}!void {
     const tokens = try tokenizeSimple(allocator, command_text);
     defer allocator.free(tokens);
     if (tokens.len == 0) return;
 
     var i: usize = 0;
     while (i < tokens.len) : (i += 1) {
-        if (!isCurlLikeToken(tokens[i])) continue;
-        if (!isCommandPosition(tokens, i)) continue;
-
-        // Scan operands until next shell operator.
-        var j = i + 1;
-        while (j < tokens.len) : (j += 1) {
-            if (isShellOperator(tokens[j])) break;
-            const t = tokens[j];
-            if (t.len == 0) continue;
-
-            // --url=VALUE / -url=VALUE → transfer URL (always classify).
-            if (std.mem.startsWith(u8, t, "--url=") or std.mem.startsWith(u8, t, "-url=")) {
-                const raw = if (std.mem.startsWith(u8, t, "--url=")) t["--url=".len..] else t["-url=".len..];
-                const host = network_tags.hostFromUrlOrHost(raw);
-                try appendCurlHostHit(allocator, hits, host);
-                continue;
-            }
-
-            // --url / -url VALUE → transfer URL (always classify).
-            if ((std.mem.eql(u8, t, "--url") or std.mem.eql(u8, t, "-url")) and j + 1 < tokens.len) {
-                const host = network_tags.hostFromUrlOrHost(tokens[j + 1]);
-                try appendCurlHostHit(allocator, hits, host);
-                j += 1;
-                continue;
-            }
-
-            // Value-taking options: skip the next token (not a transfer URL).
-            if (t[0] == '-') {
-                if (curlFlagTakesValue(t) and j + 1 < tokens.len and !isShellOperator(tokens[j + 1])) {
-                    j += 1; // skip option value
-                }
-                continue;
-            }
-
-            if (startsWithIgnoreCase(t, "https://") or startsWithIgnoreCase(t, "http://")) {
-                const host = network_tags.hostFromUrlOrHost(t);
-                try appendCurlHostHit(allocator, hits, host);
-                continue;
-            }
-
-            // Bare host-looking tokens that match a curated tag.
-            if (std.mem.indexOfScalar(u8, t, '.') != null) {
-                const host = network_tags.hostFromUrlOrHost(t);
-                try appendCurlHostHit(allocator, hits, host);
-            }
+        if (isCurlLikeToken(tokens[i]) and isCommandPosition(tokens, i)) {
+            try appendCurlOperands(allocator, tokens, i + 1, hosts, opaque_config, isCurlToken(tokens[i]));
+            continue;
         }
+        if (isDashCShellToken(tokens[i]) and isCommandPosition(tokens, i)) {
+            try appendDashCEmbedHosts(allocator, tokens, i + 1, hosts, opaque_config, depth);
+        }
+    }
+}
+
+/// Append effect hits for every curl/wget URL / tagged host operand in command position.
+fn appendCurlLikeHostEffects(
+    allocator: std.mem.Allocator,
+    command_text: []const u8,
+    hits: *std.ArrayList(catalog.EffectHit),
+) !void {
+    var hosts: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (hosts.items) |h| allocator.free(h);
+        hosts.deinit(allocator);
+    }
+    try appendCurlLikeHosts(allocator, command_text, &hosts, null, 0);
+    for (hosts.items) |host| {
+        try appendCurlHostHit(allocator, hits, host);
     }
 }
 
@@ -710,4 +998,137 @@ test "curl publish host after more than 48 tokens still classifies" {
     defer std.testing.allocator.free(hits);
     try std.testing.expect(hits.len >= 1);
     try std.testing.expectEqualStrings("comms.publish", hits[0].id);
+}
+
+test "extractCurlLikeHosts collects unmatched and allowlisted destinations" {
+    const invalid = try extractCurlLikeHosts(std.testing.allocator, "curl https://example.invalid/");
+    defer freeCurlLikeHosts(std.testing.allocator, invalid);
+    try std.testing.expectEqual(@as(usize, 1), invalid.len);
+    try std.testing.expectEqualStrings("example.invalid", invalid[0]);
+
+    const github = try extractCurlLikeHosts(std.testing.allocator, "curl https://api.github.com/");
+    defer freeCurlLikeHosts(std.testing.allocator, github);
+    try std.testing.expectEqual(@as(usize, 1), github.len);
+    try std.testing.expectEqualStrings("api.github.com", github[0]);
+
+    const wget_url = try extractCurlLikeHosts(std.testing.allocator, "wget --url https://example.invalid/install.sh");
+    defer freeCurlLikeHosts(std.testing.allocator, wget_url);
+    try std.testing.expectEqual(@as(usize, 1), wget_url.len);
+    try std.testing.expectEqualStrings("example.invalid", wget_url[0]);
+}
+
+fn extractHostsContain(hosts: []const []const u8, want: []const u8) bool {
+    for (hosts) |h| {
+        if (std.ascii.eqlIgnoreCase(h, want)) return true;
+    }
+    return false;
+}
+
+test "extractCurlLikeHosts unwraps bash -c curl payload" {
+    const hosts = try extractCurlLikeHosts(std.testing.allocator, "bash -c 'curl https://example.invalid/'");
+    defer freeCurlLikeHosts(std.testing.allocator, hosts);
+    try std.testing.expect(extractHostsContain(hosts, "example.invalid"));
+}
+
+test "extractCurlLikeHosts unwraps bash -lc curl payload" {
+    const hosts = try extractCurlLikeHosts(std.testing.allocator, "bash -lc 'curl https://example.invalid/'");
+    defer freeCurlLikeHosts(std.testing.allocator, hosts);
+    try std.testing.expect(extractHostsContain(hosts, "example.invalid"));
+}
+
+test "extractCurlLikeHosts treats --proxy as destination" {
+    const hosts = try extractCurlLikeHosts(
+        std.testing.allocator,
+        "curl -x http://example.invalid https://api.github.com/",
+    );
+    defer freeCurlLikeHosts(std.testing.allocator, hosts);
+    try std.testing.expect(extractHostsContain(hosts, "example.invalid"));
+    try std.testing.expect(extractHostsContain(hosts, "api.github.com"));
+}
+
+test "extractCurlLikeHosts treats --connect-to ADDR hop as destination" {
+    const hosts = try extractCurlLikeHosts(
+        std.testing.allocator,
+        "curl --connect-to api.github.com:443:example.invalid:443 https://api.github.com/",
+    );
+    defer freeCurlLikeHosts(std.testing.allocator, hosts);
+    try std.testing.expect(extractHostsContain(hosts, "example.invalid"));
+}
+
+test "extractCurlLikeHosts treats --resolve addr as destination" {
+    const hosts = try extractCurlLikeHosts(
+        std.testing.allocator,
+        "curl --resolve api.github.com:443:example.invalid https://api.github.com/",
+    );
+    defer freeCurlLikeHosts(std.testing.allocator, hosts);
+    try std.testing.expect(extractHostsContain(hosts, "example.invalid"));
+}
+
+test "extractCurlLikeHosts treats --doh-url as destination" {
+    const hosts = try extractCurlLikeHosts(
+        std.testing.allocator,
+        "curl --doh-url https://example.invalid/dns-query https://api.github.com/",
+    );
+    defer freeCurlLikeHosts(std.testing.allocator, hosts);
+    try std.testing.expect(extractHostsContain(hosts, "example.invalid"));
+}
+
+test "extractCurlLikeHosts fail-closes on --config without inline URL" {
+    try std.testing.expectError(
+        error.UnreadableCurlConfig,
+        extractCurlLikeHosts(std.testing.allocator, "curl --config /tmp/curlrc"),
+    );
+    try std.testing.expectError(
+        error.UnreadableCurlConfig,
+        extractCurlLikeHosts(std.testing.allocator, "curl -K foo.cfg https://api.github.com/"),
+    );
+}
+
+test "extractCurlLikeHosts keeps scheme-less localhost empty" {
+    const hosts = try extractCurlLikeHosts(std.testing.allocator, "curl localhost");
+    defer freeCurlLikeHosts(std.testing.allocator, hosts);
+    try std.testing.expectEqual(@as(usize, 0), hosts.len);
+}
+
+test "extractCurlLikeHosts unwraps exec curl" {
+    const hosts = try extractCurlLikeHosts(std.testing.allocator, "exec curl https://example.invalid/");
+    defer freeCurlLikeHosts(std.testing.allocator, hosts);
+    try std.testing.expect(extractHostsContain(hosts, "example.invalid"));
+}
+
+test "extractCurlLikeHosts treats --proxy1.0 and --socks5 as destinations" {
+    const proxy = try extractCurlLikeHosts(
+        std.testing.allocator,
+        "curl --proxy1.0 203.0.113.1:8080 https://api.github.com/",
+    );
+    defer freeCurlLikeHosts(std.testing.allocator, proxy);
+    try std.testing.expect(extractHostsContain(proxy, "203.0.113.1"));
+    try std.testing.expect(extractHostsContain(proxy, "api.github.com"));
+
+    const socks = try extractCurlLikeHosts(
+        std.testing.allocator,
+        "curl --socks5 localhost:1080 https://api.github.com/",
+    );
+    defer freeCurlLikeHosts(std.testing.allocator, socks);
+    try std.testing.expect(extractHostsContain(socks, "localhost"));
+    try std.testing.expect(extractHostsContain(socks, "api.github.com"));
+}
+
+test "extractCurlLikeHosts unwraps bash -xc curl payload" {
+    const hosts = try extractCurlLikeHosts(std.testing.allocator, "bash -xc 'curl https://example.invalid/'");
+    defer freeCurlLikeHosts(std.testing.allocator, hosts);
+    try std.testing.expect(extractHostsContain(hosts, "example.invalid"));
+}
+
+test "extractCurlLikeHosts fail-closes on curl clustered -sK config" {
+    try std.testing.expectError(
+        error.UnreadableCurlConfig,
+        extractCurlLikeHosts(std.testing.allocator, "curl -sK curlrc https://api.github.com/"),
+    );
+}
+
+test "extractCurlLikeHosts does not treat wget -K as curl config" {
+    const hosts = try extractCurlLikeHosts(std.testing.allocator, "wget -K -q https://example.invalid/");
+    defer freeCurlLikeHosts(std.testing.allocator, hosts);
+    try std.testing.expect(extractHostsContain(hosts, "example.invalid"));
 }

@@ -26,7 +26,7 @@ pub const MockServer = struct {
     }
 
     fn start(socket_path: []const u8, mode: Mode, payload_bytes: usize) !MockServer {
-        const server_fd = try daemon_uds.bindListenUnixSocket(socket_path);
+        const server_fd = try daemon_uds.bindListenUnixSocket(socket_path, 1);
         var server: MockServer = .{
             .server_fd = server_fd,
             .socket_path = socket_path,

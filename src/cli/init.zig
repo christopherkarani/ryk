@@ -432,22 +432,13 @@ test "init rejects invalid preset names clearly" {
 
 // ---------------------------------------------------------------------------
 // AINA P3 S5 — init path discovery refresh (DIS-1 / DIS-7)
-// Plan §3.6: `ryk init` runs adapters for detected hosts and refreshes managed file.
+// `ryk init` runs adapters for detected hosts and refreshes managed file.
 //
-// Expected production API (implementer lands in init.zig; may share body with
-// start.zig via `@import("init.zig")` from start — do NOT import start from init):
-//
-//   pub fn refreshManagedDiscovery(
-//       io: std.Io,
-//       allocator: std.mem.Allocator,
-//       workspace_root: []const u8,
-//       home: []const u8,
-//       host_keys: []const []const u8,
-//   ) !void
-//
-// Product wire: after policy write, call refresh for known adapter keys
-// (pi/opencode minimum) using parent HOME + abs workspace_root. Soft-skip when
-// no auth configs. Never wipe user policy allows on rediscovery.
+// refreshManagedDiscovery is re-exported from policy/network_discovered (both
+// init and start re-export the same function; neither imports the other). After
+// policy write, call refresh for known adapter keys (pi/opencode minimum) using
+// parent HOME + abs workspace_root. Soft-skip when no auth configs. Never wipe
+// user policy allows on rediscovery.
 // ---------------------------------------------------------------------------
 
 const p3_init_pi_auth_json =
