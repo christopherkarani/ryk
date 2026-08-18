@@ -345,26 +345,6 @@ test "writePretty colors DENY Decision only" {
     try expectCsiOnlyOnDecisionLine(out);
 }
 
-test "writePretty deny next is safer not the other inspect verb" {
-    theme.setTestActive(.{ .capability = .none, .background = .dark });
-    defer theme.setTestActive(null);
-    var buf: [4096]u8 = undefined;
-    var w: std.Io.Writer = .fixed(&buf);
-    const eval = shell_engine.Evaluation{
-        .decision = .deny,
-        .rule_id = "core.filesystem:rm-rf-general",
-        .severity = .high,
-        .reason = "destructive",
-        .owned = false,
-    };
-    try writePretty(std.testing.io, &w, "rm -rf /", eval);
-    const out = w.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, out, "Safer: rm -rf ./build") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "Next: ryk test") == null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "Next: ryk explain") == null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "Next:") == null);
-}
-
 test "writePretty deny without safer has no inspect Next" {
     theme.setTestActive(.{ .capability = .none, .background = .dark });
     defer theme.setTestActive(null);

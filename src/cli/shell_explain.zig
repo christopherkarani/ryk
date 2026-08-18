@@ -413,3 +413,30 @@ test "s-product-wire: shell_explain without stores still reports DENY for destru
     try std.testing.expectEqual(exit_codes.success, code);
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "DENY") != null);
 }
+
+test "shell_explain deny next is safer not ryk test" {
+    var xdg = try sProductWireIsolateXdg();
+    defer xdg.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, ".git");
+
+    const previous_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(previous_cwd);
+    try std.process.setCurrentDir(std.testing.io, tmp.dir);
+    defer std.process.setCurrentPath(std.testing.io, previous_cwd) catch {};
+
+    var stdout_buf: [16384]u8 = undefined;
+    var stderr_buf: [1024]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+    const code = try command(std.testing.io, &.{"rm -rf /"}, &stdout_writer, &stderr_writer);
+    try std.testing.expectEqual(exit_codes.success, code);
+    const out = stdout_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "DENY") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Safer:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Next: ryk test") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Next: ryk explain") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Next:") == null);
+}
