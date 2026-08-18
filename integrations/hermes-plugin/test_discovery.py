@@ -596,25 +596,8 @@ class HermesPluginDiscoveryTests(unittest.TestCase):
                 result = handler(tool_name="terminal", args={"command": "git status"})
             self.assertEqual(result, {"action": "block", "message": "blocked by ryk"})
 
-    def test_pre_tool_call_leftover_allow_from_ryk_proceeds(self) -> None:
-        """Leftover unused ask is remapped by ryk; plugin proceeds on allow."""
-        ctx = mock.Mock()
-        _PLUGIN._register(ctx, "pre_tool_call")
-        handler = ctx.register_hook.call_args.args[1]
-        with mock.patch.object(
-            _PLUGIN,
-            "_call_ryk",
-            return_value={
-                "decision": "allow",
-                "message": "leftover unused policy ask permitted",
-                "rule_id": "core.filesystem:destructive_rm",
-            },
-        ):
-            result = handler(tool_name="terminal", args={"command": "rm -rf /tmp/x"})
-        self.assertIsNone(result)
-
-    def test_pre_tool_call_unexpected_ask_is_fail_closed(self) -> None:
-        """Plugin must not invent leftover-ask permit if ryk still emitted ask."""
+    def test_pre_tool_call_unexpected_ask_is_deny(self) -> None:
+        """Leaked ask after the Zig rewrite is fail-closed deny."""
         ctx = mock.Mock()
         _PLUGIN._register(ctx, "pre_tool_call")
         handler = ctx.register_hook.call_args.args[1]
@@ -637,7 +620,8 @@ class HermesPluginDiscoveryTests(unittest.TestCase):
                 },
             ):
                 result = handler(tool_name="terminal", args={"command": "rm -rf /tmp/x"})
-        self.assertEqual(result["action"], "block")
+        self.assertEqual(result.get("action"), "block")
+        self.assertIn("approval required", result.get("message", "").lower())
 
     def test_pre_tool_call_stage_never_permits(self) -> None:
         """Staged writes are hold/deny, not leftover unused ask."""
@@ -677,7 +661,7 @@ class HermesPluginDiscoveryTests(unittest.TestCase):
             ):
                 result = handler(tool_name="terminal", args={"command": "git push"})
         self.assertEqual(result.get("action"), "block")
-        self.assertIn("noninteractive", result.get("message", "").lower())
+        self.assertIn("approval required", result.get("message", "").lower())
 
     def test_unattended_marker_hardens_ask_to_block_with_env_cleared(self) -> None:
         """`.ryk_unattended` alone must drive ask→block even when CI env is absent."""
@@ -713,7 +697,7 @@ class HermesPluginDiscoveryTests(unittest.TestCase):
                 ):
                     result = handler(tool_name="terminal", args={"command": "git push"})
             self.assertEqual(result.get("action"), "block")
-            self.assertIn("noninteractive", result.get("message", "").lower())
+            self.assertIn("approval required", result.get("message", "").lower())
 
     def test_call_ryk_passes_ci_flag_when_unattended(self) -> None:
         """Unattended hooks must invoke `ryk hook hermes … --ci`."""
@@ -812,7 +796,7 @@ class HermesPluginDiscoveryTests(unittest.TestCase):
         for decision, expected in (
             ("allow", "proceed"),
             ("block", "hard_block"),
-            ("ask", "hard_block"),
+            ("ask", "fail_closed_block"),
             ("warn", "advisory_log"),
         ):
             with self.subTest(decision=decision):
@@ -922,7 +906,7 @@ class HermesPluginDiscoveryTests(unittest.TestCase):
         self.assertIn("core.shell:network", rule_only)
         self.assertNotIn("\n", rule_only)
 
-    def test_unexpected_ask_is_fail_closed(self) -> None:
+    def test_attended_ask_is_unexpected_deny(self) -> None:
         mapping = _PLUGIN._mapping
         out = mapping.map_pre_tool_call(
             {
@@ -939,6 +923,7 @@ class HermesPluginDiscoveryTests(unittest.TestCase):
             environ={},
         )
         self.assertEqual(out["action"], "block")
+        self.assertNotIn("Recourse", out["message"])
 
     def test_ci_ask_block_message_is_short_single_line(self) -> None:
         mapping = _PLUGIN._mapping
@@ -957,7 +942,6 @@ class HermesPluginDiscoveryTests(unittest.TestCase):
         self.assertEqual(out["action"], "block")
         message = out["message"]
         self.assertIn("approval required", message.lower())
-        self.assertIn("noninteractive", message.lower())
         self.assertNotIn("Recourse", message)
         self.assertNotIn("Next:", message)
         self.assertNotIn("\n", message)
@@ -1044,7 +1028,7 @@ class HermesPluginDiscoveryTests(unittest.TestCase):
         self.assertFalse(message.endswith("...[truncated]"))
 
     def test_ci_ask_block_message_respects_host_char_cap(self) -> None:
-        """CI harden clause must still fit Hermes host message budget."""
+        """Unexpected ask still fits Hermes host message budget."""
         mapping = _PLUGIN._mapping
         out = mapping.map_pre_tool_call(
             {
@@ -1063,7 +1047,6 @@ class HermesPluginDiscoveryTests(unittest.TestCase):
         message = out["message"]
         self.assertLessEqual(len(message), 200)
         self.assertNotIn("\n", message)
-        self.assertIn("noninteractive", message.lower())
         self.assertNotIn("Recourse", message)
 
     def test_pre_tool_call_allows_only_explicit_allow(self) -> None:

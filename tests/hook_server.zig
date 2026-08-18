@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const hook_serve = @import("ryk").cli.hook_serve;
+const hook = @import("ryk").cli.hook;
 const hook_ipc = @import("ryk").cli.hook_ipc;
 const hook_client = @import("ryk").cli.hook_client;
 const daemon_uds = @import("ryk").cli.daemon_uds;
@@ -27,49 +28,6 @@ const default_policy = "policies/default.yaml";
 
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern "c" fn unsetenv(name: [*:0]const u8) c_int;
-
-const unattended_env_keys = [_][*:0]const u8{
-    "CI",
-    "RYK_CI",
-    "RYK_NONINTERACTIVE",
-    "RYK_UNATTENDED",
-};
-
-const UnattendedEnvSnapshot = struct {
-    prev: [unattended_env_keys.len]?[:0]u8,
-
-    fn restore(self: *UnattendedEnvSnapshot) void {
-        for (unattended_env_keys, 0..) |key, i| {
-            if (self.prev[i]) |value| {
-                _ = setenv(key, value.ptr, 1);
-                std.testing.allocator.free(value);
-                self.prev[i] = null;
-            } else {
-                _ = unsetenv(key);
-            }
-        }
-    }
-};
-
-/// Snapshot then unset unattended keys so in-process hook-serve sees attended.
-/// Restore on defer — a leaked unset CI makes later tests in this binary lie.
-fn clearUnattendedEnv() !UnattendedEnvSnapshot {
-    var snap = UnattendedEnvSnapshot{ .prev = .{null} ** unattended_env_keys.len };
-    errdefer {
-        for (snap.prev) |maybe| {
-            if (maybe) |value| std.testing.allocator.free(value);
-        }
-    }
-    for (unattended_env_keys, 0..) |key, i| {
-        if (std.c.getenv(key)) |raw| {
-            snap.prev[i] = try std.testing.allocator.dupeZ(u8, std.mem.span(raw));
-        }
-    }
-    for (unattended_env_keys) |key| {
-        _ = unsetenv(key);
-    }
-    return snap;
-}
 
 fn readFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     return try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, allocator, .limited(256 * 1024));
@@ -715,8 +673,10 @@ test "one server serves evaluate allow" {
 
 test "one server permits leftover unused ask on coding hosts" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
-    var unattended = try clearUnattendedEnv();
-    defer unattended.restore();
+    hook.test_unattended_override = false;
+    defer {
+        hook.test_unattended_override = null;
+    }
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
@@ -805,30 +765,20 @@ test "one server permits leftover unused ask on coding hosts" {
     try std.testing.expectEqual(@as(u8, 2), ci_resp.response.exit);
 }
 
-test "one server denies leftover unused ask when ambient CI is set" {
+test "one server denies leftover unused ask when req.ci is true" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
-    const prev_ci: ?[:0]u8 = if (std.c.getenv("CI")) |raw|
-        try std.testing.allocator.dupeZ(u8, std.mem.span(raw))
-    else
-        null;
-    defer {
-        if (prev_ci) |value| {
-            _ = setenv("CI", value.ptr, 1);
-            std.testing.allocator.free(value);
-        } else {
-            _ = unsetenv("CI");
-        }
-    }
-    try std.testing.expectEqual(@as(c_int, 0), setenv("CI", "true", 1));
+    // Override stays unset so req.ci=true is what hardens leftover. Sibling
+    // leftover-allow pins test_unattended_override=false so live CI cannot flip it.
+    try std.testing.expect(hook.test_unattended_override == null);
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir);
-    const short = try makeTestSock(std.testing.allocator, "leftover-ask-ci");
+    const short = try makeTestSock(std.testing.allocator, "leftover-ci");
     defer short.deinit(std.testing.allocator);
     const sock = short.sock;
-    const ws = try std.fs.path.join(std.testing.allocator, &.{ dir, "ask-ws-ci" });
+    const ws = try std.fs.path.join(std.testing.allocator, &.{ dir, "ask-ws" });
     defer std.testing.allocator.free(ws);
     try std.Io.Dir.cwd().createDirPath(std.testing.io, ws);
 
@@ -845,6 +795,12 @@ test "one server denies leftover unused ask when ambient CI is set" {
         .{leftover_cmd},
     );
     defer std.testing.allocator.free(grok_payload);
+    const eval_payload = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"schema_version\":1,\"request_id\":\"req-ci\",\"kind\":\"shell_command\",\"command\":\"{s}\",\"cwd\":\"{s}\",\"source\":{{\"host\":\"pi\",\"tool_name\":\"bash\",\"mode\":\"tui\",\"session_id\":\"pi-leftover-ci\"}}}}",
+        .{ leftover_cmd, ws },
+    );
+    defer std.testing.allocator.free(eval_payload);
 
     const server = try startServer(sock);
     defer stopServer(sock, server);
@@ -854,6 +810,7 @@ test "one server denies leftover unused ask when ambient CI is set" {
         .method = "hook",
         .host = "grok",
         .event = "PreToolUse",
+        .ci = true,
         .workspace = ws,
         .payload_json = grok_payload,
     });
@@ -863,6 +820,26 @@ test "one server denies leftover unused ask when ambient CI is set" {
     var grok_resp = try hook_ipc.parseResponse(std.testing.allocator, grok_raw);
     defer grok_resp.deinit();
     try std.testing.expectEqual(@as(u8, 2), grok_resp.response.exit);
+    const grok_decision = try parseDecision(std.testing.allocator, grok_resp.response.stdout);
+    defer std.testing.allocator.free(grok_decision);
+    try std.testing.expectEqualStrings("deny", grok_decision);
+
+    const eval_req = try hook_ipc.stringifyRequest(std.testing.allocator, .{
+        .id = 2,
+        .method = "evaluate",
+        .ci = true,
+        .workspace = ws,
+        .payload_json = eval_payload,
+    });
+    defer std.testing.allocator.free(eval_req);
+    const eval_raw = try exchange(std.testing.allocator, sock, eval_req);
+    defer std.testing.allocator.free(eval_raw);
+    var eval_resp = try hook_ipc.parseResponse(std.testing.allocator, eval_raw);
+    defer eval_resp.deinit();
+    try std.testing.expectEqual(@as(u8, 2), eval_resp.response.exit);
+    const eval_decision = try parseDecision(std.testing.allocator, eval_resp.response.stdout);
+    defer std.testing.allocator.free(eval_decision);
+    try std.testing.expectEqualStrings("deny", eval_decision);
 }
 
 test "one server serves cursor allow" {

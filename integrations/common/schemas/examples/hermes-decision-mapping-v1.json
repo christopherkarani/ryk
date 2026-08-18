@@ -8,8 +8,8 @@
       "allow": { "mode": "proceed" },
       "block": { "mode": "hard_block", "host_action": "block" },
       "ask": {
-        "mode": "hard_block",
-        "notes": "Leftover unused ask is remapped by ryk hook before emit. Unexpected ask is fail-closed. Unattended/CI leftover unused ask is already block."
+        "mode": "fail_closed_block",
+        "notes": "Leftover unused policy ask is rewritten by ryk hook. A leaked ask is fail-closed deny."
       },
       "warn": {
         "mode": "advisory_log",

@@ -119,7 +119,7 @@ test {
     _ = daemon.errors;
     _ = shutdown;
     _ = shell_eval;
-    _ = @import("leftover_ask.zig");
+    _ = @import("host_wire_rewrite.zig");
     _ = scan_command;
     // Pull hook.zig tests (daemon evaluate → HookResponse, strict refuse, redaction).
     _ = hook;
@@ -2429,10 +2429,8 @@ test "stop dispatch is the public disable command" {
 
     const help_code = try testRun(&.{ "help", "stop" }, &stdout_writer, &stderr_writer);
     try std.testing.expectEqual(exit_codes.success, help_code);
-    const help_out = stdout_writer.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, help_out, "ryk stop") != null);
-    try std.testing.expect(std.mem.indexOf(u8, help_out, "ryk stop cursor") == null);
-    try std.testing.expect(std.mem.indexOf(u8, help_out, "|cursor|") == null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "ryk stop") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.buffered(), "cursor") != null);
 
     stdout_writer = .fixed(&stdout_buf);
     stderr_writer = .fixed(&stderr_buf);

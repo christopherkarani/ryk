@@ -468,9 +468,11 @@ function normalizeBlockingDecision(decision, base, options = {}) {
         };
     }
     if (decision === 'ask') {
+        // Leftover unused policy ask is rewritten by ryk hook before emit.
+        // A leaked `ask` here is unexpected: fail-closed deny.
         return failClosedBlock(options.unattended ? 'ryk_unattended_ask' : 'ryk_unexpected_ask', options.unattended
             ? 'ryk requested approval, but this OpenClaw process is unattended; blocking without waiting.'
-            : 'ryk leftover unused ask was not remapped; blocking fail-closed.', base);
+            : 'ryk returned an unexpected ask; blocking fail-closed.', base);
     }
     if (!ALLOW_DECISIONS.has(decision)) {
         return failClosedBlock('ryk_unrecognized_decision', `ryk returned unrecognized decision "${decision}"; blocking as a precaution.`, base);
@@ -491,9 +493,8 @@ function normalizeBlockingDecision(decision, base, options = {}) {
  * Parse ryk hook stdout into a decision.
  * Non-blocking: soft-allow on empty/malformed.
  * Blocking: fail closed on empty/whitespace, parse errors, missing/non-string
- * decision, unattended leftover `ask`, and unrecognized decisions. Attended
- * leftover unused policy `ask` is remapped by ryk hook before emit.
- * An unexpected leftover `ask` here is fail-closed. Approval is not translated
+ * decision, unexpected `ask`, and unrecognized decisions. Leftover unused
+ * policy ask is rewritten by `ryk hook` before emit. Approval is not translated
  * into a host-native request.
  */
 export function parseHookResponse(stdout, blocking, options = {}) {
@@ -556,12 +557,10 @@ async function callRyk(rykBin, event, data, sessionId, blocking, logger, options
     }
     try {
         const hookArgs = ['hook', 'openclaw', event];
-        // Unattended/CI must pass --ci so leftover unused ryk ask hardens inside
-        // the CLI, not only in the host mapping layer. Stage, FM steward ask, and
-        // SoftBlock never ride the leftover-ask permit wire.
-        if (options.unattended || isUnattended()) {
+        // Host extra `RYK_OPENCLAW_UNATTENDED` is not a Zig shared key — fold it
+        // into `--ci` so leftover unused policy ask hardens inside ryk.
+        if (options.unattended)
             hookArgs.push('--ci');
-        }
         const stdout = await runRykHookProcess(rykBin, hookArgs, payload.json, blocking ? 15000 : 10000, options.cwd);
         return parseHookResponse(stdout, blocking, options);
     }
