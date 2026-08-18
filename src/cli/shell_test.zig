@@ -5,6 +5,8 @@ const shell_eval = @import("shell_eval.zig");
 const pack_config = @import("pack_config.zig");
 const core = @import("ryk_core").core;
 const reasons = @import("../tui/reasons.zig");
+const explain_render = @import("explain_render.zig");
+const theme = @import("../tui/theme.zig");
 
 pub fn command(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: anytype) !u8 {
     if (isRykTestHelp(argv)) {
@@ -99,11 +101,7 @@ pub fn command(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: an
         try stdout.writeAll(json);
         try stdout.writeAll("\n");
     } else {
-        const decision = switch (eval.decision) {
-            .allow => "ALLOW",
-            .deny => "DENY",
-        };
-        try stdout.print("Decision: {s}\n", .{decision});
+        try explain_render.writeDecisionLine(io, stdout, eval.decision);
         if (eval.decision == .deny) {
             if (eval.rule_id) |rid| try stdout.print("Rule: {s}\n", .{rid});
             try stdout.print("Why: {s}\n", .{eval.reason});
@@ -275,6 +273,7 @@ test "test rm -rf / is deny not an unknown-option error" {
     try std.testing.expect(std.mem.indexOf(u8, out, "rm -rf ./build") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "Always") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "always") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[") == null);
     try std.testing.expect(std.mem.indexOf(u8, stderr_writer.buffered(), "unknown option") == null);
 }
 
@@ -302,6 +301,107 @@ test "test human output is a decision panel" {
     try std.testing.expect(std.mem.indexOf(u8, out, "always") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "allowlist") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "Safer:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[") == null);
+}
+
+fn expectCsiOnlyOnDecisionLine(out: []const u8) !void {
+    var it = std.mem.splitScalar(u8, out, '\n');
+    var saw_decision = false;
+    while (it.next()) |line| {
+        const has_csi = std.mem.indexOf(u8, line, "\x1b[") != null;
+        if (std.mem.indexOf(u8, line, "Decision:") != null) {
+            saw_decision = true;
+            try std.testing.expect(has_csi);
+            try std.testing.expect(std.mem.indexOf(u8, line, "DENY") != null);
+        } else {
+            try std.testing.expect(!has_csi);
+        }
+    }
+    try std.testing.expect(saw_decision);
+}
+
+test "shell_test colors DENY Decision only" {
+    theme.setTestActive(.{ .capability = .truecolor, .background = .dark });
+    defer theme.setTestActive(null);
+
+    var xdg = try sProductWireIsolateXdg();
+    defer xdg.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, ".git");
+    const previous_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(previous_cwd);
+    try std.process.setCurrentDir(std.testing.io, tmp.dir);
+    defer std.process.setCurrentPath(std.testing.io, previous_cwd) catch {};
+
+    var stdout_buf: [4096]u8 = undefined;
+    var stderr_buf: [1024]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+    const code = try command(std.testing.io, &.{ "rm", "-rf", "/" }, &stdout_writer, &stderr_writer);
+    try std.testing.expectEqual(@as(u8, 2), code);
+    const out = stdout_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Decision:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "DENY") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Why:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Rule:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Safer:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Next:") != null);
+    try expectCsiOnlyOnDecisionLine(out);
+}
+
+test "shell_test ALLOW Decision has no CSI" {
+    theme.setTestActive(.{ .capability = .truecolor, .background = .dark });
+    defer theme.setTestActive(null);
+
+    var xdg = try sProductWireIsolateXdg();
+    defer xdg.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, ".git");
+    const previous_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(previous_cwd);
+    try std.process.setCurrentDir(std.testing.io, tmp.dir);
+    defer std.process.setCurrentPath(std.testing.io, previous_cwd) catch {};
+
+    var stdout_buf: [4096]u8 = undefined;
+    var stderr_buf: [1024]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+    const code = try command(std.testing.io, &.{"git status"}, &stdout_writer, &stderr_writer);
+    try std.testing.expectEqual(@as(u8, 0), code);
+    const out = stdout_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Decision: ALLOW") != null);
+}
+
+test "shell_test json DENY has no CSI" {
+    theme.setTestActive(.{ .capability = .truecolor, .background = .dark });
+    defer theme.setTestActive(null);
+
+    var xdg = try sProductWireIsolateXdg();
+    defer xdg.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, ".git");
+    const previous_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(previous_cwd);
+    try std.process.setCurrentDir(std.testing.io, tmp.dir);
+    defer std.process.setCurrentPath(std.testing.io, previous_cwd) catch {};
+
+    var stdout_buf: [4096]u8 = undefined;
+    var stderr_buf: [1024]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+    const code = try command(std.testing.io, &.{ "--format", "json", "rm", "-rf", "/" }, &stdout_writer, &stderr_writer);
+    try std.testing.expectEqual(@as(u8, 2), code);
+    const out = stdout_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"decision\"") != null);
 }
 
 test "joinArgs" {

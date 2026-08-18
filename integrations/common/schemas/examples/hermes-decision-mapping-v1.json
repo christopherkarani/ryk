@@ -8,8 +8,8 @@
       "allow": { "mode": "proceed" },
       "block": { "mode": "hard_block", "host_action": "block" },
       "ask": {
-        "mode": "proceed",
-        "notes": "Residual ask is permit so agents can work. Unattended/CI hardens to block."
+        "mode": "fail_closed_block",
+        "notes": "Leftover unused policy ask is rewritten by ryk hook. A leaked ask is fail-closed deny."
       },
       "warn": {
         "mode": "advisory_log",

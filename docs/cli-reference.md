@@ -447,5 +447,5 @@ These are recorded because they affect documentation and automation:
 
 1. ryk help run mentions yolo in the displayed mode list, but the current run parser rejects --mode yolo and accepts only observe, ask, strict, and ci. Use the accepted list until the help and parser converge.
 2. ryk help decide and the parser accept --stdin. Piped stdin has failed with EndOfStream in the reader, so do not treat that route as reliable. Prefer the inline --json form. The source location is [decide.zig](../src/cli/decide.zig#L696).
-3. --json is scoped to a command implementation. `replay --json --list` has rendered the list form rather than a JSON document. Treat each subcommand's help as its output contract.
+3. --json is scoped to a command implementation. `replay --list --json` emits a JSON list document (`schema_version`, `sessions`). Treat each subcommand's help as its output contract.
 4. doctor --json can return exit 0 with ready: false; use doctor --check when readiness must control a job.

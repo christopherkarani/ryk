@@ -51,7 +51,7 @@ pub fn command(io: std.Io, argv: []const []const u8, stdout: anytype, stderr: an
     defer allocator.free(workspace_root);
 
     if (options.list) {
-        return listSessions(io, allocator, workspace_root, stdout);
+        return listSessions(io, allocator, workspace_root, stdout, options.json);
     }
 
     return replaySession(io, allocator, workspace_root, argv, options, stdout, stderr);
@@ -111,7 +111,7 @@ fn replaySession(
     }) catch |err| switch (err) {
         error.FileNotFound => {
             if (options.fallback_to_list) {
-                return listSessions(io, allocator, workspace_root, stdout);
+                return listSessions(io, allocator, workspace_root, stdout, options.json);
             }
             if (looksLikeHostConversationId(options.session)) {
                 try writeHostConversationIdError(stderr);
@@ -453,18 +453,26 @@ fn extractSummaryCommand(summary: []const u8, buf: []u8) []const u8 {
     return buf[0..n];
 }
 
-fn listSessions(io: std.Io, allocator: std.mem.Allocator, workspace_root: []const u8, stdout: anytype) !u8 {
+fn listSessions(io: std.Io, allocator: std.mem.Allocator, workspace_root: []const u8, stdout: anytype, json: bool) !u8 {
     const sessions_dir = try std.fs.path.join(allocator, &.{ workspace_root, ".ryk", "sessions" });
     defer allocator.free(sessions_dir);
 
     var dir = std.Io.Dir.cwd().openDir(io, sessions_dir, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => {
-            try stdout.writeAll(empty_sessions_hint);
+            if (json) {
+                try stdout.writeAll("{\"schema_version\":1,\"sessions\":[]}\n");
+            } else {
+                try stdout.writeAll(empty_sessions_hint);
+            }
             return exit_codes.success;
         },
         else => return err,
     };
     defer dir.close(io);
+
+    if (json) {
+        return writeSessionListJson(io, allocator, sessions_dir, dir, stdout);
+    }
 
     try stdout.writeAll("SESSION              UPDATED              COMMAND\n");
 
@@ -491,6 +499,35 @@ fn listSessions(io: std.Io, allocator: std.mem.Allocator, workspace_root: []cons
         try stdout.writeAll("Run `ryk replay --session <id>` to view a session.\n");
     }
 
+    return exit_codes.success;
+}
+
+fn writeSessionListJson(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    sessions_dir: []const u8,
+    dir: std.Io.Dir,
+    stdout: anytype,
+) !u8 {
+    try stdout.writeAll("{\"schema_version\":1,\"sessions\":[");
+    var first = true;
+    var iter = dir.iterate();
+    while (try iter.next(io)) |entry| {
+        if (entry.kind != .directory) continue;
+        if (!first) try stdout.writeAll(",");
+        first = false;
+        var updated_buf: [20]u8 = undefined;
+        var command_buf: [48]u8 = undefined;
+        const meta = readSessionListMeta(io, allocator, sessions_dir, entry.name, &updated_buf, &command_buf);
+        try stdout.writeAll("{\"id\":");
+        try core.util.writeJsonString(stdout, entry.name);
+        try stdout.writeAll(",\"updated\":");
+        try core.util.writeJsonString(stdout, meta.updated);
+        try stdout.writeAll(",\"command\":");
+        try core.util.writeJsonString(stdout, meta.command);
+        try stdout.writeAll("}");
+    }
+    try stdout.writeAll("]}\n");
     return exit_codes.success;
 }
 
@@ -628,6 +665,99 @@ test "replay --list prints sessions or friendly empty message" {
     const output = stdout_writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, output, "session-a") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "session-b") != null);
+}
+
+test "replay --list --json emits session list document" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, ".ryk");
+    {
+        const policy_file = try tmp.dir.createFile(std.testing.io, ".ryk/policy.yaml", .{});
+        defer policy_file.close(std.testing.io);
+        try policy_file.writeStreamingAll(std.testing.io, "version: 1\nmode: observe\n");
+    }
+    try tmp.dir.createDirPath(std.testing.io, ".ryk/sessions/session-a");
+    try tmp.dir.createDirPath(std.testing.io, ".ryk/sessions/session-b");
+
+    const prev_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(prev_cwd);
+    try std.process.setCurrentDir(std.testing.io, tmp.dir);
+    defer std.process.setCurrentPath(std.testing.io, prev_cwd) catch {};
+
+    var stdout_buf: [2048]u8 = undefined;
+    var stderr_buf: [256]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+
+    const code = try command(std.testing.io, &.{ "--list", "--json" }, &stdout_writer, &stderr_writer);
+    try std.testing.expectEqual(exit_codes.success, code);
+    try std.testing.expectEqualStrings("", stderr_writer.buffered());
+
+    const raw = stdout_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, raw, "SESSION") == null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "No sessions") == null);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+    const schema = parsed.value.object.get("schema_version") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(schema == .integer);
+    try std.testing.expectEqual(@as(i64, 1), schema.integer);
+    const sessions = parsed.value.object.get("sessions") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(sessions == .array);
+    try std.testing.expectEqual(@as(usize, 2), sessions.array.items.len);
+
+    var found_a = false;
+    var found_b = false;
+    for (sessions.array.items) |item| {
+        try std.testing.expect(item == .object);
+        const id = item.object.get("id") orelse return error.TestUnexpectedResult;
+        try std.testing.expect(id == .string);
+        if (std.mem.eql(u8, id.string, "session-a")) found_a = true;
+        if (std.mem.eql(u8, id.string, "session-b")) found_b = true;
+        try std.testing.expect(item.object.get("updated") != null);
+        try std.testing.expect(item.object.get("command") != null);
+    }
+    try std.testing.expect(found_a);
+    try std.testing.expect(found_b);
+}
+
+test "replay --list --json with no sessions dir emits empty array" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, ".ryk");
+    {
+        const policy_file = try tmp.dir.createFile(std.testing.io, ".ryk/policy.yaml", .{});
+        defer policy_file.close(std.testing.io);
+        try policy_file.writeStreamingAll(std.testing.io, "version: 1\nmode: observe\n");
+    }
+
+    const prev_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(prev_cwd);
+    try std.process.setCurrentDir(std.testing.io, tmp.dir);
+    defer std.process.setCurrentPath(std.testing.io, prev_cwd) catch {};
+
+    var stdout_buf: [512]u8 = undefined;
+    var stderr_buf: [256]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+
+    const code = try command(std.testing.io, &.{ "--list", "--json" }, &stdout_writer, &stderr_writer);
+    try std.testing.expectEqual(exit_codes.success, code);
+    try std.testing.expectEqualStrings("", stderr_writer.buffered());
+
+    const raw = stdout_writer.buffered();
+    try std.testing.expectEqualStrings("{\"schema_version\":1,\"sessions\":[]}\n", raw);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "No sessions") == null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "ryk start") == null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "SESSION") == null);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 1), parsed.value.object.get("schema_version").?.integer);
+    try std.testing.expectEqual(@as(usize, 0), parsed.value.object.get("sessions").?.array.items.len);
 }
 
 test "replay with no args and no sessions shows friendly empty state" {

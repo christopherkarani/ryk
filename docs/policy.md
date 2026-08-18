@@ -78,7 +78,7 @@ Shell v1 shapes only (no bulk-email / VIP fixtures). Prefer product **evaluate**
 
 #### `ryk evaluate` (machine JSON; Pi and similar)
 
-`decision: "ask"` uses **exit 0** (same as allow) — hosts **must** read the JSON `decision` field. Deny is exit `2`; evaluator fail-closed is exit `3`.
+On this coding-host enforcement wire, leftover unused policy ask is **`allow`** (exit 0). Never-permit ask (SoftBlock, FM steward ask, missing origin) and deny are **`deny`** (exit 2). Evaluator fail-closed is exit `3`. Hosts **must** read the JSON `decision` field.
 
 ```sh
 # 1) Network pipe to shell is a critical hard fence → deny (YOLO / ask cannot unlock)
@@ -121,7 +121,7 @@ swift run fm-steward classify --card Fixtures/timeout_forced.json --human
 
 YOLO uses the **same severity matrix as `ask`** (low continues; medium/high may prompt) plus sandbox when session-attached — it is **not** refuse-all and **not** allow-all. Hard fence still denies catastrophe. On Mac, FM soft seatbelt may still upgrade soft continue → **ask** for hard-danger residuals (assist only).
 
-`ryk evaluate` takes no `--mode` flag: mode comes from the **discovered** policy (`.ryk/policy.yaml` → user config → built-ins), and `RYK_MODE` may only **raise** strictness (never ambient-soften). Put `mode: yolo` in the workspace policy first (or use a policy that already has it), then run shell v1 evaluate shapes. Hosts must read the JSON `decision` field (`ask` is exit 0).
+`ryk evaluate` takes no `--mode` flag: mode comes from the **discovered** policy (`.ryk/policy.yaml` → user config → built-ins), and `RYK_MODE` may only **raise** strictness (never ambient-soften). Put `mode: yolo` in the workspace policy first (or use a policy that already has it), then run shell v1 evaluate shapes. Hosts must read the JSON `decision` field. Leftover unused policy ask is `allow` (exit 0).
 
 ```sh
 # Prerequisite: workspace .ryk/policy.yaml has mode: yolo
