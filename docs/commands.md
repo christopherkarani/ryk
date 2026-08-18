@@ -4,7 +4,7 @@ ryk checks the direct command before launch and installs session PATH shims for 
 
 ## Rich output and `--no-rich`
 
-By default ryk renders human-facing output with colour, Unicode box-drawing, decision badges, risk meters, and (where useful) inline spinner frames on a terminal. When output is piped, when `NO_COLOR` is set, or when `TERM=dumb`, ryk automatically falls back to clean plain text.
+By default ryk renders human-facing output with colour, Unicode box-drawing, decision badges, risk meters, and (where useful) inline spinner frames on a terminal. When output is piped, when `NO_COLOR` is set, or when `TERM=dumb`, ryk automatically falls back to clean plain text. `ryk test` and default `ryk explain` color only the DENY Decision word on a colour TTY; ALLOW stays plain. `NO_COLOR`, `--no-rich` / `RYK_NO_RICH`, `TERM=dumb`, and pipes stay plain text.
 
 For piping, scripting, CI logs, or terminals that mis-render colour, force plain text everywhere with `--no-rich` (or set `RYK_NO_RICH=1`):
 

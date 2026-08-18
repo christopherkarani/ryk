@@ -3,6 +3,7 @@ pub const load = @import("load.zig");
 pub const validate = @import("validate.zig");
 pub const compile = @import("compile.zig");
 pub const evaluate = @import("evaluate.zig");
+pub const host_runtime_reads = @import("host_runtime_reads.zig");
 pub const explain = @import("explain.zig");
 pub const matchers = @import("matchers.zig");
 pub const network_eval = @import("network_eval.zig");
@@ -25,6 +26,7 @@ test {
     _ = validate;
     _ = compile;
     _ = evaluate;
+    _ = host_runtime_reads;
     _ = explain;
     _ = matchers;
     _ = network_eval;

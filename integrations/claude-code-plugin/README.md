@@ -127,10 +127,10 @@ ryk returns host-actionable decisions on hook stdout. Claude Code interprets the
 |---|---|
 | `allow` | Proceed |
 | `block` | Deny the tool / permission |
-| `ask` | **allow** so coding agents can work. Unattended / `--ci` hardens to deny. Explicit `block` stays deny. |
+| leftover unused policy `ask` | **allow** from `ryk hook` when attended; deny when unattended / `--ci`. A leaked `ask` after rewrite is fail-closed deny. Explicit `block` stays deny. |
 | `warn` | Advisory; do not silently equate to hard deny unless policy/CI requires it |
 
-Unattended (`ryk hook ... --ci`, `RYK_UNATTENDED`, `CI`) hardens residual `ask` → `block`. Attended coding sessions permit residual ask.
+Unattended (`ryk hook ... --ci`, `RYK_UNATTENDED`, `CI`) hardens leftover unused policy ask → `block`. Attended leftover is rewritten to allow by `ryk hook`.
 
 ## Strongest protection warning
 

@@ -6,15 +6,21 @@ const theme = @import("../tui/theme.zig");
 const terminal_text = @import("../tui/terminal_text.zig");
 const reasons = @import("../tui/reasons.zig");
 
+/// Glanceable Decision line. Colors only DENY on a colour TTY; ALLOW stays plain.
+pub fn writeDecisionLine(io: std.Io, writer: anytype, decision: shell_engine.Decision) !void {
+    try writer.writeAll("Decision: ");
+    switch (decision) {
+        .allow => try writer.writeAll("ALLOW"),
+        .deny => try theme.paint(io, writer, .danger, "DENY"),
+    }
+    try writer.writeAll("\n");
+}
+
 /// Glanceable human receipt: decision + why. Deny names the rule and a safer
 /// command. Allow stays quiet (no Always / allowlist / Safer chrome).
 pub fn writePretty(io: std.Io, writer: anytype, command_text: []const u8, eval: shell_engine.Evaluation) !void {
-    _ = io;
-    const dec_label = switch (eval.decision) {
-        .allow => "ALLOW",
-        .deny => "DENY",
-    };
-    try writer.print("Decision: {s}\nWhy: {s}\n", .{ dec_label, eval.reason });
+    try writeDecisionLine(io, writer, eval.decision);
+    try writer.print("Why: {s}\n", .{eval.reason});
     if (eval.decision == .deny) {
         if (eval.rule_id) |rid| try writer.print("Rule: {s}\n", .{rid});
         const alts = try reasons.safeAlternatives(std.heap.smp_allocator, command_text);
@@ -247,6 +253,7 @@ test "writePretty is a glanceable decision receipt" {
     };
     try writePretty(std.testing.io, &w, "rm -rf /", eval);
     const out = w.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "Decision: DENY") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "Why: destructive") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "Rule: core.filesystem:rm-rf-general") != null);
@@ -282,6 +289,7 @@ test "writePretty allow path is a glanceable receipt" {
     };
     try writePretty(std.testing.io, &w, "git status", eval);
     const out = w.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "Decision: ALLOW") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "Why: No destructive pack matched.") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "Next:") == null);
@@ -291,4 +299,64 @@ test "writePretty allow path is a glanceable receipt" {
     try std.testing.expect(std.mem.indexOf(u8, out, "Safer:") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "Rule:") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "full_evaluation") == null);
+}
+
+fn expectCsiOnlyOnDecisionLine(out: []const u8) !void {
+    var it = std.mem.splitScalar(u8, out, '\n');
+    var saw_decision = false;
+    while (it.next()) |line| {
+        const has_csi = std.mem.indexOf(u8, line, "\x1b[") != null;
+        if (std.mem.indexOf(u8, line, "Decision:") != null) {
+            saw_decision = true;
+            try std.testing.expect(has_csi);
+            try std.testing.expect(std.mem.indexOf(u8, line, "DENY") != null);
+        } else {
+            try std.testing.expect(!has_csi);
+        }
+    }
+    try std.testing.expect(saw_decision);
+}
+
+test "writePretty colors DENY Decision only" {
+    theme.setTestActive(.{ .capability = .truecolor, .background = .dark });
+    defer theme.setTestActive(null);
+    var buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    const eval = shell_engine.Evaluation{
+        .decision = .deny,
+        .rule_id = "core.filesystem:rm-rf-general",
+        .pack_id = "core.filesystem",
+        .pattern_name = "rm-rf-general",
+        .severity = .high,
+        .reason = "destructive",
+        .owned = false,
+    };
+    try writePretty(std.testing.io, &w, "rm -rf /", eval);
+    const out = w.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Decision:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "DENY") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Why: destructive") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Rule: core.filesystem:rm-rf-general") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Safer:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Next:") != null);
+    try expectCsiOnlyOnDecisionLine(out);
+}
+
+test "writePretty ALLOW stays uncolored" {
+    theme.setTestActive(.{ .capability = .truecolor, .background = .dark });
+    defer theme.setTestActive(null);
+    var buf: [2048]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    const eval = shell_engine.Evaluation{
+        .decision = .allow,
+        .severity = .low,
+        .reason = "No destructive pack matched.",
+        .owned = false,
+    };
+    try writePretty(std.testing.io, &w, "git status", eval);
+    const out = w.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Decision: ALLOW") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Why: No destructive pack matched.") != null);
 }

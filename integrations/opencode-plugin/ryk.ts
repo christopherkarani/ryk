@@ -115,8 +115,8 @@ type PluginHooks = {
   ) => Promise<void>;
 };
 
-/** Decisions that may pass through on a blocking path. Residual ask is permit unless unattended. */
-const ALLOW_DECISIONS = new Set(['allow', 'warn', 'context_only', 'ask']);
+/** Decisions that may pass through on a blocking path. Unexpected `ask` is deny. */
+const ALLOW_DECISIONS = new Set(['allow', 'warn', 'context_only']);
 
 /** Decisions that do not veto tool.execute.before after parsing. */
 const BLOCKING_PASS_THROUGH = new Set(['allow', 'warn', 'context_only']);
@@ -127,7 +127,7 @@ function envFlagTruthy(raw: string | undefined): boolean {
   return value === '1' || value === 'true' || value === 'yes' || value === 'on';
 }
 
-/** Residual ask hardens to deny only when the operator set an unattended/CI flag. */
+/** Shared unattended keys. Leftover unused policy ask is rewritten by ryk hook. */
 function isUnattendedEnv(env: NodeJS.ProcessEnv = process.env): boolean {
   return (
     envFlagTruthy(env.RYK_UNATTENDED) ||
@@ -554,7 +554,9 @@ function callRyk(
 
   try {
     // argv array — no shell interpolation of rykBin or event
-    const stdout = execFileSync(rykBin, ['hook', 'opencode', event], {
+    const hookArgs = ['hook', 'opencode', event];
+    if (isUnattendedEnv()) hookArgs.push('--ci');
+    const stdout = execFileSync(rykBin, hookArgs, {
       input: payloadJson,
       encoding: 'utf-8',
       timeout: blocking ? 15000 : 10000,
@@ -822,12 +824,10 @@ async function applyBlockingDecision(
     return;
   }
 
-  // Residual ask is permit so coding agents can work. Unattended hardens to deny.
-  if (response.decision === 'ask' && !isUnattendedEnv()) {
-    return;
-  }
+  // Leftover unused policy ask is rewritten by ryk hook before emit.
+  // A leaked `ask` is unexpected: fail-closed deny.
 
-  // block, unattended ask, error, unrecognized → veto tool execution
+  // block, unexpected ask, error, unrecognized → veto tool execution
   await hardBlockWithToast(
     ctx,
     formatShortBlock(response, context),
@@ -839,7 +839,7 @@ async function applyBlockingDecision(
 const PERMISSION_STATUS: Record<string, PermissionAskOutput['status']> = {
   block: 'deny',
   error: 'deny',
-  ask: 'allow',
+  ask: 'deny',
   allow: 'allow',
   context_only: 'allow',
   // Advisory: proceed. No host ask UI.
@@ -847,10 +847,6 @@ const PERMISSION_STATUS: Record<string, PermissionAskOutput['status']> = {
 };
 
 function applyPermissionDecision(response: RykResponse, output: PermissionAskOutput): void {
-  if (response.decision === 'ask' && isUnattendedEnv()) {
-    output.status = 'deny';
-    return;
-  }
   const status = PERMISSION_STATUS[response.decision];
   if (!status) {
     const msg = response.message || response.reason || 'ryk returned an invalid permission decision';

@@ -123,7 +123,8 @@ pub const Runtime = struct {
             self.state.server.deinit(io);
         }
         // Bound reclaim: force-shutdown client + upstream FDs, then wait a hard budget.
-        // Mid-dial cannot use ConnectOptions.timeout on Zig 0.16 (TODO panic).
+        // Mid-dial is poll-bounded by upstream_dial_timeout_ms (Zig 0.16 Threaded
+        // ConnectOptions.timeout panics); this budget covers leftover workers.
         const hard_reclaim_ns: u64 = 5 * std.time.ns_per_s;
         const reclaim_started = std.Io.Clock.Timestamp.now(io, .awake);
         while (self.state.active_connections.load(.acquire) > 0) {
@@ -154,6 +155,11 @@ pub const Runtime = struct {
 /// On `Runtime.deinit` / stop, active client FDs are force-shutdown so reclaim does
 /// not wait this full budget.
 const tunnel_idle_ms: usize = 300_000;
+/// Mid-dial bound for posix nonblocking connect + poll. Matches Runtime.deinit
+/// hard reclaim (5s). Zig 0.16 Threaded `ConnectOptions.timeout` panics
+/// (`TODO implement netConnectIpPosix with timeout`), so this is not OS
+/// `ConnectOptions.timeout` — grade remains `proxy`.
+const upstream_dial_timeout_ms: u64 = 5000;
 /// Cap in-memory proxy audit trail (M011). Older events dropped FIFO.
 /// Mirrors telemetry max_queue_events style bound — not a durability store.
 const max_audit_events: usize = 256;
@@ -558,15 +564,16 @@ fn defaultLookup(context: ?*anyopaque, io: std.Io, host: []const u8, port: u16, 
 /// is denied and audited (`network_connect_denied`) as a rebinding shape.
 ///
 /// Honors Runtime stop before dial. Zig 0.16 Threaded `netConnectIp` panics if
-/// `ConnectOptions.timeout != .none`, so dials are not OS-timeout bound here;
-/// `Runtime.deinit` force-closes client+upstream FDs and uses a hard reclaim budget
-/// so teardown cannot hang forever on blackhole mid-dial workers.
+/// `ConnectOptions.timeout != .none`, so posix dials use `connectIpBounded`
+/// (nonblocking connect + poll, `upstream_dial_timeout_ms`) instead of passing
+/// a timeout. Windows stays unbounded `address.connect`. A timeout on one answer
+/// still tries later answers. `Runtime.deinit` force-closes client+upstream FDs
+/// and uses a matching hard reclaim budget.
 fn connectUpstream(state: *State, io: std.Io, host: []const u8, port: u16) !std.Io.net.Stream {
     if (state.stop.load(.acquire)) return error.ProxyStopped;
-    // Never pass ConnectOptions.timeout — Threaded backend panics (Zig 0.16 TODO).
     if (std.Io.net.IpAddress.parse(host, port)) |address| {
         // IP literals were policy-evaluated as the destination itself.
-        return address.connect(io, .{ .mode = .stream });
+        return connectIpBounded(state, io, address, upstream_dial_timeout_ms);
     } else |_| {}
 
     var addresses: [32]std.Io.net.IpAddress = undefined;
@@ -581,9 +588,12 @@ fn connectUpstream(state: *State, io: std.Io, host: []const u8, port: u16) !std.
             fenced = fence;
             continue;
         }
-        return address.connect(io, .{ .mode = .stream }) catch |err| {
-            connect_err = err;
-            continue;
+        return connectIpBounded(state, io, address, upstream_dial_timeout_ms) catch |err| switch (err) {
+            error.ProxyStopped => return error.ProxyStopped,
+            else => {
+                connect_err = err;
+                continue;
+            },
         };
     }
     if (connect_err == null and fenced != null) {
@@ -601,6 +611,160 @@ fn connectUpstream(state: *State, io: std.Io, host: []const u8, port: u16) !std.
         return error.ResolvedAddressDenied;
     }
     return connect_err orelse error.UnknownHostName;
+}
+
+/// TCP connect that never passes `ConnectOptions.timeout` (Zig 0.16 Threaded
+/// panics). Posix: nonblocking socket + `poll(OUT)` until `timeout_ms` or
+/// `state.stop`. Windows: unbounded `address.connect`.
+fn connectIpBounded(
+    state: *State,
+    io: std.Io,
+    address: std.Io.net.IpAddress,
+    timeout_ms: u64,
+) !std.Io.net.Stream {
+    if (state.stop.load(.acquire)) return error.ProxyStopped;
+    if (comptime builtin.os.tag == .windows) {
+        return address.connect(io, .{ .mode = .stream });
+    }
+    return connectIpBoundedPosix(state, io, address, timeout_ms);
+}
+
+fn connectIpBoundedPosix(
+    state: *State,
+    io: std.Io,
+    address: std.Io.net.IpAddress,
+    timeout_ms: u64,
+) !std.Io.net.Stream {
+    const family: c_uint = switch (address) {
+        .ip4 => std.posix.AF.INET,
+        .ip6 => std.posix.AF.INET6,
+    };
+    const raw = std.c.socket(family, std.c.SOCK.STREAM, 0);
+    if (raw < 0) return mapConnectErrno(std.posix.errno(@as(isize, raw)));
+    const fd: std.posix.fd_t = raw;
+    errdefer _ = std.c.close(fd);
+
+    setServerSocketCloexec(fd) catch return error.Unexpected;
+    try setSocketNonblock(fd, true);
+
+    const connect_rc = switch (address) {
+        .ip4 => |ip4| blk: {
+            const sa = std.posix.sockaddr.in{
+                .port = std.mem.nativeToBig(u16, ip4.port),
+                .addr = @bitCast(ip4.bytes),
+            };
+            break :blk std.c.connect(fd, @ptrCast(&sa), @sizeOf(std.posix.sockaddr.in));
+        },
+        .ip6 => |ip6| blk: {
+            const sa = std.posix.sockaddr.in6{
+                .port = std.mem.nativeToBig(u16, ip6.port),
+                .flowinfo = ip6.flow,
+                .addr = ip6.bytes,
+                .scope_id = ip6.interface.index,
+            };
+            break :blk std.c.connect(fd, @ptrCast(&sa), @sizeOf(std.posix.sockaddr.in6));
+        },
+    };
+    if (connect_rc < 0) {
+        switch (std.posix.errno(@as(isize, connect_rc))) {
+            .SUCCESS => {},
+            .INTR, .INPROGRESS, .AGAIN, .ALREADY => try waitConnectReady(state, io, fd, timeout_ms),
+            else => |e| return mapConnectErrno(e),
+        }
+        try takeConnectSocketError(fd);
+    }
+
+    try setSocketNonblock(fd, false);
+    return .{ .socket = .{ .handle = fd, .address = address } };
+}
+
+fn waitConnectReady(state: *State, io: std.Io, fd: std.posix.fd_t, timeout_ms: u64) !void {
+    const started = std.Io.Clock.Timestamp.now(io, .awake);
+    const deadline_ns: i96 = @as(i96, @intCast(timeout_ms)) * std.time.ns_per_ms;
+    while (true) {
+        if (state.stop.load(.acquire)) return error.ProxyStopped;
+        // untilNow = start → now. durationFromNow is inverted (now → start).
+        const elapsed_ns = started.untilNow(io).raw.nanoseconds;
+        if (elapsed_ns >= deadline_ns) return error.ConnectionTimedOut;
+        const remaining_ns = deadline_ns - elapsed_ns;
+        const remaining_ms: i96 = @divTrunc(remaining_ns + std.time.ns_per_ms - 1, std.time.ns_per_ms);
+        const slice_ms: i32 = @intCast(@min(remaining_ms, 50));
+        var fds = [_]std.posix.pollfd{.{
+            .fd = fd,
+            .events = std.posix.POLL.OUT,
+            .revents = 0,
+        }};
+        const ready = std.posix.poll(&fds, slice_ms) catch return error.Unexpected;
+        if (ready == 0) continue;
+        return;
+    }
+}
+
+fn setSocketNonblock(fd: std.posix.fd_t, on: bool) !void {
+    const current_raw = std.posix.system.fcntl(fd, std.posix.F.GETFL, @as(usize, 0));
+    if (std.posix.errno(current_raw) != .SUCCESS) return error.Unexpected;
+    const current: u32 = @intCast(current_raw);
+    const nonblock_bit: u32 = @bitCast(std.posix.O{ .NONBLOCK = true });
+    const next = if (on) current | nonblock_bit else current & ~nonblock_bit;
+    const result = std.posix.system.fcntl(fd, std.posix.F.SETFL, next);
+    if (std.posix.errno(result) != .SUCCESS) return error.Unexpected;
+}
+
+fn takeConnectSocketError(fd: std.posix.fd_t) !void {
+    var so_err: i32 = 0;
+    var len: std.c.socklen_t = @sizeOf(i32);
+    if (std.c.getsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.ERROR, @ptrCast(&so_err), &len) < 0)
+        return error.Unexpected;
+    if (so_err == 0) return;
+    // Compare raw errno ints (daemon_uds pattern). @enumFromInt of an
+    // unmapped code would still work on non-exhaustive E, but integer
+    // compare keeps unknown OS codes off the enum switch.
+    if (so_err == @intFromEnum(std.posix.E.TIMEDOUT)) return error.ConnectionTimedOut;
+    if (so_err == @intFromEnum(std.posix.E.CONNREFUSED)) return error.ConnectionRefused;
+    if (so_err == @intFromEnum(std.posix.E.CONNRESET)) return error.ConnectionResetByPeer;
+    if (so_err == @intFromEnum(std.posix.E.HOSTUNREACH)) return error.HostUnreachable;
+    if (so_err == @intFromEnum(std.posix.E.NETUNREACH)) return error.NetworkUnreachable;
+    if (so_err == @intFromEnum(std.posix.E.NETDOWN)) return error.NetworkDown;
+    if (so_err == @intFromEnum(std.posix.E.ACCES) or so_err == @intFromEnum(std.posix.E.PERM))
+        return error.AccessDenied;
+    if (so_err == @intFromEnum(std.posix.E.ADDRNOTAVAIL)) return error.AddressUnavailable;
+    if (@hasField(std.posix.E, "HOSTDOWN") and so_err == @intFromEnum(std.posix.E.HOSTDOWN))
+        return error.HostUnreachable;
+    return error.Unexpected;
+}
+
+fn mapConnectErrno(err: std.posix.E) error{
+    AddressUnavailable,
+    AddressFamilyUnsupported,
+    ConnectionPending,
+    ConnectionRefused,
+    ConnectionResetByPeer,
+    ConnectionTimedOut,
+    HostUnreachable,
+    NetworkUnreachable,
+    NetworkDown,
+    AccessDenied,
+    ProcessFdQuotaExceeded,
+    SystemFdQuotaExceeded,
+    SystemResources,
+    Unexpected,
+} {
+    return switch (err) {
+        .ADDRNOTAVAIL => error.AddressUnavailable,
+        .AFNOSUPPORT => error.AddressFamilyUnsupported,
+        .ALREADY => error.ConnectionPending,
+        .CONNREFUSED => error.ConnectionRefused,
+        .CONNRESET => error.ConnectionResetByPeer,
+        .TIMEDOUT => error.ConnectionTimedOut,
+        .HOSTUNREACH, .HOSTDOWN => error.HostUnreachable,
+        .NETUNREACH => error.NetworkUnreachable,
+        .NETDOWN => error.NetworkDown,
+        .ACCES, .PERM => error.AccessDenied,
+        .MFILE => error.ProcessFdQuotaExceeded,
+        .NFILE => error.SystemFdQuotaExceeded,
+        .NOBUFS, .NOMEM => error.SystemResources,
+        else => error.Unexpected,
+    };
 }
 
 fn forwardHttp(
@@ -1546,6 +1710,53 @@ test "connectUpstream dials IP literals and DNS hostnames" {
     host_stream.close(io);
 }
 
+test "connectIpBounded returns within the dial timeout (blackhole or fail-fast)" {
+    // Zig 0.16 Threaded ConnectOptions.timeout panics; this proves the poll
+    // bound (or OS fail-fast) so a TEST-NET / non-accepting dest cannot hang.
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const io = threaded.io();
+
+    var loaded = try @import("ryk_core").policy.load.parseFromSlice(std.testing.allocator,
+        \\version: 1
+        \\mode: observe
+        \\network:
+        \\  mode: allowlist
+        \\  allow:
+        \\    - "localhost"
+    , "connect-bounded.yaml");
+    defer loaded.deinit();
+    var runtime = try listen(std.testing.allocator, &loaded, .observe);
+    defer runtime.deinit();
+
+    // RFC 5737 TEST-NET-1: typically blackholed; some stacks fail fast
+    // (NetworkUnreachable / HostUnreachable). Either is OK — must not hang
+    // or panic.
+    const dest = try std.Io.net.IpAddress.parse("192.0.2.1", 1);
+    const timeout_ms: u64 = 200;
+    const started = std.Io.Clock.Timestamp.now(io, .awake);
+    const result = connectIpBounded(runtime.state, io, dest, timeout_ms);
+    const elapsed_ns = started.untilNow(io).raw.nanoseconds;
+    const slack_ns: i96 = 2 * std.time.ns_per_s;
+    try std.testing.expect(elapsed_ns >= 0);
+    try std.testing.expect(elapsed_ns < @as(i96, @intCast(timeout_ms)) * std.time.ns_per_ms + slack_ns);
+
+    if (result) |stream| {
+        stream.close(io);
+    } else |err| switch (err) {
+        error.ConnectionTimedOut,
+        error.NetworkUnreachable,
+        error.HostUnreachable,
+        error.NetworkDown,
+        error.ConnectionRefused,
+        error.AccessDenied,
+        error.AddressUnavailable,
+        error.Unexpected, // OS fail-fast with an unmapped SO_ERROR
+        => {},
+        else => return err,
+    }
+}
+
 const FakeLookup = struct {
     answers: []const std.Io.net.IpAddress,
     calls: usize = 0,
@@ -1810,11 +2021,12 @@ test "proxy tunnel survives mid-stream quiet gap of 5s (CONNECT shares fn tunnel
     const head_len = try readHttpResponse(io, client, &head_buf);
     try std.testing.expect(std.mem.indexOf(u8, head_buf[0..head_len], "200 Connection Established") != null);
 
-    // Read tunnel body until both chunks arrive (or 10s deadline).
+    // Read tunnel body until both chunks arrive. The upstream pause is 5s;
+    // give 20s so a loaded monopath run cannot miss chunk-b on the deadline.
     var body_buf: [64]u8 = undefined;
     var total: usize = 0;
     const started = std.Io.Clock.Timestamp.now(io, .awake);
-    const deadline_ns: i96 = 10 * std.time.ns_per_s;
+    const deadline_ns: i96 = 20 * std.time.ns_per_s;
     while (total < body_buf.len and started.durationFromNow(io).raw.nanoseconds < deadline_ns) {
         if (std.mem.indexOf(u8, body_buf[0..total], "chunk-a") != null and
             std.mem.indexOf(u8, body_buf[0..total], "chunk-b") != null) break;

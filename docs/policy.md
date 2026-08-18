@@ -27,6 +27,7 @@ If a discovered policy file exists but is invalid or unreadable, ryk fails close
 - `yolo`: **YOLO + seatbelt** — first-class mode for autonomous agent work. Uses the same severity matrix as `ask` (low continues; medium/high may prompt; not refuse-all). The agent continues under sandbox (Seatbelt/Landlock when session-attached) plus the hard fence. Prefer `yolo` over treating “ask on everything” as the hero path. Built-in preset: `ryk policy check --preset yolo` / `mode: yolo` in YAML.
 - `strict`: deny unknown or risky actions unless allowed. When a shell **permit-list is configured** for Strict evaluation (`commands.allow` / host permit), commands **off** that list are **refused** (deny, never ask-spam); reason includes `strict: not on allowlist`. On-list does **not** auto-allow high/medium pack hits — the severity matrix still applies after the refuse gate. With an **empty / unconfigured** permit list, Strict keeps the severity matrix only (not refuse-all-off-list).
   - **Coding create-path (DCG):** `generic-agent` and coding host presets ship **empty** `commands.allow` + `commands.default: allow` under `mode: strict`. Unmatched shell is not approval-gated; high/medium pack hits **block** (never ask); critical stays hard-fenced. Catastrophe `commands.deny` patterns remain. This is intentional — not the sample permit list used by `strict-local` / `yolo` / `ask` built-ins.
+  - **Host-runtime reads:** file-read policy allow is workspace `./**`. Absolute reads of first-class host skill trees (`~/.grok/skills/**`, `~/.grok/bundled/skills/**`, `~/.grok/installed-plugins/**/skills/**`, `~/.grok/third-party/**`, `~/.agents/skills/**`, `~/.claude/skills/**`, `~/.claude/plugins/**/skills/**`, `~/.codex/skills/**`, `~/.cursor/skills-cursor/**`, `~/.cursor/skills/**`, `~/.pi/agent/skills/**`, `~/.hermes/skills/**`, `~/.openclaw/skills/**`) are a built-in allow (`builtin.files.read.allow[host_skill]`). `~/.grok/third-party/**` is the whole pack checkout (broader than `…/skills/**`); secret basenames and resolved targets still apply. Env-rooted homes accumulate with those defaults: `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `HERMES_HOME`, `PI_CODING_AGENT_DIR`. Outside-workspace `AGENTS.md` / `CLAUDE.md` (and the `AGENTS.MD` / `CLAUDE.MD` spellings) under `$HOME` are a sibling allow (`builtin.files.read.allow[host_instruction]`) so hosts can walk parent/home instruction files. Policy may allow a non-ancestor `~/other-project/AGENTS.md`; OS sandbox (when attached) still only grants ancestor files. Workspace or catalog-internal symlink reads are allowed only if the **resolved** target is still in this catalog; a workspace symlink to an outside non-catalog path is denied even when the target is missing (readlink, never the `./alias`), and an unresolved catalog symlink is not an allow. The catalog itself rejects `.env` / `.env.*` / `auth.json` / `.credentials.json` / `credentials.json` / `id_ed25519` basenames (ASCII case-insensitive), `.ssh` / `.aws` / `.gnupg` path segments, and `..` segments; `~/.ssh/**` remains an explicit deny. Paths outside the catalog (including `~/.grok/auth.json` and host config) stay unmatched deny under coding DCG. Not leftover unused `ask`. Not whole `~/.grok` / `~/.claude` / `~/.codex`. Writes stay gated. Intercept/proxy `decideRead` stays workspace-only; this catalog is evaluate and host-hook only (hook/wrapper grade, not OS-enforced).
   - **Sample permit lists:** built-in `strict` / `yolo` / `ask` / `strict-local` still carry a curated `commands.allow` sample. Unquoted `&&` chains are on-list only when **every** segment matches; pipelines, sequencing, redirects, newlines, background, and `$()` / backticks stay off-list.
 - `ci`: non-interactive strict behavior; ask becomes deny.
 - `redteam`: strict fixture mode for deterministic tests (strict-like permit refuse when a list is configured).
@@ -77,7 +78,7 @@ Shell v1 shapes only (no bulk-email / VIP fixtures). Prefer product **evaluate**
 
 #### `ryk evaluate` (machine JSON; Pi and similar)
 
-`decision: "ask"` uses **exit 0** (same as allow) — hosts **must** read the JSON `decision` field. Deny is exit `2`; evaluator fail-closed is exit `3`.
+On this coding-host enforcement wire, leftover unused policy ask is **`allow`** (exit 0). Never-permit ask (SoftBlock, FM steward ask, missing origin) and deny are **`deny`** (exit 2). Evaluator fail-closed is exit `3`. Hosts **must** read the JSON `decision` field.
 
 ```sh
 # 1) Network pipe to shell is a critical hard fence → deny (YOLO / ask cannot unlock)
@@ -120,7 +121,7 @@ swift run fm-steward classify --card Fixtures/timeout_forced.json --human
 
 YOLO uses the **same severity matrix as `ask`** (low continues; medium/high may prompt) plus sandbox when session-attached — it is **not** refuse-all and **not** allow-all. Hard fence still denies catastrophe. On Mac, FM soft seatbelt may still upgrade soft continue → **ask** for hard-danger residuals (assist only).
 
-`ryk evaluate` takes no `--mode` flag: mode comes from the **discovered** policy (`.ryk/policy.yaml` → user config → built-ins), and `RYK_MODE` may only **raise** strictness (never ambient-soften). Put `mode: yolo` in the workspace policy first (or use a policy that already has it), then run shell v1 evaluate shapes. Hosts must read the JSON `decision` field (`ask` is exit 0).
+`ryk evaluate` takes no `--mode` flag: mode comes from the **discovered** policy (`.ryk/policy.yaml` → user config → built-ins), and `RYK_MODE` may only **raise** strictness (never ambient-soften). Put `mode: yolo` in the workspace policy first (or use a policy that already has it), then run shell v1 evaluate shapes. Hosts must read the JSON `decision` field. Leftover unused policy ask is `allow` (exit 0).
 
 ```sh
 # Prerequisite: workspace .ryk/policy.yaml has mode: yolo
@@ -134,7 +135,7 @@ printf '%s' "{\"schema_version\":1,\"kind\":\"shell_command\",\"command\":\"echo
 # 2) High non-critical destroy (rm -rf of a workspace dir) → may ask; not refuse-all
 printf '%s' "{\"schema_version\":1,\"kind\":\"shell_command\",\"command\":\"rm -rf ./build\",\"cwd\":\"$(pwd)\"}" \
   | ./zig-out/bin/ryk evaluate --json --stdin
-# Expect: "decision": "ask" (exit 0) under yolo/ask for core.filesystem:rm-rf-general.
+# Expect: "decision": "allow" (exit 0) — leftover unused policy ask on this wire.
 #         curl|bash is critical (zig.shell:network-pipe-to-shell) and still denies under yolo.
 
 # Optional: RYK_MODE=strict|ci can only raise above policy yolo; RYK_MODE=yolo alone

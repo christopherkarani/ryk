@@ -1464,7 +1464,7 @@ fn collectHostDoctorRows(io: std.Io, allocator: std.mem.Allocator) !HostDoctorSn
 
     for (host_status.managed_hosts) |host_name| {
         const installed = plugin.hostPluginInstalledFromReport(host_name, doctor_report);
-        const detected = plugin.binaryInPath(io, allocator, host_name);
+        const detected = plugin.hostBinaryDetectedFromReport(host_name, doctor_report);
         if (std.mem.eql(u8, host_name, "hermes") and installed) hermes_installed = true;
 
         const wired: []const u8 = if (installed) "yes" else if (detected) "no" else "—";
@@ -2112,6 +2112,26 @@ test "doctor packs section stays known when daemon is unavailable" {
             std.mem.indexOf(u8, written, "Packs") != null,
     );
     try std.testing.expect(std.mem.indexOf(u8, written, "shell evaluation fails closed") == null);
+}
+
+test "collectHostDoctorRows reuses plugin report host_binaries without binaryInPath" {
+    // #448: default host-row collect must use the plugin-report PATH snapshot.
+    // Managed hosts must not re-walk PATH via plugin.binaryInPath / binaryInPath(.
+    const src = @embedFile("doctor.zig");
+    const start = std.mem.indexOf(u8, src, "fn collectHostDoctorRows(") orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    const after = src[start..];
+    const end_rel = std.mem.indexOf(u8, after[1..], "\nfn ") orelse after.len - 1;
+    const fn_src = after[0 .. 1 + end_rel];
+
+    try std.testing.expect(std.mem.indexOf(u8, fn_src, "hostBinaryDetectedFromReport") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fn_src, "hostPluginInstalledFromReport") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fn_src, "collectPluginDoctorReportWithHermesSmoke") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fn_src, "inspectPi") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fn_src, "inspectGrok") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fn_src, "binaryInPath") == null);
 }
 
 test "doctor host table lists managed hosts and shell gates" {
