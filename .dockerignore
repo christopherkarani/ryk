@@ -5,6 +5,7 @@ dist
 dist-dry-run
 node_modules
 **/node_modules
+orca-*/
 ryk-dashboard-ui/.next
 ryk-dashboard-ui/tsconfig.tsbuildinfo
 .aegis

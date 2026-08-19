@@ -71,20 +71,24 @@ test "agent handoff docs are excluded from the public repository" {
 }
 
 test "gitignore blocks handoffs, releases, and orca husks" {
-    const text = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, ".gitignore", std.testing.allocator, .limited(512 * 1024));
-    defer std.testing.allocator.free(text);
-    try expectContains(text, "docs/handoffs/");
-    try expectContains(text, "docs/releases/");
-    try expectContains(text, "orca-*/");
-}
+    const gitignore = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, ".gitignore", std.testing.allocator, .limited(512 * 1024));
+    defer std.testing.allocator.free(gitignore);
+    try expectContains(gitignore, "docs/handoffs/");
+    try expectContains(gitignore, "docs/releases/");
+    try expectContains(gitignore, "orca-*/");
 
-test "retired orca product trees are absent" {
-    const retired = [_][]const u8{
-        "orca-dashboard-ui",
-        "orca-pi",
-        "orca-rs",
-    };
-    for (retired) |path| try expectMissing(path);
+    const dockerignore = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, ".dockerignore", std.testing.allocator, .limited(512 * 1024));
+    defer std.testing.allocator.free(dockerignore);
+    try expectContains(dockerignore, "orca-*/");
+
+    var dir = try std.Io.Dir.cwd().openDir(std.testing.io, ".", .{ .iterate = true });
+    defer dir.close(std.testing.io);
+    var it = dir.iterate();
+    while (try it.next(std.testing.io)) |entry| {
+        if (!std.mem.startsWith(u8, entry.name, "orca-")) continue;
+        std.debug.print("retired orca product tree present: {s}\n", .{entry.name});
+        return error.RetiredOrcaTreePresent;
+    }
 }
 
 test "public README stays product-focused and safety-bounded" {
