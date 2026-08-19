@@ -195,7 +195,7 @@ print_host_hint() {
 # enforcement on; until then the installer says signing is not yet active
 # instead of pretending a missing signature is fine. cut-release keeps this line
 # in sync with keys/ryk-release-minisign.pub.
-RELEASE_PUBKEY="${RYK_RELEASE_PUBKEY:-RWRT939LDw3PqVhMG6KbPElv6+hIVfmXaI3ETzsecuDIIndo97tJjUsM}"
+RELEASE_PUBKEY="${RYK_RELEASE_PUBKEY:-RWQpHx1kRqLfNpXTIs3D4Oscr6f0odamidPP3xjNtCrHTvvYrrLaYzAI}"
 SIGNATURE_NAME="checksums.txt.minisig"
 SIGNATURE_STATE="unverified"
 
