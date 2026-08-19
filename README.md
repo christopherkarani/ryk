@@ -1,3 +1,5 @@
+
+
 <p align="center">
   <a href="https://rykanv.com/">Website</a> ·
   <a href="https://discord.gg/uZn9MDUYKx">Discord</a> ·
@@ -33,6 +35,8 @@ Run Claude Code, Codex, Pi, OpenCode, Hermes, OpenClaw, or Grok through one loca
 
 ```sh
 curl -fsSL https://rykanv.com/install | sh
+# or install the npm launcher
+npm install -g @rykan/ryk
 ```
 
 ## Start an agent
