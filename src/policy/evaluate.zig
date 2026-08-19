@@ -339,14 +339,14 @@ fn evaluateNetworkPolicy(
         return explicitOwnedLabel(allocator, mode, decision, "network.ask", match);
     }
 
-    if (network_policy.default) |default| return defaultDecision(allocator, mode, default, "network.default", false),
+    if (network_policy.default) |default| return defaultDecision(allocator, mode, default, "network.default", false);
     const fallback: schema.DecisionValue = switch (effective) {
         .off, .allowlist => .deny,
         .ask => .ask,
         .observe => .observe,
         .open => .allow,
     };
-    return defaultDecision(allocator, mode, fallback, "network mode default", false),
+    return defaultDecision(allocator, mode, fallback, "network mode default", false);
 }
 
 const NetworkParts = struct {

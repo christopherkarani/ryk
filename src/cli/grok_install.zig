@@ -275,17 +275,17 @@ fn entryIsRykFileWriteMatcher(entry: std.json.Value) bool {
 }
 
 fn stripRykFileWriteMatchers(pre_tool: *std.json.Array) bool {
-    var write_i: usize = 0;
+    var keep_index: usize = 0;
     var removed = false;
     for (pre_tool.items) |entry| {
         if (entryIsRykFileWriteMatcher(entry)) {
             removed = true;
             continue;
         }
-        pre_tool.items[write_i] = entry;
-        write_i += 1;
+        pre_tool.items[keep_index] = entry;
+        keep_index += 1;
     }
-    pre_tool.shrinkRetainingCapacity(write_i);
+    pre_tool.shrinkRetainingCapacity(keep_index);
     return removed;
 }
 
