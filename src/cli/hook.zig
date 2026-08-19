@@ -3758,91 +3758,60 @@ test "hook PreToolUse file_read allows README.md" {
     try std.testing.expectEqualStrings("file.read", result.category);
 }
 
-test "hook PreToolUse file_read permits leftover unused outside-workspace path" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDir(std.testing.io, "workspace", .default_dir);
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "notes.md", .data = "scratch\n" });
+test "hook PreToolUse leftover unused notes.md is permit attended and deny unattended" {
+    const Case = struct { generic_agent: bool, ci: bool, expect: PluginDecision };
+    const cases = [_]Case{
+        .{ .generic_agent = false, .ci = false, .expect = .allow },
+        .{ .generic_agent = false, .ci = true, .expect = .block },
+        .{ .generic_agent = true, .ci = false, .expect = .allow },
+        .{ .generic_agent = true, .ci = true, .expect = .block },
+    };
 
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, "workspace", std.testing.allocator);
-    defer std.testing.allocator.free(root);
-    const notes_path = try tmp.dir.realPathFileAlloc(std.testing.io, "notes.md", std.testing.allocator);
-    defer std.testing.allocator.free(notes_path);
+    for (cases) |case| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.createDir(std.testing.io, "workspace", .default_dir);
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "notes.md", .data = "scratch\n" });
 
-    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = gpa_state.deinit();
-    const allocator = gpa_state.allocator();
+        const root = try tmp.dir.realPathFileAlloc(std.testing.io, "workspace", std.testing.allocator);
+        defer std.testing.allocator.free(root);
+        const notes_path = try tmp.dir.realPathFileAlloc(std.testing.io, "notes.md", std.testing.allocator);
+        defer std.testing.allocator.free(notes_path);
 
-    var policy_obj = try core_api.loadPolicyPreset(allocator, .strict);
-    defer policy_obj.deinit();
+        var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+        defer _ = gpa_state.deinit();
+        const allocator = gpa_state.allocator();
 
-    const payload_json = try std.fmt.allocPrint(
-        allocator,
-        "{{\"toolName\":\"read_file\",\"toolInput\":{{\"target_file\":\"{s}\"}}}}",
-        .{notes_path},
-    );
-    defer allocator.free(payload_json);
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload_json, .{});
-    defer parsed.deinit();
+        var result = if (case.generic_agent)
+            try evaluateGenericAgentReadHook(allocator, root, notes_path, case.ci)
+        else blk: {
+            var policy_obj = try core_api.loadPolicyPreset(allocator, .strict);
+            defer policy_obj.deinit();
+            const payload_json = try std.fmt.allocPrint(
+                allocator,
+                "{{\"toolName\":\"read_file\",\"toolInput\":{{\"target_file\":\"{s}\"}}}}",
+                .{notes_path},
+            );
+            defer allocator.free(payload_json);
+            var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload_json, .{});
+            defer parsed.deinit();
+            break :blk try evaluateHookForTestWithOptions(
+                allocator,
+                root,
+                @ptrCast(@alignCast(policy_obj)),
+                .grok,
+                .PreToolUse,
+                parsed.value,
+                case.ci,
+                null,
+            );
+        };
+        defer result.deinit(allocator);
 
-    var result = try evaluateHookForTestWithOptions(
-        allocator,
-        root,
-        @ptrCast(@alignCast(policy_obj)),
-        .grok,
-        .PreToolUse,
-        parsed.value,
-        false,
-        null,
-    );
-    defer result.deinit(allocator);
-
-    result.decision = applyHostWireRewrite(result.decision, result.ask_origin, false);
-    try std.testing.expectEqual(PluginDecision.allow, result.decision);
-    try std.testing.expectEqualStrings("file.read", result.category);
-}
-
-test "hook PreToolUse leftover unused file.read stays deny when unattended" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDir(std.testing.io, "workspace", .default_dir);
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "notes.md", .data = "scratch\n" });
-
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, "workspace", std.testing.allocator);
-    defer std.testing.allocator.free(root);
-    const notes_path = try tmp.dir.realPathFileAlloc(std.testing.io, "notes.md", std.testing.allocator);
-    defer std.testing.allocator.free(notes_path);
-
-    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = gpa_state.deinit();
-    const allocator = gpa_state.allocator();
-
-    var policy_obj = try core_api.loadPolicyPreset(allocator, .strict);
-    defer policy_obj.deinit();
-
-    const payload_json = try std.fmt.allocPrint(
-        allocator,
-        "{{\"toolName\":\"read_file\",\"toolInput\":{{\"target_file\":\"{s}\"}}}}",
-        .{notes_path},
-    );
-    defer allocator.free(payload_json);
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload_json, .{});
-    defer parsed.deinit();
-
-    var result = try evaluateHookForTestWithOptions(
-        allocator,
-        root,
-        @ptrCast(@alignCast(policy_obj)),
-        .grok,
-        .PreToolUse,
-        parsed.value,
-        true,
-        null,
-    );
-    defer result.deinit(allocator);
-
-    try std.testing.expectEqual(PluginDecision.block, result.decision);
-    try std.testing.expectEqualStrings("file.read", result.category);
+        result.decision = applyHostWireRewrite(result.decision, result.ask_origin, case.ci);
+        try std.testing.expectEqual(case.expect, result.decision);
+        try std.testing.expectEqualStrings("file.read", result.category);
+    }
 }
 
 fn evaluateGenericAgentReadHook(
@@ -3871,50 +3840,6 @@ fn evaluateGenericAgentReadHook(
         ci_mode,
         null,
     );
-}
-
-test "hook PreToolUse generic_agent leftover unused notes.md still permits" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDir(std.testing.io, "workspace", .default_dir);
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "notes.md", .data = "scratch\n" });
-
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, "workspace", std.testing.allocator);
-    defer std.testing.allocator.free(root);
-    const notes_path = try tmp.dir.realPathFileAlloc(std.testing.io, "notes.md", std.testing.allocator);
-    defer std.testing.allocator.free(notes_path);
-
-    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = gpa_state.deinit();
-    const allocator = gpa_state.allocator();
-
-    var result = try evaluateGenericAgentReadHook(allocator, root, notes_path, false);
-    defer result.deinit(allocator);
-
-    result.decision = applyHostWireRewrite(result.decision, result.ask_origin, false);
-    try std.testing.expectEqual(PluginDecision.allow, result.decision);
-    try std.testing.expectEqualStrings("file.read", result.category);
-}
-
-test "hook PreToolUse generic_agent leftover unused stays deny when unattended" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDir(std.testing.io, "workspace", .default_dir);
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "notes.md", .data = "scratch\n" });
-
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, "workspace", std.testing.allocator);
-    defer std.testing.allocator.free(root);
-    const notes_path = try tmp.dir.realPathFileAlloc(std.testing.io, "notes.md", std.testing.allocator);
-    defer std.testing.allocator.free(notes_path);
-
-    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = gpa_state.deinit();
-    const allocator = gpa_state.allocator();
-
-    var result = try evaluateGenericAgentReadHook(allocator, root, notes_path, true);
-    defer result.deinit(allocator);
-
-    try std.testing.expectEqual(PluginDecision.block, result.decision);
 }
 
 test "hook PreToolUse generic_agent blocks extra-worktree .env" {
