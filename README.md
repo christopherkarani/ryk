@@ -15,6 +15,7 @@
   <a href="https://github.com/christopherkarani/ryk/actions/workflows/build.yml"><img src="https://img.shields.io/github/actions/workflow/status/christopherkarani/ryk/build.yml?label=build" alt="Build status"></a>
   <a href="https://github.com/christopherkarani/ryk/blob/main/LICENSE"><img src="https://img.shields.io/github/license/christopherkarani/ryk" alt="Apache 2.0 license"></a>
   <a href="https://github.com/christopherkarani/ryk"><img src="https://img.shields.io/github/stars/christopherkarani/ryk?style=flat" alt="GitHub stars"></a>
+  <a href="https://github.com/christopherkarani/ryk/releases/latest"><img src="https://img.shields.io/github/v/release/christopherkarani/ryk" alt="GitHub release"></a>
 </p>
 
 # ryk
@@ -34,6 +35,8 @@ Run Claude Code, Codex, Pi, OpenCode, Hermes, OpenClaw, or Grok through one loca
 ```sh
 curl -fsSL https://rykanv.com/install | sh
 ```
+
+Latest is [v0.2.21](https://github.com/christopherkarani/ryk/releases/tag/v0.2.21). Pin with `RYK_VERSION=0.2.21`.
 
 ## Start an agent
 
@@ -197,6 +200,7 @@ Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request. For secur
 - [Website](https://rykanv.com/)
 - [Discord](https://discord.gg/uZn9MDUYKx)
 - [GitHub issues](https://github.com/christopherkarani/ryk/issues)
+- [Releases](https://github.com/christopherkarani/ryk/releases)
 
 ## License
 
