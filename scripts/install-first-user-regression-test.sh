@@ -11,6 +11,11 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 VERSION="$(tr -d '[:space:]' < "${REPO_ROOT}/VERSION")"
 INSTALL_SH="${REPO_ROOT}/scripts/install.sh"
 
+# Unsigned mock artifacts. Signing fail-closed is covered by
+# test-release-signing.sh; keep this harness on the sentinel override so a
+# provisioned default key does not refuse the mocks.
+export RYK_RELEASE_PUBKEY="${RYK_RELEASE_PUBKEY:-RYK_RELEASE_PUBKEY_UNPROVISIONED}"
+
 fail() {
   printf 'install-first-user-regression: %s\n' "$1" >&2
   exit 1
