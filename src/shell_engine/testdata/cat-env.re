@@ -1,0 +1,1 @@
+(?i)\b(?:cat|head|tail|less|more|bat)\b(?:\s+(?:--|[+-]?[^\s]+)){0,6}\s+["']?(?:\./|(?:[^\s"']+/))?\.env(?!\.(?:example|sample|template)\b)["']?(?=\s|$|&&|\|\||;|&)

@@ -72,6 +72,15 @@ test "pcre2 unicode property patterns fail closed without UCD" {
     try std.testing.expectError(error.CompileFailed, Regex.compile("\\P{N}"));
 }
 
+test "pcre2 cat-env regex matches head -n 5 .env" {
+    var re = try Regex.compile(@embedFile("testdata/cat-env.re"));
+    defer re.deinit();
+    try std.testing.expect(try re.isMatch("cat .env"));
+    try std.testing.expect(try re.isMatch("head -n 5 .env"));
+    try std.testing.expect(try re.isMatch("cat -- .env"));
+    try std.testing.expect(!(try re.isMatch("head -c 800 /tmp/gw-body-$$.txt")));
+}
+
 test "pcre2 no-match is zero and compile errors are not no-match" {
     var re = try Regex.compile("(?:^|[^[:alnum:]_-])git\\s+reset");
     defer re.deinit();

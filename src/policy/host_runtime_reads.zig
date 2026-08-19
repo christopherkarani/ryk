@@ -244,11 +244,35 @@ fn matchRootSuffixes(
     suffixes: []const []const u8,
 ) bool {
     var buf: [4096]u8 = undefined;
+    const prefix = fsAlias(root_prefix);
+    const target = fsAlias(path);
     for (suffixes) |suffix| {
-        const pattern = joinPattern(&buf, &.{ root_prefix, home_rel, suffix }) orelse continue;
-        if (matchers.matchesPath(pattern, path)) return true;
+        const pattern = joinPattern(&buf, &.{ prefix, home_rel, suffix }) orelse continue;
+        if (matchers.matchesPath(pattern, target)) return true;
     }
     return false;
+}
+
+/// macOS `/var`, `/tmp`, and `/etc` are the same nodes as `/private/var` etc.
+/// Compare catalog homes against realpath'd targets using the public form.
+fn macosFsAlias(path: []const u8) []const u8 {
+    const prefix = "/private";
+    if (path.len <= prefix.len or !std.mem.startsWith(u8, path, prefix) or path[prefix.len] != '/')
+        return path;
+    const rest = path[prefix.len..];
+    const names = [_][]const u8{ "/var", "/tmp", "/etc" };
+    for (names) |name| {
+        if (std.mem.eql(u8, rest, name)) return rest;
+        if (rest.len > name.len and std.mem.startsWith(u8, rest, name) and
+            (rest[name.len] == '/' or rest[name.len] == '\\'))
+            return rest;
+    }
+    return path;
+}
+
+fn fsAlias(path: []const u8) []const u8 {
+    if (path.len == 0 or path[0] != '/') return path;
+    return macosFsAlias(path);
 }
 
 fn joinPattern(buf: []u8, parts: []const []const u8) ?[]const u8 {
@@ -325,11 +349,13 @@ fn isInstructionBasename(name: []const u8) bool {
 }
 
 fn isUnderHome(path: []const u8, home: []const u8) bool {
-    if (home.len == 0 or !std.fs.path.isAbsolute(home)) return false;
-    if (!std.fs.path.isAbsolute(path)) return false;
-    if (path.len <= home.len) return false;
-    if (!std.mem.startsWith(u8, path, home)) return false;
-    return path[home.len] == '/' or path[home.len] == '\\';
+    const path_n = fsAlias(path);
+    const home_n = fsAlias(home);
+    if (home_n.len == 0 or !std.fs.path.isAbsolute(home_n)) return false;
+    if (!std.fs.path.isAbsolute(path_n)) return false;
+    if (path_n.len <= home_n.len) return false;
+    if (!std.mem.startsWith(u8, path_n, home_n)) return false;
+    return path_n[home_n.len] == '/' or path_n[home_n.len] == '\\';
 }
 
 pub fn pathHasDotDotSegment(path: []const u8) bool {
@@ -423,6 +449,16 @@ test "host support catalog allows grok docs rules and observations" {
     for (allowed) |path| {
         try std.testing.expectEqual(MatchKind.support, classifyWithEnv(path, env[0..1]));
     }
+
+    try std.testing.expectEqual(
+        MatchKind.support,
+        classifyWithEnv("/private" ++ test_home ++ "/.grok/skill-observations/log.md", env[0..1]),
+    );
+    const private_home = [_]EnvPair{.{ .key = "HOME", .value = "/private" ++ test_home }};
+    try std.testing.expectEqual(
+        MatchKind.support,
+        classifyWithEnv(test_home ++ "/.grok/docs/user-guide/hooks.md", &private_home),
+    );
 
     try std.testing.expectEqual(MatchKind.none, classifyWithEnv(test_home ++ "/.grok/auth.json", env[0..1]));
     try std.testing.expectEqual(MatchKind.none, classifyWithEnv(test_home ++ "/.grok/config.toml", env[0..1]));
@@ -629,6 +665,59 @@ test "classifyExisting fails closed on unresolved catalog symlink" {
 
     try std.testing.expectEqual(MatchKind.skill, classify(alias));
     try std.testing.expectEqual(MatchKind.none, try classifyExisting(io, std.testing.allocator, alias));
+}
+
+test "classifyExisting allows skill-observations when HOME is macOS /var/folders alias" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "home/.grok/skill-observations");
+    try tmp.dir.createDirPath(io, "home/.grok/docs/user-guide");
+    try tmp.dir.writeFile(io, .{ .sub_path = "home/.grok/skill-observations/log.md", .data = "log\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "home/.grok/docs/user-guide/hooks.md", .data = "hooks\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "home/.grok/skill-observations/auth.json", .data = "{}\n" });
+
+    const home_resolved = try tmp.dir.realPathFileAlloc(io, "home", std.testing.allocator);
+    defer std.testing.allocator.free(home_resolved);
+    const home_alias = macosPublicPath(home_resolved);
+
+    const prev_home = blk: {
+        if (std.c.getenv("HOME")) |value| break :blk try std.testing.allocator.dupeZ(u8, std.mem.span(value));
+        break :blk null;
+    };
+    defer if (prev_home) |value| std.testing.allocator.free(value);
+    const home_z = try std.testing.allocator.dupeZ(u8, home_alias);
+    defer std.testing.allocator.free(home_z);
+    try std.testing.expectEqual(@as(c_int, 0), setenv("HOME", home_z, 1));
+    defer {
+        if (prev_home) |value| {
+            _ = setenv("HOME", value, 1);
+        } else {
+            _ = unsetenv("HOME");
+        }
+    }
+
+    const log_alias = try std.fmt.allocPrint(std.testing.allocator, "{s}/.grok/skill-observations/log.md", .{home_alias});
+    defer std.testing.allocator.free(log_alias);
+    const docs_alias = try std.fmt.allocPrint(std.testing.allocator, "{s}/.grok/docs/user-guide/hooks.md", .{home_alias});
+    defer std.testing.allocator.free(docs_alias);
+    const secret_alias = try std.fmt.allocPrint(std.testing.allocator, "{s}/.grok/skill-observations/auth.json", .{home_alias});
+    defer std.testing.allocator.free(secret_alias);
+
+    try std.testing.expectEqual(MatchKind.support, classify(log_alias));
+    try std.testing.expectEqual(MatchKind.support, try classifyExisting(io, std.testing.allocator, log_alias));
+    try std.testing.expectEqual(MatchKind.support, classify(docs_alias));
+    try std.testing.expectEqual(MatchKind.support, try classifyExisting(io, std.testing.allocator, docs_alias));
+    try std.testing.expectEqual(MatchKind.none, classify(secret_alias));
+    try std.testing.expectEqual(MatchKind.none, try classifyExisting(io, std.testing.allocator, secret_alias));
+}
+
+fn macosPublicPath(path: []const u8) []const u8 {
+    const prefix = "/private";
+    if (path.len > prefix.len and std.mem.startsWith(u8, path, prefix) and path[prefix.len] == '/') {
+        return path[prefix.len..];
+    }
+    return path;
 }
 
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;

@@ -3616,6 +3616,22 @@ test "hook Grok PreToolUse rejects web_search as unsupported" {
     try std.testing.expectError(error.UnsupportedGrokPreToolUse, grokHookPayload(web_search.value, .PreToolUse));
 }
 
+test "hook Grok PreToolUse search_replace envelope with old_string new_string is not malformed" {
+    const allocator = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        \\{"hookEventName":"pre_tool_use","sessionId":"s1","cwd":"/tmp/project","workspaceRoot":"/tmp/project","toolName":"search_replace","toolInput":{"target_file":"src/cli/hook.zig","old_string":"fn a() void {}","new_string":"fn a() void { return; }"}}
+    ,
+        .{},
+    );
+    defer parsed.deinit();
+    _ = try grokHookPayload(parsed.value, .PreToolUse);
+    const classification = classifyHookEvent(.PreToolUse, parsed.value);
+    try std.testing.expectEqual(HookEventClassification.non_shell, std.meta.activeTag(classification));
+    try std.testing.expectEqual(NonShellHookEvent.file_write, classification.non_shell);
+}
+
 test "hook Grok PreToolUse accepts write edit write_file create_file search_replace with target_file" {
     const allocator = std.testing.allocator;
     const tools = [_][]const u8{ "write", "edit", "write_file", "create_file", "search_replace", "str_replace", "apply_patch" };
@@ -3812,6 +3828,86 @@ test "hook PreToolUse leftover unused notes.md is permit attended and deny unatt
         try std.testing.expectEqual(case.expect, result.decision);
         try std.testing.expectEqualStrings("file.read", result.category);
     }
+}
+
+test "hook PreToolUse file_read allows tmp HOME grok skill-observations" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    try tmp.dir.createDirPath(io, "home/.grok/skill-observations");
+    try tmp.dir.createDirPath(io, "home/.grok/docs/user-guide");
+    try tmp.dir.createDirPath(io, "workspace");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "home/.grok/skill-observations/log.md",
+        .data = "log\n",
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "home/.grok/docs/user-guide/hooks.md",
+        .data = "hooks\n",
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "home/.grok/auth.json",
+        .data = "{}\n",
+    });
+
+    const home_resolved = try tmp.dir.realPathFileAlloc(io, "home", std.testing.allocator);
+    defer std.testing.allocator.free(home_resolved);
+    const home = macosPublicHome(home_resolved);
+    const root = try tmp.dir.realPathFileAlloc(io, "workspace", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const log_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/.grok/skill-observations/log.md", .{home});
+    defer std.testing.allocator.free(log_path);
+    const docs_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/.grok/docs/user-guide/hooks.md", .{home});
+    defer std.testing.allocator.free(docs_path);
+
+    const prev_home = blk: {
+        if (std.c.getenv("HOME")) |value| break :blk try std.testing.allocator.dupeZ(u8, std.mem.span(value));
+        break :blk null;
+    };
+    defer if (prev_home) |value| std.testing.allocator.free(value);
+    const home_z = try std.testing.allocator.dupeZ(u8, home);
+    defer std.testing.allocator.free(home_z);
+    try std.testing.expectEqual(@as(c_int, 0), setenv("HOME", home_z, 1));
+    defer {
+        if (prev_home) |value| {
+            _ = setenv("HOME", value, 1);
+        } else {
+            _ = unsetenv("HOME");
+        }
+    }
+
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const allocator = gpa_state.allocator();
+
+    var log_result = try evaluateGenericAgentReadHook(allocator, root, log_path, false);
+    defer log_result.deinit(allocator);
+    log_result.decision = applyHostWireRewrite(log_result.decision, log_result.ask_origin, false);
+    try std.testing.expectEqual(PluginDecision.allow, log_result.decision);
+    try std.testing.expectEqualStrings("file.read", log_result.category);
+    try std.testing.expect(log_result.rule != null);
+    try std.testing.expectEqualStrings("builtin.files.read.allow[host_support]", log_result.rule.?);
+
+    var docs_result = try evaluateGenericAgentReadHook(allocator, root, docs_path, false);
+    defer docs_result.deinit(allocator);
+    docs_result.decision = applyHostWireRewrite(docs_result.decision, docs_result.ask_origin, false);
+    try std.testing.expectEqual(PluginDecision.allow, docs_result.decision);
+    try std.testing.expectEqualStrings("builtin.files.read.allow[host_support]", docs_result.rule.?);
+
+    const auth_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/.grok/auth.json", .{home});
+    defer std.testing.allocator.free(auth_path);
+    var auth_result = try evaluateGenericAgentReadHook(allocator, root, auth_path, false);
+    defer auth_result.deinit(allocator);
+    auth_result.decision = applyHostWireRewrite(auth_result.decision, auth_result.ask_origin, false);
+    try std.testing.expectEqual(PluginDecision.block, auth_result.decision);
+}
+
+fn macosPublicHome(path: []const u8) []const u8 {
+    const prefix = "/private";
+    if (path.len > prefix.len and std.mem.startsWith(u8, path, prefix) and path[prefix.len] == '/') {
+        return path[prefix.len..];
+    }
+    return path;
 }
 
 fn evaluateGenericAgentReadHook(

@@ -1,0 +1,31 @@
+# More service instances + gateway fingerprint
+fdir="/tmp/ryk-mdns2-$$"
+mkdir -p "$fdir"
+dns-sd -B _ssh._tcp local. > "$fdir/ssh" 2>&1 & p1=$!
+dns-sd -B _sftp-ssh._tcp local. > "$fdir/sftp" 2>&1 & p2=$!
+dns-sd -B _rfb._tcp local. > "$fdir/rfb" 2>&1 & p3=$!
+dns-sd -B _openclaw-gw._tcp local. > "$fdir/oc" 2>&1 & p4=$!
+dns-sd -B _ipps._tcp local. > "$fdir/ipps" 2>&1 & p5=$!
+dns-sd -B _companion-link._tcp local. > "$fdir/comp" 2>&1 & p6=$!
+sleep 5
+kill $p1 $p2 $p3 $p4 $p5 $p6 2>/dev/null
+echo "===== extra mdns ====="
+for f in "$fdir"/*; do echo "----- $(basename $f) -----"; grep "Add " "$f" | grep -v TIMESTAMP; done
+
+echo
+echo "===== gateway HTTP ====="
+curl -sS -m 3 -D - http://192.168.100.1/ -o /tmp/gw-body-$$.txt | head -40
+echo "----- body head -----"
+head -c 800 /tmp/gw-body-$$.txt; echo
+echo "===== gateway 443 ====="
+curl -skS -m 3 -D - https://192.168.100.1/ -o /tmp/gw-ssl-$$.txt | head -25
+head -c 400 /tmp/gw-ssl-$$.txt; echo
+echo "===== common UniFi ====="
+curl -skS -m 3 -D - https://192.168.100.1:8443/ -o /dev/null | head -20
+curl -sS -m 2 http://192.168.100.1:80/info | head
+echo
+echo "===== ping TTL/sizes of live hosts ====="
+for ip in 192.168.100.1 192.168.100.66 192.168.100.71 192.168.100.166 192.168.100.214 192.168.100.236; do
+  echo "-- $ip --"
+  ping -c 2 -W 400 "$ip" 2>&1 | tail -4
+done

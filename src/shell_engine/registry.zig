@@ -897,6 +897,47 @@ test "match infrastructure error hit is deny not allow_miss" {
     try std.testing.expect(r.deny.severity == .critical);
 }
 
+test "harvested grok shell commands are not pcre-match-error" {
+    const cases = [_][]const u8{
+        @embedFile("testdata/harvested-pcre-b1.txt"),
+        @embedFile("testdata/harvested-pcre-b2.txt"),
+        @embedFile("testdata/harvested-pcre-b3.txt"),
+    };
+    try ensureInitDefault();
+    for (cases, 0..) |cmd, i| {
+        const r = matchCommandDetailed(cmd);
+        if (r == .deny and std.mem.eql(u8, r.deny.pattern_name, "pcre-match-error")) {
+            for (g_packs) |*pack| {
+                if (!packIsActive(pack.*, .{})) continue;
+                if (!mightMatch(pack.*, cmd)) continue;
+                for (pack.safe) |*pat| {
+                    if (!safePatternMightMatch(pat.regex_source, cmd)) continue;
+                    ensurePatternCompiled(pat) catch {
+                        std.debug.print("B{d} compile-fail {s}:{s}\n", .{ i + 1, pack.id, pat.name });
+                        continue;
+                    };
+                    _ = pat.regex.?.isMatch(cmd) catch {
+                        std.debug.print("B{d} safe-infra {s}:{s}\n", .{ i + 1, pack.id, pat.name });
+                        continue;
+                    };
+                }
+                for (pack.destructive) |*pat| {
+                    if (!patternMightMatch(pat.regex_source, cmd)) continue;
+                    ensurePatternCompiled(pat) catch {
+                        std.debug.print("B{d} compile-fail {s}:{s}\n", .{ i + 1, pack.id, pat.name });
+                        continue;
+                    };
+                    _ = pat.regex.?.findMatch(cmd) catch {
+                        std.debug.print("B{d} dest-infra {s}:{s}\n", .{ i + 1, pack.id, pat.name });
+                        continue;
+                    };
+                }
+            }
+            try std.testing.expect(false);
+        }
+    }
+}
+
 fn expectMatchEqual(lazy: MatchResult, eager: MatchResult) !void {
     try std.testing.expectEqual(std.meta.activeTag(lazy), std.meta.activeTag(eager));
     if (lazy == .deny) {

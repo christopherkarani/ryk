@@ -210,6 +210,11 @@ pub fn evaluateCommand(allocator: std.mem.Allocator, command: []const u8, option
         const working = masked_storage.?;
         try appendUniqueCandidate(allocator, &candidates, working);
         try appendSegments(allocator, &candidates, working);
+    } else if (has_heredoc and !is_herestring_only and !heredocReceiverIsShell(trimmed)) {
+        // Language-interpreter heredoc (python <<'PY'): do not split the source
+        // body into shell segments. evalOne masks the body for pack match and
+        // classifies language APIs on the original command.
+        try appendUniqueCandidate(allocator, &candidates, trimmed);
     } else {
         // Prefer per-segment evaluation so assignment values and safe prefixes
         // cannot poison a full-string regex match. Also keep the full command
@@ -886,6 +891,81 @@ fn isDataSinkBasename(base: []const u8) bool {
 /// True when a `<<` heredoc (not `<<<`) is received by a shell/interpreter path.
 /// Handles whitespace, attached forms (`/bin/bash<<'EOF'`), and options before
 /// the redirect (`bash -s <<'EOF'`) by resolving argv0 of the simple command.
+fn isShellInterpreterBasename(base: []const u8) bool {
+    const names = [_][]const u8{ "sh", "bash", "zsh", "ksh", "dash", "fish" };
+    for (names) |n| {
+        if (std.ascii.eqlIgnoreCase(base, n)) return true;
+    }
+    return false;
+}
+
+fn heredocReceiverIsShell(cmd: []const u8) bool {
+    var i: usize = 0;
+    while (i + 1 < cmd.len) : (i += 1) {
+        if (cmd[i] != '<' or cmd[i + 1] != '<') continue;
+        if (i + 2 < cmd.len and cmd[i + 2] == '<') {
+            i += 2;
+            continue;
+        }
+        const segment = simpleCommandPrefixBefore(cmd, i);
+        if (segmentHasShellReceiver(segment)) return true;
+    }
+    return false;
+}
+
+/// Like `segmentArgv0Kind`, but true only for sh/bash/zsh/… after env/sudo wrappers.
+/// Python/ruby/node receivers stay false so their heredoc bodies can be masked.
+fn segmentHasShellReceiver(segment: []const u8) bool {
+    var i: usize = 0;
+    while (i < segment.len) {
+        while (i < segment.len and std.ascii.isWhitespace(segment[i])) : (i += 1) {}
+        if (i >= segment.len) break;
+
+        var j = i;
+        while (j < segment.len and (std.ascii.isAlphanumeric(segment[j]) or segment[j] == '_')) : (j += 1) {}
+        if (j > i and j < segment.len and segment[j] == '=') {
+            while (j < segment.len and !std.ascii.isWhitespace(segment[j])) : (j += 1) {}
+            i = j;
+            continue;
+        }
+
+        const word = nextShellWord(segment, &i);
+        if (word.len == 0) break;
+
+        var bare = word;
+        if (bare.len >= 2 and (bare[0] == '\'' or bare[0] == '"') and bare[bare.len - 1] == bare[0]) {
+            bare = bare[1 .. bare.len - 1];
+        }
+        var base = commandWordBasename(bare);
+        if (base.len >= 4 and std.ascii.eqlIgnoreCase(base[base.len - 4 ..], ".exe")) {
+            base = base[0 .. base.len - 4];
+        }
+
+        if (isHeredocWrapperBasename(base)) {
+            while (i < segment.len) {
+                var peek = i;
+                while (peek < segment.len and std.ascii.isWhitespace(segment[peek])) : (peek += 1) {}
+                if (peek >= segment.len) break;
+                if (segment[peek] != '-') break;
+                const opt = nextShellWord(segment, &i);
+                if (wrapperOptionTakesOperand(base, opt)) {
+                    var peek2 = i;
+                    while (peek2 < segment.len and std.ascii.isWhitespace(segment[peek2])) : (peek2 += 1) {}
+                    if (peek2 < segment.len and segment[peek2] != '-') {
+                        _ = nextShellWord(segment, &i);
+                    }
+                }
+            }
+            continue;
+        }
+        if (isShellReservedWord(base)) continue;
+        if (isShellInterpreterBasename(base)) return true;
+        if (base.len > 0 and base[0] == '-') continue;
+        return false;
+    }
+    return false;
+}
+
 fn heredocReceiverIsExecuting(cmd: []const u8) bool {
     var i: usize = 0;
     while (i + 1 < cmd.len) : (i += 1) {
@@ -1495,7 +1575,18 @@ fn evalOne(allocator: std.mem.Allocator, cand: []const u8, match_opts: registry.
     // Pure assignment segment (VAR=value) — not executed as a command word.
     if (isAssignmentOnly(trimmed)) return null;
 
+    // Outer inspect verbs: classify the ryk invocation, not the quoted sample.
+    if (isRykInspectMeta(trimmed)) return null;
+
+    // Fork bomb is a function definition, not a pack-keyword command word.
+    if (matchForkBomb(trimmed)) |h| return h;
+
+    // Language-runtime destructive APIs on the original (python heredoc / -c).
+    // Quoted inspect wrappers already returned above.
+    if (matchLangDestruct(trimmed)) |h| return h;
+
     // Mask non-executing heredoc bodies (cat/tee/grep <<EOF …) so data cannot trigger packs.
+    // Quoted python/ruby heredocs are masked for shell packs; bash heredocs stay visible.
     // When skip_data_sanitize (pipe-to-shell LHS), leave bodies visible — stdin is executing.
     const masked_hd = if (opts.skip_data_sanitize)
         try allocator.dupe(u8, trimmed)
@@ -1509,9 +1600,6 @@ fn evalOne(allocator: std.mem.Allocator, cand: []const u8, match_opts: registry.
         try sanitize.sanitizeForMatching(allocator, masked_hd);
     defer allocator.free(sanitized);
 
-    // Language-runtime destructive APIs inside -c/-e bodies (no pack regex covers these).
-    if (matchLangDestruct(sanitized)) |h| return h;
-
     // ${TMPDIR:-/tmp}/… is a temp-family path (bash default expansion).
     const for_match = try rewriteTempDefault(allocator, sanitized);
     defer allocator.free(for_match);
@@ -1524,6 +1612,52 @@ fn evalOne(allocator: std.mem.Allocator, cand: []const u8, match_opts: registry.
     if (matchDeny(norm.normalized, match_opts)) |h| return h;
 
     return null;
+}
+
+fn skipFirstShellWord(cmd: []const u8) []const u8 {
+    const t = std.mem.trim(u8, cmd, " \t\r\n");
+    var i: usize = 0;
+    while (i < t.len and !std.ascii.isWhitespace(t[i])) : (i += 1) {}
+    while (i < t.len and std.ascii.isWhitespace(t[i])) : (i += 1) {}
+    return t[i..];
+}
+
+/// `ryk explain` / `ryk test` / `ryk evaluate` / `ryk decide` inspect a sample.
+/// The outer verb is not the destructive command in the argument.
+fn isRykInspectMeta(cmd: []const u8) bool {
+    const base = firstTokenBasename(cmd);
+    if (!std.ascii.eqlIgnoreCase(base, "ryk")) return false;
+    var rest = skipFirstShellWord(cmd);
+    while (rest.len > 0 and rest[0] == '-') {
+        rest = skipFirstShellWord(rest);
+    }
+    if (rest.len == 0) return false;
+    var end: usize = 0;
+    while (end < rest.len and !std.ascii.isWhitespace(rest[end])) : (end += 1) {}
+    const sub = rest[0..end];
+    return std.mem.eql(u8, sub, "explain") or
+        std.mem.eql(u8, sub, "test") or
+        std.mem.eql(u8, sub, "evaluate") or
+        std.mem.eql(u8, sub, "decide");
+}
+
+fn matchForkBomb(cmd: []const u8) ?registry.Hit {
+    var buf: [256]u8 = undefined;
+    if (cmd.len > buf.len) return null;
+    var n: usize = 0;
+    for (cmd) |c| {
+        if (c == ' ' or c == '\t' or c == '\n' or c == '\r') continue;
+        buf[n] = c;
+        n += 1;
+    }
+    const compact = buf[0..n];
+    if (std.mem.indexOf(u8, compact, ":(){:|:&};:") == null) return null;
+    return .{
+        .pack_id = "core.filesystem",
+        .pattern_name = "fork-bomb",
+        .severity = .critical,
+        .reason = "Fork bomb (:(){ :|:& };:) spawns unbounded processes. This command will NOT be executed.",
+    };
 }
 
 fn isAssignmentOnly(cmd: []const u8) bool {
@@ -1796,7 +1930,10 @@ fn heredocBodyLikelyUnmasked(masked: []const u8, original: []const u8) bool {
 fn maskNonExecutingHeredoc(allocator: std.mem.Allocator, cmd: []const u8) ![]u8 {
     const out = try allocator.dupe(u8, cmd);
     if (std.mem.indexOf(u8, cmd, "<<") == null) return out;
-    if (isExecutingContext(cmd)) return out;
+    // Shell-executing heredocs stay visible (the body is the script).
+    // Language-interpreter heredocs (python <<'PY') are source data for shell
+    // packs; language APIs are classified on the original command in evalOne.
+    if (heredocReceiverIsShell(cmd)) return out;
 
     // Find first << (not <<<)
     var i: usize = 0;
@@ -2018,11 +2155,102 @@ test "evaluateCommand allows git stash drop" {
     try std.testing.expect(eval.decision == .allow);
 }
 
+test "evaluateCommand allows commit message containing dash D" {
+    var eval = try evaluateCommand(std.testing.allocator, "git commit -m \"fix: -D is in the message\"", .{});
+    defer eval.deinit(std.testing.allocator);
+    try std.testing.expect(eval.decision == .allow);
+}
+
 test "evaluateCommand still denies git stash clear" {
     var eval = try evaluateCommand(std.testing.allocator, "git stash clear", .{});
     defer eval.deinit(std.testing.allocator);
     try std.testing.expect(eval.decision == .deny);
     try std.testing.expect(std.mem.indexOf(u8, eval.rule_id.?, "stash-clear") != null);
+}
+
+test "evaluateCommand still denies python heredoc shutil rmtree" {
+    const cmd =
+        \\python3 <<'PY'
+        \\import shutil
+        \\shutil.rmtree('dir')
+        \\PY
+    ;
+    var eval = try evaluateCommand(std.testing.allocator, cmd, .{});
+    defer eval.deinit(std.testing.allocator);
+    try std.testing.expect(eval.decision == .deny);
+}
+
+test "evaluateCommand allows python heredoc that stores git branch -D as data" {
+    const cmd =
+        \\python3 <<'PY'
+        \\import re
+        \\pat=r'git branch -D topic'
+        \\print(pat)
+        \\PY
+    ;
+    var eval = try evaluateCommand(std.testing.allocator, cmd, .{});
+    defer eval.deinit(std.testing.allocator);
+    try std.testing.expect(eval.decision == .allow);
+}
+
+test "evaluateCommand allows ryk explain of python rmtree sample" {
+    const cmd = "ryk explain \"python3 -c 'import shutil; shutil.rmtree(\\\"dir\\\")'\"";
+    var eval = try evaluateCommand(std.testing.allocator, cmd, .{});
+    defer eval.deinit(std.testing.allocator);
+    try std.testing.expect(eval.decision == .allow);
+}
+
+test "evaluateCommand allows ryk test of rm -rf sample" {
+    var eval = try evaluateCommand(std.testing.allocator, "ryk test -- 'rm -rf /tmp/x'", .{});
+    defer eval.deinit(std.testing.allocator);
+    try std.testing.expect(eval.decision == .allow);
+}
+
+test "evaluateCommand still denies inner rm -rf sandbox" {
+    var eval = try evaluateCommand(std.testing.allocator, "rm -rf ./.ryk-sandbox", .{});
+    defer eval.deinit(std.testing.allocator);
+    try std.testing.expect(eval.decision == .deny);
+}
+
+test "evaluateCommand still denies home glob wipe and mv home" {
+    const cases = [_]struct { cmd: []const u8, rule: []const u8 }{
+        .{ .cmd = "rm -rf ~/*", .rule = "core.filesystem:rm-rf-root-home" },
+        .{ .cmd = "mv ~ /tmp/lost", .rule = "core.filesystem:mv-sensitive-source-root-home" },
+    };
+    for (cases) |c| {
+        var eval = try evaluateCommand(std.testing.allocator, c.cmd, .{});
+        defer eval.deinit(std.testing.allocator);
+        try std.testing.expect(eval.decision == .deny);
+        try std.testing.expectEqualStrings(c.rule, eval.rule_id.?);
+    }
+}
+
+test "evaluateCommand denies fork bomb" {
+    var eval = try evaluateCommand(std.testing.allocator, ":(){ :|:& };:", .{});
+    defer eval.deinit(std.testing.allocator);
+    try std.testing.expect(eval.decision == .deny);
+    try std.testing.expect(eval.pack_id != null);
+    try std.testing.expectEqualStrings("core.filesystem", eval.pack_id.?);
+    try std.testing.expect(eval.pattern_name != null);
+    try std.testing.expectEqualStrings("fork-bomb", eval.pattern_name.?);
+}
+
+test "evaluateCommand harvested pcre strings are not pcre-match-error" {
+    const cases = [_][]const u8{
+        @embedFile("testdata/harvested-pcre-b1.txt"),
+        @embedFile("testdata/harvested-pcre-b2.txt"),
+        @embedFile("testdata/harvested-pcre-b3.txt"),
+    };
+    for (cases) |cmd| {
+        var eval = try evaluateCommand(std.testing.allocator, cmd, .{});
+        defer eval.deinit(std.testing.allocator);
+        if (eval.pack_id) |pack| {
+            try std.testing.expect(!std.mem.eql(u8, pack, "zig.shell"));
+        }
+        if (eval.pattern_name) |name| {
+            try std.testing.expect(!std.mem.eql(u8, name, "pcre-match-error"));
+        }
+    }
 }
 
 test "evaluateCommand denies git reset --hard" {
@@ -2145,6 +2373,34 @@ test "evaluateCommand denies echo/printf/cat redirect to sensitive path" {
         try std.testing.expect(eval.rule_id != null);
         try std.testing.expectEqualStrings("core.filesystem:redirect-truncate-root-home", eval.rule_id.?);
     }
+}
+
+test "evaluateCommand allows cat redirect to var folders scratch" {
+    const cmd =
+        \\cat > /var/folders/ns/xmz0zmpj7p148vdgr4bwzp8h0000gn/T/grok-501/maspr-fpfn-test.json <<'EOF'
+        \\{}
+        \\EOF
+    ;
+    var eval = try evaluateCommand(std.testing.allocator, cmd, .{});
+    defer eval.deinit(std.testing.allocator);
+    try std.testing.expect(eval.decision == .allow);
+}
+
+test "evaluateCommand still denies redirect to var log" {
+    var eval = try evaluateCommand(std.testing.allocator, "> /var/log/syslog", .{});
+    defer eval.deinit(std.testing.allocator);
+    try std.testing.expect(eval.decision == .deny);
+    try std.testing.expectEqualStrings("core.filesystem:redirect-truncate-root-home", eval.rule_id.?);
+}
+
+test "evaluateCommand allows gh pr view redirect to tmp scratch" {
+    var eval = try evaluateCommand(
+        std.testing.allocator,
+        "gh pr view https://github.com/christopherkarani/ryk/pull/533 > /tmp/ryk-scratch-meta.json",
+        .{},
+    );
+    defer eval.deinit(std.testing.allocator);
+    try std.testing.expect(eval.decision == .allow);
 }
 
 test "evaluateCommand denies node fs.rmSync wipe of root" {
@@ -2650,6 +2906,7 @@ test "phase2 credentials cat-env Mode A" {
         .{ .cmd = "echo 'cat .env'", .expect_deny = false },
         .{ .cmd = "less rm -rf /", .expect_deny = false },
         .{ .cmd = "more rm -rf /", .expect_deny = false },
+        .{ .cmd = "head -c 800 /tmp/gw-body-$$.txt", .expect_deny = false },
     };
     for (cases) |c| {
         var eval = try evaluateCommand(std.testing.allocator, c.cmd, .{});

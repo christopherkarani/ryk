@@ -41,6 +41,7 @@
 
 ## [Unreleased]
 
+* Host-runtime reads match macOS `/var` ↔ `/private/var` (and `/tmp`, `/etc`) so a temp `HOME` under `/var/folders` still allows `~/.grok/docs/**` / `rules/**` / `skill-observations/**`. `ryk explain` / `ryk test --` of a sample is not itself `rm-rf-*`. `core.credentials:cat-env` no longer fail-closes ordinary `head`/`curl` pipelines as `pcre-match-error`. Scratch redirects under `/var/folders` and `/var/tmp` are not `redirect-truncate-root-home`; `> /etc/passwd` and `> /var/log/*` still deny.
 * Hooks stay out of the agent's way except for dangerous commands and secret files. Default Grok install wires Bash + Read only (Write/Edit off the hook wire). Attended leftover unused file.read default-deny (extra worktree, notes) is permit; explicit deny, `.env`, `~/.ssh`, and symlink escapes still block. `git branch -f` is not treated as force-delete; `git stash drop` is allowed; `git branch -D` and `git stash clear` still deny. Host-runtime reads include `~/.grok/docs/**`, `~/.grok/rules/**`, and `~/.grok/skill-observations/**`. Coding DCG no longer denies workspace files whose names contain `token`/`secret`/`credential`. Max protection remains opt-in via `ryk <agent>`.
 * `ryk test` and default `ryk explain` DENY no longer ping-pong Next between the other inspect verb. Safer is the one action when a safer command exists.
 * Dashboard feed load redacts historical JSONL user fields and rewrites a token-shaped `session_id` to the path-safe literal `redacted` (not `[REDACTED]`) so Session stays a valid path key.
