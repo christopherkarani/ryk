@@ -126,7 +126,7 @@ is_reviewed_synthetic_file() {
     scripts/test-telemetry-release-contract.sh) expected='feecda8d4d7089f244b7eefe5f8f7b0d51577abe810aa77cd9b7ad01aec0dba3' ;;
     packages/core/tests/contract.zig) expected='a687e982724f5e023b1c2df6182f5c5c81abe6562e804c7cbc459a507e699fbb' ;;
     fixtures/network-exfil/http-query-exfil/fixture.yaml) expected='9a72613bd364dec2d991921230acd2990483202b6ee663ef0c37d5d6aa1bc07e' ;;
-    docs/credentials.md) expected='a7e64118673fa102f2f26f714ae57caf24a61efdfb38aabe3bbb53befa046832' ;;
+    docs/credentials.md) expected='8c083cc575dfc16641dcc67f26dffc99462a6e78a822a3a6cea2b6f29a47759c' ;;
     *) return 1 ;;
   esac
   [[ "$(shasum -a 256 "$file" | awk '{print $1}')" == "$expected" ]]
