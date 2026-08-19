@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.2.22] - 2026-08-19
+
+## What's Changed
+* fix(hooks): stop blocking ordinary agent work by @christopherkarani in https://github.com/christopherkarani/ryk/pull/533
+* fix(hooks): stop false-denying ordinary Grok work (macOS `/private` HOME alias, cat-env PCRE, scratch redirects, `ryk explain`/`test` inspect)
+* fix(policy): tag file-read leftover defaults only by @christopherkarani in https://github.com/christopherkarani/ryk/pull/534
+* fix: close leftover MAPR 533 polish and compile by @christopherkarani in https://github.com/christopherkarani/ryk/pull/536
+* docs(readme): surface v0.2.21 release badge and pin by @christopherkarani in https://github.com/christopherkarani/ryk/pull/537
+* chore: remove leftover orca product trees from the workspace surface by @christopherkarani in https://github.com/christopherkarani/ryk/pull/532
+* chore(release): provision Chris's minisign public key by @christopherkarani in https://github.com/christopherkarani/ryk/pull/540
+
+
+**Full Changelog**: https://github.com/christopherkarani/ryk/compare/v0.2.21...v0.2.22
+
 ## [0.2.21] - 2026-08-18
 
 ## What's Changed

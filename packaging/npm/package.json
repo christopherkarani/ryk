@@ -1,6 +1,6 @@
 {
   "name": "@rykan/ryk",
-  "version": "0.2.21",
+  "version": "0.2.22",
   "description": "npm launcher for the Zig-built ryk binary (Rykan V).",
   "license": "Apache-2.0",
   "homepage": "https://github.com/christopherkarani/ryk",
@@ -29,7 +29,7 @@
     "README.md"
   ],
   "ryk": {
-    "artifactBaseUrl": "https://github.com/christopherkarani/ryk/releases/download/v0.2.21",
+    "artifactBaseUrl": "https://github.com/christopherkarani/ryk/releases/download/v0.2.22",
     "supportedTargets": [
       "darwin-amd64",
       "darwin-arm64",

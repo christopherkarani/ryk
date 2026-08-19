@@ -1,6 +1,6 @@
 {
   "name": "ryk-opencode-plugin",
-  "version": "0.2.21",
+  "version": "0.2.22",
   "description": "OpenCode plugin wrapper for ryk runtime guardrails.",
   "type": "module",
   "main": "dist/index.js",
