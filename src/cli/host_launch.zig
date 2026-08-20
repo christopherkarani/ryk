@@ -361,6 +361,44 @@ test "host_ask_resume tryDispatch warns when host hard-blocks ask with no resume
     try std.testing.expect(std.mem.indexOf(u8, err, "host-decision-mapping.md") != null);
 }
 
+test "host_ask_resume tryDispatch grok warn matches hard-block-no-resume hosts" {
+    const allocator = std.testing.allocator;
+    var environ_map = std.process.Environ.Map.init(allocator);
+    defer environ_map.deinit();
+
+    var stdout_buf: [64]u8 = undefined;
+    var stderr_buf: [512]u8 = undefined;
+    var stdout_writer: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr_writer: std.Io.Writer = .fixed(&stderr_buf);
+
+    const code = try tryDispatch(
+        allocator,
+        "grok",
+        &.{},
+        struct {
+            fn run(
+                _: std.Io,
+                _: *const std.process.Environ.Map,
+                _: []const []const u8,
+                _: anytype,
+                _: anytype,
+            ) !u8 {
+                return 0;
+            }
+        }.run,
+        std.testing.io,
+        &environ_map,
+        &stdout_writer,
+        &stderr_writer,
+    );
+    try std.testing.expectEqual(@as(u8, 0), code.?);
+    const err = stderr_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, err, "grok") != null);
+    try std.testing.expect(std.mem.indexOf(u8, err, "hard-blocks ask with no resume") != null);
+    try std.testing.expect(std.mem.indexOf(u8, err, "partial") == null);
+    try std.testing.expect(std.mem.indexOf(u8, err, "host-decision-mapping.md") != null);
+}
+
 test "tryDispatch intercepts bare --help before rewriting to run" {
     const allocator = std.testing.allocator;
     var environ_map = std.process.Environ.Map.init(allocator);

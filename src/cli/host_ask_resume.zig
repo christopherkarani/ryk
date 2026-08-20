@@ -20,7 +20,7 @@ pub fn toolAskEnforcement(host: []const u8) ToolAskEnforcement {
     if (std.mem.eql(u8, host, "hermes")) return .native_approve_and_resume;
     if (std.mem.eql(u8, host, "claude")) return .partial_host_ask;
     if (std.mem.eql(u8, host, "codex")) return .partial_host_ask;
-    if (std.mem.eql(u8, host, "grok")) return .partial_host_ask;
+    if (std.mem.eql(u8, host, "grok")) return .hard_block_no_resume;
     if (std.mem.eql(u8, host, "openclaw")) return .partial_host_ask;
     if (std.mem.eql(u8, host, "opencode")) return .hard_block_no_resume;
     if (std.mem.eql(u8, host, "cursor")) return .hard_block_no_resume;
@@ -86,7 +86,8 @@ test "host_ask_resume matrix: hermes resumes; opencode/cursor hard-block; opencl
     try std.testing.expect(hardBlocksAskWithNoResume("cursor"));
     try std.testing.expectEqual(ToolAskEnforcement.partial_host_ask, toolAskEnforcement("claude"));
     try std.testing.expectEqual(ToolAskEnforcement.partial_host_ask, toolAskEnforcement("codex"));
-    try std.testing.expectEqual(ToolAskEnforcement.partial_host_ask, toolAskEnforcement("grok"));
+    try std.testing.expectEqual(ToolAskEnforcement.hard_block_no_resume, toolAskEnforcement("grok"));
+    try std.testing.expect(hardBlocksAskWithNoResume("grok"));
     try std.testing.expectEqual(ToolAskEnforcement.host_dependent, toolAskEnforcement("pi"));
     try std.testing.expectEqual(ToolAskEnforcement.unknown, toolAskEnforcement("not-a-host"));
 
@@ -95,6 +96,27 @@ test "host_ask_resume matrix: hermes resumes; opencode/cursor hard-block; opencl
     try std.testing.expect(std.mem.indexOf(u8, openclaw_warn, "openclaw") != null);
     try std.testing.expect(std.mem.indexOf(u8, openclaw_warn, "ask resume is partial (hook-grade)") != null);
     try std.testing.expect(std.mem.indexOf(u8, openclaw_warn, "hard-blocks ask with no resume") == null);
+}
+
+test "host_ask_resume grok launch warn matches other hard-block-no-resume hosts" {
+    try std.testing.expectEqual(ToolAskEnforcement.hard_block_no_resume, toolAskEnforcement("grok"));
+    try std.testing.expectEqual(toolAskEnforcement("opencode"), toolAskEnforcement("grok"));
+    try std.testing.expectEqual(toolAskEnforcement("cursor"), toolAskEnforcement("grok"));
+    try std.testing.expectEqual(ToolAskEnforcement.partial_host_ask, toolAskEnforcement("claude"));
+    try std.testing.expectEqual(ToolAskEnforcement.partial_host_ask, toolAskEnforcement("codex"));
+    try std.testing.expectEqual(ToolAskEnforcement.host_dependent, toolAskEnforcement("pi"));
+    try std.testing.expect(try formatWarn(std.testing.allocator, &.{"hermes"}) == null);
+
+    const grok_warn = (try formatWarn(std.testing.allocator, &.{"grok"})).?;
+    defer std.testing.allocator.free(grok_warn);
+    const opencode_warn = (try formatWarn(std.testing.allocator, &.{"opencode"})).?;
+    defer std.testing.allocator.free(opencode_warn);
+    try std.testing.expect(std.mem.indexOf(u8, grok_warn, "grok") != null);
+    try std.testing.expect(std.mem.indexOf(u8, grok_warn, "hard-blocks ask with no resume") != null);
+    try std.testing.expect(std.mem.indexOf(u8, grok_warn, "partial") == null);
+    try std.testing.expect(std.mem.indexOf(u8, grok_warn, "allow") == null);
+    try std.testing.expect(std.mem.indexOf(u8, opencode_warn, "hard-blocks ask with no resume") != null);
+    try std.testing.expectEqualStrings(warnLine("grok").?, warnLine("opencode").?);
 }
 
 test "host_ask_resume formatWarn names hard-block hosts and stays silent for hermes-only" {
