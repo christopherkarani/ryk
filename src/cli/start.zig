@@ -1165,6 +1165,50 @@ test "host_ask_resume start OpenClaw completion warns about no ask resume" {
     try std.testing.expect(std.mem.indexOf(u8, written, "host-decision-mapping.md") != null);
 }
 
+test "host_ask_resume start Grok completion warns hard-block no resume" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+
+    const verification = onboarding.VerificationOutcome{
+        .safe_allowed = true,
+        .dangerous_denied = true,
+        .hook_verified = true,
+        .host_evidence = .native,
+        .detail = onboarding.HostEvidence.native.label(),
+    };
+    const daemon_check = onboarding.DaemonCheck{
+        .status = .compatible,
+        .detail = "in-process",
+        .remediation = "none",
+    };
+    var output_buffer: [16 * 1024]u8 = undefined;
+    var output: std.Io.Writer = .fixed(&output_buffer);
+    try writeSuccessEndCard(
+        std.testing.io,
+        std.testing.allocator,
+        &output,
+        root,
+        "strict-local",
+        .command_guard,
+        &.{"grok"},
+        &.{"grok"},
+        daemon_check,
+        verification,
+        "ask",
+        true,
+    );
+
+    const written = output.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "Setup complete") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "Ask resume") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "grok") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "hard-blocks ask with no resume") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "ask resume is partial (hook-grade)") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "host-decision-mapping.md") != null);
+}
+
 test "start leave-alone empty-host card says policy unchanged after verify" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
