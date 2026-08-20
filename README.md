@@ -1,3 +1,5 @@
+
+
 <p align="center">
   <a href="https://rykanv.com/">Website</a> ·
   <a href="https://discord.gg/uZn9MDUYKx">Discord</a> ·
@@ -34,6 +36,8 @@ Run Claude Code, Codex, Pi, OpenCode, Hermes, OpenClaw, or Grok through one loca
 
 ```sh
 curl -fsSL https://rykanv.com/install | sh
+# or install the npm launcher
+npm install -g @rykan/ryk
 ```
 
 Latest is [v0.2.21](https://github.com/christopherkarani/ryk/releases/tag/v0.2.21). Pin with `RYK_VERSION=0.2.21`.
